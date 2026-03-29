@@ -110,10 +110,16 @@ class Phase1AnalyzeWorker(QThread):
         super().__init__()
         self.session_context = session_context
         self.config = config
+        self._event_bus = EventBus()
+        self._is_cancelled = False
+
+    def cancel(self):
+        self._is_cancelled = True
+        self._event_bus.cancel()
 
     def run(self):
         try:
-            event_bus = EventBus()
+            event_bus = self._event_bus
 
             # Use the already loaded session
             session = self.session_context
@@ -156,6 +162,8 @@ class Phase1AnalyzeWorker(QThread):
                     }
                     loaded = 0
                     for future in as_completed(futures):
+                        if self._is_cancelled:
+                            break
                         t = futures[future]
                         try:
                             res = future.result()
@@ -236,10 +244,16 @@ class AnalyzeWorker(QThread):
         self.source_dir = source_dir
         self.config = config
         self.recursive = recursive
+        self._event_bus = EventBus()
+        self._is_cancelled = False
+
+    def cancel(self):
+        self._is_cancelled = True
+        self._event_bus.cancel()
 
     def run(self):
         try:
-            event_bus = EventBus()
+            event_bus = self._event_bus
 
             self.progress.emit("Loading session\u2026")
             session = load_session(self.source_dir, self.config, event_bus=event_bus,
@@ -679,7 +693,7 @@ class TopologyApplyWorker(QThread):
 
     progress = Signal(str)
     progress_value = Signal(int, int)
-    apply_finished = Signal()           # renamed: avoid shadowing QThread.finished
+    apply_finished = Signal()
     error = Signal(str)
 
     def __init__(self, session, output_dir: str, source_dir: str | None = None,
@@ -689,6 +703,10 @@ class TopologyApplyWorker(QThread):
         self._output_dir = output_dir
         self._source_dir = source_dir
         self._peaks_dir = peaks_dir
+        self._is_cancelled = False
+
+    def cancel(self):
+        self._is_cancelled = True
 
     def run(self):
         try:
@@ -748,6 +766,9 @@ class TopologyApplyWorker(QThread):
             # track_map.  Fall back to loading directly from source_dir.
             source_audio: dict[str, tuple] = {}
             for step, filename in enumerate(sorted(needed_sources)):
+                if self._is_cancelled:
+                    return
+
                 log.debug("Apply topology: loading source '%s' (%d/%d)", filename, step + 1, total)
                 self.progress.emit(f"Loading {filename}")
                 self.progress_value.emit(step, total)
@@ -778,6 +799,9 @@ class TopologyApplyWorker(QThread):
             written_files: list[tuple[str, str, int]] = []  # (output_filename, dst_path, sr)
             base_step = n_sources
             for idx, entry in enumerate(topology.entries):
+                if self._is_cancelled:
+                    return
+
                 step = base_step + idx
                 log.debug("Apply topology: writing '%s' (%d/%d)", entry.output_filename, step + 1, total)
                 self.progress.emit(f"Writing {entry.output_filename}")
@@ -845,9 +869,12 @@ class TopologyApplyWorker(QThread):
                     build_peaks, save_peaks, load_peaks,
                     peaks_path_for, get_source_mtime,
                 )
-                peak_base = n_sources + n_entries
-                for pidx, (out_fn, dst, sr) in enumerate(written_files):
-                    step = peak_base + pidx
+                peak_base_step = n_sources + n_entries
+                for idx, (out_fn, dst, sr) in enumerate(written_files):
+                    if self._is_cancelled:
+                        return
+
+                    step = peak_base_step + idx
                     log.debug("Apply topology: building peaks '%s' (%d/%d)", out_fn, step + 1, total)
                     self.progress.emit(f"Building peaks for {out_fn}")
                     self.progress_value.emit(step, total)

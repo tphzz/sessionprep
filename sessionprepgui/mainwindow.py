@@ -900,7 +900,18 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
             if reply != QMessageBox.Yes:
                 event.ignore()
                 return
+
         self._playback.stop()
+
+        # Stop active background tasks cleanly so ThreadPoolExecutor can terminate
+        from PySide6.QtCore import QThread
+        for worker_attr in ["_worker", "_phase1_worker", "_topo_apply_worker", "_setup_worker"]:
+            worker = getattr(self, worker_attr, None)
+            if isinstance(worker, QThread) and worker.isRunning():
+                if hasattr(worker, "cancel"):
+                    worker.cancel()
+                worker.wait(500)
+
         super().closeEvent(event)
 
 

@@ -14,6 +14,11 @@ class EventBus:
     def __init__(self) -> None:
         self._handlers: dict[str, list[Callable[..., Any]]] = {}
         self._lock = threading.Lock()
+        self.is_cancelled = threading.Event()
+
+    def cancel(self) -> None:
+        """Signal internal processes to abort work cleanly."""
+        self.is_cancelled.set()
 
     def subscribe(self, event_type: str, handler: Callable[..., Any]) -> None:
         """Register a handler for an event type."""
