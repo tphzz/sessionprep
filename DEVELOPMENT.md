@@ -431,9 +431,13 @@ sessionprepgui/                  # GUI package (PySide6)
     waveform/
         __init__.py              # Re-exports WaveformWidget, WaveformLoadWorker, SPECTROGRAM_COLORMAPS
         compute.py               # Colormaps, mel math, spectrogram computation, QThread workers
+                                 #   (WaveformLoadWorker, SpectrogramWorker, PeakBuildWorker)
+        peakcache.py             # Pre-computed peak mipmap cache: build, save, load, query
+                                 #   Binary .peaks format for fast waveform rendering
         renderer.py              # WaveformRenderer — peaks, waveform drawing, RMS overlay, dB scale, markers
         spectrogram.py           # SpectrogramRenderer — mel image, frequency scale, freq zoom/pan
         overlay.py               # Stateless overlay drawing functions (issue overlays, time scale)
+        panel.py                 # WaveformPanel — composite widget: toolbar + WaveformWidget + transport bar
         widget.py                # WaveformWidget — thin orchestrator coordinating WaveformRenderer
                                  #   and SpectrogramRenderer
 
@@ -772,7 +776,7 @@ Contains audio I/O, cached DSP helpers, and stateless DSP functions.
 **File discovery:**
 
 - `discover_track(filepath) -> TrackContext` — reads audio file metadata (channels, samplerate, bitdepth, duration) without loading audio data. Sets `filename = os.path.basename(filepath)` — callers override with relative paths when recursive scanning is active.
-- `discover_audio_files(root_dir, recursive=False, skip_folders=None) -> list[str]` — returns a sorted list of audio file paths relative to *root_dir*. When `recursive=False`, returns bare filenames (flat `os.listdir`). When `True`, walks subdirectories via `os.walk(followlinks=False)` and returns forward-slash–separated relative paths (e.g. `"drums/01_Kick.wav"`). Directories whose name appears in `skip_folders` are pruned (e.g. `{"sp_01_tracklayout", "sp_02_prepared"}`). Results sorted by `protools_sort_key`.
+- `discover_audio_files(root_dir, recursive=False, skip_folders=None) -> list[str]` — returns a sorted list of audio file paths relative to *root_dir*. When `recursive=False`, returns bare filenames (flat `os.listdir`). When `True`, walks subdirectories via `os.walk(followlinks=False)` and returns forward-slash–separated relative paths (e.g. `"drums/01_Kick.wav"`). Directories whose name appears in `skip_folders` are pruned (e.g. `{"sp_01_tracklayout", "sp_02_prepared", "sp_peaks"}`). Results sorted by `protools_sort_key`.
 
 **File I/O:**
 
@@ -1022,7 +1026,7 @@ DAWproject, +12 dB for Pro Tools). The headroom margin is configured via
 `fader_headroom_db` (default 8 dB). If the highest fader offset exceeds
 `ceiling - headroom`, all fader offsets are shifted down uniformly by the
 excess amount. The shift is stored in `ProcessorResult.data["fader_rebalance_shift"]`
-and logged via `dbg()` when `SP_DEBUG` is active.
+and logged via `dbg()` when `SP_LOG_LEVEL=DEBUG` is active.
 
 ### 7.7 Registration
 
@@ -1307,7 +1311,7 @@ the current state.
 
 ### 9.5 Profiling & Debugging
 
-When the `SP_DEBUG` environment variable is set to `1` or `true`, the pipeline
+When the `SP_LOG_LEVEL` environment variable is set to `DEBUG`, the pipeline
 emits per-component timing via `dbg()` (from `sessionprepgui/log.py`).
 Output goes to stderr with timestamps and caller class names.
 
@@ -1664,7 +1668,7 @@ group).
 | `theme.py`                | `COLORS` dict, `FILE_COLOR_*` constants, dark palette + stylesheet                                                                                                                                                                                                                                                                                                                            |
 | `helpers.py`              | `esc()`, `track_analysis_label(track, detectors=None)` (filters via `is_relevant()`), `fmt_time()`, severity maps                                                                                                                                                                                                                                                                             |
 | `widgets.py`              | `BatchEditTableWidget`, `BatchComboBox` — reusable batch-edit base classes preserving multi-row selection across cell-widget clicks (zero app imports)                                                                                                                                                                                                                                        |
-| `log.py`                  | `dbg(msg)` — lightweight debug logging to stderr, gated by `SP_DEBUG` env var. Timestamped output with caller class name. Used by `pipeline.py`, `dawproject.py`, and other modules via conditional import.                                                                                                                                                                                   |
+| `log.py`                  | `dbg(msg)` — lightweight debug logging to stderr, gated by `SP_LOG_LEVEL=DEBUG`. Timestamped output with caller class name. Used by `pipeline.py`, `dawproject.py`, and other modules via conditional import.                                                                                                                                                                                   |
 | `analysis/mixin.py`       | `AnalysisMixin` — open/save/load session, analyze, prepare, session Config tab wiring                                                                                                                                                                                                                                                                                                         |
 | `analysis/worker.py`      | QThread workers: `AnalyzeWorker` (pipeline in background, thread-safe progress, per-track signals), `BatchReanalyzeWorker` (subset re-analysis after batch overrides), `PrepareWorker` (runs `Pipeline.prepare()` in background with progress), `DawCheckWorker` (connectivity check), `DawFetchWorker` (folder fetch), `DawTransferWorker` (transfer with progress + progress_value signals) |
 | `daw/mixin.py`            | `DawMixin` — DAW processor selection, check/fetch/transfer/sync, folder tree, drag-and-drop track assignment, Track Name inline editing, duplication with `-[N]` naming                                                                                                                                                                                                                       |
@@ -1680,10 +1684,12 @@ group).
 | `tracks/groups_mixin.py`  | `GroupsMixin` — group assignment UI, color rendering in track table                                                                                                                                                                                                                                                                                                                           |
 | `tracks/table_widgets.py` | Track table widget classes (custom cell widgets, batch-edit base classes)                                                                                                                                                                                                                                                                                                                     |
 | `waveform/__init__.py`    | Re-exports `WaveformWidget`, `WaveformLoadWorker`, `SPECTROGRAM_COLORMAPS`                                                                                                                                                                                                                                                                                                                    |
-| `waveform/compute.py`     | Colormaps (magma/viridis/grayscale LUTs), mel math, spectrogram computation, `WaveformLoadWorker` QThread                                                                                                                                                                                                                                                                                     |
-| `waveform/renderer.py`    | `WaveformRenderer` — vectorised NumPy peak/RMS downsampling, waveform drawing, RMS L/R and AVG envelopes, dB scale, peak/RMS markers                                                                                                                                                                                                                                                          |
+| `waveform/compute.py`     | Colormaps (magma/viridis/grayscale LUTs), mel math, spectrogram computation, `WaveformLoadWorker` QThread, `PeakBuildWorker` (batch peak cache builder using thread pool)                                                                                                                                                                                                                      |
+| `waveform/peakcache.py`   | Pre-computed peak mipmap cache: `PeakData`, `MipLevel`, `build_peaks()`, `save_peaks()`, `load_peaks()`, `query_peaks_fast()`. Binary `.peaks` file format (`SPK1`) with staleness detection via source file mtime                                                                                                                                                                            |
+| `waveform/renderer.py`    | `WaveformRenderer` — vectorised NumPy peak/RMS downsampling, waveform drawing, RMS L/R and AVG envelopes, dB scale, peak/RMS markers. Uses mip-level peak queries when `PeakData` is available for near-instant rendering                                                                                                                                                                      |
 | `waveform/spectrogram.py` | `SpectrogramRenderer` — mel spectrogram QImage (256 mel bins via `scipy.signal.stft`), frequency scale, freq zoom/pan, background recompute worker                                                                                                                                                                                                                                            |
 | `waveform/overlay.py`     | Stateless overlay drawing functions — detector issue overlays (with optional frequency bounds), horizontal time scale                                                                                                                                                                                                                                                                         |
+| `waveform/panel.py`       | `WaveformPanel` — composite widget: waveform toolbar + `WaveformWidget` + transport bar. Reused in Phase 1 (topology preview) and Phase 2 (file detail)                                                                                                                                                                                                                                       |
 | `waveform/widget.py`      | `WaveformWidget` — thin orchestrator coordinating `WaveformRenderer` and `SpectrogramRenderer`; paintEvent, mouse/keyboard event handlers, zoom/pan API, public setters                                                                                                                                                                                                                       |
 | `prefs/param_form.py`     | **Portable** generic widget factory — `ParamSpec` protocol, `PathPickerMode`, `PathPicker`, `_build_widget`, `_build_param_page`, `_set_widget_value`, `_read_widget`, tooltip/subtext builders, `sanitize_output_folder`.  Zero sessionpreplib dependency; copy to any PySide6 project.                                                                                                      |
 | `prefs/preset_panel.py`   | **Portable** `NamedPresetPanel` — reusable CRUD widget for named presets with add/duplicate/rename/delete signals.                                                                                                                                                                                                                                                                            |
@@ -2039,6 +2045,76 @@ widgets when available, falling back to the global preset otherwise.
 
 The CLI is **not** affected by this file — it continues to use its own
 `default_config()` + command-line arguments.
+
+### 18.5 Waveform Peak Cache
+
+Waveform rendering uses a **pre-computed peak mipmap cache** (similar to
+Cubase/Reaper `.peaks` files) to avoid expensive raw-sample downsampling on
+every paint. The cache is built eagerly in the background and persisted to disk
+as binary `.peaks` files in the `sp_peaks/` directory.
+
+**Architecture:**
+
+```mermaid
+graph LR
+    A[Folder Open] --> B["_on_phase1_done()"]
+    B --> C["PeakBuildWorker (bg thread pool)"]
+    C --> D["sp_peaks/*.peaks files"]
+    C --> E["In-memory _peak_cache dict"]
+    E --> F["WaveformRenderer.set_peak_data()"]
+    F --> G["query_peaks_fast() → instant paint"]
+```
+
+**File format (`SPK1`):**
+
+| Field          | Size    | Description                           |
+|----------------|---------|---------------------------------------|
+| Magic          | 4 bytes | `SPK1`                                |
+| Version        | 2 bytes | Format version (currently 1)          |
+| Channels       | 2 bytes | Number of audio channels              |
+| Samplerate     | 4 bytes | Source file sample rate                |
+| Total samples  | 8 bytes | Source file total sample count         |
+| Source mtime    | 8 bytes | Source file modification time (epoch)  |
+| Num levels     | 2 bytes | Number of mip levels                  |
+| *(per level)*  |         |                                       |
+| Samples/bin    | 4 bytes | Resolution of this mip level          |
+| Num bins       | 4 bytes | Number of bins in this level          |
+| Data           | varies  | `float32[n_bins × channels × 2]` (min/max) |
+
+Four mip levels at 256, 1024, 4096, and 16384 samples/bin. A 5-minute stereo
+48 kHz file produces ~1.2 MB of peak data total.
+
+**Integration points:**
+
+- `settings.py` — `peak_cache_folder` default (`"sp_peaks"`), added to
+  `skip_folders` so the cache directory is not scanned as audio content.
+- `analysis/mixin.py` — `_start_peak_build()` triggered from
+  `_on_phase1_done()` and `_on_analyze_done()`. Maintains `_peak_cache` dict
+  (filename → `PeakData`). Worker cleanup in `_clear_workspace()`.
+- `topology/mixin.py` — injects `PeakData` into the Phase 1 waveform display
+  via `set_peak_data()` after `set_precomputed()`. Passes `peaks_dir` to
+  `TopologyApplyWorker` so output files get cached during Apply.
+- `detail/mixin.py` — injects `PeakData` into the Phase 2 waveform display
+  after `set_precomputed()`.
+- `analysis/worker.py` — `TopologyApplyWorker` builds and saves `.peaks` files
+  immediately after writing each output file.
+- `waveform/renderer.py` — `_build_peaks()` uses `query_peaks_fast()` when
+  `PeakData` is available, falling back to raw-sample downsampling otherwise.
+
+**Staleness:** Each `.peaks` file stores the source file's `mtime`. On load,
+`load_peaks()` compares the stored mtime against the current source file; stale
+caches return `None` and are silently rebuilt.
+
+**Instant Preview Mode (`set_preview_mode`):**
+To eliminate visual latency caused by heavy audio file disk I/O, the UI supports
+an **Instant Preview Mode**. If a track is selected and its `.peaks` cache exists, 
+the GUI initializes the `WaveformWidget` with dummy empty channels and applies the
+peak cache immediately. This renders the perfect waveform visualization instantaneously
+(zero disk I/O, zero CPU). Asynchronously, `AudioLoadWorker` and `WaveformLoadWorker` 
+load the full audio data in the background. When they complete, they seamlessly replace 
+the dummy channels to enable the Mel Spectrogram, RMS envelope, and audio playback.
+If a peak cache finishes building *while* the UI is blocked loading audio, the UI
+aggressively pushes the new peak cache to instantly resolve the loading state.
 
 ---
 

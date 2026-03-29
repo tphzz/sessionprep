@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import collections
+import logging
 import threading
 
 import numpy as np
@@ -13,6 +15,8 @@ from scipy.signal import stft as scipy_stft
 # ---------------------------------------------------------------------------
 # Spectrogram colormaps
 # ---------------------------------------------------------------------------
+
+log = logging.getLogger(__name__)
 
 SPECTROGRAM_COLORMAPS: dict[str, np.ndarray] = {}  # name → (256, 4) uint8 RGBA
 
@@ -118,15 +122,15 @@ def compute_mel_spectrogram(channels: list[np.ndarray], sr: int, *,
     if not channels:
         return None
     if hop is None:
-        hop = n_fft // 4
-    # Mix to mono
+        hop = n_fft  # optimized for UI speed (4x faster than n_fft // 4)
+    # Mix to mono in-place to avoid massive memory allocations
     if len(channels) == 1:
-        mono = channels[0].astype(np.float64)
+        mono = channels[0]
     else:
-        mono = np.mean(
-            np.column_stack([ch.astype(np.float64) for ch in channels]),
-            axis=1,
-        )
+        mono = channels[0].copy()
+        for ch in channels[1:]:
+            mono += ch
+        mono /= len(channels)
     if len(mono) < n_fft:
         return None
     # STFT
@@ -161,6 +165,7 @@ class WaveformLoadWorker(QThread):
                  rms_window_samples: int, *,
                  spec_n_fft: int = _SPEC_N_FFT,
                  spec_window: str = "hann",
+                 compute_spectrogram: bool = True,
                  parent=None):
         super().__init__(parent)
         self._audio_data = audio_data
@@ -168,6 +173,7 @@ class WaveformLoadWorker(QThread):
         self._rms_win = rms_window_samples
         self._spec_n_fft = spec_n_fft
         self._spec_window = spec_window
+        self._compute_spectrogram = compute_spectrogram
         self._cancelled = threading.Event()
 
     def cancel(self):
@@ -175,20 +181,24 @@ class WaveformLoadWorker(QThread):
         self._cancelled.set()
 
     def run(self):
+        import time, logging
+        t_start = time.perf_counter()
+        log = logging.getLogger(__name__)
+
         data = self._audio_data
         sr = self._samplerate
         win = self._rms_win
 
         # --- Channel splitting ---
-        if data is None or data.size == 0:
-            return
-        if data.ndim == 1:
-            channels = [np.ascontiguousarray(data)]
+        if isinstance(data, list):
+            channels = data
         else:
-            channels = [
-                np.ascontiguousarray(data[:, ch])
-                for ch in range(data.shape[1])
-            ]
+            if data is None or data.size == 0:
+                return
+            if data.ndim == 1:
+                channels = [data]
+            else:
+                channels = [data[:, ch] for ch in range(data.shape[1])]
         if not channels:
             return
         nch = len(channels)
@@ -197,23 +207,36 @@ class WaveformLoadWorker(QThread):
         if self._cancelled.is_set():
             return
 
-        # --- Peak finding ---
+        if self._cancelled.is_set():
+            return
+
+        # --- Peak finding (Zero allocation) ---
+        t0 = time.perf_counter()
+        
+        def _find_peak(ch: np.ndarray) -> int:
+            p_max = int(np.argmax(ch))
+            p_min = int(np.argmin(ch))
+            return p_min if abs(float(ch[p_min])) > abs(float(ch[p_max])) else p_max
+
         if nch == 1:
-            peak_sample = int(np.argmax(np.abs(channels[0])))
+            peak_sample = _find_peak(channels[0])
             peak_channel = 0
         else:
-            abs_cols = np.column_stack([np.abs(ch) for ch in channels])
-            max_per_sample = np.max(abs_cols, axis=1)
-            peak_sample = int(np.argmax(max_per_sample))
-            peak_channel = int(np.argmax(abs_cols[peak_sample]))
+            peaks_per_ch = [_find_peak(ch) for ch in channels]
+            max_vals = [abs(float(channels[i][p])) for i, p in enumerate(peaks_per_ch)]
+            peak_channel = int(np.argmax(max_vals))
+            peak_sample = peaks_per_ch[peak_channel]
         peak_lin = abs(float(channels[peak_channel][peak_sample]))
         peak_db = 20.0 * np.log10(peak_lin) if peak_lin > 0 else float('-inf')
         peak_amplitude = float(channels[peak_channel][peak_sample])
+
+        log.debug("[Trace] WaveformLoadWorker Peak finding: %.2f ms", (time.perf_counter() - t0) * 1000)
 
         if self._cancelled.is_set():
             return
 
         # --- RMS cumsum (computed once, reused for envelope drawing) ---
+        t0 = time.perf_counter()
         rms_max_sample = -1
         rms_max_db = float('-inf')
         rms_max_amplitude = 0.0
@@ -245,17 +268,25 @@ class WaveformLoadWorker(QThread):
                 rms_max_db = 20.0 * np.log10(rms_lin) if rms_lin > 0 else float('-inf')
                 rms_max_amplitude = rms_lin
 
+        log.debug("[Trace] WaveformLoadWorker RMS: %.2f ms", (time.perf_counter() - t0) * 1000)
+
         if self._cancelled.is_set():
             return
 
         # --- Spectrogram ---
-        spec_db = compute_mel_spectrogram(
-            channels, sr,
-            n_fft=self._spec_n_fft, window=self._spec_window,
-        )
+        spec_db = None
+        if self._compute_spectrogram:
+            t0 = time.perf_counter()
+            spec_db = compute_mel_spectrogram(
+                channels, sr,
+                n_fft=self._spec_n_fft, window=self._spec_window,
+            )
+            log.debug("[Trace] WaveformLoadWorker STFT: %.2f ms", (time.perf_counter() - t0) * 1000)
 
-        if self._cancelled.is_set():
-            return
+            if self._cancelled.is_set():
+                return
+
+        log.debug("[Trace] WaveformLoadWorker TOTAL: %.2f ms", (time.perf_counter() - t_start) * 1000)
 
         self.finished.emit({
             "channels": channels,
@@ -301,3 +332,140 @@ class SpectrogramRecomputeWorker(QThread):
         if self._cancelled.is_set():
             return
         self.finished.emit(result)
+
+
+class PeakBuildWorker(QThread):
+    """Eagerly build and save ``.peaks`` files for a batch of audio files.
+
+    Runs in the background with a thread pool — does not block the UI.
+    Emits ``file_done(filename, PeakData)`` for each completed file so the
+    caller can cache the result in memory.
+
+    The work queue is mutable: call ``prioritize(filename)`` to move a file
+    to the front of the pending queue so it is processed next.
+    """
+
+    progress = Signal(str)                 # status message
+    progress_value = Signal(int, int)      # (current, total)
+    file_done = Signal(str, object)        # (filename, PeakData)
+    all_done = Signal()
+
+    def __init__(self, items: list[tuple[str, str, str]],
+                 parent=None):
+        """
+        Parameters
+        ----------
+        items : list of (filepath, filename, peaks_path)
+            *filepath*: absolute path to the audio file on disk.
+            *filename*: canonical filename (used as cache key).
+            *peaks_path*: absolute path for the ``.peaks`` output file.
+        """
+        super().__init__(parent)
+        self._items_map: dict[str, tuple[str, str, str]] = {
+            fn: (fp, fn, pp) for fp, fn, pp in items
+        }
+        self._queue: collections.deque[str] = collections.deque(
+            fn for _, fn, _ in items
+        )
+        self._lock = threading.Lock()
+        self._cancelled = threading.Event()
+        self._total = len(items)
+
+    def cancel(self):
+        self._cancelled.set()
+
+    def prioritize(self, filename: str):
+        """Move *filename* to the front of the pending queue (if still pending)."""
+        with self._lock:
+            try:
+                self._queue.remove(filename)
+            except ValueError:
+                return  # already processed or not in queue
+            self._queue.appendleft(filename)
+            log.debug("Prioritized peak build for '%s'", filename)
+
+    def _next_item(self) -> tuple[str, str, str] | None:
+        """Pop the next item from the queue under lock."""
+        with self._lock:
+            while self._queue:
+                fn = self._queue.popleft()
+                item = self._items_map.get(fn)
+                if item:
+                    return item
+        return None
+
+    def run(self):
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import os
+        import soundfile as sf
+        from .peakcache import (
+            build_peaks, save_peaks, load_peaks, get_source_mtime,
+        )
+
+        def _process(filepath, filename, peaks_path):
+            if self._cancelled.is_set():
+                return None, None
+            mtime = get_source_mtime(filepath)
+            # Check if existing peaks are still valid
+            existing = load_peaks(peaks_path, expected_mtime=mtime)
+            if existing is not None:
+                return filename, existing
+            # Build from audio
+            import time as _time
+            _t0 = _time.perf_counter()
+            try:
+                data, sr = sf.read(filepath, dtype="float64")
+            except Exception as e:
+                log.debug("Failed to read '%s' for peak cache: %s", filename, e)
+                return None, None
+            if self._cancelled.is_set():
+                return None, None
+            peak_data = build_peaks(data, sr, source_mtime=mtime)
+            try:
+                save_peaks(peak_data, peaks_path)
+                _elapsed = (_time.perf_counter() - _t0) * 1000
+                log.debug("Built peak cache for '%s' -> %s (%d levels, %.1f ms)", filename, peaks_path, len(peak_data.levels), _elapsed)
+            except OSError as e:
+                log.debug("Failed to save peak cache for '%s' -> %s: %s", filename, peaks_path, e)
+            return filename, peak_data
+
+        max_workers = min(os.cpu_count() or 4, 6)
+        completed = 0
+
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            # Process items in small batches to keep the queue reorderable
+            while not self._cancelled.is_set():
+                # grab a batch of up to max_workers items
+                batch = []
+                for _ in range(max_workers):
+                    item = self._next_item()
+                    if item is None:
+                        break
+                    batch.append(item)
+                if not batch:
+                    break  # queue exhausted
+
+                futures = {
+                    pool.submit(_process, fp, fn, pp): fn
+                    for fp, fn, pp in batch
+                }
+                for future in as_completed(futures):
+                    if self._cancelled.is_set():
+                        return
+                    filename, peak_data = future.result()
+                    completed += 1
+                    if filename and peak_data:
+                        self.progress.emit(
+                            f"Building peak cache: {filename}"
+                            f"  ({completed}/{self._total})")
+                        self.progress_value.emit(completed, self._total)
+                        self.file_done.emit(filename, peak_data)
+                    else:
+                        self.progress_value.emit(completed, self._total)
+
+        if not self._cancelled.is_set():
+            self.progress.emit("Peak cache creation finished.")
+            log.info("Peak cache background batch finished (%d files)", self._total)
+            self.all_done.emit()
+
+

@@ -99,6 +99,9 @@ class Pipeline:
 
     def _analyze_track(self, track: TrackContext, idx: int, total: int, detectors: list[TrackDetector]):
         """Run all track-level detectors for a single track (thread-safe)."""
+        if self.event_bus and self.event_bus.is_cancelled.is_set():
+            return
+
         self._emit("track.analyze_start", filename=track.filename,
                    index=idx, total=total)
         t_track_start = time.perf_counter()
@@ -162,6 +165,9 @@ class Pipeline:
         # Session-level detectors
         track_map = {t.filename: t for t in session.tracks}
         for det in session_dets:
+            if self.event_bus and self.event_bus.is_cancelled.is_set():
+                break
+
             try:
                 self._emit("session_detector.start", detector_id=det.id)
                 t0 = time.perf_counter()
@@ -207,6 +213,9 @@ class Pipeline:
 
     def _plan_track(self, track: TrackContext, idx: int, total: int):
         """Run all audio processors for a single track (thread-safe)."""
+        if self.event_bus and self.event_bus.is_cancelled.is_set():
+            return
+
         self._emit("track.plan_start", filename=track.filename,
                    index=idx, total=total)
         t_track_start = time.perf_counter()
@@ -671,6 +680,20 @@ def _load_one_track(
     event_bus: EventBus | None,
 ) -> TrackContext:
     """Load a single WAV file (used by thread pool in load_session)."""
+    if event_bus and event_bus.is_cancelled.is_set():
+        return TrackContext(
+            filename=filename,
+            filepath=os.path.join(source_dir, filename),
+            audio_data=None,
+            samplerate=0,
+            channels=0,
+            total_samples=0,
+            bitdepth="",
+            subtype="",
+            duration_sec=0.0,
+            status="Cancelled",
+        )
+
     filepath = os.path.join(source_dir, filename)
     if event_bus:
         event_bus.emit("track.load", filename=filename,

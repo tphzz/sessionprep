@@ -640,6 +640,7 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
         self._wf_panel.play_clicked.connect(self._on_play)
         self._wf_panel.stop_clicked.connect(self._on_stop)
         self._wf_panel.position_clicked.connect(self._on_waveform_seek)
+        self._wf_panel.display_mode_changed.connect(self._on_display_mode_changed)
         self._wf_panel.waveform.set_invert_scroll(
             self._config.get("app", {}).get("invert_scroll", "default"))
 
@@ -899,7 +900,18 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
             if reply != QMessageBox.Yes:
                 event.ignore()
                 return
+
         self._playback.stop()
+
+        # Stop active background tasks cleanly so ThreadPoolExecutor can terminate
+        from PySide6.QtCore import QThread
+        for worker_attr in ["_worker", "_phase1_worker", "_topo_apply_worker", "_setup_worker"]:
+            worker = getattr(self, worker_attr, None)
+            if isinstance(worker, QThread) and worker.isRunning():
+                if hasattr(worker, "cancel"):
+                    worker.cancel()
+                worker.wait(500)
+
         super().closeEvent(event)
 
 
