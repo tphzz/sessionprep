@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import logging
 import threading
+
+log = logging.getLogger(__name__)
 
 from PySide6.QtCore import QThread, Signal
 
