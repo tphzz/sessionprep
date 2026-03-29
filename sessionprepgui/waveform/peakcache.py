@@ -86,17 +86,28 @@ def build_peaks(
     n_samples, n_channels = audio_data.shape
     levels: list[MipLevel] = []
 
+    # Force contiguous memory per channel once to avoid slow strided reductions.
+    # Taking .min(axis=1) on a (bins, spb, channels) array is catastrophically
+    # slow for stereo files because it traverses the non-contiguous spb axis.
+    channel_arrays = [np.ascontiguousarray(audio_data[:, c]) for c in range(n_channels)]
+
     for spb in MIP_BINS:
         n_bins = n_samples // spb
         if n_bins < 1:
             continue
         usable = n_bins * spb
-        # Reshape to (n_bins, spb, channels)
-        reshaped = audio_data[:usable].reshape(n_bins, spb, n_channels)
-        mins = reshaped.min(axis=1)   # (n_bins, channels)
-        maxs = reshaped.max(axis=1)   # (n_bins, channels)
+        
+        ch_data = []
+        for c_array in channel_arrays:
+            # Reshape contiguous 1D channel array to (n_bins, spb)
+            c_reshaped = c_array[:usable].reshape(n_bins, spb)
+            # Reductions over the contiguous inner axis are massively faster
+            c_mins = c_reshaped.min(axis=1)
+            c_maxs = c_reshaped.max(axis=1)
+            ch_data.append(np.stack([c_mins, c_maxs], axis=-1))
+
         # Stack into (n_bins, channels, 2)
-        data = np.stack([mins, maxs], axis=-1).astype(np.float32)
+        data = np.stack(ch_data, axis=1).astype(np.float32)
         levels.append(MipLevel(samples_per_bin=spb, data=data))
 
     return PeakData(

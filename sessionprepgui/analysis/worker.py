@@ -736,7 +736,10 @@ class TopologyApplyWorker(QThread):
                 for src in entry.sources:
                     needed_sources.add(src.input_filename)
 
-            total = len(needed_sources) + len(topology.entries)
+            n_sources = len(needed_sources)
+            n_entries = len(topology.entries)
+            # Total includes peak building phase when peaks_dir is set
+            total = n_sources + n_entries + (n_entries if self._peaks_dir else 0)
 
             # Phase A: Load source audio
             # After a previous Apply+Analyze cycle, session.tracks may
@@ -745,6 +748,7 @@ class TopologyApplyWorker(QThread):
             # track_map.  Fall back to loading directly from source_dir.
             source_audio: dict[str, tuple] = {}
             for step, filename in enumerate(sorted(needed_sources)):
+                log.debug("Apply topology: loading source '%s' (%d/%d)", filename, step + 1, total)
                 self.progress.emit(f"Loading {filename}")
                 self.progress_value.emit(step, total)
                 track = track_map.get(filename)
@@ -768,12 +772,14 @@ class TopologyApplyWorker(QThread):
                     track.total_samples = loaded.total_samples
                 source_audio[filename] = (loaded.audio_data, loaded.samplerate)
 
-            # Phase B: Resolve topology + write output files
+            # Phase B: Resolve topology + write output files (no peak building)
             output_tracks = []
             errors = []
-            base_step = len(needed_sources)
+            written_files: list[tuple[str, str, int]] = []  # (output_filename, dst_path, sr)
+            base_step = n_sources
             for idx, entry in enumerate(topology.entries):
                 step = base_step + idx
+                log.debug("Apply topology: writing '%s' (%d/%d)", entry.output_filename, step + 1, total)
                 self.progress.emit(f"Writing {entry.output_filename}")
                 self.progress_value.emit(step, total)
 
@@ -811,23 +817,7 @@ class TopologyApplyWorker(QThread):
                     dst = os.path.join(output_dir, entry.output_filename)
                     os.makedirs(os.path.dirname(dst), exist_ok=True)
                     sf.write(dst, resolved, sr, subtype=subtype)
-
-                    # Build + save peak cache for this output file
-                    if self._peaks_dir:
-                        try:
-                            from ..waveform.peakcache import (
-                                build_peaks, save_peaks, peaks_path_for,
-                                get_source_mtime,
-                            )
-                            log.debug("Building peak cache for applied output '%s'", entry.output_filename)
-                            mtime = get_source_mtime(dst)
-                            pd = build_peaks(resolved, sr, source_mtime=mtime)
-                            pp = peaks_path_for(
-                                self._peaks_dir, entry.output_filename)
-                            save_peaks(pd, pp)
-                            log.debug("Saved peak cache for '%s' (%d levels)", entry.output_filename, len(pd.levels))
-                        except Exception as e:
-                            log.debug("Failed to build/save peak cache for '%s': %s", entry.output_filename, e)
+                    written_files.append((entry.output_filename, dst, sr))
 
                     n_samples = resolved.shape[0]
                     out_tc = TrackContext(
@@ -845,6 +835,55 @@ class TopologyApplyWorker(QThread):
                     output_tracks.append(out_tc)
                 except Exception as e:
                     errors.append((entry.output_filename, str(e)))
+
+            # Free source audio memory before peak building
+            source_audio.clear()
+
+            # Phase C: Build peak caches (re-reading from just-written files)
+            if self._peaks_dir:
+                from ..waveform.peakcache import (
+                    build_peaks, save_peaks, load_peaks,
+                    peaks_path_for, get_source_mtime,
+                )
+                peak_base = n_sources + n_entries
+                for pidx, (out_fn, dst, sr) in enumerate(written_files):
+                    step = peak_base + pidx
+                    log.debug("Apply topology: building peaks '%s' (%d/%d)", out_fn, step + 1, total)
+                    self.progress.emit(f"Building peaks for {out_fn}")
+                    self.progress_value.emit(step, total)
+
+                    try:
+                        pp = peaks_path_for(self._peaks_dir, out_fn)
+                        mtime = get_source_mtime(dst)
+                        # Check shape: if total_samples and channels match,
+                        # the content is unchanged and we can skip.
+                        info = sf.info(dst)
+                        existing = load_peaks(pp)
+                        if (existing is not None
+                                and existing.total_samples == info.frames
+                                and existing.channels == info.channels):
+                            log.debug("Peak cache for '%s' is up-to-date, skipping rebuild -> %s", out_fn, pp)
+                            continue
+
+                        import time as _time
+                        _t0 = _time.perf_counter()
+                        data, file_sr = sf.read(dst, dtype="float64")
+                        _t_read = _time.perf_counter()
+                        pd = build_peaks(data, file_sr, source_mtime=mtime)
+                        _t_build = _time.perf_counter()
+                        save_peaks(pd, pp)
+                        _t_save = _time.perf_counter()
+                        log.debug(
+                            "Built peak cache for '%s' -> %s "
+                            "(%d ch, %d levels, read=%.1f ms, build=%.1f ms, save=%.1f ms, total=%.1f ms)",
+                            out_fn, pp, pd.channels, len(pd.levels),
+                            (_t_read - _t0) * 1000,
+                            (_t_build - _t_read) * 1000,
+                            (_t_save - _t_build) * 1000,
+                            (_t_save - _t0) * 1000,
+                        )
+                    except Exception as e:
+                        log.debug("Failed to build/save peak cache for '%s' -> %s: %s", out_fn, pp, e)
 
             self.progress_value.emit(total, total)
 

@@ -703,6 +703,13 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         )
         self.setWindowTitle("SessionPrep")
 
+        # Eagerly build peak cache for source tracks (Phase 1 waveforms)
+        if source_dir and source_tracks:
+            self._start_peak_build(source_tracks, source_dir)
+        # And for analysis tracks (Phase 2 waveforms) if topology was applied
+        if self._topology_dir and tracks:
+            self._start_peak_build(tracks, self._topology_dir)
+
     # ── Analyze ──────────────────────────────────────────────────────────
 
     @Slot()

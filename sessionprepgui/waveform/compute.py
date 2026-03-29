@@ -411,7 +411,8 @@ class PeakBuildWorker(QThread):
             if existing is not None:
                 return filename, existing
             # Build from audio
-            log.debug("Building peak cache for '%s'", filename)
+            import time as _time
+            _t0 = _time.perf_counter()
             try:
                 data, sr = sf.read(filepath, dtype="float64")
             except Exception as e:
@@ -422,9 +423,10 @@ class PeakBuildWorker(QThread):
             peak_data = build_peaks(data, sr, source_mtime=mtime)
             try:
                 save_peaks(peak_data, peaks_path)
-                log.debug("Saved peak cache for '%s' (%d levels)", filename, len(peak_data.levels))
+                _elapsed = (_time.perf_counter() - _t0) * 1000
+                log.debug("Built peak cache for '%s' -> %s (%d levels, %.1f ms)", filename, peaks_path, len(peak_data.levels), _elapsed)
             except OSError as e:
-                log.debug("Failed to save peak cache for '%s': %s", filename, e)
+                log.debug("Failed to save peak cache for '%s' -> %s: %s", filename, peaks_path, e)
             return filename, peak_data
 
         max_workers = min(os.cpu_count() or 4, 6)

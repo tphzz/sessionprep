@@ -360,6 +360,7 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
         self._topo_reset_action.setEnabled(False)
         self._topo_status_label.setText("Applying topology\u2026")
         self._topo_progress.start("Applying topology\u2026")
+        self._status_bar.setVisible(False)
 
         # Put Phase 1 topology on session for the worker to read
         self._session.topology = self._topo_topology
@@ -375,8 +376,8 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
 
     @Slot(str)
     def _on_topo_apply_progress(self, message: str):
+        log.debug("Apply topology: %s", message)
         self._topo_progress.set_message(message)
-        self._status_bar.showMessage(message)
 
     @Slot(int, int)
     def _on_topo_apply_progress_value(self, current: int, total: int):
@@ -395,7 +396,6 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
             msg = (f"Topology applied: {n_out} file(s) written, "
                    f"{len(errors)} error(s)")
             self._topo_progress.finish(msg)
-            self._status_bar.showMessage(msg)
             detail = "\n".join(f"\u2022 {fn}: {err}" for fn, err in errors)
             QMessageBox.warning(
                 self, "Apply Topology \u2014 errors",
@@ -403,7 +403,8 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
         else:
             msg = f"Topology applied: {n_out} file(s) written"
             self._topo_progress.finish(msg)
-            self._status_bar.showMessage(msg)
+        self._status_bar.setVisible(True)
+        self._status_bar.showMessage(msg)
 
         output_folder = self._config.get("app", {}).get(
             "phase1_output_folder", "sp_01_tracklayout")
@@ -420,6 +421,7 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
         self._topo_apply_action.setEnabled(True)
         self._topo_reset_action.setEnabled(True)
         self._topo_progress.fail(message)
+        self._status_bar.setVisible(True)
         self._status_bar.showMessage(f"Apply topology error: {message}")
 
     # ── Actions ───────────────────────────────────────────────────────
