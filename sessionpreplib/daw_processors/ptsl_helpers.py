@@ -17,10 +17,58 @@ import logging
 
 log = logging.getLogger(__name__)
 
+PTSL_COMMAND_ID_FALLBACKS: dict[str, int] = {
+    # Pro Tools 2025.10 additions.
+    "CId_CreateSignalPath": 146,
+    "CId_SetTrackMainOutputAssignments": 147,
+    "CId_SetTrackColor": 153,
+    "CId_GetTrackPlaylists": 154,
+    "CId_SetTrackTimebase": 155,
+    "CId_GetColorPalette": 156,
+    "CId_DeleteTracks": 157,
+    "CId_WriteSelectedTranscriptionToJSONFile": 159,
+    # Pro Tools 2026.04 additions.
+    "CId_SetTrackHeight": 160,
+    "CId_ClearTrackMainOutputAssignments": 161,
+    "CId_ShowRendererWindow": 162,
+    "CId_GetRendererOutSignalPath": 163,
+    "CId_DeleteSignalPaths": 164,
+    "CId_GetTrackMainOutputAssignments": 165,
+}
+
+
+def command_id(command: int | str) -> int:
+    """Resolve a PTSL command name or numeric ID to an integer enum value.
+
+    Newer Pro Tools servers accept the numeric command ID in the request
+    header even when the installed py-ptsl generated enum wrapper is stale.
+    The fallback IDs are sourced from the current PTSL changelog/proto.
+    """
+    if isinstance(command, int):
+        return command
+    if not isinstance(command, str):
+        raise TypeError(f"PTSL command must be int or str, got {type(command)!r}")
+
+    from ptsl import PTSL_pb2 as pt
+
+    try:
+        return int(getattr(pt.CommandId, command))
+    except AttributeError:
+        pass
+
+    try:
+        return PTSL_COMMAND_ID_FALLBACKS[command]
+    except KeyError as exc:
+        raise ValueError(
+            f"Unknown PTSL command {command!r}; update "
+            "PTSL_COMMAND_ID_FALLBACKS from the current PTSL proto if this "
+            "command is newer than py-ptsl."
+        ) from exc
+
 
 # ── Low-level request / response ─────────────────────────────────────
 
-def run_command(engine, command_id, body: dict,
+def run_command(engine, command, body: dict,
                 batch_job_id: str | None = None,
                 progress: int = 0) -> dict | None:
     """Send a PTSL command, optionally within a batch job.
@@ -32,7 +80,9 @@ def run_command(engine, command_id, body: dict,
 
     Args:
         engine: A connected py-ptsl ``Engine`` instance.
-        command_id: PTSL ``CommandId`` enum value.
+        command: PTSL ``CommandId`` enum value, raw numeric ID, or command
+            name string. Newer command names can be resolved through
+            ``PTSL_COMMAND_ID_FALLBACKS`` when py-ptsl is stale.
         body: Request body dict (will be JSON-serialised).
         batch_job_id: If set, includes the batch job header.
         progress: Batch job progress percentage (0-100).
@@ -46,10 +96,11 @@ def run_command(engine, command_id, body: dict,
     from ptsl import PTSL_pb2 as pt
     from google.protobuf import json_format
 
+    resolved_command_id = command_id(command)
     header_kwargs: dict[str, Any] = {
         "task_id": "",
         "session_id": engine.client.session_id,
-        "command": command_id,
+        "command": resolved_command_id,
         "version": 2025,
         "version_minor": 10,
         "version_revision": 0,
@@ -631,3 +682,59 @@ def set_track_color(
     return run_command(
         engine, "CId_SetTrackColor", body,
         batch_job_id=batch_job_id, progress=progress)
+
+
+def set_track_height(
+    engine,
+    height: str,
+    track_names: list[str] | None = None,
+    track_ids: list[str] | None = None,
+    batch_job_id: str | None = None,
+    progress: int = 0,
+) -> dict | None:
+    """Set the edit/mix window height for one or more tracks."""
+    body: dict[str, Any] = {"height": height}
+    if track_names:
+        body["track_names"] = track_names
+    if track_ids:
+        body["track_ids"] = track_ids
+    return run_command(
+        engine, "CId_SetTrackHeight", body,
+        batch_job_id=batch_job_id, progress=progress)
+
+
+def set_track_main_output_assignments(
+    engine,
+    signalpath_ids: list[str],
+    track_names: list[str] | None = None,
+    track_ids: list[str] | None = None,
+    batch_job_id: str | None = None,
+    progress: int = 0,
+) -> dict | None:
+    """Set one or more tracks' main output paths to signal path IDs."""
+    body: dict[str, Any] = {"signalpath_ids": signalpath_ids}
+    if track_names:
+        body["track_names"] = track_names
+    if track_ids:
+        body["track_ids"] = track_ids
+    return run_command(
+        engine, "CId_SetTrackMainOutputAssignments", body,
+        batch_job_id=batch_job_id, progress=progress)
+
+
+def get_track_main_output_assignments(
+    engine,
+    track_ids: list[str],
+    batch_job_id: str | None = None,
+    progress: int = 0,
+) -> list[str]:
+    """Return signal path IDs assigned to the track's main output.
+
+    ``CId_GetTrackMainOutputAssignments`` was added in PTSL 2026.04 and may
+    not be present in older py-ptsl generated enum wrappers.
+    """
+    resp = run_command(
+        engine, "CId_GetTrackMainOutputAssignments",
+        {"track_ids": track_ids},
+        batch_job_id=batch_job_id, progress=progress)
+    return list((resp or {}).get("signalpath_ids", []))

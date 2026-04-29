@@ -61,6 +61,31 @@ _APP_DEFAULTS: dict[str, Any] = {
     "invert_scroll": "default",
     "active_config_preset": "Default",
     "active_group_preset": "Default",
+    "active_protools_track_height_preset": "Default",
+    "protools_track_height_presets": {
+        "Default": {
+            "scope": "selected",
+            "mode": "track_type",
+            "all_height": "THeight_Small",
+            "heights": {
+                "TT_Audio": "THeight_Small",
+                "TT_Aux": "THeight_Small",
+                "TT_Instrument": "THeight_Small",
+                "TT_Midi": "THeight_Small",
+                "TT_Master": "THeight_Medium",
+                "TT_Vca": "THeight_Medium",
+                "TT_BasicFolder": "THeight_Medium",
+                "TT_RoutingFolder": "THeight_Medium",
+                "TT_Video": "THeight_Mini",
+                "TT_Tempo": "THeight_Mini",
+                "TT_Markers": "THeight_Mini",
+                "TT_Meter": "THeight_Mini",
+                "TT_KeySignature": "THeight_Mini",
+                "TT_ChordSymbols": "THeight_Mini",
+                "TT_CompLane": "THeight_Mini",
+            },
+        },
+    },
 }
 
 # ---------------------------------------------------------------------------

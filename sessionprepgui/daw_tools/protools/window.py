@@ -16,7 +16,10 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
+from ...theme import apply_dark_theme
+
 from .color_tool import ColorTool
+from .track_height_tool import TrackHeightTool
 
 
 class ProToolsUtilsWindow(QDialog):
@@ -25,6 +28,7 @@ class ProToolsUtilsWindow(QDialog):
     def __init__(self, config: dict, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Pro Tools Utils")
+        self.setWindowFlag(Qt.Window, True)
         self.setMinimumSize(600, 300)
         self.setAttribute(Qt.WA_DeleteOnClose, False)  # reuse window
 
@@ -32,6 +36,7 @@ class ProToolsUtilsWindow(QDialog):
         self._engine = None
 
         self._init_ui()
+        apply_dark_theme(self)
 
     # ── UI ────────────────────────────────────────────────────────────
 
@@ -68,6 +73,8 @@ class ProToolsUtilsWindow(QDialog):
         # Register tools
         self._color_tool = ColorTool(self._config, self)
         self._tabs.addTab(self._color_tool, "Color Picker")
+        self._track_height_tool = TrackHeightTool(self._config, self)
+        self._tabs.addTab(self._track_height_tool, "Track Heights")
 
     # ── Connection management ────────────────────────────────────────
 
@@ -103,6 +110,7 @@ class ProToolsUtilsWindow(QDialog):
             self._status_label.setStyleSheet("color: #4caf50; font-size: 9pt;")
             self._connect_btn.setText("Disconnect")
             self._color_tool.set_engine(self._engine)
+            self._track_height_tool.set_engine(self._engine)
         except Exception as e:
             self._status_label.setText(f"Connection failed: {e}")
             self._status_label.setStyleSheet("color: #f44336; font-size: 9pt;")
@@ -119,11 +127,13 @@ class ProToolsUtilsWindow(QDialog):
         self._status_label.setStyleSheet("color: #aaa; font-size: 9pt;")
         self._connect_btn.setText("Connect")
         self._color_tool.set_engine(None)
+        self._track_height_tool.set_engine(None)
 
     def update_config(self, config: dict):
         """Update the config (e.g. after preferences change)."""
         self._config = config
         self._color_tool.update_config(config)
+        self._track_height_tool.update_config(config)
 
     def showEvent(self, event):
         super().showEvent(event)

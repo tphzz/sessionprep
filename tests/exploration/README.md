@@ -22,3 +22,16 @@ Connects to the current session, iterates sequentially over all `Audio` tracks, 
 ```bash
 uv run python tests/exploration/probe_faders.py
 ```
+
+### `probe_track_io.py`
+Connects to the current session, selects one track by exact name, reads the
+track's direct main output assignment IDs via `CId_GetTrackMainOutputAssignments`,
+and exports Session Info for the selected track to investigate whether input bus
+routing is exposed there. PTSL 2026.04 does not appear to expose a direct
+`GetTrackInputAssignments` command in the proto.
+
+**Usage:**
+```bash
+uv run python tests/exploration/probe_track_io.py Kick
+uv run python tests/exploration/probe_track_io.py "Drum Bus"
+```

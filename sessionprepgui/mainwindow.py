@@ -869,8 +869,7 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
         """Open (or activate) the Pro Tools Utils window."""
         from .daw_tools.protools.window import ProToolsUtilsWindow
         if self._pt_utils_window is None:
-            self._pt_utils_window = ProToolsUtilsWindow(
-                self._config, parent=self)
+            self._pt_utils_window = ProToolsUtilsWindow(self._config)
         else:
             self._pt_utils_window.update_config(self._config)
         self._pt_utils_window.show()

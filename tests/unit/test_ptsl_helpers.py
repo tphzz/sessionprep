@@ -13,6 +13,33 @@ pytestmark = pytest.mark.skipif(
     reason="py-ptsl not installed"
 )
 
+def test_command_id_uses_fallback_for_newer_ptsl_commands():
+    assert ptsl_helpers.command_id("CId_GetTrackMainOutputAssignments") == 165
+    assert ptsl_helpers.command_id(165) == 165
+
+
+def test_command_id_rejects_unknown_command_name():
+    with pytest.raises(ValueError):
+        ptsl_helpers.command_id("CId_DoesNotExist")
+
+
+def test_run_command_accepts_fallback_command_name(mock_engine, ptsl_factory):
+    mock_engine.client.raw_client.SendGrpcRequest.return_value = ptsl_factory.ok(
+        {"signalpath_ids": ["0x30000245"]}
+    )
+
+    resp = ptsl_helpers.run_command(
+        mock_engine,
+        "CId_GetTrackMainOutputAssignments",
+        {"track_ids": ["track-123"]},
+    )
+
+    assert resp == {"signalpath_ids": ["0x30000245"]}
+    req = mock_engine.client.raw_client.SendGrpcRequest.call_args[0][0]
+    assert req.header.command == 165
+    assert json.loads(req.request_body_json) == {"track_ids": ["track-123"]}
+
+
 def test_run_command_builds_correct_header(mock_engine, ptsl_factory):
     mock_engine.client.raw_client.SendGrpcRequest.return_value = ptsl_factory.ok({"dummy": "value"})
 
@@ -154,3 +181,57 @@ def test_create_track_without_folder(mock_engine, ptsl_factory):
     
     assert "insertion_point_track_name" not in body
     assert "insertion_point_position" not in body
+
+
+def test_set_track_main_output_assignments(mock_engine, ptsl_factory):
+    mock_engine.client.raw_client.SendGrpcRequest.return_value = ptsl_factory.ok()
+
+    ptsl_helpers.set_track_main_output_assignments(
+        mock_engine,
+        ["0x30000245"],
+        track_ids=["track-123"],
+    )
+
+    req = mock_engine.client.raw_client.SendGrpcRequest.call_args[0][0]
+    body = json.loads(req.request_body_json)
+    assert req.header.command == 147
+    assert body == {
+        "track_ids": ["track-123"],
+        "signalpath_ids": ["0x30000245"],
+    }
+
+
+def test_set_track_height(mock_engine, ptsl_factory):
+    mock_engine.client.raw_client.SendGrpcRequest.return_value = ptsl_factory.ok(
+        {"success_count": 1}
+    )
+
+    resp = ptsl_helpers.set_track_height(
+        mock_engine,
+        "THeight_Large",
+        track_ids=["track-123"],
+    )
+
+    assert resp == {"success_count": 1}
+    req = mock_engine.client.raw_client.SendGrpcRequest.call_args[0][0]
+    body = json.loads(req.request_body_json)
+    assert req.header.command == 160
+    assert body == {
+        "track_ids": ["track-123"],
+        "height": "THeight_Large",
+    }
+
+
+def test_get_track_main_output_assignments(mock_engine, ptsl_factory):
+    mock_engine.client.raw_client.SendGrpcRequest.return_value = ptsl_factory.ok(
+        {"signalpath_ids": ["0x30000245"]}
+    )
+
+    output_ids = ptsl_helpers.get_track_main_output_assignments(
+        mock_engine,
+        ["track-123"],
+    )
+
+    assert output_ids == ["0x30000245"]
+    req = mock_engine.client.raw_client.SendGrpcRequest.call_args[0][0]
+    assert req.header.command == 165

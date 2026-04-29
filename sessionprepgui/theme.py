@@ -119,7 +119,7 @@ PT_DEFAULT_COLORS: list[dict[str, str]] = [
 # ---------------------------------------------------------------------------
 
 STYLESHEET = """
-    QMainWindow { background-color: #1e1e1e; }
+    QMainWindow, QDialog { background-color: #1e1e1e; }
     QMenuBar { background-color: #252525; color: #dddddd; }
     QMenuBar::item:selected { background-color: #3a3a3a; }
     QMenu { background-color: #2d2d2d; color: #dddddd; border: 1px solid #555; }
