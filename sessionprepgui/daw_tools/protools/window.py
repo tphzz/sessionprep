@@ -5,13 +5,15 @@ Hosts per-tool tabs and manages a shared PTSL engine connection.
 
 from __future__ import annotations
 
+from PySide6.QtGui import QFont
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QDialog,
     QHBoxLayout,
     QLabel,
-    QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QTabWidget,
     QVBoxLayout,
@@ -64,6 +66,9 @@ class ProToolsUtilsWindow(QDialog):
         self._config = config
         self._engine = None
         self._last_connection_error = ""
+        self._connection_title = "Disconnected"
+        self._connection_hint = ""
+        self._connection_state = "disconnected"
 
         self._init_ui()
         apply_dark_theme(self)
@@ -78,30 +83,16 @@ class ProToolsUtilsWindow(QDialog):
         header = QHBoxLayout()
         header.setSpacing(8)
 
-        status_col = QVBoxLayout()
-        status_col.setSpacing(2)
-        self._status_label = QLabel("Disconnected")
-        self._status_label.setStyleSheet("color: #aaa; font-size: 9pt;")
-        status_col.addWidget(self._status_label)
-        self._hint_label = QLabel("")
-        self._hint_label.setWordWrap(True)
-        self._hint_label.setStyleSheet("color: #888; font-size: 8pt;")
-        status_col.addWidget(self._hint_label)
-        header.addLayout(status_col, 1)
+        header.addStretch()
 
-        self._details_btn = QPushButton("Details")
-        self._details_btn.clicked.connect(self._show_connection_details)
-        self._details_btn.setVisible(False)
-        header.addWidget(self._details_btn)
+        self._connection_btn = QPushButton("Pro Tools: Offline")
+        self._connection_btn.clicked.connect(self._show_connection_dialog)
+        header.addWidget(self._connection_btn)
 
         self._on_top_cb = QCheckBox("Always on Top")
         self._on_top_cb.setStyleSheet("color: #aaa; font-size: 8pt;")
         self._on_top_cb.toggled.connect(self._toggle_on_top)
         header.addWidget(self._on_top_cb)
-
-        self._connect_btn = QPushButton("Connect")
-        self._connect_btn.clicked.connect(self._toggle_connection)
-        header.addWidget(self._connect_btn)
 
         layout.addLayout(header)
 
@@ -115,6 +106,7 @@ class ProToolsUtilsWindow(QDialog):
         self._tabs.addTab(self._color_tool, "Color Picker")
         self._track_height_tool = TrackHeightTool(self._config, self)
         self._tabs.addTab(self._track_height_tool, "Track Heights")
+        self._update_connection_button()
 
     # ── Connection management ────────────────────────────────────────
 
@@ -146,23 +138,21 @@ class ProToolsUtilsWindow(QDialog):
                 company_name="SessionPrep",
                 application_name="Pro Tools Utils",
             )
-            self._status_label.setText("Connected")
-            self._status_label.setStyleSheet("color: #4caf50; font-size: 9pt;")
-            self._hint_label.setText("")
-            self._details_btn.setVisible(False)
+            self._connection_state = "connected"
+            self._connection_title = "Connected to Pro Tools"
+            self._connection_hint = ""
             self._last_connection_error = ""
-            self._connect_btn.setText("Disconnect")
+            self._update_connection_button()
             self._color_tool.set_engine(self._engine)
             self._track_height_tool.set_engine(self._engine)
         except Exception as e:
             title, hint = _connection_failure_message(e)
-            self._status_label.setText(title)
-            self._status_label.setStyleSheet("color: #f44336; font-size: 9pt;")
-            self._hint_label.setText(hint)
+            self._connection_state = "failed"
+            self._connection_title = title
+            self._connection_hint = hint
             self._last_connection_error = str(e)
-            self._details_btn.setVisible(bool(self._last_connection_error))
-            self._connect_btn.setText("Connect")
             self._engine = None
+            self._update_connection_button()
             self._color_tool.set_engine(None)
             self._track_height_tool.set_engine(None)
 
@@ -173,26 +163,33 @@ class ProToolsUtilsWindow(QDialog):
             except Exception:
                 pass
             self._engine = None
-        self._status_label.setText("Disconnected")
-        self._status_label.setStyleSheet("color: #aaa; font-size: 9pt;")
-        self._hint_label.setText("")
-        self._details_btn.setVisible(False)
+        self._connection_state = "disconnected"
+        self._connection_title = "Disconnected"
+        self._connection_hint = ""
         self._last_connection_error = ""
-        self._connect_btn.setText("Connect")
+        self._update_connection_button()
         self._color_tool.set_engine(None)
         self._track_height_tool.set_engine(None)
 
-    def _show_connection_details(self):
-        if not self._last_connection_error:
-            return
-        msg = QMessageBox(self)
-        msg.setWindowTitle("Pro Tools Connection Details")
-        msg.setIcon(QMessageBox.Warning)
-        msg.setText(self._status_label.text())
-        msg.setInformativeText(self._hint_label.text())
-        msg.setDetailedText(self._last_connection_error)
-        msg.setStandardButtons(QMessageBox.Ok)
-        msg.exec()
+    def _update_connection_button(self):
+        if self._connection_state == "connected":
+            text = "Pro Tools: Connected"
+            color = "#4caf50"
+        elif self._connection_state == "failed":
+            text = "Pro Tools: Offline"
+            color = "#f44336"
+        else:
+            text = "Pro Tools: Offline"
+            color = "#aaa"
+        self._connection_btn.setText(text)
+        self._connection_btn.setToolTip(self._connection_title)
+        self._connection_btn.setStyleSheet(
+            f"color: {color}; font-weight: 600; padding: 4px 12px;"
+        )
+
+    def _show_connection_dialog(self):
+        dialog = _ConnectionDialog(self)
+        dialog.exec()
 
     def update_config(self, config: dict):
         """Update the config (e.g. after preferences change)."""
@@ -208,3 +205,78 @@ class ProToolsUtilsWindow(QDialog):
     def closeEvent(self, event):
         self._disconnect()
         super().closeEvent(event)
+
+
+class _ConnectionDialog(QDialog):
+    """Connection status and diagnostics for Pro Tools Utils."""
+
+    def __init__(self, window: ProToolsUtilsWindow):
+        super().__init__(window)
+        self._window = window
+        self.setWindowTitle("Pro Tools Connection")
+        self.setMinimumSize(760, 360)
+        self._init_ui()
+        self._refresh()
+
+    def _init_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+
+        self._title = QLabel("")
+        self._title.setStyleSheet("font-size: 11pt; font-weight: 600;")
+        layout.addWidget(self._title)
+
+        self._hint = QLabel("")
+        self._hint.setWordWrap(True)
+        self._hint.setStyleSheet("color: #aaa; font-size: 9pt;")
+        layout.addWidget(self._hint)
+
+        self._details_label = QLabel("Technical Details")
+        self._details_label.setStyleSheet("color: #aaa; font-size: 9pt;")
+        layout.addWidget(self._details_label)
+
+        self._details = QPlainTextEdit()
+        self._details.setReadOnly(True)
+        self._details.setLineWrapMode(QPlainTextEdit.NoWrap)
+        self._details.setFont(QFont("Consolas", 9))
+        layout.addWidget(self._details, 1)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        self._copy_btn = QPushButton("Copy")
+        self._copy_btn.clicked.connect(self._copy_details)
+        buttons.addWidget(self._copy_btn)
+        self._action_btn = QPushButton("Connect")
+        self._action_btn.clicked.connect(self._on_action)
+        buttons.addWidget(self._action_btn)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        buttons.addWidget(close_btn)
+        layout.addLayout(buttons)
+
+    def _refresh(self):
+        window = self._window
+        self._title.setText(window._connection_title)
+        self._hint.setText(window._connection_hint)
+        has_error = bool(window._last_connection_error)
+        self._details_label.setVisible(has_error)
+        self._details.setVisible(has_error)
+        self._details.setPlainText(window._last_connection_error)
+        self._copy_btn.setVisible(has_error)
+
+        if window._engine is None:
+            self._action_btn.setText("Connect")
+        else:
+            self._action_btn.setText("Disconnect")
+
+    def _on_action(self):
+        if self._window._engine is None:
+            self._window._connect()
+        else:
+            self._window._disconnect()
+        self._refresh()
+
+    def _copy_details(self):
+        if self._window._last_connection_error:
+            QApplication.clipboard().setText(self._window._last_connection_error)
