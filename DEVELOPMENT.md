@@ -270,23 +270,29 @@ After installation, the CLI is available as `sessionprep`.
 
 ### 2.3 Version Management
 
-The version number lives in a single file:
+The version number is derived from Git; do not edit a hard-coded version in
+the codebase.
 
-```
-sessionpreplib/_version.py   →   __version__ = "0.1.0"
-```
+- If `HEAD` is exactly on a tag, the version is the tag name normalized as a
+  PEP 440 version.
+- Otherwise, the current branch name is treated as the base version and the
+  short commit hash is appended as a dev build, for example
+  `0.3.5.dev0+gb2f7cf6`.
+- Release branches and tags should therefore use version-like names such as
+  `0.3.5`.
 
-Everything else reads from this one source:
+Everything else reads from this computed source:
 
 | Consumer               | How it reads the version                                           |
 |------------------------|--------------------------------------------------------------------|
-| `pyproject.toml`       | `dynamic = ["version"]` + `[tool.hatch.version] path`              |
+| `pyproject.toml`       | `dynamic = ["version"]`; `setup.py` computes it from Git           |
 | `sessionpreplib`       | `from ._version import __version__` (re-exported in `__init__.py`) |
 | CLI (`sessionprep.py`) | `from sessionpreplib import __version__` (powers `--version` flag) |
 | GUI About dialog       | `from sessionpreplib import __version__`                           |
-| PyInstaller builds     | Bundled automatically via `--collect-all sessionpreplib`           |
+| Frozen builds          | Build scripts generate `sessionpreplib/_build_version.py`          |
 
-To bump the version, edit only `sessionpreplib/_version.py`.
+For installer/package metadata, pass the same computed version to the external
+packager, e.g. Inno Setup `APP_VERSION` or nfpm `VERSION`.
 
 ### 2.6 Linux Build Requirements
 

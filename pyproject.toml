@@ -3,33 +3,32 @@ name = "sessionprep"
 dynamic = ["version"]
 description = "Batch audio analyzer and normalizer for mix session preparation"
 readme = "README.md"
-license = { text = "GPL-3.0-or-later" }
+license = "GPL-3.0-or-later"
 requires-python = ">=3.13,<3.14"
 
-dependencies = ["numpy>=1.26", "soundfile>=0.12", "scipy>=1.12"]
+dependencies = [
+    "numpy>=1.26",
+    "packaging>=24",
+    "soundfile>=0.12",
+    "scipy>=1.12",
+]
 
 [project.scripts]
 sessionprep = "sessionprep:process_files"
 
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["setuptools>=69", "wheel", "packaging>=24"]
+build-backend = "setuptools.build_meta"
 
-[tool.hatch.metadata]
-allow-direct-references = true
+[tool.setuptools]
+py-modules = ["sessionprep"]
+include-package-data = true
 
-[tool.hatch.version]
-path = "sessionpreplib/_version.py"
+[tool.setuptools.packages.find]
+include = ["sessionpreplib*", "sessionprepgui*"]
 
-[tool.hatch.build.targets.wheel]
-packages = ["sessionpreplib", "sessionprepgui"]
-# Include the CLI script at the top level
-include = [
-    "sessionpreplib/**",
-    "sessionprepgui/**",
-    "sessionprep.py",
-    "sessionprep-gui.py",
-]
+[tool.setuptools.package-data]
+sessionprepgui = ["res/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

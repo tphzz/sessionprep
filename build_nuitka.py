@@ -10,7 +10,14 @@ import os
 import shutil
 import subprocess
 import argparse
-from build_conf import TARGETS, BASE_DIR, DIST_NUITKA, MACOS_APP_NAME
+from build_conf import (
+    TARGETS,
+    BASE_DIR,
+    DIST_NUITKA,
+    MACOS_APP_NAME,
+    remove_build_version_file,
+    write_build_version_file,
+)
 
 RPS_VERSION = "0.2.2"
 
@@ -104,6 +111,8 @@ def run_nuitka(target_key, clean=False):
     print(f"\n[BUILD] Building target: {target_key.upper()}")
     print(f"        Script: {script_path}")
     print(f"        Output: {target['name']}")
+    version = write_build_version_file()
+    print(f"        Version: {version}")
 
     # Base Nuitka command
     cmd = [
@@ -160,7 +169,10 @@ def run_nuitka(target_key, clean=False):
 
     # Run
     print(f"        Command: {' '.join(cmd)}")
-    subprocess.check_call(cmd)
+    try:
+        subprocess.check_call(cmd)
+    finally:
+        remove_build_version_file()
 
     # On macOS GUI, output is a .app bundle (directory), not a single file.
     # Nuitka names the bundle from the script name, not --output-filename.

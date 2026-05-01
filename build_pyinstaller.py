@@ -13,7 +13,14 @@ import subprocess
 import sys
 import platform
 
-from build_conf import TARGETS, BASE_DIR, DIST_PYINSTALLER, MACOS_APP_NAME
+from build_conf import (
+    TARGETS,
+    BASE_DIR,
+    DIST_PYINSTALLER,
+    MACOS_APP_NAME,
+    remove_build_version_file,
+    write_build_version_file,
+)
 
 DIST_DIR = os.path.join(BASE_DIR, DIST_PYINSTALLER)
 
@@ -64,6 +71,9 @@ def build(target_key: str, onefile: bool = False):
             print("Install GUI dependencies first:  uv sync --extra gui")
         print()
         return False
+
+    version = write_build_version_file()
+    print(f"Version: {version}")
 
     # Define consistent paths matching Nuitka structure
     # Work path: dist_pyinstaller/sessionprep-linux-x64.build
@@ -117,7 +127,10 @@ def build(target_key: str, onefile: bool = False):
     print(f"Running: {' '.join(cmd)}")
     print()
 
-    result = subprocess.run(cmd, cwd=BASE_DIR)
+    try:
+        result = subprocess.run(cmd, cwd=BASE_DIR)
+    finally:
+        remove_build_version_file()
     if result.returncode != 0:
         print(f"\nBuild failed for {app_name} with exit code {result.returncode}", file=sys.stderr)
         return False
