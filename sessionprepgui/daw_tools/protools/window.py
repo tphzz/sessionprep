@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QHBoxLayout,
     QLabel,
+    QMessageBox,
     QPushButton,
     QTabWidget,
     QVBoxLayout,
@@ -20,6 +21,34 @@ from ...theme import apply_dark_theme
 
 from .color_tool import ColorTool
 from .track_height_tool import TrackHeightTool
+
+
+def _connection_failure_message(exc: Exception) -> tuple[str, str]:
+    """Return a compact user-facing connection failure title and hint."""
+    if isinstance(exc, ImportError):
+        return (
+            "py-ptsl is not installed",
+            "Install the Pro Tools scripting dependency, then click Connect.",
+        )
+
+    text = str(exc)
+    lowered = text.lower()
+    unavailable_markers = (
+        "statuscode.unavailable",
+        "connection refused",
+        "failed to connect to all addresses",
+        "connectex",
+    )
+    if any(marker in lowered for marker in unavailable_markers):
+        return (
+            "Pro Tools not available",
+            "Start Pro Tools and make sure scripting is enabled, then click Connect.",
+        )
+
+    return (
+        "Connection failed",
+        "Check Pro Tools and PTSL, then click Connect to try again.",
+    )
 
 
 class ProToolsUtilsWindow(QDialog):
@@ -34,6 +63,7 @@ class ProToolsUtilsWindow(QDialog):
 
         self._config = config
         self._engine = None
+        self._last_connection_error = ""
 
         self._init_ui()
         apply_dark_theme(self)
@@ -48,11 +78,21 @@ class ProToolsUtilsWindow(QDialog):
         header = QHBoxLayout()
         header.setSpacing(8)
 
+        status_col = QVBoxLayout()
+        status_col.setSpacing(2)
         self._status_label = QLabel("Disconnected")
         self._status_label.setStyleSheet("color: #aaa; font-size: 9pt;")
-        header.addWidget(self._status_label)
+        status_col.addWidget(self._status_label)
+        self._hint_label = QLabel("")
+        self._hint_label.setWordWrap(True)
+        self._hint_label.setStyleSheet("color: #888; font-size: 8pt;")
+        status_col.addWidget(self._hint_label)
+        header.addLayout(status_col, 1)
 
-        header.addStretch()
+        self._details_btn = QPushButton("Details")
+        self._details_btn.clicked.connect(self._show_connection_details)
+        self._details_btn.setVisible(False)
+        header.addWidget(self._details_btn)
 
         self._on_top_cb = QCheckBox("Always on Top")
         self._on_top_cb.setStyleSheet("color: #aaa; font-size: 8pt;")
@@ -108,13 +148,23 @@ class ProToolsUtilsWindow(QDialog):
             )
             self._status_label.setText("Connected")
             self._status_label.setStyleSheet("color: #4caf50; font-size: 9pt;")
+            self._hint_label.setText("")
+            self._details_btn.setVisible(False)
+            self._last_connection_error = ""
             self._connect_btn.setText("Disconnect")
             self._color_tool.set_engine(self._engine)
             self._track_height_tool.set_engine(self._engine)
         except Exception as e:
-            self._status_label.setText(f"Connection failed: {e}")
+            title, hint = _connection_failure_message(e)
+            self._status_label.setText(title)
             self._status_label.setStyleSheet("color: #f44336; font-size: 9pt;")
+            self._hint_label.setText(hint)
+            self._last_connection_error = str(e)
+            self._details_btn.setVisible(bool(self._last_connection_error))
+            self._connect_btn.setText("Connect")
             self._engine = None
+            self._color_tool.set_engine(None)
+            self._track_height_tool.set_engine(None)
 
     def _disconnect(self):
         if self._engine is not None:
@@ -125,9 +175,24 @@ class ProToolsUtilsWindow(QDialog):
             self._engine = None
         self._status_label.setText("Disconnected")
         self._status_label.setStyleSheet("color: #aaa; font-size: 9pt;")
+        self._hint_label.setText("")
+        self._details_btn.setVisible(False)
+        self._last_connection_error = ""
         self._connect_btn.setText("Connect")
         self._color_tool.set_engine(None)
         self._track_height_tool.set_engine(None)
+
+    def _show_connection_details(self):
+        if not self._last_connection_error:
+            return
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Pro Tools Connection Details")
+        msg.setIcon(QMessageBox.Warning)
+        msg.setText(self._status_label.text())
+        msg.setInformativeText(self._hint_label.text())
+        msg.setDetailedText(self._last_connection_error)
+        msg.setStandardButtons(QMessageBox.Ok)
+        msg.exec()
 
     def update_config(self, config: dict):
         """Update the config (e.g. after preferences change)."""
