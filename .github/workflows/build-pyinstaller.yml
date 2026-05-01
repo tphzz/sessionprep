@@ -43,8 +43,8 @@ jobs:
             | sudo tee /etc/apt/sources.list.d/goreleaser.list
           sudo apt-get update -q && sudo apt-get install -y nfpm
 
-          export VERSION=$(python -c \
-            "exec(open('sessionpreplib/_version.py').read()); print(__version__)")
+          export VERSION=$(uv run python -c \
+            "from sessionpreplib._version import get_version; print(get_version(strict=True))")
           export DIST_DIR=dist_pyinstaller
 
           TMPCONFIG=$(mktemp --suffix=.yaml)
@@ -69,7 +69,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $ver = (python -c "exec(open('sessionpreplib/_version.py').read()); print(__version__)").Trim()
+          $ver = (uv run python -c "from sessionpreplib._version import get_version; print(get_version(strict=True))").Trim()
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" `
             "/DAPP_VERSION=$ver" `
             "/DDIST_DIR=dist_pyinstaller" `

@@ -70,6 +70,21 @@ def test_invalid_branch_base_fails(monkeypatch):
         _version.get_version(strict=True)
 
 
+def test_version_normalization_without_packaging(monkeypatch):
+    monkeypatch.setattr(_version, "Version", None)
+
+    assert _version._normalize_version("v0.3.5.dev0+gb2f7cf6", source="test") == (
+        "0.3.5.dev0+gb2f7cf6"
+    )
+
+
+def test_invalid_version_without_packaging_fails(monkeypatch):
+    monkeypatch.setattr(_version, "Version", None)
+
+    with pytest.raises(_version.VersionResolutionError):
+        _version._normalize_version("feature/foo", source="test")
+
+
 def test_generated_build_version_is_used_without_git(monkeypatch, tmp_path):
     _no_metadata(monkeypatch)
     monkeypatch.setattr(

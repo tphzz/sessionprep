@@ -4,14 +4,27 @@ from __future__ import annotations
 
 import importlib.metadata
 import importlib.util
+import re
 import subprocess
 from pathlib import Path
 
-from packaging.version import InvalidVersion, Version
+try:
+    from packaging.version import InvalidVersion, Version
+except ModuleNotFoundError:
+    InvalidVersion = ValueError
+    Version = None
 
 
 _DIST_NAME = "sessionprep"
 _UNKNOWN_VERSION = "0.0.0+unknown"
+_FALLBACK_VERSION_RE = re.compile(
+    r"^v?\d+(?:\.\d+)*"
+    r"(?:(?:a|b|rc|post|dev)\d*)?"
+    r"(?:\.post\d+)?"
+    r"(?:\.dev\d+)?"
+    r"(?:\+[A-Za-z0-9]+(?:[._-][A-Za-z0-9]+)*)?$",
+    re.IGNORECASE,
+)
 
 
 class VersionResolutionError(RuntimeError):
@@ -22,6 +35,13 @@ def _normalize_version(value: str, *, source: str) -> str:
     text = value.strip()
     if not text:
         raise VersionResolutionError(f"Empty version from {source}")
+    if Version is None:
+        normalized = text[1:] if text[:1].lower() == "v" else text
+        if _FALLBACK_VERSION_RE.fullmatch(text):
+            return normalized
+        raise VersionResolutionError(
+            f"{source} value {text!r} is not a valid PEP 440 version"
+        )
     try:
         return str(Version(text))
     except InvalidVersion as exc:
