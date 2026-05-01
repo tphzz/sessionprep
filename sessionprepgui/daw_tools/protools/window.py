@@ -6,7 +6,7 @@ Hosts per-tool tabs and manages a shared PTSL engine connection.
 from __future__ import annotations
 
 from PySide6.QtGui import QFont
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -22,39 +22,18 @@ from PySide6.QtWidgets import (
 from ...theme import apply_dark_theme
 
 from .color_tool import ColorTool
+from .connection_common import (
+    PTSL_CONNECT_TIMEOUT_MS,
+    connection_button_state as _connection_button_state,
+)
 from .track_height_tool import TrackHeightTool
-
-
-def _connection_failure_message(exc: Exception) -> tuple[str, str]:
-    """Return a compact user-facing connection failure title and hint."""
-    if isinstance(exc, ImportError):
-        return (
-            "py-ptsl is not installed",
-            "Install the Pro Tools scripting dependency, then click Connect.",
-        )
-
-    text = str(exc)
-    lowered = text.lower()
-    unavailable_markers = (
-        "statuscode.unavailable",
-        "connection refused",
-        "failed to connect to all addresses",
-        "connectex",
-    )
-    if any(marker in lowered for marker in unavailable_markers):
-        return (
-            "Pro Tools not available",
-            "Start Pro Tools and make sure scripting is enabled, then click Connect.",
-        )
-
-    return (
-        "Connection failed",
-        "Check Pro Tools and PTSL, then click Connect to try again.",
-    )
+from .worker_client import ProToolsWorkerClient
 
 
 class ProToolsUtilsWindow(QDialog):
     """Detached utility window for Pro Tools interactive tools."""
+
+    connection_state_changed = Signal()
 
     def __init__(self, config: dict, parent=None):
         super().__init__(parent)
@@ -69,6 +48,10 @@ class ProToolsUtilsWindow(QDialog):
         self._connection_title = "Disconnected"
         self._connection_hint = ""
         self._connection_state = "disconnected"
+        self._connection_attempt_id = 0
+        self._client: ProToolsWorkerClient | None = None
+        self._closing = False
+        self._suppress_next_show_connect = False
 
         self._init_ui()
         apply_dark_theme(self)
@@ -123,64 +106,106 @@ class ProToolsUtilsWindow(QDialog):
         self.setWindowFlags(flags)
         if was_visible:
             self.setGeometry(geo)
+            self._suppress_next_show_connect = True
             self.show()
 
     def _toggle_connection(self):
-        if self._engine is not None:
+        if self._connection_state == "connected":
             self._disconnect()
         else:
-            self._connect()
+            self._start_connect()
 
-    def _connect(self):
-        try:
-            from ptsl import Engine
-            self._engine = Engine(
-                company_name="SessionPrep",
-                application_name="Pro Tools Utils",
-            )
+    def _start_connect(self):
+        if self._connection_state == "connecting":
+            return
+
+        self._connection_attempt_id += 1
+        attempt_id = self._connection_attempt_id
+        self._connection_state = "connecting"
+        self._connection_title = "Connecting to Pro Tools..."
+        self._connection_hint = ""
+        self._last_connection_error = ""
+        self._engine = None
+        self._color_tool.set_client(None)
+        self._track_height_tool.set_client(None)
+        self._update_connection_button()
+        self.connection_state_changed.emit()
+
+        self._client = ProToolsWorkerClient(self)
+        self._client.worker_failed.connect(self._on_worker_failed)
+        self._client.request(
+            "connect",
+            {},
+            lambda response, current_attempt=attempt_id: self._on_connect_response(
+                response,
+                current_attempt,
+            ),
+            timeout_ms=PTSL_CONNECT_TIMEOUT_MS,
+        )
+
+    def _on_connect_response(self, response: dict, attempt_id: int):
+        if self._is_stale_connect_result(attempt_id):
+            return
+        if response.get("ok"):
+            self._engine = self._client
             self._connection_state = "connected"
             self._connection_title = "Connected to Pro Tools"
             self._connection_hint = ""
             self._last_connection_error = ""
             self._update_connection_button()
-            self._color_tool.set_engine(self._engine)
-            self._track_height_tool.set_engine(self._engine)
-        except Exception as e:
-            title, hint = _connection_failure_message(e)
-            self._connection_state = "failed"
-            self._connection_title = title
-            self._connection_hint = hint
-            self._last_connection_error = str(e)
-            self._engine = None
-            self._update_connection_button()
-            self._color_tool.set_engine(None)
-            self._track_height_tool.set_engine(None)
+            self._color_tool.set_client(self._client)
+            self._track_height_tool.set_client(self._client)
+            self.connection_state_changed.emit()
+        else:
+            self._set_connection_failed(
+                str(response.get("error") or ""),
+                str(response.get("title") or "Connection failed"),
+                str(response.get("hint") or ""),
+            )
+
+    def _on_worker_failed(self, error: str, title: str, hint: str):
+        if self._closing or self._connection_state == "disconnected":
+            return
+        self._set_connection_failed(error, title, hint)
+
+    def _set_connection_failed(self, error: str, title: str, hint: str):
+        self._engine = None
+        if self._client is not None:
+            self._client.stop()
+            self._client = None
+        self._connection_state = "failed"
+        self._connection_title = title
+        self._connection_hint = hint
+        self._last_connection_error = error
+        self._update_connection_button()
+        self._color_tool.set_client(None)
+        self._track_height_tool.set_client(None)
+        self.connection_state_changed.emit()
+
+    def _is_stale_connect_result(self, attempt_id: int) -> bool:
+        return (
+            self._closing
+            or attempt_id != self._connection_attempt_id
+            or self._connection_state != "connecting"
+        )
 
     def _disconnect(self):
-        if self._engine is not None:
-            try:
-                self._engine.close()
-            except Exception:
-                pass
-            self._engine = None
+        self._connection_attempt_id += 1
+        if self._client is not None:
+            self._client.stop()
+            self._client = None
+        self._engine = None
         self._connection_state = "disconnected"
         self._connection_title = "Disconnected"
         self._connection_hint = ""
         self._last_connection_error = ""
         self._update_connection_button()
-        self._color_tool.set_engine(None)
-        self._track_height_tool.set_engine(None)
+        self._color_tool.set_client(None)
+        self._track_height_tool.set_client(None)
+        self.connection_state_changed.emit()
 
     def _update_connection_button(self):
-        if self._connection_state == "connected":
-            text = "Pro Tools: Connected"
-            color = "#4caf50"
-        elif self._connection_state == "failed":
-            text = "Pro Tools: Offline"
-            color = "#f44336"
-        else:
-            text = "Pro Tools: Offline"
-            color = "#aaa"
+        text, color = _connection_button_state(self._connection_state)
         self._connection_btn.setText(text)
         self._connection_btn.setToolTip(self._connection_title)
         self._connection_btn.setStyleSheet(
@@ -199,10 +224,18 @@ class ProToolsUtilsWindow(QDialog):
 
     def showEvent(self, event):
         super().showEvent(event)
-        if self._engine is None:
-            self._connect()
+        self._closing = False
+        if self._suppress_next_show_connect:
+            self._suppress_next_show_connect = False
+            return
+        if (
+            self._engine is None
+            and self._connection_state != "connecting"
+        ):
+            self._start_connect()
 
     def closeEvent(self, event):
+        self._closing = True
         self._disconnect()
         super().closeEvent(event)
 
@@ -215,7 +248,9 @@ class _ConnectionDialog(QDialog):
         self._window = window
         self.setWindowTitle("Pro Tools Connection")
         self.setMinimumSize(760, 360)
+        self._close_on_connected = False
         self._init_ui()
+        self._window.connection_state_changed.connect(self._refresh)
         self._refresh()
 
     def _init_ui(self):
@@ -257,6 +292,12 @@ class _ConnectionDialog(QDialog):
 
     def _refresh(self):
         window = self._window
+        if (
+            self._close_on_connected
+            and window._connection_state == "connected"
+        ):
+            self.accept()
+            return
         self._title.setText(window._connection_title)
         self._hint.setText(window._connection_hint)
         has_error = bool(window._last_connection_error)
@@ -266,14 +307,22 @@ class _ConnectionDialog(QDialog):
         self._copy_btn.setVisible(has_error)
 
         if window._engine is None:
-            self._action_btn.setText("Connect")
+            if window._connection_state == "connecting":
+                self._action_btn.setText("Connecting...")
+                self._action_btn.setEnabled(False)
+            else:
+                self._action_btn.setText("Connect")
+                self._action_btn.setEnabled(True)
         else:
             self._action_btn.setText("Disconnect")
+            self._action_btn.setEnabled(True)
 
     def _on_action(self):
         if self._window._engine is None:
-            self._window._connect()
+            self._close_on_connected = True
+            self._window._start_connect()
         else:
+            self._close_on_connected = False
             self._window._disconnect()
         self._refresh()
 

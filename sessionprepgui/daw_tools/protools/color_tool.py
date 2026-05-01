@@ -1,11 +1,6 @@
-"""Color Picker tool for Pro Tools.
-
-Shows the SessionPrep color palette; clicking a color pushes it
-to the selected track(s) in Pro Tools via PTSL.
-"""
+"""Color Picker tool for Pro Tools."""
 
 from __future__ import annotations
-
 
 from PySide6.QtWidgets import (
     QHBoxLayout,
@@ -17,6 +12,7 @@ from PySide6.QtWidgets import (
 from sessionpreplib.daw_processors import ptsl_helpers as ptslh
 
 from ...widgets import ColorGridPanel
+from .connection_common import PTSL_MUTATION_TIMEOUT_MS, PTSL_READ_TIMEOUT_MS
 
 
 class ColorTool(QWidget):
@@ -25,12 +21,10 @@ class ColorTool(QWidget):
     def __init__(self, config: dict, parent=None):
         super().__init__(parent)
         self._config = config
-        self._engine = None
+        self._client = None
         self._pt_palette: list[str] = []
         self._init_ui()
         self._load_palette()
-
-    # ── UI ────────────────────────────────────────────────────────────
 
     def _init_ui(self):
         layout = QVBoxLayout(self)
@@ -45,11 +39,13 @@ class ColorTool(QWidget):
         layout.addWidget(desc)
 
         self._grid = ColorGridPanel(
-            cell_height=28, stretch_vertical=True, parent=self)
+            cell_height=28,
+            stretch_vertical=True,
+            parent=self,
+        )
         self._grid.colorClicked.connect(self._on_color_clicked)
         layout.addWidget(self._grid)
 
-        # Status bar
         status_row = QHBoxLayout()
         self._status = QLabel("")
         self._status.setStyleSheet("color: #888; font-size: 8pt;")
@@ -57,53 +53,55 @@ class ColorTool(QWidget):
         status_row.addStretch()
         layout.addLayout(status_row)
 
-    # ── Public API ───────────────────────────────────────────────────
-
     def set_engine(self, engine):
-        """Set or clear the PTSL engine."""
-        self._engine = engine
+        """Compatibility shim for older callers."""
+        self.set_client(engine)
+
+    def set_client(self, client):
+        """Set or clear the Pro Tools worker client."""
+        self._client = client
         self._pt_palette = []
-        if engine is not None:
-            self._fetch_pt_palette()
 
     def update_config(self, config: dict):
         """Refresh the palette grid from an updated config."""
         self._config = config
         self._load_palette()
 
-    # ── Internal ─────────────────────────────────────────────────────
-
     def _load_palette(self):
-        """Load the SessionPrep palette from config into the grid."""
         colors = self._config.get("colors", [])
         self._grid.set_colors(colors)
 
+    def _set_status(self, text: str, color: str):
+        self._status.setText(text)
+        self._status.setStyleSheet(f"color: {color}; font-size: 8pt;")
+
     def _fetch_pt_palette(self):
-        """Fetch the Pro Tools track color palette via PTSL."""
-        if self._engine is None:
+        if self._client is None:
             return
-        try:
-            resp = ptslh.run_command(
-                self._engine, "CId_GetColorPalette",
-                {"color_palette_target": "CPTarget_Tracks"})
-            self._pt_palette = (resp or {}).get("color_list", [])
-            count = len(self._pt_palette)
-            if count:
-                self._status.setText(f"PT palette loaded ({count} colors)")
-                self._status.setStyleSheet("color: #4caf50; font-size: 8pt;")
-            else:
-                self._status.setText(
-                    f"PT palette empty (response: {resp})")
-                self._status.setStyleSheet("color: #ff9800; font-size: 8pt;")
-        except Exception as e:
-            self._status.setText(f"Failed to fetch PT palette: {e}")
-            self._status.setStyleSheet("color: #f44336; font-size: 8pt;")
+        self._client.request(
+            "get_color_palette",
+            {"target": "CPTarget_Tracks"},
+            self._on_palette_response,
+            timeout_ms=PTSL_READ_TIMEOUT_MS,
+        )
+
+    def _on_palette_response(self, response: dict):
+        if not response.get("ok"):
+            self._set_status(
+                f"Failed to fetch PT palette: {response.get('error') or ''}",
+                "#f44336",
+            )
+            return
+        self._pt_palette = list(response.get("result") or [])
+        count = len(self._pt_palette)
+        if count:
+            self._set_status(f"PT palette loaded ({count} colors)", "#4caf50")
+        else:
+            self._set_status("PT palette empty", "#ff9800")
 
     def _on_color_clicked(self, index: int):
-        """Handle a palette cell click — push color to Pro Tools."""
-        if self._engine is None:
-            self._status.setText("Not connected to Pro Tools")
-            self._status.setStyleSheet("color: #f44336; font-size: 8pt;")
+        if self._client is None:
+            self._set_status("Not connected to Pro Tools", "#f44336")
             return
 
         colors = self._config.get("colors", [])
@@ -116,36 +114,74 @@ class ColorTool(QWidget):
         if not argb:
             return
 
-        # Fetch PT palette if not cached
         if not self._pt_palette:
-            self._fetch_pt_palette()
-        if not self._pt_palette:
-            self._status.setText("No PT palette available")
-            self._status.setStyleSheet("color: #f44336; font-size: 8pt;")
+            self._set_status("Loading Pro Tools palette...", "#aaa")
+            self._client.request(
+                "get_color_palette",
+                {"target": "CPTarget_Tracks"},
+                lambda response, idx=index: self._on_palette_then_apply(
+                    response,
+                    idx,
+                ),
+                timeout_ms=PTSL_READ_TIMEOUT_MS,
+            )
             return
 
-        # Find closest PT palette match (0-based → 1-based for PT)
+        self._apply_color(argb, name)
+
+    def _on_palette_then_apply(self, response: dict, index: int):
+        self._on_palette_response(response)
+        if not self._pt_palette:
+            return
+        colors = self._config.get("colors", [])
+        if index < 0 or index >= len(colors):
+            return
+        entry = colors[index]
+        self._apply_color(entry.get("argb", ""), entry.get("name", ""))
+
+    def _apply_color(self, argb: str, name: str):
         pt_index = ptslh.closest_palette_index(argb, self._pt_palette)
         if pt_index is None:
-            self._status.setText("Could not match color")
-            self._status.setStyleSheet("color: #f44336; font-size: 8pt;")
+            self._set_status("Could not match color", "#f44336")
             return
 
-        # Apply to selected tracks
-        try:
-            selected = ptslh.get_selected_track_names(self._engine)
-            if not selected:
-                self._status.setText("No tracks selected in Pro Tools")
-                self._status.setStyleSheet("color: #ff9800; font-size: 8pt;")
-                return
-            ptslh.set_track_color(
-                self._engine, color_index=pt_index + 1,
-                track_names=selected)
-            label = name or argb
-            self._status.setText(
-                f"Applied '{label}' → PT index {pt_index} "
-                f"({len(selected)} track{'s' if len(selected) != 1 else ''})")
-            self._status.setStyleSheet("color: #4caf50; font-size: 8pt;")
-        except Exception as e:
-            self._status.setText(f"Error: {e}")
-            self._status.setStyleSheet("color: #f44336; font-size: 8pt;")
+        self._set_status("Applying color...", "#aaa")
+        self._client.request(
+            "get_selected_track_names",
+            {},
+            lambda response, color_index=pt_index + 1, label=name or argb: (
+                self._on_selected_tracks_for_color(response, color_index, label)
+            ),
+            timeout_ms=PTSL_READ_TIMEOUT_MS,
+        )
+
+    def _on_selected_tracks_for_color(
+        self,
+        response: dict,
+        color_index: int,
+        label: str,
+    ):
+        if not response.get("ok"):
+            self._set_status(f"Error: {response.get('error') or ''}", "#f44336")
+            return
+        selected = list(response.get("result") or [])
+        if not selected:
+            self._set_status("No tracks selected in Pro Tools", "#ff9800")
+            return
+        self._client.request(
+            "set_track_color",
+            {"color_index": color_index, "track_names": selected},
+            lambda apply_response, count=len(selected), text=label: (
+                self._on_color_applied(apply_response, count, text)
+            ),
+            timeout_ms=PTSL_MUTATION_TIMEOUT_MS,
+        )
+
+    def _on_color_applied(self, response: dict, count: int, label: str):
+        if not response.get("ok"):
+            self._set_status(f"Error: {response.get('error') or ''}", "#f44336")
+            return
+        self._set_status(
+            f"Applied '{label}' ({count} track{'s' if count != 1 else ''})",
+            "#4caf50",
+        )

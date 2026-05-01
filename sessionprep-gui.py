@@ -9,7 +9,14 @@ Usage:
 Requires: PySide6 (install via `uv pip install PySide6`)
 """
 
-from sessionprepgui import main
-
 if __name__ == "__main__":
+    import sys
+
+    if "--ptsl-worker" in sys.argv:
+        from sessionprepgui.daw_tools.protools.worker_process import main as worker_main
+
+        sys.exit(worker_main())
+
+    from sessionprepgui import main
+
     main()

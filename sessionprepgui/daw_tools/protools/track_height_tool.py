@@ -22,10 +22,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from sessionpreplib.daw_processors import ptsl_helpers as ptslh
-
 from ...prefs.preset_panel import NamedPresetPanel
 from ...settings import save_config
+from .connection_common import PTSL_MUTATION_TIMEOUT_MS, PTSL_READ_TIMEOUT_MS
 
 
 COL_TYPE = 0
@@ -194,7 +193,7 @@ class TrackHeightTool(QWidget):
     def __init__(self, config: dict, parent=None):
         super().__init__(parent)
         self._config = config
-        self._engine = None
+        self._client = None
         self._presets_data: dict[str, dict[str, Any]] = {}
         self._loading = False
         self._combos: dict[str, QComboBox] = {}
@@ -333,7 +332,10 @@ class TrackHeightTool(QWidget):
         self._set_status(text, "#4caf50")
 
     def set_engine(self, engine):
-        self._engine = engine
+        self.set_client(engine)
+
+    def set_client(self, client):
+        self._client = client
         self._preview_tracks = []
         self._update_connection_state()
 
@@ -506,16 +508,6 @@ class TrackHeightTool(QWidget):
         self._table.sortItems(column, order)
         self._table.horizontalHeader().setSortIndicator(column, order)
 
-    def _fetch_tracks(self) -> list[dict[str, Any]]:
-        if self._engine is None:
-            raise RuntimeError("Not connected to Pro Tools")
-        resp = ptslh.run_command(
-            self._engine,
-            "CId_GetTrackList",
-            {"pagination_request": {"limit": 0, "offset": 0}},
-        )
-        return list((resp or {}).get("track_list", []))
-
     def _tracks_for_scope(
         self,
         tracks: list[dict[str, Any]],
@@ -537,118 +529,155 @@ class TrackHeightTool(QWidget):
         ]
 
     def _refresh_preview(self):
-        try:
-            self._preview_tracks = self._fetch_tracks()
-            preset = self._current_widget_preset()
-            scoped = self._tracks_for_scope(self._preview_tracks, preset)
-            if preset.get("mode") == "all":
-                heights = Counter(
-                    track.get("height") or "THeight_Unknown"
-                    for track in scoped
-                )
-                text = ", ".join(
-                    f"{height.replace('THeight_', '')}: {count}"
-                    for height, count in sorted(heights.items())
-                )
-                suffix = f" ({text})" if text else ""
-                self._all_summary.setText(
-                    f"{len(scoped)} of {len(self._preview_tracks)} "
-                    f"tracks match scope{suffix}"
-                )
-                self._set_success_status(
-                    f"Preview loaded: {len(scoped)} of "
-                    f"{len(self._preview_tracks)} tracks match scope"
-                )
-                return
+        if self._client is None:
+            self._set_error_status("Not connected to Pro Tools")
+            return
+        self._refresh_btn.setEnabled(False)
+        self._set_status("Loading preview...", "#aaa")
+        self._client.request(
+            "get_track_list",
+            {},
+            self._on_preview_tracks,
+            timeout_ms=PTSL_READ_TIMEOUT_MS,
+        )
 
-            counts: Counter[str] = Counter()
-            current: dict[str, Counter[str]] = defaultdict(Counter)
-            for track in scoped:
-                track_type = _normalize_track_type(track.get("type", ""))
-                counts[track_type] += 1
-                height = track.get("height") or "THeight_Unknown"
-                current[track_type][height] += 1
+    def _on_preview_tracks(self, response: dict):
+        self._refresh_btn.setEnabled(True)
+        if not response.get("ok"):
+            self._set_error_status(f"Preview failed: {response.get('error') or ''}")
+            return
+        self._preview_tracks = list(response.get("result") or [])
+        preset = self._current_widget_preset()
+        self._render_preview(self._preview_tracks, preset)
 
-            for row in range(self._table.rowCount()):
-                item = self._table.item(row, COL_TYPE)
-                track_type = item.data(Qt.UserRole)
-                count = counts.get(track_type, 0)
-                count_item = self._table.item(row, COL_MATCHED)
-                count_item.setText(str(count))
-                count_item.setData(Qt.UserRole, count)
-                heights = current.get(track_type, Counter())
-                text = ", ".join(
-                    f"{height.replace('THeight_', '')}: {count}"
-                    for height, count in sorted(heights.items())
-                )
-                self._table.item(row, COL_CURRENT).setText(text)
-
-            self._sort_table(self._sort_column, self._sort_order)
-
-            self._set_success_status(
-                f"Preview loaded: {len(scoped)} of {len(self._preview_tracks)} tracks match scope"
+    def _render_preview(self, tracks: list[dict[str, Any]], preset: dict[str, Any]):
+        scoped = self._tracks_for_scope(tracks, preset)
+        if preset.get("mode") == "all":
+            heights = Counter(
+                track.get("height") or "THeight_Unknown"
+                for track in scoped
             )
-        except Exception as exc:
-            self._set_error_status(f"Preview failed: {exc}")
+            text = ", ".join(
+                f"{height.replace('THeight_', '')}: {count}"
+                for height, count in sorted(heights.items())
+            )
+            suffix = f" ({text})" if text else ""
+            self._all_summary.setText(
+                f"{len(scoped)} of {len(tracks)} tracks match scope{suffix}"
+            )
+            self._set_success_status(
+                f"Preview loaded: {len(scoped)} of {len(tracks)} tracks match scope"
+            )
+            return
+
+        counts: Counter[str] = Counter()
+        current: dict[str, Counter[str]] = defaultdict(Counter)
+        for track in scoped:
+            track_type = _normalize_track_type(track.get("type", ""))
+            counts[track_type] += 1
+            height = track.get("height") or "THeight_Unknown"
+            current[track_type][height] += 1
+
+        for row in range(self._table.rowCount()):
+            item = self._table.item(row, COL_TYPE)
+            track_type = item.data(Qt.UserRole)
+            count = counts.get(track_type, 0)
+            count_item = self._table.item(row, COL_MATCHED)
+            count_item.setText(str(count))
+            count_item.setData(Qt.UserRole, count)
+            heights = current.get(track_type, Counter())
+            text = ", ".join(
+                f"{height.replace('THeight_', '')}: {count}"
+                for height, count in sorted(heights.items())
+            )
+            self._table.item(row, COL_CURRENT).setText(text)
+
+        self._sort_table(self._sort_column, self._sort_order)
+        self._set_success_status(
+            f"Preview loaded: {len(scoped)} of {len(tracks)} tracks match scope"
+        )
 
     def _apply_preset(self):
-        if self._engine is None:
+        if self._client is None:
             self._set_error_status("Not connected to Pro Tools")
             return
 
-        try:
-            tracks = self._fetch_tracks()
-            preset = self._current_widget_preset()
-            scoped = self._tracks_for_scope(tracks, preset)
-            if preset.get("mode") == "all":
-                all_height = preset.get("all_height", "")
-                if not all_height:
-                    self._set_warning_status("No height selected")
-                    return
-                track_ids = [track.get("id") for track in scoped if track.get("id")]
-                if not track_ids:
-                    self._set_warning_status("No matching tracks in scope")
-                    return
-                ptslh.set_track_height(
-                    self._engine,
-                    all_height,
-                    track_ids=track_ids,
-                )
-                self._set_success_status(
-                    f"Applied height preset to {len(track_ids)} track(s)"
-                )
-                self._refresh_preview()
+        self._apply_btn.setEnabled(False)
+        self._set_status("Applying height preset...", "#aaa")
+        self._client.request(
+            "get_track_list",
+            {},
+            self._on_apply_tracks,
+            timeout_ms=PTSL_READ_TIMEOUT_MS,
+        )
+
+    def _on_apply_tracks(self, response: dict):
+        if not response.get("ok"):
+            self._apply_btn.setEnabled(True)
+            self._set_error_status(f"Apply failed: {response.get('error') or ''}")
+            return
+
+        tracks = list(response.get("result") or [])
+        preset = self._current_widget_preset()
+        scoped = self._tracks_for_scope(tracks, preset)
+        if preset.get("mode") == "all":
+            all_height = preset.get("all_height", "")
+            if not all_height:
+                self._apply_btn.setEnabled(True)
+                self._set_warning_status("No height selected")
                 return
-
-            heights = preset.get("heights", {})
-            by_height: dict[str, list[str]] = defaultdict(list)
-            for track in scoped:
-                track_id = track.get("id")
-                track_type = _normalize_track_type(track.get("type", ""))
-                height = heights.get(track_type, "")
-                if track_id and height:
-                    by_height[height].append(track_id)
-
-            if not by_height:
-                self._set_warning_status("No matching tracks with configured heights")
+            track_ids = [track.get("id") for track in scoped if track.get("id")]
+            if not track_ids:
+                self._apply_btn.setEnabled(True)
+                self._set_warning_status("No matching tracks in scope")
                 return
+            self._request_height_changes({all_height: track_ids})
+            return
 
-            changed = 0
-            for height, track_ids in by_height.items():
-                ptslh.set_track_height(
-                    self._engine,
-                    height,
-                    track_ids=track_ids,
-                )
-                changed += len(track_ids)
+        heights = preset.get("heights", {})
+        by_height: dict[str, list[str]] = defaultdict(list)
+        for track in scoped:
+            track_id = track.get("id")
+            track_type = _normalize_track_type(track.get("type", ""))
+            height = heights.get(track_type, "")
+            if track_id and height:
+                by_height[height].append(track_id)
 
+        if not by_height:
+            self._apply_btn.setEnabled(True)
+            self._set_warning_status("No matching tracks with configured heights")
+            return
+        self._request_height_changes(by_height)
+
+    def _request_height_changes(self, by_height: dict[str, list[str]]):
+        pending = len(by_height)
+        changed = sum(len(track_ids) for track_ids in by_height.values())
+        failures: list[str] = []
+
+        def on_height_response(response: dict):
+            nonlocal pending
+            if not response.get("ok"):
+                failures.append(str(response.get("error") or "Unknown error"))
+            pending -= 1
+            if pending:
+                return
+            self._apply_btn.setEnabled(True)
+            if failures:
+                self._set_error_status(f"Apply failed: {failures[0]}")
+                return
             self._set_success_status(f"Applied height preset to {changed} track(s)")
             self._refresh_preview()
-        except Exception as exc:
-            self._set_error_status(f"Apply failed: {exc}")
+
+        for height, track_ids in by_height.items():
+            self._client.request(
+                "set_track_height",
+                {"height": height, "track_ids": track_ids},
+                on_height_response,
+                timeout_ms=PTSL_MUTATION_TIMEOUT_MS,
+            )
 
     def _update_connection_state(self):
-        if self._engine is None:
+        if self._client is None:
             self._set_status("", "#888")
         elif self._status.text() == "Disconnected":
             self._set_status("", "#888")
