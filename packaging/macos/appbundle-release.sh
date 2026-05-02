@@ -122,13 +122,28 @@ xcrun stapler staple "$APP_PATH"
 rm "$ZIP_PATH"
 
 # ==============================================================================
-# Step 2: Create the DMG
+# Step 2: Create the DMG (with Applications Shortcut)
 # ==============================================================================
+log_info "Preparing DMG staging area..."
+STAGING_DIR="dmg_staging"
+if [ -d "$STAGING_DIR" ]; then rm -rf "$STAGING_DIR"; fi
+mkdir -p "$STAGING_DIR"
+
+# Copy the app (already stapled!) into the staging folder
+# We use 'cp -R' or 'ditto' to preserve the signature and ticket
+ditto "$APP_PATH" "$STAGING_DIR/$(basename "$APP_PATH")"
+
+# Create the symlink to /Applications
+ln -s /Applications "$STAGING_DIR/Applications"
+
 log_info "Creating DMG: $DMG_PATH..."
 if [ -f "$DMG_PATH" ]; then rm "$DMG_PATH"; fi
 
-# Simple hdiutil creation. UDZO format is compressed and read-only.
-hdiutil create -volname "$BUNDLE_NAME" -srcfolder "$APP_PATH" -ov -format UDZO "$DMG_PATH"
+# Point hdiutil to the staging directory instead of just the .app
+hdiutil create -volname "$BUNDLE_NAME" -srcfolder "$STAGING_DIR" -ov -format UDZO "$DMG_PATH"
+
+# Cleanup staging area
+rm -rf "$STAGING_DIR"
 
 # ==============================================================================
 # Step 3: Sign the DMG
