@@ -67,8 +67,7 @@ uv sync
 ```
 
 `uv sync` reads `pyproject.toml`, creates `.venv/`, installs all dependencies
-(including dev group: pytest, pytest-cov, pyinstaller), and generates `uv.lock`
-for reproducible installs.
+(including the dev group), and generates `uv.lock` for reproducible installs.
 
 ### 1.3 Running the CLI
 
@@ -174,43 +173,17 @@ $env:SP_LOG_LEVEL = "DEBUG"; uv run python sessionprep-gui.py
 
 ## 2. Building & Distribution
 
-SessionPrep supports two build engines for creating standalone executables:
-**PyInstaller** (fast, standard) and **Nuitka** (high-performance, compiled).
-Both engines share a centralized configuration in `build_conf.py`.
+SessionPrep uses **Nuitka** for creating standalone executables.
+The build metadata is centralized in `build_conf.py`.
 
 ### 2.1 Centralized Metadata (`build_conf.py`)
 
 All build metadata—target entry points, asset paths, platform-specific names,
-and library exclusion rules—is defined in `build_conf.py`. This ensures that
-both build engines produce consistent results and maintain strict dependency
-hygiene (e.g., ensuring `rich` is never bundled with the GUI).
+and library exclusion rules—is defined in `build_conf.py`. This keeps target
+configuration consistent and maintains strict dependency hygiene, for example
+ensuring `rich` is never bundled with the GUI.
 
-### 2.2 PyInstaller Build (Standard)
-
-The `build_pyinstaller.py` script automates PyInstaller builds. It produces
-executables that are relatively quick to build but have slightly slower
-startup (~2-3s) because they unpack to a temporary directory.
-
-```bash
-# Build both CLI and GUI (onedir, default)
-uv run python build_pyinstaller.py
-
-# Build both as single executables
-uv run python build_pyinstaller.py --onefile
-
-# Build CLI only
-uv run python build_pyinstaller.py cli
-
-# Build GUI only
-uv run python build_pyinstaller.py gui
-
-# Clean previous build artifacts first
-uv run python build_pyinstaller.py --clean gui
-```
-
-Output goes to `dist_pyinstaller/`.
-
-### 2.3 Nuitka Build (High-Performance)
+### 2.2 Nuitka Build
 
 The `build_nuitka.py` script uses Nuitka to transpile the Python code into C
 and compile it to a native machine-code binary. This results in faster startup
@@ -233,7 +206,7 @@ uv run python build_nuitka.py --clean all
 
 Output goes to `dist_nuitka/`.
 
-### 2.4 Platform Suffixes
+### 2.3 Platform Suffixes
 
 Each executable name includes a platform and architecture suffix generated
 automatically by `build_conf.py`:
@@ -254,7 +227,7 @@ distribution.
 **Prerequisites for GUI builds:** GUI dependencies must be installed:
 `uv sync --extra gui`.
 
-### 2.5 Python Package (pip-installable)
+### 2.4 Python Package (pip-installable)
 
 The project remains installable as a standard Python package:
 
@@ -268,7 +241,7 @@ uv build
 
 After installation, the CLI is available as `sessionprep`.
 
-### 2.3 Version Management
+### 2.5 Version Management
 
 The version number is derived from Git; do not edit a hard-coded version in
 the codebase.
@@ -319,10 +292,10 @@ sudo dnf install gcc patchelf ccache libatomic-static
 | `pyproject.toml`       | Package metadata, dependencies, build config, entry points  |
 | `uv.lock`              | Lockfile for reproducible dependency resolution             |
 | `build_conf.py`        | Shared build metadata and isolation rules (Source of Truth) |
-| `build_pyinstaller.py` | PyInstaller automation (standard builds)                    |
 | `build_nuitka.py`      | Nuitka automation (optimized builds)                        |
 | `sessionprep.py`       | Thin CLI entry point                                        |
 | `sessionprep-gui.py`   | Thin GUI entry point                                        |
+
 ### 2.5 Dependencies
 
 | Package       | Type           | Used by                                                                                                    |
@@ -337,8 +310,6 @@ sudo dnf install gcc patchelf ccache libatomic-static
 | `dawproject`  | Optional (gui) | `sessionpreplib/daw_processors/dawproject.py` (DAWproject file format library)                             |
 | `pytest`      | Dev            | Test runner                                                                                                |
 | `pytest-cov`  | Dev            | Coverage reporting                                                                                         |
-| `pyinstaller` | Dev            | Standalone executable builds                                                                               |
-| `Pillow`      | Dev            | Icon format conversion for PyInstaller (macOS .png → .icns)                                                |
 
 Core runtime dependencies (`numpy`, `soundfile`, `scipy`) are declared in
 `[project].dependencies`. GUI-only dependencies (`PySide6`, `sounddevice`)

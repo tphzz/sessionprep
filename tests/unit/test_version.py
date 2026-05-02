@@ -123,7 +123,6 @@ def test_static_build_version_module_is_used(monkeypatch):
 def test_build_version_module_is_included_for_freezers():
     for target in TARGETS.values():
         assert BUILD_VERSION_MODULE in target["nuitka_include_modules"]
-        assert BUILD_VERSION_MODULE in target["pyinstaller_hidden_imports"]
 
 
 def test_installed_metadata_is_runtime_fallback(monkeypatch):
