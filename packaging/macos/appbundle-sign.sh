@@ -63,8 +63,8 @@ fi
 # ==============================================================================
 select_certificate() {
     log_info "No certificate provided via -c. Querying local keychain..."
-    
-    # Query keychain and filter for Developer ID. 
+
+    # Query keychain and filter for Developer ID.
     # '|| true' prevents the strict mode from killing the script if grep finds nothing.
     local cert_raw
     cert_raw=$(security find-identity -v -p codesigning | grep "Developer ID Application" || true)
@@ -76,13 +76,13 @@ select_certificate() {
     # Read output into arrays
     local cert_hashes=()
     local cert_names=()
-    
+
     while IFS= read -r line; do
         # Extract the hex hash (2nd column in security output)
         local hash=$(echo "$line" | awk '{print $2}')
         # Extract the human-readable name inside the quotes
         local name=$(echo "$line" | grep -o '".*"' | sed 's/"//g')
-        
+
         cert_hashes+=("$hash")
         cert_names+=("$name")
     done <<< "$cert_raw"
@@ -96,10 +96,10 @@ select_certificate() {
 
     # Interactive menu if multiple certificates are found
     echo -e "${YELLOW}Multiple Developer ID certificates found. Please choose one:${NC}"
-    
+
     # Customize the prompt text for the 'select' menu
     PS3="Enter the number of the certificate to use (1-${#cert_names[@]}): "
-    
+
     select opt in "${cert_names[@]}"; do
         if [ -n "$opt" ]; then
             # Find the index of the selected option
@@ -167,6 +167,13 @@ if [ -z "$CERT_NAME" ]; then
     select_certificate
 fi
 
+# ==============================================================================
+# Step 0.5: Clear Extended Attributes (Fixes "resource fork / detritus" error)
+# ==============================================================================
+log_info "Clearing extended attributes (xattr) to prevent detritus errors..."
+xattr -cr "$APP_PATH"
+log_success "Extended attributes successfully cleared."
+
 # Step 1: Execute the built-in reorganizer function
 reorganize_resources "$APP_PATH"
 
@@ -176,6 +183,55 @@ while IFS= read -r -d '' file; do
     codesign --force --verify --timestamp --options runtime --sign "$CERT_NAME" "$file"
 done < <(find "$APP_PATH" -type f \( -name "*.dylib" -o -name "*.so" \) -print0)
 log_success "All embedded libraries were successfully signed."
+
+
+# ==============================================================================
+# Step 2.5: Sign ALL extensionless binaries (The "Python/Qt/Scientific" Fix)
+# ==============================================================================
+log_info "Checking for ALL extensionless binaries in Contents/MacOS (Python, Qt, etc.)..."
+
+# Dieser Befehl ermittelt den absoluten Pfad zum Ordner, in dem dieses Skript liegt
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENTITLEMENTS="$SCRIPT_DIR/entitlements.plist"
+
+# Kurzer Check, ob die Datei dort auch wirklich existiert
+if [ ! -f "$ENTITLEMENTS" ]; then
+    log_error "Entitlements file not found at: $ENTITLEMENTS"
+fi
+
+# We search the entire MacOS directory for files that have NO dot in their name.
+# These are typically the core libraries that cause the "Different Team IDs" crash.
+# We exclude directories (-type f) and focus only on files.
+while IFS= read -r -d '' binary; do
+    binary_name=$(basename "$binary")
+    
+    # We skip hidden files like .DS_Store or similar just in case
+    if [[ "$binary_name" == .* ]]; then continue; fi
+
+    log_info "Signing extensionless binary: $binary_name"
+    codesign --force --verify --timestamp --options runtime --entitlements "$ENTITLEMENTS" --sign "$CERT_NAME" "$binary"
+
+done < <(find "$APP_PATH/Contents/MacOS" -type f ! -name "*.*" -print0)
+
+log_success "All extensionless core binaries have been signed with entitlements."
+
+# ==============================================================================
+# Step 3: Sign main executable
+# ==============================================================================
+
+# Sign the main executable
+# Dynamically find the executable based on the .app name
+APP_EXEC_NAME=$(basename "$APP_PATH" .app)
+if [ -f "$APP_PATH/Contents/MacOS/$APP_EXEC_NAME" ]; then
+    log_info "Signing main executable: Contents/MacOS/$APP_EXEC_NAME"
+    codesign --force --verify --timestamp --options runtime --sign "$CERT_NAME" "$APP_PATH/Contents/MacOS/$APP_EXEC_NAME"
+fi
+
+# Fallback: Specifically check for the GUI name from your crash log
+if [ -f "$APP_PATH/Contents/MacOS/sessionprep-gui-macos-arm64" ]; then
+    log_info "Signing main executable: Contents/MacOS/sessionprep-gui-macos-arm64"
+    codesign --force --verify --timestamp --options runtime --sign "$CERT_NAME" "$APP_PATH/Contents/MacOS/sessionprep-gui-macos-arm64"
+fi
 
 # Step 3: Sign the main app bundle
 log_info "Signing the main app bundle: $APP_PATH"
