@@ -125,20 +125,6 @@ uv run python sessionprep-gui.py             # run the GUI
 uv run python sessionprep.py /path/to/tracks # run the CLI
 ```
 
-Or manually with pip (if you don't use [uv](https://docs.astral.sh/uv/)):
-
-```bash
-pip install .[cli,gui]                      # install with optional dependencies
-python sessionprep-gui.py                   # GUI
-python sessionprep.py /path/to/tracks       # CLI
-```
-
-> **Note:** `uv sync` is the recommended setup — it handles the virtual
-> environment, Python version, and all dependencies automatically.
-> Both CLI and GUI require `numpy`, `soundfile`, and `scipy`. The GUI
-> additionally requires `PySide6` and `sounddevice`; the CLI additionally
-> requires `rich`.
-
 See [DEVELOPMENT.md](DEVELOPMENT.md) for full development setup, building, and
 distribution instructions.
 
@@ -245,7 +231,7 @@ multiple groups a warning is printed.
 | [REFERENCE.md](REFERENCE.md)     | Detector reference, analysis metrics, processing details         |
 | [TECHNICAL.md](TECHNICAL.md)     | Audio engineering background, normalization theory, signal chain |
 | [DEVELOPMENT.md](DEVELOPMENT.md) | Development setup, building, library architecture                |
-| [TODO.md](TODO.md)               | Backlog and planned features                                     |
+| [KANBAN.md](KANBAN.md)           | Backlog and planned features                                     |
 
 ---
 

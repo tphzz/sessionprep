@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import os
 import sys
 import time
 from typing import Any
 
-from PySide6.QtCore import Qt, Slot, QSize
+from PySide6.QtCore import Qt, Slot, QSize, QTimer
 from PySide6.QtGui import (
     QAction, QFont, QIcon, QKeySequence, QShortcut,
 )
@@ -49,6 +50,11 @@ from .prefs import PreferencesDialog
 from .detail import render_track_detail_html, PlaybackController, DetailMixin
 from .waveform import WaveformPanel, WaveformLoadWorker
 from .widgets import ProgressPanel
+from .window_geometry import (
+    FALLBACK_STARTUP_SIZE,
+    calculate_startup_geometry,
+    screen_for_startup,
+)
 from .analysis import (
     AnalysisMixin,
     AudioLoadWorker, BatchReanalyzeWorker, DawCheckWorker,
@@ -64,6 +70,57 @@ from .daw import DawMixin
 from .topology import TopologyMixin
 from .batch import BatchQueueDock, BatchManager
 
+log = logging.getLogger(__name__)
+
+
+def _size_text(size: QSize) -> str:
+    return f"{size.width()}x{size.height()}"
+
+
+def _rect_text(rect) -> str:
+    return f"{rect.x()},{rect.y()} {rect.width()}x{rect.height()}"
+
+
+def _window_state_text(state) -> str:
+    value = getattr(state, "value", None)
+    if value is None:
+        return str(state)
+    return f"{state} ({value})"
+
+
+class _CurrentPageTabWidget(QTabWidget):
+    """Tab widget whose minimum hints are based on the active page."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.currentChanged.connect(lambda _index: self.updateGeometry())
+
+    def minimumSizeHint(self) -> QSize:
+        return self._current_page_hint(super().minimumSizeHint(), minimum=True)
+
+    def sizeHint(self) -> QSize:
+        return self._current_page_hint(super().sizeHint(), minimum=False)
+
+    def _current_page_hint(self, base: QSize, *, minimum: bool) -> QSize:
+        current = self.currentWidget()
+        stack = self.findChild(QStackedWidget, "qt_tabwidget_stackedwidget")
+        if current is None or stack is None:
+            return base
+
+        stack_hint = stack.minimumSizeHint() if minimum else stack.sizeHint()
+        page_hint = current.minimumSizeHint() if minimum else current.sizeHint()
+        tab_hint = (
+            self.tabBar().minimumSizeHint()
+            if minimum else self.tabBar().sizeHint()
+        )
+
+        chrome_w = max(0, base.width() - stack_hint.width())
+        chrome_h = max(0, base.height() - stack_hint.height())
+        return QSize(
+            max(page_hint.width(), tab_hint.width()) + chrome_w,
+            page_hint.height() + chrome_h,
+        )
+
 
 class SessionPrepWindow(  # pylint: disable=too-many-ancestors
     QMainWindow,
@@ -74,20 +131,6 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
         super().__init__()
         self.setWindowTitle("SessionPrep")
         self.setWindowIcon(_app_icon())
-
-        # Size and center on the primary screen, clamped to available space
-        screen = QApplication.primaryScreen()
-        if screen:
-            avail = screen.availableGeometry()
-            w = min(1600, avail.width() - 40)
-            h = min(950, avail.height() - 40)
-            self.resize(w, h)
-            self.move(
-                avail.x() + (avail.width() - w) // 2,
-                avail.y() + (avail.height() - h) // 2,
-            )
-        else:
-            self.resize(1600, 950)
 
         self._session = None
         self._summary = None
@@ -168,6 +211,8 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
         apply_dark_theme(self)
         dbg(f"apply_dark_theme: {(time.perf_counter() - t0) * 1000:.1f} ms")
 
+        self._apply_initial_window_geometry()
+
         # Spacebar toggles play/stop
         self._space_shortcut = QShortcut(QKeySequence(Qt.Key_Space), self)
         self._space_shortcut.activated.connect(self._on_toggle_play)
@@ -176,6 +221,110 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
             f"{(time.perf_counter() - t_init) * 1000:.1f} ms")
 
     # ── Config helpers ───────────────────────────────────────────────────
+
+    def _apply_initial_window_geometry(self):
+        """Size and center the main window on the most relevant screen."""
+        screen = screen_for_startup()
+        if screen is None:
+            self.resize(FALLBACK_STARTUP_SIZE)
+            log.debug(
+                "Startup geometry: no screen detected; fallback_size=%s actual=%s",
+                _size_text(FALLBACK_STARTUP_SIZE),
+                _rect_text(self.geometry()),
+            )
+            return
+
+        available = screen.availableGeometry()
+        full = screen.geometry()
+        minimum_hint = self.minimumSizeHint()
+        minimum_size = self.minimumSize()
+        geometry = calculate_startup_geometry(
+            available,
+            minimum_hint,
+        )
+        log.debug(
+            "Startup geometry request: screen=%r dpr=%.2f full=%s available=%s "
+            "minimum_hint=%s minimum_size=%s requested=%s",
+            screen.name(),
+            screen.devicePixelRatio(),
+            _rect_text(full),
+            _rect_text(available),
+            _size_text(minimum_hint),
+            _size_text(minimum_size),
+            _rect_text(geometry),
+        )
+        self.setGeometry(geometry)
+        log.debug(
+            "Startup geometry applied before show: requested=%s actual=%s frame=%s",
+            _rect_text(geometry),
+            _rect_text(self.geometry()),
+            _rect_text(self.frameGeometry()),
+        )
+        self._log_startup_size_hints()
+
+    def _log_startup_size_hints(self):
+        """Log the largest propagated size hints for startup diagnosis."""
+        phase_info = ""
+        if hasattr(self, "_phase_tabs"):
+            phase_info = (
+                f" phase_current={self._phase_tabs.currentIndex()}"
+                f" phase_min_hint={_size_text(self._phase_tabs.minimumSizeHint())}"
+                f" phase_size_hint={_size_text(self._phase_tabs.sizeHint())}"
+            )
+        log.debug(
+            "Startup geometry hints: window_min_hint=%s window_size_hint=%s "
+            "central_min_hint=%s central_size_hint=%s%s",
+            _size_text(self.minimumSizeHint()),
+            _size_text(self.sizeHint()),
+            _size_text(self.centralWidget().minimumSizeHint())
+            if self.centralWidget() else "none",
+            _size_text(self.centralWidget().sizeHint())
+            if self.centralWidget() else "none",
+            phase_info,
+        )
+        if hasattr(self, "_phase_tabs"):
+            for index in range(self._phase_tabs.count()):
+                page = self._phase_tabs.widget(index)
+                if page is None:
+                    continue
+                log.debug(
+                    "Startup geometry phase tab: index=%d title=%r visible=%s "
+                    "min_hint=%s size_hint=%s min_size=%s",
+                    index,
+                    self._phase_tabs.tabText(index),
+                    page.isVisibleTo(self),
+                    _size_text(page.minimumSizeHint()),
+                    _size_text(page.sizeHint()),
+                    _size_text(page.minimumSize()),
+                )
+
+        contributors = []
+        for widget in self.findChildren(QWidget):
+            hint = widget.minimumSizeHint()
+            size_hint = widget.sizeHint()
+            if hint.height() <= 120 and size_hint.height() <= 180:
+                continue
+            contributors.append((
+                max(hint.height(), size_hint.height()),
+                type(widget).__name__,
+                widget.objectName() or "-",
+                _size_text(hint),
+                _size_text(size_hint),
+                _size_text(widget.minimumSize()),
+                widget.isVisibleTo(self),
+            ))
+        contributors.sort(reverse=True)
+        for _, cls_name, object_name, hint, size_hint, min_size, visible in contributors[:12]:
+            log.debug(
+                "Startup geometry hint contributor: class=%s object=%s "
+                "visible=%s min_hint=%s size_hint=%s min_size=%s",
+                cls_name,
+                object_name,
+                visible,
+                hint,
+                size_hint,
+                min_size,
+            )
 
     def _flat_config(self) -> dict[str, Any]:
         """Return a flat config dict from the active config preset.
@@ -206,7 +355,7 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
         self._init_menus()
 
         # ── Top-level phase tabs ──────────────────────────────────────────
-        self._phase_tabs = QTabWidget()
+        self._phase_tabs = _CurrentPageTabWidget()
         self._phase_tabs.setObjectName("phaseTabs")
         self._phase_tabs.setDocumentMode(True)
 
@@ -952,6 +1101,19 @@ def main():
     t0 = time.perf_counter()
     window.show()
     dbg(f"window.show: {(time.perf_counter() - t0) * 1000:.1f} ms")
+    log.debug(
+        "Startup geometry after show: actual=%s frame=%s window_state=%s",
+        _rect_text(window.geometry()),
+        _rect_text(window.frameGeometry()),
+        _window_state_text(window.windowState()),
+    )
+    QTimer.singleShot(0, lambda: log.debug(
+        "Startup geometry after event loop starts: actual=%s frame=%s "
+        "window_state=%s",
+        _rect_text(window.geometry()),
+        _rect_text(window.frameGeometry()),
+        _window_state_text(window.windowState()),
+    ))
 
     dbg(f"main() total: {(time.perf_counter() - t_main) * 1000:.1f} ms")
     sys.exit(app.exec())
