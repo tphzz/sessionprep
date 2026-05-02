@@ -39,7 +39,7 @@ from ..tracks.table_widgets import (
     _FolderDropTree, _SetupDragTable,
     _SETUP_RIGHT_PLACEHOLDER, _SETUP_RIGHT_TREE,
 )
-from ..theme import COLORS, PT_DEFAULT_COLORS
+from ..theme import COLORS, PT_DEFAULT_COLORS, tune_toolbar_checkbox
 from ..widgets import ProgressPanel
 from ..analysis.worker import DawCheckWorker, DawFetchWorker, DawTransferWorker
 
@@ -89,6 +89,7 @@ class DawMixin:  # pylint: disable=too-few-public-methods
 
         # ── Use Processed checkbox ─────────────────────────────────────
         self._use_processed_cb = QCheckBox("Use Processed")
+        tune_toolbar_checkbox(self._use_processed_cb)
         self._use_processed_cb.setLayoutDirection(Qt.RightToLeft)
         self._use_processed_cb.setEnabled(False)
         self._use_processed_cb.toggled.connect(self._on_use_processed_toggled)

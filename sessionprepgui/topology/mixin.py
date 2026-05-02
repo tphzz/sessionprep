@@ -32,7 +32,7 @@ from sessionpreplib.topology import build_default_topology
 from sessionpreplib.utils import protools_sort_key
 
 from ..widgets import ProgressPanel
-from ..theme import COLORS
+from ..theme import COLORS, tune_toolbar_checkbox
 from ..tracks.table_widgets import _PHASE_TOPOLOGY, _PHASE_ANALYSIS, _PHASE_SETUP
 from ..waveform import WaveformPanel
 
@@ -76,6 +76,7 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
         toolbar.addAction(topo_open_action)
 
         self._recursive_cb = QCheckBox("Scan subfolders")
+        tune_toolbar_checkbox(self._recursive_cb)
         self._recursive_cb.setToolTip(
             "When checked, Open Folder will recursively discover "
             "audio files in all subdirectories")

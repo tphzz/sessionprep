@@ -178,6 +178,13 @@ STYLESHEET = """
 """
 
 
+def tune_toolbar_checkbox(checkbox) -> None:
+    """Match toolbar checkbox label size without styling the native indicator."""
+    font = checkbox.font()
+    font.setPointSize(10)
+    checkbox.setFont(font)
+
+
 def apply_dark_theme(window) -> None:
     """Apply the dark palette and stylesheet to the application and window."""
     app = QApplication.instance()
