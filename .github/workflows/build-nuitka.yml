@@ -82,7 +82,7 @@ jobs:
         id: version
         shell: bash
         run: |
-          VER=$(uv run python -c "from sessionpreplib._version import get_version; print(get_version(strict=True))")
+          VER=$(uv run python -c "from build_conf import get_version; print(get_version(strict=True))")
           echo "ver=$VER" >> "$GITHUB_OUTPUT"
 
       # -----------------------------------------------------------------------
