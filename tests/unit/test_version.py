@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import subprocess
+import sys
+import types
 import pytest
 
+from build_conf import BUILD_VERSION_MODULE, TARGETS
 from sessionpreplib import _version
 
 
@@ -101,6 +104,26 @@ def test_generated_build_version_is_used_without_git(monkeypatch, tmp_path):
     monkeypatch.setattr(_version, "__file__", str(version_file))
 
     assert _version.get_version(strict=True) == "0.3.5.dev0+gb2f7cf6"
+
+
+def test_static_build_version_module_is_used(monkeypatch):
+    _no_metadata(monkeypatch)
+    monkeypatch.setattr(
+        _version.subprocess,
+        "run",
+        _git_runner({}),
+    )
+    module = types.ModuleType(BUILD_VERSION_MODULE)
+    module.BUILD_VERSION = "0.3.5.dev0+gb2f7cf6"
+    monkeypatch.setitem(sys.modules, BUILD_VERSION_MODULE, module)
+
+    assert _version.get_version(strict=True) == "0.3.5.dev0+gb2f7cf6"
+
+
+def test_build_version_module_is_included_for_freezers():
+    for target in TARGETS.values():
+        assert BUILD_VERSION_MODULE in target["nuitka_include_modules"]
+        assert BUILD_VERSION_MODULE in target["pyinstaller_hidden_imports"]
 
 
 def test_installed_metadata_is_runtime_fallback(monkeypatch):

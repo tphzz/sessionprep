@@ -146,6 +146,9 @@ def run_nuitka(target_key, clean=False):
     for plugin in target.get("nuitka_plugins", []):
         cmd.append(f"--enable-plugin={plugin}")
 
+    for module in target.get("nuitka_include_modules", []):
+        cmd.append(f"--include-module={module}")
+
     # Exclusions (The "Clean Dependencies" Logic)
     for exclude in target.get("nuitka_exclude", []):
         cmd.append(f"--nofollow-import-to={exclude}")

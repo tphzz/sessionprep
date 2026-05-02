@@ -71,6 +71,16 @@ def _git(args: list[str], *, cwd: Path) -> str | None:
 
 
 def _build_version() -> str | None:
+    try:
+        from sessionpreplib._build_version import BUILD_VERSION
+    except ImportError:
+        BUILD_VERSION = _build_version_from_file()
+    if BUILD_VERSION is None:
+        return None
+    return _normalize_version(str(BUILD_VERSION), source="_build_version.py")
+
+
+def _build_version_from_file() -> str | None:
     path = Path(__file__).with_name("_build_version.py")
     if not path.is_file():
         return None
@@ -82,9 +92,7 @@ def _build_version() -> str | None:
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     BUILD_VERSION = getattr(module, "BUILD_VERSION", None)
-    if BUILD_VERSION is None:
-        return None
-    return _normalize_version(str(BUILD_VERSION), source="_build_version.py")
+    return BUILD_VERSION
 
 
 def _git_version(*, strict: bool) -> str | None:
