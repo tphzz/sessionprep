@@ -43,3 +43,8 @@ GEMINI.md
 # Temporary build directories
 _dawproject_build/
 _dawproject_build/*
+
+.env
+.env/*
+*.env
+
