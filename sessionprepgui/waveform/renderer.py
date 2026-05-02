@@ -11,6 +11,7 @@ from PySide6.QtGui import (QColor, QFont, QLinearGradient, QPainter,
                            QPen, QPolygonF)
 
 from ..theme import COLORS
+from .peakcache import PeakData, query_peaks_fast
 
 _CHANNEL_COLORS = [
     "#44aa44", "#44aaaa", "#aa44aa", "#aaaa44",
@@ -49,6 +50,7 @@ class WaveformRenderer:
         self._rms_cumsums: list[np.ndarray] = []
         self._rms_window_samples: int = 0
         self._channels: list[np.ndarray] = []
+        self._peak_data: PeakData | None = None
         self._peak_sample: int = -1
         self._peak_channel: int = -1
         self._peak_db: float = float('-inf')
@@ -69,6 +71,7 @@ class WaveformRenderer:
         self._rms_cumsums = []
         self._rms_window_samples = 0
         self._channels = []
+        self._peak_data = None
         self._peak_sample = -1
         self._peak_channel = -1
         self._peak_db = float('-inf')
@@ -103,6 +106,7 @@ class WaveformRenderer:
         self._rms_max_db = rms_max_db
         self._rms_max_amplitude = rms_max_amplitude
         self._rms_max_dirty = rms_max_dirty
+        self._peak_data = None
         self._peaks_cache = []
         self._cached_view = (0, 0, 0)
         self._rms_envelope = []
@@ -120,6 +124,12 @@ class WaveformRenderer:
         self._rms_max_amplitude = 0.0
         self._rms_max_dirty = bool(self._channels and window_samples > 0)
 
+    def set_peak_data(self, peak_data: PeakData | None):
+        """Set pre-computed peak mipmap data for fast rendering."""
+        self._peak_data = peak_data
+        self._peaks_cache = []
+        self._cached_view = (0, 0, 0)
+
     def invalidate(self):
         """Invalidate peak and RMS caches (zoom change, resize, large scroll)."""
         self._peaks_cache = []
@@ -136,16 +146,23 @@ class WaveformRenderer:
 
     def paint(self, painter: QPainter, ctx: WaveformRenderCtx):
         """Full waveform draw pass: envelope + dB scale + RMS + markers."""
-        painter.setRenderHint(QPainter.Antialiasing, ctx.wf_antialias)
+        # Adaptive Antialiasing: High channel counts pack polygons into just a few pixels.
+        # Sub-pixel rendering at that density takes 1000ms+ and provides no visual benefit.
+        use_aa = ctx.wf_antialias and (ctx.num_channels <= 12)
+        painter.setRenderHint(QPainter.Antialiasing, use_aa)
+
         self._build_peaks(ctx)
         if ctx.show_rms_lr or ctx.show_rms_avg:
             self._build_rms_envelope(ctx)
         nch = ctx.num_channels
+        if nch == 0:
+            return
         lane_h = ctx.draw_h / nch
         self._draw_db_scale(painter, ctx, nch, lane_h)
         self._draw_waveform_channels(painter, ctx, nch, lane_h)
         if ctx.show_rms_lr or ctx.show_rms_avg:
             self._draw_rms_overlay(painter, ctx, nch, lane_h)
+
         painter.setRenderHint(QPainter.Antialiasing, True)
         if ctx.show_markers:
             self._draw_markers(painter, ctx, nch, lane_h)
@@ -231,7 +248,24 @@ class WaveformRenderer:
         """Downsample audio to peak envelope, with incremental scroll updates."""
         channels = ctx.channels
         width = ctx.draw_w
-        if not channels or width <= 0:
+        if width <= 0:
+            self._peaks_cache = []
+            return
+        # Fast path: use pre-computed peak mipmap if available
+        if self._peak_data is not None and self._peak_data.levels:
+            cache_key = (width, ctx.view_start, ctx.view_end)
+            if self._cached_view == cache_key and self._peaks_cache:
+                return
+            vs, ve = ctx.view_start, ctx.view_end
+            if ve - vs <= 0:
+                self._peaks_cache = []
+                return
+            self._peaks_cache = query_peaks_fast(
+                self._peak_data, vs, ve, width)
+            self._cached_view = cache_key
+            return
+        # Fallback: raw sample downsampling
+        if not channels:
             self._peaks_cache = []
             return
         cache_key = (width, ctx.view_start, ctx.view_end)

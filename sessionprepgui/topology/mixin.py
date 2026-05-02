@@ -6,7 +6,7 @@ import logging
 import os
 
 log = logging.getLogger(__name__)
-from PySide6.QtCore import Qt, Slot
+from PySide6.QtCore import Qt, Slot, QTimer
 from PySide6.QtGui import QAction, QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -139,9 +139,9 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
 
         toolbar.addSeparator()
 
-        self._topo_wf_toggle = QAction("\u25B6 Waveform", self)
+        self._topo_wf_toggle = QAction("\u25BC Waveform", self)
         self._topo_wf_toggle.setCheckable(True)
-        self._topo_wf_toggle.setChecked(False)
+        self._topo_wf_toggle.setChecked(True)
         self._topo_wf_toggle.setToolTip("Show / hide the waveform preview")
         self._topo_wf_toggle.toggled.connect(self._on_topo_wf_toggle)
         toolbar.addAction(self._topo_wf_toggle)
@@ -193,7 +193,13 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
 
         h_splitter.setSizes([400, 400])
 
-        # Cross-tree exclusive selection
+        # Cross-tree exclusive selection via debounced timer
+        self._topo_sel_side: str | None = None
+        self._topo_sel_timer = QTimer(page)
+        self._topo_sel_timer.setSingleShot(True)
+        self._topo_sel_timer.setInterval(150)
+        self._topo_sel_timer.timeout.connect(self._do_topo_selection_changed)
+
         self._topo_input_tree.selectionModel().selectionChanged.connect(
             lambda sel, desel: self._on_topo_selection_changed("input"))
         self._topo_output_tree.selectionModel().selectionChanged.connect(
@@ -203,13 +209,20 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
         self._syncing_scroll = False
         self._topo_input_tree.verticalScrollBar().valueChanged.connect(self._on_input_scroll)
 
-        # Waveform preview panel (starts collapsed)
+        # Waveform preview panel (starts expanded)
         self._topo_wf_panel = WaveformPanel(analysis_mode=False)
-        self._topo_wf_panel.setVisible(False)
-        self._topo_wf_expanded = False
+        self._topo_wf_panel.setVisible(True)
+        self._topo_wf_expanded = True
         self._topo_wf_panel.play_clicked.connect(self._on_topo_play)
         self._topo_wf_panel.stop_clicked.connect(self._on_topo_stop)
         self._topo_wf_panel.position_clicked.connect(self._on_topo_wf_seek)
+        self._topo_wf_panel.display_mode_changed.connect(self._on_topo_display_mode_changed)
+
+        self._topo_wf_panel.fft_group.triggered.connect(self._on_topo_spec_fft_changed)
+        self._topo_wf_panel.win_group.triggered.connect(self._on_topo_spec_window_changed)
+        self._topo_wf_panel.cmap_group.triggered.connect(self._on_topo_spec_cmap_changed)
+        self._topo_wf_panel.floor_group.triggered.connect(self._on_topo_spec_floor_changed)
+        self._topo_wf_panel.ceil_group.triggered.connect(self._on_topo_spec_ceil_changed)
 
         # Vertical splitter: trees on top, waveform at bottom
         v_splitter = QSplitter(Qt.Vertical)
@@ -340,16 +353,21 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
         output_folder = self._config.get("app", {}).get(
             "phase1_output_folder", "sp_01_tracklayout")
         output_dir = os.path.join(self._source_dir, output_folder)
+        peaks_folder = self._config.get("app", {}).get(
+            "peak_cache_folder", "sp_peaks")
+        peaks_dir = os.path.join(output_dir, peaks_folder)
 
         self._topo_apply_action.setEnabled(False)
         self._topo_reset_action.setEnabled(False)
         self._topo_status_label.setText("Applying topology\u2026")
         self._topo_progress.start("Applying topology\u2026")
+        self._status_bar.setVisible(False)
 
         # Put Phase 1 topology on session for the worker to read
         self._session.topology = self._topo_topology
         self._topo_apply_worker = TopologyApplyWorker(
-            self._session, output_dir, source_dir=self._source_dir)
+            self._session, output_dir, source_dir=self._source_dir,
+            peaks_dir=peaks_dir)
         self._topo_apply_worker.progress.connect(self._on_topo_apply_progress)
         self._topo_apply_worker.progress_value.connect(
             self._on_topo_apply_progress_value)
@@ -359,8 +377,8 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
 
     @Slot(str)
     def _on_topo_apply_progress(self, message: str):
+        log.debug("Apply topology: %s", message)
         self._topo_progress.set_message(message)
-        self._status_bar.showMessage(message)
 
     @Slot(int, int)
     def _on_topo_apply_progress_value(self, current: int, total: int):
@@ -379,7 +397,6 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
             msg = (f"Topology applied: {n_out} file(s) written, "
                    f"{len(errors)} error(s)")
             self._topo_progress.finish(msg)
-            self._status_bar.showMessage(msg)
             detail = "\n".join(f"\u2022 {fn}: {err}" for fn, err in errors)
             QMessageBox.warning(
                 self, "Apply Topology \u2014 errors",
@@ -387,7 +404,8 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
         else:
             msg = f"Topology applied: {n_out} file(s) written"
             self._topo_progress.finish(msg)
-            self._status_bar.showMessage(msg)
+        self._status_bar.setVisible(True)
+        self._status_bar.showMessage(msg)
 
         output_folder = self._config.get("app", {}).get(
             "phase1_output_folder", "sp_01_tracklayout")
@@ -404,6 +422,7 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
         self._topo_apply_action.setEnabled(True)
         self._topo_reset_action.setEnabled(True)
         self._topo_progress.fail(message)
+        self._status_bar.setVisible(True)
         self._status_bar.showMessage(f"Apply topology error: {message}")
 
     # ── Actions ───────────────────────────────────────────────────────
@@ -624,24 +643,36 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
     # ── Cross-tree exclusive selection ────────────────────────────────
 
     def _on_topo_selection_changed(self, side: str):
-        """Handle selection change in input or output tree."""
+        """Handle selection change in input or output tree (debounced)."""
         if side == "input":
-            tree = self._topo_input_tree
             other = self._topo_output_tree
         else:
-            tree = self._topo_output_tree
             other = self._topo_input_tree
 
-        items = tree.selectedItems()
-        if not items:
-            return
-
-        # Clear other tree's selection
+        # Clear other tree's selection immediately for UI responsiveness
         if self._topo_selected_side != side:
             other.blockSignals(True)
             other.clearSelection()
             other.blockSignals(False)
         self._topo_selected_side = side
+
+        # Start or reset the 150ms debounce timer
+        self._topo_sel_side = side
+        self._topo_sel_timer.start()
+
+    def _do_topo_selection_changed(self):
+        side = self._topo_sel_side
+        if not side:
+            return
+
+        if side == "input":
+            tree = self._topo_input_tree
+        else:
+            tree = self._topo_output_tree
+
+        items = tree.selectedItems()
+        if not items:
+            return
 
         # Determine what's selected
         file_items = []
@@ -723,8 +754,13 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
 
     def _topo_load_input_waveform(self, filename: str):
         """Load waveform for a single input file."""
+        import time, logging
+        t0 = time.perf_counter()
+        log = logging.getLogger(__name__)
+
         self._topo_cancel_workers()
         self._on_topo_stop()
+        self._topo_wf_filename = filename  # track for peak cache lookup
 
         track_map = self._topo_track_map()
         track = track_map.get(filename)
@@ -738,8 +774,19 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
 
         if self._topo_wf_expanded:
             self._topo_wf_panel.setVisible(True)
-        self._topo_wf_panel.waveform.set_loading(True)
+
+        peak_cache = getattr(self, '_peak_cache', {})
+        if filename in peak_cache:
+            self._topo_wf_panel.waveform.set_preview_mode(
+                track.channels, track.total_samples, track.samplerate, peak_cache[filename]
+            )
+        else:
+            self._topo_wf_panel.waveform.set_loading(True)
+            if hasattr(self, '_prioritize_peak'):
+                self._prioritize_peak(filename)
+
         self._topo_wf_panel.play_btn.setEnabled(False)
+        log.debug("[Trace] _topo_load_input_waveform setup for '%s': %.2f ms", filename, (time.perf_counter() - t0) * 1000)
 
         from ..analysis.worker import AudioLoadWorker
         worker = AudioLoadWorker(track, parent=self)
@@ -939,9 +986,18 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
     def _topo_show_waveform(self, audio_data, samplerate: int,
                             labels: list[str] | None = None):
         """Run WaveformLoadWorker and display result."""
+        import time, logging
+        t0 = time.perf_counter()
+        log = logging.getLogger(__name__)
+
         import numpy as np
-        if audio_data is None or (isinstance(audio_data, np.ndarray)
-                                  and audio_data.size == 0):
+        if audio_data is None:
+            self._topo_wf_panel.waveform.set_loading(False)
+            return
+        if isinstance(audio_data, np.ndarray) and audio_data.size == 0:
+            self._topo_wf_panel.waveform.set_loading(False)
+            return
+        if isinstance(audio_data, list) and not audio_data:
             self._topo_wf_panel.waveform.set_loading(False)
             return
 
@@ -960,15 +1016,54 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
         self._topo_wf_worker = worker
         worker.finished.connect(self._on_topo_wf_loaded)
         worker.start()
+        log.debug("[Trace] _topo_show_waveform setup: %.2f ms", (time.perf_counter() - t0) * 1000)
 
     def _on_topo_wf_loaded(self, result: dict):
+        import time, logging
+        t0 = time.perf_counter()
+        log = logging.getLogger(__name__)
+
         self._topo_wf_worker = None
         self._topo_wf_panel.waveform.set_precomputed(result)
+        # Apply cached peak data for mip-level rendering
+        peak_cache = getattr(self, '_peak_cache', {})
+        wf_fn = getattr(self, '_topo_wf_filename', None)
+        if wf_fn and wf_fn in peak_cache:
+            self._topo_wf_panel.waveform.set_peak_data(peak_cache[wf_fn])
+        elif wf_fn and hasattr(self, '_prioritize_peak'):
+            self._prioritize_peak(wf_fn)
         n_ch = len(result["channels"])
         labels = getattr(self, '_topo_pending_labels', None)
         self._topo_wf_panel.update_play_mode_channels(n_ch, labels=labels)
         self._topo_wf_panel.play_btn.setEnabled(True)
         self._topo_update_time_label(0)
+        log.debug("[Trace] _on_topo_wf_loaded final UI application: %.2f ms", (time.perf_counter() - t0) * 1000)
+
+    @Slot(str)
+    def _on_topo_display_mode_changed(self, mode: str):
+        if mode == "spectrogram" and self._topo_cached_audio:
+            if getattr(self._topo_wf_panel.waveform._spec_renderer, '_spec_data', None) is None:
+                self._topo_show_waveform(self._topo_cached_audio[1], self._topo_cached_audio[3])
+
+    @Slot(QAction)
+    def _on_topo_spec_fft_changed(self, action: QAction):
+        self._topo_wf_panel.waveform.set_spec_fft(int(action.data()))
+
+    @Slot(QAction)
+    def _on_topo_spec_window_changed(self, action: QAction):
+        self._topo_wf_panel.waveform.set_spec_window(action.data())
+
+    @Slot(QAction)
+    def _on_topo_spec_cmap_changed(self, action: QAction):
+        self._topo_wf_panel.waveform.set_colormap(action.data())
+
+    @Slot(QAction)
+    def _on_topo_spec_floor_changed(self, action: QAction):
+        self._topo_wf_panel.waveform.set_spec_db_floor(float(action.data()))
+
+    @Slot(QAction)
+    def _on_topo_spec_ceil_changed(self, action: QAction):
+        self._topo_wf_panel.waveform.set_spec_db_ceil(float(action.data()))
 
     # ── Playback ──────────────────────────────────────────────────────
 
@@ -1010,7 +1105,12 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
         if not cached:
             return
         _, display_audio, _playback, sr = cached
-        total = display_audio.shape[0] if display_audio is not None else 0
+        if display_audio is None:
+            total = 0
+        elif isinstance(display_audio, list):
+            total = display_audio[0].shape[0] if display_audio else 0
+        else:
+            total = display_audio.shape[0]
         from sessionpreplib.audio import format_duration
         cur_str = format_duration(current_sample, sr)
         tot_str = format_duration(total, sr)

@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import logging
 import threading
+
+log = logging.getLogger(__name__)
 
 from PySide6.QtCore import QThread, Signal
 
@@ -107,10 +110,16 @@ class Phase1AnalyzeWorker(QThread):
         super().__init__()
         self.session_context = session_context
         self.config = config
+        self._event_bus = EventBus()
+        self._is_cancelled = False
+
+    def cancel(self):
+        self._is_cancelled = True
+        self._event_bus.cancel()
 
     def run(self):
         try:
-            event_bus = EventBus()
+            event_bus = self._event_bus
 
             # Use the already loaded session
             session = self.session_context
@@ -153,6 +162,8 @@ class Phase1AnalyzeWorker(QThread):
                     }
                     loaded = 0
                     for future in as_completed(futures):
+                        if self._is_cancelled:
+                            break
                         t = futures[future]
                         try:
                             res = future.result()
@@ -233,10 +244,16 @@ class AnalyzeWorker(QThread):
         self.source_dir = source_dir
         self.config = config
         self.recursive = recursive
+        self._event_bus = EventBus()
+        self._is_cancelled = False
+
+    def cancel(self):
+        self._is_cancelled = True
+        self._event_bus.cancel()
 
     def run(self):
         try:
-            event_bus = EventBus()
+            event_bus = self._event_bus
 
             self.progress.emit("Loading session\u2026")
             session = load_session(self.source_dir, self.config, event_bus=event_bus,
@@ -356,10 +373,19 @@ class AudioLoadWorker(QThread):
 
     def run(self):
         try:
+            import time, logging
+            t0 = time.perf_counter()
+            log = logging.getLogger(__name__)
+
             from sessionpreplib.audio import load_track
             import soundfile as sf
             import numpy as np
             data, sr = sf.read(self._track.filepath, dtype='float64')
+
+            elapsed = (time.perf_counter() - t0) * 1000
+            if getattr(self._track, 'filename', None):
+                log.debug("[Trace] AudioLoadWorker I/O (sf.read) for '%s': %.2f ms", self._track.filename, elapsed)
+
             if self._cancelled:
                 return
             self._track.audio_data = data
@@ -447,6 +473,11 @@ class TopoMultiAudioWorker(QThread):
         self._cancelled = True
 
     def run(self):
+        import logging, time
+        t0 = time.perf_counter()
+        log = logging.getLogger(__name__)
+        log.debug("[Trace] TopoMultiAudioWorker loading %d items", len(self._items))
+
         try:
             import os
             import numpy as np
@@ -459,6 +490,47 @@ class TopoMultiAudioWorker(QThread):
 
             from sessionprepgui.waveform.panel import WaveformPanel
 
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+
+            # --- 1. Pre-collect all unique audio file paths ---
+            required_files = set()
+            if self._side == "input":
+                required_files.update(item[0] for item in self._items)
+            else:
+                for item in self._items:
+                    for src in item[0].sources:
+                        required_files.add(os.path.join(self._source_dir, src.input_filename))
+
+            # --- 2. Parallel I/O Load ---
+            audio_cache: dict[str, tuple[np.ndarray, int]] = {}
+            # Limit workers to 4 to prevent SSD thrashing and massive memory spike
+            max_workers = min(4, (os.cpu_count() or 1))
+
+            log.debug("[Trace] TopoMultiAudioWorker loading %d unique files with %d workers", len(required_files), max_workers)
+
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                fut_to_path = {
+                    pool.submit(sf.read, path, dtype='float64'): path
+                    for path in required_files
+                }
+                for fut in as_completed(fut_to_path):
+                    if self._cancelled:
+                        pool.shutdown(wait=False, cancel_futures=True)
+                        return
+                    path = fut_to_path[fut]
+                    t_load = time.perf_counter()
+                    data, file_sr = fut.result()
+                    log.debug("[Trace] TopoMultiAudioWorker loaded '%s'. Shape: %s, %.1f MB",
+                              os.path.basename(path), data.shape, data.nbytes / (1024 * 1024))
+                    audio_cache[path] = (data, file_sr)
+
+            if self._cancelled:
+                return
+
+            log.debug("[Trace] TopoMultiAudioWorker completed parallel I/O in %.2f ms", (time.perf_counter() - t0) * 1000)
+            t_process = time.perf_counter()
+
+            # --- 3. Process loaded audio natively ---
             if self._side == "input":
                 for item in self._items:
                     if self._cancelled:
@@ -467,7 +539,8 @@ class TopoMultiAudioWorker(QThread):
                     name = item[1]
                     channels_to_keep = item[2] if len(item) > 2 else None
 
-                    data, file_sr = sf.read(filepath, dtype='float64')
+                    # Retrieve directly from in-memory parallel cache
+                    data, file_sr = audio_cache[filepath]
                     sr = file_sr
                     if data.ndim == 1:
                         data = data.reshape(-1, 1)
@@ -503,10 +576,10 @@ class TopoMultiAudioWorker(QThread):
                         if self._cancelled:
                             return
                         path = os.path.join(self._source_dir, src.input_filename)
-                        data, file_sr = sf.read(path, dtype='float64')
+                        data, file_sr = audio_cache[path]
                         track_audio[src.input_filename] = (data, file_sr)
                         sr = file_sr
-                    
+
                     resolved = resolve_entry_audio(entry, track_audio)
                     if resolved.ndim == 1:
                         resolved = resolved.reshape(-1, 1)
@@ -531,38 +604,43 @@ class TopoMultiAudioWorker(QThread):
             if self._cancelled or not track_arrays:
                 return
 
-            # --- Build display audio (all channels concatenated) ---
+            # --- Build display audio (list of contiguous 1D channels) ---
+            log.debug("[Trace] TopoMultiAudioWorker building display & playback arrays...")
+            t_stack = time.perf_counter()
+            display_audio = []
             max_samples = max(a.shape[0] for a in track_arrays)
-            padded = []
             for a in track_arrays:
                 if a.shape[0] < max_samples:
                     pad = np.zeros((max_samples - a.shape[0], a.shape[1]),
                                    dtype=np.float64)
                     a = np.vstack([a, pad])
-                padded.append(a)
-            display_audio = np.hstack(padded)  # (max_samples, total_ch)
+                # Each channel becomes its own perfectly contiguous slice
+                for c in range(a.shape[1]):
+                    display_audio.append(np.ascontiguousarray(a[:, c]))
 
             # --- Build playback audio (summed by channel position) ---
             max_ch = max(track_ch_counts)
             n_tracks = len(track_arrays)
             playback = np.zeros((max_samples, max_ch), dtype=np.float64)
-            for a in padded:
-                playback[:, :a.shape[1]] += a
+            for a in track_arrays:
+                playback[:a.shape[0], :a.shape[1]] += a
             playback /= n_tracks
 
-            # Squeeze mono
+            # Squeeze mono playback
             if playback.shape[1] == 1:
                 playback = playback[:, 0]
-            if display_audio.shape[1] == 1:
-                display_audio = display_audio[:, 0]
 
             # --- Channel labels ---
             labels = []
             for lst in track_labels_list:
                 labels.extend(lst)
 
+            log.debug("[Trace] TopoMultiAudioWorker finished %d items (Total: %.2f ms, Process/Stack: %.2f ms)",
+                      len(self._items), (time.perf_counter() - t0) * 1000, (time.perf_counter() - t_process) * 1000)
             self.finished.emit(display_audio, playback, sr, labels)
         except Exception as exc:
+            import traceback, logging
+            logging.getLogger(__name__).error("TopoMultiAudioWorker error: %s", traceback.format_exc())
             self.error.emit(str(exc))
 
 
@@ -615,14 +693,20 @@ class TopologyApplyWorker(QThread):
 
     progress = Signal(str)
     progress_value = Signal(int, int)
-    apply_finished = Signal()           # renamed: avoid shadowing QThread.finished
+    apply_finished = Signal()
     error = Signal(str)
 
-    def __init__(self, session, output_dir: str, source_dir: str | None = None):
+    def __init__(self, session, output_dir: str, source_dir: str | None = None,
+                 peaks_dir: str | None = None):
         super().__init__()
         self._session = session
         self._output_dir = output_dir
         self._source_dir = source_dir
+        self._peaks_dir = peaks_dir
+        self._is_cancelled = False
+
+    def cancel(self):
+        self._is_cancelled = True
 
     def run(self):
         try:
@@ -670,7 +754,10 @@ class TopologyApplyWorker(QThread):
                 for src in entry.sources:
                     needed_sources.add(src.input_filename)
 
-            total = len(needed_sources) + len(topology.entries)
+            n_sources = len(needed_sources)
+            n_entries = len(topology.entries)
+            # Total includes peak building phase when peaks_dir is set
+            total = n_sources + n_entries + (n_entries if self._peaks_dir else 0)
 
             # Phase A: Load source audio
             # After a previous Apply+Analyze cycle, session.tracks may
@@ -679,6 +766,10 @@ class TopologyApplyWorker(QThread):
             # track_map.  Fall back to loading directly from source_dir.
             source_audio: dict[str, tuple] = {}
             for step, filename in enumerate(sorted(needed_sources)):
+                if self._is_cancelled:
+                    return
+
+                log.debug("Apply topology: loading source '%s' (%d/%d)", filename, step + 1, total)
                 self.progress.emit(f"Loading {filename}")
                 self.progress_value.emit(step, total)
                 track = track_map.get(filename)
@@ -702,14 +793,23 @@ class TopologyApplyWorker(QThread):
                     track.total_samples = loaded.total_samples
                 source_audio[filename] = (loaded.audio_data, loaded.samplerate)
 
-            # Phase B: Resolve topology + write output files
+            # Phase B: Resolve topology + write output files (no peak building)
             output_tracks = []
             errors = []
-            base_step = len(needed_sources)
+            written_files: list[tuple[str, str, int]] = []  # (output_filename, dst_path, sr)
+            base_step = n_sources
             for idx, entry in enumerate(topology.entries):
+                if self._is_cancelled:
+                    return
+
                 step = base_step + idx
+                log.debug("Apply topology: writing '%s' (%d/%d)", entry.output_filename, step + 1, total)
                 self.progress.emit(f"Writing {entry.output_filename}")
                 self.progress_value.emit(step, total)
+
+                # Skip entries with no channels (e.g. all channels moved elsewhere)
+                if entry.output_channels < 1 or not entry.sources:
+                    continue
 
                 try:
                     # Check all sources are available before resolving
@@ -741,6 +841,7 @@ class TopologyApplyWorker(QThread):
                     dst = os.path.join(output_dir, entry.output_filename)
                     os.makedirs(os.path.dirname(dst), exist_ok=True)
                     sf.write(dst, resolved, sr, subtype=subtype)
+                    written_files.append((entry.output_filename, dst, sr))
 
                     n_samples = resolved.shape[0]
                     out_tc = TrackContext(
@@ -758,6 +859,58 @@ class TopologyApplyWorker(QThread):
                     output_tracks.append(out_tc)
                 except Exception as e:
                     errors.append((entry.output_filename, str(e)))
+
+            # Free source audio memory before peak building
+            source_audio.clear()
+
+            # Phase C: Build peak caches (re-reading from just-written files)
+            if self._peaks_dir:
+                from ..waveform.peakcache import (
+                    build_peaks, save_peaks, load_peaks,
+                    peaks_path_for, get_source_mtime,
+                )
+                peak_base_step = n_sources + n_entries
+                for idx, (out_fn, dst, sr) in enumerate(written_files):
+                    if self._is_cancelled:
+                        return
+
+                    step = peak_base_step + idx
+                    log.debug("Apply topology: building peaks '%s' (%d/%d)", out_fn, step + 1, total)
+                    self.progress.emit(f"Building peaks for {out_fn}")
+                    self.progress_value.emit(step, total)
+
+                    try:
+                        pp = peaks_path_for(self._peaks_dir, out_fn)
+                        mtime = get_source_mtime(dst)
+                        # Check shape: if total_samples and channels match,
+                        # the content is unchanged and we can skip.
+                        info = sf.info(dst)
+                        existing = load_peaks(pp)
+                        if (existing is not None
+                                and existing.total_samples == info.frames
+                                and existing.channels == info.channels):
+                            log.debug("Peak cache for '%s' is up-to-date, skipping rebuild -> %s", out_fn, pp)
+                            continue
+
+                        import time as _time
+                        _t0 = _time.perf_counter()
+                        data, file_sr = sf.read(dst, dtype="float64")
+                        _t_read = _time.perf_counter()
+                        pd = build_peaks(data, file_sr, source_mtime=mtime)
+                        _t_build = _time.perf_counter()
+                        save_peaks(pd, pp)
+                        _t_save = _time.perf_counter()
+                        log.debug(
+                            "Built peak cache for '%s' -> %s "
+                            "(%d ch, %d levels, read=%.1f ms, build=%.1f ms, save=%.1f ms, total=%.1f ms)",
+                            out_fn, pp, pd.channels, len(pd.levels),
+                            (_t_read - _t0) * 1000,
+                            (_t_build - _t_read) * 1000,
+                            (_t_save - _t_build) * 1000,
+                            (_t_save - _t0) * 1000,
+                        )
+                    except Exception as e:
+                        log.debug("Failed to build/save peak cache for '%s' -> %s: %s", out_fn, pp, e)
 
             self.progress_value.emit(total, total)
 

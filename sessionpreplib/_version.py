@@ -6,6 +6,7 @@ import importlib.metadata
 import importlib.util
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 try:
@@ -71,10 +72,15 @@ def _git(args: list[str], *, cwd: Path) -> str | None:
 
 
 def _build_version() -> str | None:
-    try:
-        from sessionpreplib._build_version import BUILD_VERSION
-    except ImportError:
+    loaded_module = sys.modules.get("sessionpreplib._build_version")
+    BUILD_VERSION = getattr(loaded_module, "BUILD_VERSION", None)
+    if BUILD_VERSION is None:
         BUILD_VERSION = _build_version_from_file()
+    if BUILD_VERSION is None:
+        try:
+            from sessionpreplib._build_version import BUILD_VERSION
+        except ImportError:
+            BUILD_VERSION = None
     if BUILD_VERSION is None:
         return None
     return _normalize_version(str(BUILD_VERSION), source="_build_version.py")
