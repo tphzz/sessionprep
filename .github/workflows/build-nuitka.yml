@@ -145,25 +145,74 @@ jobs:
       # -----------------------------------------------------------------------
       # macOS packaging
       # -----------------------------------------------------------------------
-      - name: Package macOS .app bundles as DMG
+      - name: Import macOS Code Signing Certificate
         if: runner.os == 'macOS'
+        uses: apple-actions/import-codesign-certs@v5.0.3
+        with:
+          p12-file-base64: ${{ secrets.P12_BASE64 }}
+          p12-password: ${{ secrets.P12_PASSWORD }}
+
+      - name: Sign macOS .app bundle
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          MACOS_DEV_ID_CERT_NAME: ${{ secrets.MACOS_DEV_ID_CERT_NAME }}
+        run: |
+          if [ -z "$MACOS_DEV_ID_CERT_NAME" ]; then
+            echo "MACOS_DEV_ID_CERT_NAME secret is required for macOS signing." >&2
+            exit 1
+          fi
+
+          APP_PATH="dist_nuitka/SessionPrep.app"
+          if [ ! -d "$APP_PATH" ]; then
+            echo "Expected app bundle not found: $APP_PATH" >&2
+            exit 1
+          fi
+
+          packaging/macos/appbundle-sign.sh \
+            -a "$APP_PATH" \
+            -c "$MACOS_DEV_ID_CERT_NAME"
+
+      - name: Package macOS development DMG
+        if: runner.os == 'macOS' && github.ref_type != 'tag'
+        shell: bash
         run: |
           brew install create-dmg
           VERSION="${{ steps.version.outputs.ver }}"
-          for app in dist_nuitka/*.app; do
-            [ -d "$app" ] || continue
-            name=$(basename "$app" .app)
-            STAGING=$(mktemp -d)
-            cp -R "$app" "$STAGING/"
-            create-dmg \
-              --volname "$name" \
-              --app-drop-link 600 185 \
-              --sandbox-safe \
-              "dist_nuitka/sessionprep-${VERSION}-${{ matrix.suffix }}.dmg" \
-              "$STAGING"
-            rm -rf "$STAGING"
-          done
+          APP_PATH="dist_nuitka/SessionPrep.app"
+          APP_NAME=$(basename "$APP_PATH" .app)
+          DMG_PATH="dist_nuitka/sessionprep-${VERSION}-${{ matrix.suffix }}.dmg"
+
+          STAGING=$(mktemp -d)
+          trap 'rm -rf "$STAGING"' EXIT
+          ditto "$APP_PATH" "$STAGING/$(basename "$APP_PATH")"
+          create-dmg \
+            --volname "$APP_NAME" \
+            --app-drop-link 600 185 \
+            --sandbox-safe \
+            "$DMG_PATH" \
+            "$STAGING"
           rm -f dist_nuitka/rw.*.dmg
+
+      - name: Notarize and package macOS release DMG
+        if: runner.os == 'macOS' && github.ref_type == 'tag'
+        shell: bash
+        env:
+          MACOS_DEV_ID_CERT_NAME: ${{ secrets.MACOS_DEV_ID_CERT_NAME }}
+          APPLE_NOTARY_USER: ${{ secrets.APPLE_NOTARY_USER }}
+          APPLE_NOTARY_APP_PASSWORD: ${{ secrets.APPLE_NOTARY_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          VERSION="${{ steps.version.outputs.ver }}"
+          APP_PATH="dist_nuitka/SessionPrep.app"
+          FINAL_DMG="dist_nuitka/sessionprep-${VERSION}-${{ matrix.suffix }}.dmg"
+
+          packaging/macos/appbundle-release.sh -a "$APP_PATH"
+          if [ ! -f "SessionPrep.dmg" ]; then
+            echo "Expected notarized DMG not found: SessionPrep.dmg" >&2
+            exit 1
+          fi
+          mv "SessionPrep.dmg" "$FINAL_DMG"
 
       # -----------------------------------------------------------------------
       # Upload
