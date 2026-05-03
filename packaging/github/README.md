@@ -59,30 +59,69 @@ Dry-run mode does not require GitHub authentication when it uses an existing
 local `--artifact-root`. Dry-run mode with `--download-run-id` still requires
 GitHub CLI authentication because it downloads Actions artifacts first.
 
-## Important Arguments
+## Arguments
 
 `--repo OWNER/REPO` is the repository that contains the workflow artifacts and
 the draft release.
 
+`--mode branch|tag` selects the release replacement policy. Use `branch` for
+ordinary branch builds: the script creates and replaces a synthetic draft
+release tag derived from `--ref-name`. Use `tag` for real release tag builds:
+the script uses the existing Git tag from `--ref-name`, replaces only a draft
+release for that tag, and refuses to modify an already published release. In a
+real publish, `tag` mode verifies that the tag exists before creating the draft
+release.
+
+`--ref-name NAME` is the source Git ref name and is used in both modes. In
+`branch` mode, it is the branch name and is sanitized into the default synthetic
+release tag, for example `feature/test-release` becomes
+`branch-build-feature-test-release`. In `tag` mode, it is the real Git tag name
+used for the draft release. The script cannot infer this value from
+`--download-run-id`; pass the same ref name that triggered the workflow, usually
+`${{ github.ref_name }}` in GitHub Actions.
+
+`--target SHA` is the commit SHA for the workflow run being published. In
+`branch` mode, the script creates the synthetic branch-build release tag at
+that exact commit. In `tag` mode, GitHub already has a real tag from
+`--ref-name`; the script uses `--target` for validation, logging, and release
+notes so the draft is traceable to the build run.
+
 `--download-run-id ID` tells the script to download artifacts from a GitHub
 Actions run before filtering. This is useful in CI and for local reproduction.
+When this argument is used and `--artifact-root` is omitted, the script downloads
+into `downloaded-artifacts`.
 
 `--artifact-pattern GLOB` limits which GitHub Actions artifact names are
 downloaded. The default is `*`. Most repositories should pass a narrower
-project-specific pattern.
+project-specific pattern. This argument is only used together with
+`--download-run-id`.
 
 `--artifact-root DIR` is either an already downloaded artifact tree or the
-destination directory used with `--download-run-id`.
-
-`--target SHA` is the commit SHA for the workflow run being published. In branch
-mode, the script creates the synthetic branch-build release tag at that exact
-commit. In tag mode, GitHub already has a real tag from `--ref-name`; the script
-uses `--target` for validation, logging, and release notes so the draft is
-traceable to the build run.
+destination directory used with `--download-run-id`. It is required unless
+`--download-run-id` is provided.
 
 `--allowlist FILE` points to basename glob patterns for files that may become
 release assets. Directory names inside artifacts or ZIP files are ignored for
-matching.
+matching. When `--allowlist` is omitted, the script uses
+`release-assets.allowlist` from the same directory as
+`publish-draft-release.sh`, regardless of the current working directory.
+
+`--staging-dir DIR` is the clean local directory where selected release assets
+are copied before upload. The default is `release-assets`. The script refuses to
+place this directory inside the artifact root.
+
+`--release-tag TAG` overrides the release tag the script would normally use. By
+default, `branch` mode uses a synthetic `branch-build-...` tag derived from
+`--ref-name`, while `tag` mode uses `--ref-name` directly. Use this override
+only when the default tag naming policy is not appropriate for a repository.
+
+`--release-title TITLE` overrides the draft release title. By default, `branch`
+mode uses `Branch build: <ref-name>` and `tag` mode uses the release tag.
+
+`--dry-run` validates inputs, optionally downloads artifacts, filters and stages
+matching files, and then stops before creating or changing any GitHub release.
+
+`-h` and `--help` print command-line help.
 
 ## Local Dry Run
 
@@ -95,7 +134,6 @@ packaging/github/publish-draft-release.sh \
   --ref-name feature/test-release \
   --target "$(git rev-parse HEAD)" \
   --repo owner/repo \
-  --allowlist packaging/github/release-assets.allowlist \
   --dry-run
 ```
 
@@ -110,7 +148,6 @@ packaging/github/publish-draft-release.sh \
   --ref-name feature/test-release \
   --target "$(git rev-parse HEAD)" \
   --repo owner/repo \
-  --allowlist packaging/github/release-assets.allowlist \
   --dry-run
 ```
 
@@ -172,7 +209,10 @@ On every successful branch build, the script:
 
 ### Tag Mode
 
-Tag mode uses the real Git tag from `--ref-name`.
+Tag mode uses the real Git tag from `--ref-name`. That value is provided by the
+caller, but it must name an existing Git tag for publishing to succeed. The
+script passes `--verify-tag` to `gh release create`, so a typo or branch name
+used in tag mode fails instead of creating a release for the wrong ref.
 
 On a tag build, the script:
 
@@ -186,8 +226,9 @@ published releases are protected from accidental mutation.
 
 ## Allowlist Format
 
-`release-assets.allowlist` contains one basename glob pattern per line. Blank
-lines and `#` comments are ignored.
+By default, `release-assets.allowlist` is loaded from the same directory as
+`publish-draft-release.sh`. It contains one basename glob pattern per line.
+Blank lines and `#` comments are ignored.
 
 Example:
 

@@ -39,11 +39,13 @@ Usage:
 
 Required:
   --mode branch|tag        Release replacement semantics.
-  --ref-name NAME          GitHub ref name. Branch name in branch mode, tag in tag mode.
+  --ref-name NAME          GitHub ref name. Branch name in branch mode,
+                           existing Git tag name in tag mode.
   --target SHA             Commit SHA this build/release represents. In branch
                            mode the synthetic release tag is created at this
                            commit. In tag mode it is logged for traceability;
-                           the real Git tag selected by --ref-name is used.
+                           the existing Git tag selected by --ref-name is used
+                           and verified by GitHub before publishing.
   --repo OWNER/REPO        GitHub repository to publish into.
 
 Artifact source:
@@ -55,7 +57,8 @@ Artifact source:
                            Default: *
 
 Options:
-  --allowlist FILE         Glob allowlist. Default: packaging/github/release-assets.allowlist
+  --allowlist FILE         Glob allowlist. Default: release-assets.allowlist
+                           next to this script.
   --staging-dir DIR        Clean output directory for selected release assets. Default: release-assets
   --release-tag TAG        Override generated release tag.
   --release-title TITLE    Override generated release title.

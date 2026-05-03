@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import zipfile
 from pathlib import Path
@@ -14,13 +15,14 @@ def run_script(
     tmp_path: Path,
     *args: str,
     extra_env: dict[str, str] | None = None,
+    script: Path = SCRIPT,
 ) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env.setdefault("LC_ALL", "C")
     if extra_env:
         env.update(extra_env)
     return subprocess.run(
-        [str(SCRIPT), *args],
+        [str(script), *args],
         cwd=ROOT,
         env=env,
         text=True,
@@ -46,6 +48,33 @@ def base_args(tmp_path: Path, artifact_root: Path, allowlist: Path) -> list[str]
         "--staging-dir", str(tmp_path / "release-assets"),
         "--dry-run",
     ]
+
+
+def test_release_script_defaults_to_adjacent_allowlist(tmp_path):
+    tool_dir = tmp_path / "tool"
+    tool_dir.mkdir()
+    script = tool_dir / "publish-draft-release.sh"
+    shutil.copy2(SCRIPT, script)
+    write_allowlist(tool_dir / "release-assets.allowlist", "example-*.pkg")
+
+    artifact_root = tmp_path / "artifacts"
+    artifact_root.mkdir()
+    (artifact_root / "example-1.2.3.pkg").write_bytes(b"package payload")
+
+    args = [
+        "--artifact-root", str(artifact_root),
+        "--mode", "branch",
+        "--ref-name", "feature/release-test",
+        "--target", "deadbeef",
+        "--repo", "owner/repo",
+        "--staging-dir", str(tmp_path / "release-assets"),
+        "--dry-run",
+    ]
+
+    result = run_script(tmp_path, *args, script=script)
+
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert (tmp_path / "release-assets" / "example-1.2.3.pkg").read_bytes() == b"package payload"
 
 
 def test_release_script_selects_allowed_files_from_dirs_and_zips(tmp_path):
