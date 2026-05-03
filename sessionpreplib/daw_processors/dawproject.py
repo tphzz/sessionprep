@@ -120,7 +120,12 @@ class DawProjectDawProcessor(DawProcessor):
             return False, "Template file is not a valid ZIP archive."
         return True, f"Template OK: {os.path.basename(self._template_path)}"
 
-    def fetch(self, session: SessionContext) -> SessionContext:
+    def fetch(
+        self,
+        session: SessionContext,
+        *,
+        ignore_cache: bool = False,
+    ) -> SessionContext:
         try:
             from dawproject import (  # noqa: F401
                 ContentType, DawProject, Referenceable,

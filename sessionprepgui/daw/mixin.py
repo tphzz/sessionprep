@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QStackedWidget,
     QTableWidget,
     QToolBar,
+    QToolButton,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
@@ -101,10 +102,63 @@ class DawMixin:  # pylint: disable=too-few-public-methods
         self._setup_toolbar.addWidget(spacer)
 
         # ── Right: lifecycle actions ───────────────────────────────────
-        self._fetch_action = QAction("Fetch", self)
+        self._fetch_action = QToolButton(self)
+        self._fetch_action.setObjectName("fetchSplitButton")
+        self._fetch_action.setText("Fetch")
+        self._fetch_action.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self._fetch_action.setPopupMode(QToolButton.MenuButtonPopup)
+        self._fetch_action.setStyleSheet(
+            """
+            QToolButton#fetchSplitButton {
+                color: #dddddd;
+                padding: 4px 18px 4px 8px;
+                background: transparent;
+                border: none;
+            }
+            QToolButton#fetchSplitButton:hover {
+                background-color: #3a3a3a;
+            }
+            QToolButton#fetchSplitButton:pressed {
+                background-color: #2a6db5;
+            }
+            QToolButton#fetchSplitButton:disabled {
+                color: #666666;
+                background: transparent;
+            }
+            QToolButton#fetchSplitButton::menu-button {
+                width: 14px;
+                border: none;
+                background: transparent;
+                subcontrol-origin: padding;
+                subcontrol-position: right center;
+            }
+            QToolButton#fetchSplitButton::menu-button:hover {
+                background-color: #3a3a3a;
+            }
+            """
+        )
+        self._fetch_action.clicked.connect(
+            lambda _checked=False: self._on_daw_fetch(ignore_cache=False))
         self._fetch_action.setEnabled(False)
-        self._fetch_action.triggered.connect(self._on_daw_fetch)
-        self._setup_toolbar.addAction(self._fetch_action)
+
+        fetch_menu = QMenu(self._fetch_action)
+        fetch_cached_action = fetch_menu.addAction("Fetch (cached)")
+        fetch_cached_action.triggered.connect(
+            lambda _checked=False: self._on_daw_fetch(ignore_cache=False))
+        fetch_ignore_cache_action = fetch_menu.addAction("Fetch (ignore cache)")
+        fetch_ignore_cache_action.triggered.connect(
+            lambda _checked=False: self._on_daw_fetch(ignore_cache=True))
+        self._fetch_menu_button = QToolButton(self)
+        self._fetch_menu_button.setText("▼")
+        self._fetch_menu_button.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self._fetch_menu_button.setText("v")
+        self._fetch_menu_button.setPopupMode(QToolButton.InstantPopup)
+        self._fetch_menu_button.setMenu(fetch_menu)
+        self._fetch_menu_button.setFixedWidth(14)
+        self._fetch_menu_button.setEnabled(False)
+        self._fetch_menu_button.hide()
+        self._fetch_action.setMenu(fetch_menu)
+        self._setup_toolbar.addWidget(self._fetch_action)
 
         self._auto_assign_action = QAction("Auto-Assign", self)
         self._auto_assign_action.setEnabled(False)
@@ -274,6 +328,7 @@ class DawMixin:  # pylint: disable=too-few-public-methods
 
         if is_working:
             self._fetch_action.setEnabled(False)
+            self._fetch_menu_button.setEnabled(False)
             self._auto_assign_action.setEnabled(False)
             self._transfer_action.setEnabled(False)
             self._reset_manifest_action.setEnabled(False)
@@ -281,6 +336,7 @@ class DawMixin:  # pylint: disable=too-few-public-methods
 
         has_processor = self._active_daw_processor is not None
         self._fetch_action.setEnabled(has_processor)
+        self._fetch_menu_button.setEnabled(has_processor)
         dp_id = self._active_daw_processor.id if has_processor else None
         dp_state = (
             self._session.daw_state.get(dp_id, {})
@@ -349,24 +405,38 @@ class DawMixin:  # pylint: disable=too-few-public-methods
     # ── DAW Fetch + Folder Tree ───────────────────────────────────────────
 
     @Slot()
-    def _on_daw_fetch(self):
+    def _on_daw_fetch(self, ignore_cache: bool = False):
         if not self._active_daw_processor or not self._session:
             return
-        log.info("DAW fetch: %s", self._active_daw_processor.name)
+        log.info(
+            "DAW fetch: %s ignore_cache=%s",
+            self._active_daw_processor.name,
+            ignore_cache,
+        )
         self._fetch_action.setEnabled(False)
+        self._fetch_menu_button.setEnabled(False)
         # Skip pre-flight connectivity check so template cache hits are instant
-        self._do_daw_fetch()
+        self._do_daw_fetch(ignore_cache=ignore_cache)
 
-    def _do_daw_fetch(self):
+    def _do_daw_fetch(self, ignore_cache: bool = False):
         """Actually start the fetch (called after successful connectivity check)."""
-        self._status_bar.showMessage("Fetching folder structure\u2026")
+        message = (
+            "Fetching folder structure without cache..."
+            if ignore_cache
+            else "Fetching folder structure..."
+        )
+        self._status_bar.showMessage(message)
         # Ensure the progress panel is visible by switching the stack and clearing the tree
         self._setup_right_stack.setCurrentIndex(_SETUP_RIGHT_TREE)
         self._folder_tree.clear()
-        self._transfer_progress.start("Fetching folder structure\u2026")
+        self._transfer_progress.start(message)
 
         self._daw_fetch_worker = DawFetchWorker(
-            self._active_daw_processor, self._session, parent=self)
+            self._active_daw_processor,
+            self._session,
+            ignore_cache=ignore_cache,
+            parent=self,
+        )
         self._daw_fetch_worker.progress.connect(self._on_transfer_progress)
         self._daw_fetch_worker.progress_value.connect(self._on_transfer_progress_value)
         self._daw_fetch_worker.result.connect(self._on_daw_fetch_result)
@@ -380,6 +450,7 @@ class DawMixin:  # pylint: disable=too-few-public-methods
         if worker:
             worker.deleteLater()
         self._fetch_action.setEnabled(True)
+        self._fetch_menu_button.setEnabled(True)
 
         if "PRO_TOOLS_SESSION_OPEN" in message:
             self._transfer_progress.fail("Fetch aborted: Pro Tools session is open.")
@@ -544,6 +615,7 @@ class DawMixin:  # pylint: disable=too-few-public-methods
 
         self._transfer_action.setEnabled(False)
         self._fetch_action.setEnabled(False)
+        self._fetch_menu_button.setEnabled(False)
         self._run_daw_check_then(self._do_daw_transfer)
 
     def _do_daw_transfer(self):

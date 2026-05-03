@@ -43,10 +43,18 @@ class DawFetchWorker(QThread):
     progress_value = Signal(int, int)   # (current, total)
     result = Signal(bool, str, object)  # (ok, message, session_or_none)
 
-    def __init__(self, processor: DawProcessor, session, parent=None):
+    def __init__(
+        self,
+        processor: DawProcessor,
+        session,
+        *,
+        ignore_cache: bool = False,
+        parent=None,
+    ):
         super().__init__(parent)
         self._processor = processor
         self._session = session
+        self._ignore_cache = ignore_cache
 
     def _on_progress(self, current: int, total: int, message: str):
         self.progress.emit(message)
@@ -54,12 +62,19 @@ class DawFetchWorker(QThread):
 
     def run(self):
         try:
-            # Provide the progress callback if the processor supports it
-            try:
-                session = self._processor.fetch(self._session, progress_cb=self._on_progress)
-            except TypeError:
-                # Fallback for processors that don't support progress_cb yet
-                session = self._processor.fetch(self._session)
+            import inspect
+
+            params = inspect.signature(self._processor.fetch).parameters
+            accepts_kwargs = any(
+                p.kind == inspect.Parameter.VAR_KEYWORD
+                for p in params.values()
+            )
+            kwargs = {}
+            if accepts_kwargs or "progress_cb" in params:
+                kwargs["progress_cb"] = self._on_progress
+            if accepts_kwargs or "ignore_cache" in params:
+                kwargs["ignore_cache"] = self._ignore_cache
+            session = self._processor.fetch(self._session, **kwargs)
             self.result.emit(True, "Fetch complete", session)
         except Exception as e:
             self.result.emit(False, str(e), None)

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import sys
 import types
+import json
 from types import SimpleNamespace
+from pathlib import Path
 
 import pytest
 
@@ -80,6 +82,44 @@ def _session():
     return SessionContext(tracks=[], config={})
 
 
+def _template_file(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    template_file = (
+        home
+        / "Documents"
+        / "Pro Tools"
+        / "Session Templates"
+        / "SessionPrep"
+        / "Template.ptxt"
+    )
+    template_file.parent.mkdir(parents=True)
+    template_file.write_text("template", encoding="utf-8")
+    return template_file
+
+
+def _cache_file(tmp_path, monkeypatch):
+    cache_dir = tmp_path / "app"
+    cache_dir.mkdir()
+    monkeypatch.setattr(protools, "get_app_dir", lambda: str(cache_dir), raising=False)
+
+    import sessionpreplib.config as config
+
+    monkeypatch.setattr(config, "get_app_dir", lambda: str(cache_dir))
+    return cache_dir / "pt_template_cache.json"
+
+
+def _allow_fresh_fetch(monkeypatch):
+    monkeypatch.setattr(protools.ptslh, "wait_for_host_ready", lambda *a, **k: True)
+    monkeypatch.setattr(protools.ptslh, "is_session_open", lambda _engine: False)
+    monkeypatch.setattr(protools.ptslh, "close_session", lambda _engine: None)
+    monkeypatch.setattr(
+        protools.ptslh,
+        "create_session_from_template",
+        lambda *args, **kwargs: None,
+    )
+
+
 def test_fetch_passes_template_timeout_and_retries_track_list(
     fake_ptsl, monkeypatch, tmp_path
 ):
@@ -134,3 +174,100 @@ def test_fetch_failure_does_not_emit_fetch_complete(
         )
 
     assert "Fetch complete" not in progress
+
+
+def test_fetch_uses_valid_template_cache_without_opening_ptsl(
+    fake_ptsl, monkeypatch, tmp_path
+):
+    template_file = _template_file(tmp_path, monkeypatch)
+    cache_file = _cache_file(tmp_path, monkeypatch)
+    cache_file.write_text(
+        json.dumps(
+            {
+                "SessionPrep/Template": {
+                    "mtime": template_file.stat().st_mtime,
+                    "folders": [
+                        {
+                            "id": "cached-folder",
+                            "name": "Cached",
+                            "folder_type": "routing",
+                            "index": 1,
+                            "parent_id": None,
+                        }
+                    ],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = _processor(tmp_path).fetch(_session())
+
+    assert fake_ptsl == []
+    assert result.daw_state["protools_0"]["folders"][0]["name"] == "Cached"
+
+
+def test_fetch_ignore_cache_opens_ptsl_despite_valid_cache(
+    fake_ptsl, monkeypatch, tmp_path
+):
+    template_file = _template_file(tmp_path, monkeypatch)
+    cache_file = _cache_file(tmp_path, monkeypatch)
+    cache_file.write_text(
+        json.dumps(
+            {
+                "SessionPrep/Template": {
+                    "mtime": template_file.stat().st_mtime,
+                    "folders": [
+                        {
+                            "id": "cached-folder",
+                            "name": "Cached",
+                            "folder_type": "routing",
+                            "index": 1,
+                            "parent_id": None,
+                        }
+                    ],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    _allow_fresh_fetch(monkeypatch)
+
+    result = _processor(tmp_path).fetch(_session(), ignore_cache=True)
+
+    assert len(fake_ptsl) == 1
+    assert result.daw_state["protools_0"]["folders"][0]["name"] == "Routing"
+
+
+def test_fetch_ignore_cache_refreshes_template_cache(
+    fake_ptsl, monkeypatch, tmp_path
+):
+    template_file = _template_file(tmp_path, monkeypatch)
+    cache_file = _cache_file(tmp_path, monkeypatch)
+    cache_file.write_text(
+        json.dumps(
+            {
+                "SessionPrep/Template": {
+                    "mtime": template_file.stat().st_mtime,
+                    "folders": [
+                        {
+                            "id": "old-folder",
+                            "name": "Old",
+                            "folder_type": "routing",
+                            "index": 1,
+                            "parent_id": None,
+                        }
+                    ],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    _allow_fresh_fetch(monkeypatch)
+
+    _processor(tmp_path).fetch(_session(), ignore_cache=True)
+
+    cache_data = json.loads(cache_file.read_text(encoding="utf-8"))
+    folders = cache_data["SessionPrep/Template"]["folders"]
+    assert folders[0]["name"] == "Routing"
+    assert cache_data["SessionPrep/Template"]["mtime"] == template_file.stat().st_mtime

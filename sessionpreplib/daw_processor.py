@@ -95,12 +95,20 @@ class DawProcessor(ABC):
         """
 
     @abstractmethod
-    def fetch(self, session: SessionContext) -> SessionContext:
+    def fetch(
+        self,
+        session: SessionContext,
+        *,
+        ignore_cache: bool = False,
+    ) -> SessionContext:
         """Pull external state from the DAW into the session.
 
         Populates session.daw_state[self.id] with fetched data
         (routing folders, track list, colors, etc.).  The GUI can
         then display this data in the Session Setup panel.
+
+        ``ignore_cache`` requests a fresh fetch when the processor has an
+        internal cache. Processors without a cache can ignore it.
         """
 
     def resolve_output_path(

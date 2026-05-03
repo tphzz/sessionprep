@@ -250,7 +250,12 @@ class ProToolsDawProcessor(DawProcessor):
             msg = f"{msg} Last error: {last_error}"
         raise RuntimeError(msg)
 
-    def fetch(self, session: SessionContext, progress_cb=None) -> SessionContext:
+    def fetch(
+        self,
+        session: SessionContext,
+        progress_cb=None,
+        ignore_cache: bool = False,
+    ) -> SessionContext:
         if not self._temp_dir:
             raise RuntimeError(
                 "The 'Temporary project directory' is not configured in Preferences."
@@ -285,6 +290,11 @@ class ProToolsDawProcessor(DawProcessor):
         from sessionpreplib.config import get_app_dir
         import json
 
+        dbg(
+            "Pro Tools template fetch requested: "
+            f"key={self._instance_group}/{self._instance_name} "
+            f"ignore_cache={ignore_cache}"
+        )
         cache_file = Path(get_app_dir()) / "pt_template_cache.json"
         cache_data = {}
         if cache_file.is_file():
@@ -295,7 +305,7 @@ class ProToolsDawProcessor(DawProcessor):
                 cache_data = {}
 
         cache_key = f"{self._instance_group}/{self._instance_name}"
-        if current_mtime is not None and cache_key in cache_data:
+        if not ignore_cache and current_mtime is not None and cache_key in cache_data:
             entry = cache_data[cache_key]
             if entry.get("mtime") == current_mtime:
                 dbg(
@@ -326,6 +336,11 @@ class ProToolsDawProcessor(DawProcessor):
                     "assignments": assignments,
                 }
                 return session
+        elif ignore_cache:
+            dbg(
+                "Skipping Pro Tools template cache lookup because "
+                f"ignore_cache=True: key={cache_key!r}"
+            )
 
         dbg(
             "Pro Tools template cache miss: "
