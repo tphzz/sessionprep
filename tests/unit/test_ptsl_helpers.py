@@ -235,3 +235,48 @@ def test_get_track_main_output_assignments(mock_engine, ptsl_factory):
     assert output_ids == ["0x30000245"]
     req = mock_engine.client.raw_client.SendGrpcRequest.call_args[0][0]
     assert req.header.command == 165
+
+
+def test_create_session_from_template_waits_until_session_file_exists(
+    mock_engine, monkeypatch, tmp_path
+):
+    monkeypatch.setattr(ptsl_helpers, "run_command", lambda *args, **kwargs: None)
+    monkeypatch.setattr("time.sleep", lambda _seconds: None)
+
+    attempts = iter([False, False, True])
+    checked_paths = []
+
+    def fake_isfile(path):
+        checked_paths.append(path)
+        return next(attempts)
+
+    monkeypatch.setattr(ptsl_helpers.os.path, "isfile", fake_isfile)
+
+    ptsl_helpers.create_session_from_template(
+        mock_engine,
+        "TempSession",
+        str(tmp_path),
+        "SessionPrep",
+        "Template",
+        timeout=60.0,
+    )
+
+    assert checked_paths[-1].endswith("TempSession.ptx")
+
+
+def test_create_session_from_template_honors_timeout(
+    mock_engine, monkeypatch, tmp_path
+):
+    monkeypatch.setattr(ptsl_helpers, "run_command", lambda *args, **kwargs: None)
+    monkeypatch.setattr("time.sleep", lambda _seconds: None)
+    monkeypatch.setattr(ptsl_helpers.os.path, "isfile", lambda _path: False)
+
+    with pytest.raises(RuntimeError, match="failed to create the session"):
+        ptsl_helpers.create_session_from_template(
+            mock_engine,
+            "TempSession",
+            str(tmp_path),
+            "SessionPrep",
+            "Template",
+            timeout=0.01,
+        )

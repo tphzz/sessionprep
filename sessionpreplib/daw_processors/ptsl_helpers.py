@@ -15,6 +15,8 @@ from typing import Any
 
 import logging
 
+from sessionpreplib.log import dbg
+
 log = logging.getLogger(__name__)
 
 PTSL_COMMAND_ID_FALLBACKS: dict[str, int] = {
@@ -202,20 +204,39 @@ def wait_for_host_ready(engine, timeout: float = 25.0, sleep_time: float = 0.5) 
     import time
     from ptsl import ops
 
+    dbg(f"PTSL HostReadyCheck polling start: timeout={timeout:.1f}s sleep={sleep_time:.2f}s")
     start_time = time.time()
+    attempt = 0
+    last_log_second = -1
     while time.time() - start_time < timeout:
+        attempt += 1
         op = ops.HostReadyCheck()
         try:
             # We run the operation directly through the client so we can inspect the response
             engine.client.run(op)
             if op.response and getattr(op.response, "is_host_ready", False):
+                dbg(
+                    "PTSL HostReadyCheck ready: "
+                    f"attempt={attempt} elapsed={time.time() - start_time:.1f}s"
+                )
                 return True
-        except Exception:
+        except Exception as exc:
             # Ignore temporary gRPC errors, timeout, or parsing failures while waking up
-            pass
+            elapsed = time.time() - start_time
+            elapsed_second = int(elapsed)
+            if elapsed_second != last_log_second and elapsed_second % 5 == 0:
+                dbg(
+                    "PTSL HostReadyCheck temporary failure: "
+                    f"attempt={attempt} elapsed={elapsed:.1f}s error={exc}"
+                )
+                last_log_second = elapsed_second
 
         time.sleep(sleep_time)
 
+    dbg(
+        "PTSL HostReadyCheck timed out: "
+        f"attempts={attempt} elapsed={time.time() - start_time:.1f}s timeout={timeout:.1f}s"
+    )
     return False
 
 def get_color_palette(engine, target: str = "CPTarget_Tracks") -> list[str]:
@@ -263,6 +284,7 @@ def create_session_from_template(  # pylint: disable=too-many-positional-argumen
     template_group: str, template_name: str,
     sample_rate: str = "SR_48000",
     bit_depth: str = "Bit24",
+    timeout: float = 60.0,
 ) -> None:
     """Create a new Pro Tools session from a template.
     
@@ -287,8 +309,16 @@ def create_session_from_template(  # pylint: disable=too-many-positional-argumen
         "is_cloud_project": False,
     }
 
+    dbg(
+        "PTSL create_session_from_template start: "
+        f"name={session_name!r}, location={location!r}, "
+        f"template={template_group!r}/{template_name!r}, "
+        f"sample_rate={sample_rate!r}, bit_depth={bit_depth!r}, timeout={timeout:.1f}s"
+    )
+
     # 1. Create the session (Pro Tools automatically opens it as well)
     run_command(engine, pt.CommandId.CId_CreateSession, body)
+    dbg(f"PTSL CId_CreateSession returned for {session_name!r}")
 
     # Wait until Pro Tools actually loads the template and writes the PTX file.
     # It can take a few seconds for the background creation to finish.
@@ -296,18 +326,38 @@ def create_session_from_template(  # pylint: disable=too-many-positional-argumen
     session_dir = os.path.join(location, session_name)
     session_path = os.path.join(session_dir, f"{session_name}.ptx")
 
+    dbg(f"Waiting for Pro Tools session file: {session_path!r}")
+    start_time = time.time()
+    last_log_second = -1
     success = False
-    for _ in range(15):  # Wait up to 7.5 seconds
+    while time.time() - start_time < timeout:
         if os.path.isfile(session_path):
             success = True
             break
+        elapsed = time.time() - start_time
+        elapsed_second = int(elapsed)
+        if elapsed_second != last_log_second and elapsed_second % 5 == 0:
+            dbg(
+                "Still waiting for Pro Tools session file: "
+                f"elapsed={elapsed:.1f}s timeout={timeout:.1f}s path={session_path!r}"
+            )
+            last_log_second = elapsed_second
         time.sleep(0.5)
 
     if not success:
+        elapsed = time.time() - start_time
+        dbg(
+            "Timed out waiting for Pro Tools session file: "
+            f"elapsed={elapsed:.1f}s timeout={timeout:.1f}s path={session_path!r}"
+        )
         raise RuntimeError(
             f"Pro Tools failed to create the session. Please check if the "
             f"template '{template_group} / {template_name}' actually exists."
         )
+    dbg(
+        "Pro Tools session file appeared: "
+        f"elapsed={time.time() - start_time:.1f}s path={session_path!r}"
+    )
 
 def close_session(engine, save_on_close: bool = False, delay: float = 0.5) -> None:
     """Close the current Pro Tools session."""

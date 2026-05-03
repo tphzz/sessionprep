@@ -11,6 +11,7 @@ from typing import Any
 from ..models import ParamSpec
 from ..daw_processor import DawProcessor
 from ..models import DawCommand, DawCommandResult, SessionContext
+from ..log import dbg
 from . import ptsl_helpers as ptslh
 
 import logging
@@ -141,6 +142,18 @@ class ProToolsDawProcessor(DawProcessor):
                 min=0.1,
                 max=5.0,
             ),
+            ParamSpec(
+                key="protools_template_create_timeout",
+                type=float,
+                default=60.0,
+                label="Template Create Timeout (s)",
+                description=(
+                    "Seconds to wait for Pro Tools to create and open a session "
+                    "from a template."
+                ),
+                min=5.0,
+                max=300.0,
+            ),
         ]
 
     def configure(self, config: dict[str, Any]) -> None:
@@ -157,6 +170,9 @@ class ProToolsDawProcessor(DawProcessor):
         self._host: str = config.get("protools_host", "localhost")
         self._port: int = config.get("protools_port", 31416)
         self._command_delay: float = config.get("protools_command_delay", 0.5)
+        self._template_create_timeout: float = config.get(
+            "protools_template_create_timeout", 60.0
+        )
 
     def check_connectivity(self) -> tuple[bool, str]:
         try:
@@ -200,6 +216,39 @@ class ProToolsDawProcessor(DawProcessor):
                     engine.close()
                 except Exception:
                     pass
+
+    def _track_list_with_retry(self, engine, *, timeout: float, sleep_time: float):
+        """Return the Pro Tools track list, retrying while a new session settles."""
+        start_time = time.time()
+        attempt = 0
+        last_error: Exception | None = None
+        while time.time() - start_time < timeout:
+            attempt += 1
+            try:
+                dbg(f"PTSL track_list attempt {attempt}")
+                tracks = engine.track_list()
+                dbg(
+                    "PTSL track_list succeeded: "
+                    f"attempt={attempt} elapsed={time.time() - start_time:.1f}s "
+                    f"tracks={len(tracks)}"
+                )
+                return tracks
+            except Exception as exc:
+                last_error = exc
+                dbg(
+                    "PTSL track_list not ready: "
+                    f"attempt={attempt} elapsed={time.time() - start_time:.1f}s "
+                    f"error={exc}"
+                )
+                time.sleep(sleep_time)
+
+        msg = (
+            "Pro Tools created the temporary session, but did not provide the "
+            f"track list within {timeout:.1f} seconds."
+        )
+        if last_error is not None:
+            msg = f"{msg} Last error: {last_error}"
+        raise RuntimeError(msg)
 
     def fetch(self, session: SessionContext, progress_cb=None) -> SessionContext:
         if not self._temp_dir:
@@ -249,6 +298,10 @@ class ProToolsDawProcessor(DawProcessor):
         if current_mtime is not None and cache_key in cache_data:
             entry = cache_data[cache_key]
             if entry.get("mtime") == current_mtime:
+                dbg(
+                    "Pro Tools template cache hit: "
+                    f"key={cache_key!r} mtime={current_mtime}"
+                )
                 # Fast Cache Hit
                 if progress_cb:
                     progress_cb(
@@ -274,6 +327,12 @@ class ProToolsDawProcessor(DawProcessor):
                 }
                 return session
 
+        dbg(
+            "Pro Tools template cache miss: "
+            f"key={cache_key!r} template_file={str(template_file) if template_file else None!r} "
+            f"mtime={current_mtime}"
+        )
+
         try:
             from ptsl import Engine
             from ptsl import PTSL_pb2 as pt
@@ -287,23 +346,29 @@ class ProToolsDawProcessor(DawProcessor):
                 progress_cb(10, 100, "Connecting to Pro Tools...")
 
             address = f"{self._host}:{self._port}"
+            dbg(f"Opening Pro Tools engine for fetch: address={address!r}")
             engine = Engine(
                 company_name=self._company_name,
                 application_name=self._application_name,
                 address=address,
             )
+            dbg("Pro Tools engine opened for fetch")
 
             if progress_cb:
                 progress_cb(15, 100, "Waiting for Pro Tools to become ready...")
 
+            dbg("Waiting for Pro Tools host readiness before template fetch")
             if not ptslh.wait_for_host_ready(
                 engine, timeout=25.0, sleep_time=self._command_delay
             ):
+                dbg("Pro Tools host readiness timed out before template fetch")
                 raise RuntimeError(
                     "Pro Tools is busy or not ready. Please bring its window to the front to wake it."
                 )
+            dbg("Pro Tools host ready before template fetch")
 
             if ptslh.is_session_open(engine):
+                dbg("Fetch aborted because a Pro Tools session is already open")
                 raise RuntimeError("PRO_TOOLS_SESSION_OPEN")
 
             import uuid
@@ -318,18 +383,44 @@ class ProToolsDawProcessor(DawProcessor):
                 )
 
             # Create the temporary session from the template
+            dbg(
+                "Creating temporary Pro Tools session from template: "
+                f"name={temp_session_name!r} timeout={self._template_create_timeout:.1f}s"
+            )
             ptslh.create_session_from_template(
                 engine,
                 temp_session_name,
                 self._temp_dir,
                 self._instance_group,
                 self._instance_name,
+                timeout=self._template_create_timeout,
             )
+            dbg(f"Temporary Pro Tools session created: {temp_session_name!r}")
+
+            if progress_cb:
+                progress_cb(65, 100, "Waiting for Pro Tools session to become ready...")
+
+            dbg("Waiting for Pro Tools host readiness after template creation")
+            if not ptslh.wait_for_host_ready(
+                engine,
+                timeout=self._template_create_timeout,
+                sleep_time=self._command_delay,
+            ):
+                dbg("Pro Tools host readiness timed out after template creation")
+                raise RuntimeError(
+                    "Pro Tools created the temporary session, but did not become ready "
+                    f"within {self._template_create_timeout:.1f} seconds."
+                )
+            dbg("Pro Tools host ready after template creation")
 
             if progress_cb:
                 progress_cb(70, 100, "Reading track folder structure...")
 
-            all_tracks = engine.track_list()
+            all_tracks = self._track_list_with_retry(
+                engine,
+                timeout=self._template_create_timeout,
+                sleep_time=self._command_delay,
+            )
             folders: list[dict[str, Any]] = []
             for track in all_tracks:
                 if track.type in (pt.TrackType.RoutingFolder, pt.TrackType.BasicFolder):
@@ -347,6 +438,7 @@ class ProToolsDawProcessor(DawProcessor):
                             "parent_id": track.parent_folder_id or None,
                         }
                     )
+            dbg(f"Read Pro Tools folder structure: folders={len(folders)}")
 
             if progress_cb:
                 progress_cb(90, 100, "Cleaning up temporary session...")
@@ -371,19 +463,28 @@ class ProToolsDawProcessor(DawProcessor):
                     cache_file.parent.mkdir(parents=True, exist_ok=True)
                     with open(cache_file, "w", encoding="utf-8") as f:
                         json.dump(cache_data, f, indent=2, ensure_ascii=False)
+                    dbg(f"Wrote Pro Tools template cache: {str(cache_file)!r}")
                 except Exception as e:
                     log.debug(f"Failed to write template cache: {e}")
+                    dbg(f"Failed to write Pro Tools template cache: {e}")
+
+            if progress_cb:
+                progress_cb(100, 100, "Fetch complete")
 
         except Exception:
+            dbg("Pro Tools fetch failed; propagating exception")
             raise
         finally:
             if engine is not None:
                 if temp_session_name:
                     try:
+                        dbg(f"Closing temporary Pro Tools session: {temp_session_name!r}")
                         ptslh.close_session(engine)
                     except Exception as e:
                         log.debug(f"Failed to close temp session: {e}")
+                        dbg(f"Failed to close temporary Pro Tools session: {e}")
                 try:
+                    dbg("Closing Pro Tools engine after fetch")
                     engine.close()
                 except Exception:
                     pass
@@ -409,15 +510,17 @@ class ProToolsDawProcessor(DawProcessor):
                     # Retry loop to handle delayed file locks on Windows from Pro Tools closing
                     for _ in range(10):  # Try for up to 5 seconds
                         try:
+                            dbg(f"Deleting temporary Pro Tools session folder: {target_dir!r}")
                             shutil.rmtree(target_dir, ignore_errors=True)
                             if not os.path.exists(target_dir):
+                                dbg(
+                                    "Deleted temporary Pro Tools session folder: "
+                                    f"{target_dir!r}"
+                                )
                                 break
                         except Exception:
                             pass
                         time.sleep(0.5)
-
-            if progress_cb:
-                progress_cb(100, 100, "Fetch complete")
 
         return session
 
@@ -602,6 +705,10 @@ class ProToolsDawProcessor(DawProcessor):
                 progress_cb(10, 100, f"Creating session '{session.project_name}'...")
 
             try:
+                dbg(
+                    "Creating Pro Tools transfer session from template: "
+                    f"name={session.project_name!r} timeout={self._template_create_timeout:.1f}s"
+                )
                 ptslh.create_session_from_template(
                     engine,
                     session.project_name,
@@ -610,7 +717,21 @@ class ProToolsDawProcessor(DawProcessor):
                     self._instance_name,
                     sample_rate=rate_enum,
                     bit_depth=depth_enum,
+                    timeout=self._template_create_timeout,
                 )
+                dbg(f"Pro Tools transfer session created: {session.project_name!r}")
+                dbg("Waiting for Pro Tools host readiness after transfer session creation")
+                if not ptslh.wait_for_host_ready(
+                    engine,
+                    timeout=self._template_create_timeout,
+                    sleep_time=self._command_delay,
+                ):
+                    dbg("Pro Tools host readiness timed out after transfer session creation")
+                    raise RuntimeError(
+                        "Pro Tools created the session, but did not become ready "
+                        f"within {self._template_create_timeout:.1f} seconds."
+                    )
+                dbg("Pro Tools host ready after transfer session creation")
                 results.append(
                     DawCommandResult(
                         command=DawCommand("create_session", session.project_name, {}),
