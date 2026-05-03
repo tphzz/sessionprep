@@ -142,6 +142,121 @@ jobs:
             "/DARCH_SUFFIX=${{ matrix.suffix }}" `
             "packaging\windows\sessionprep.iss"
 
+      - name: Package InnoSetup rebuild inputs
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $ver = "${{ steps.version.outputs.ver }}"
+          $archSuffix = "${{ matrix.suffix }}"
+          $zipPath = "dist_nuitka/sessionprep-$ver-$archSuffix-innosetup-input.zip"
+          $stagingRoot = Join-Path $env:RUNNER_TEMP "sessionprep-innosetup-input-$archSuffix"
+
+          $requiredPaths = @(
+            "dist_nuitka/sessionprep-gui.dist",
+            "dist_nuitka/sessionprep.dist",
+            "packaging/windows/sessionprep.iss",
+            "packaging/windows/sessionprep-signed.iss",
+            "packaging/windows/sessionprep-common.isinc",
+            "sessionprepgui/res/sessionprep.ico"
+          )
+
+          foreach ($path in $requiredPaths) {
+            if (-not (Test-Path -LiteralPath $path)) {
+              throw "Required InnoSetup rebuild input is missing: $path"
+            }
+          }
+
+          if (Test-Path -LiteralPath $stagingRoot) {
+            Remove-Item -LiteralPath $stagingRoot -Recurse -Force
+          }
+          New-Item -ItemType Directory -Path $stagingRoot | Out-Null
+          New-Item -ItemType Directory -Path (Join-Path $stagingRoot "dist_nuitka") | Out-Null
+          New-Item -ItemType Directory -Path (Join-Path $stagingRoot "packaging/windows") -Force | Out-Null
+          New-Item -ItemType Directory -Path (Join-Path $stagingRoot "sessionprepgui/res") -Force | Out-Null
+
+          Copy-Item -LiteralPath "dist_nuitka/sessionprep-gui.dist" -Destination (Join-Path $stagingRoot "dist_nuitka/sessionprep-gui.dist") -Recurse
+          Copy-Item -LiteralPath "dist_nuitka/sessionprep.dist" -Destination (Join-Path $stagingRoot "dist_nuitka/sessionprep.dist") -Recurse
+          Copy-Item -LiteralPath "packaging/windows/sessionprep.iss" -Destination (Join-Path $stagingRoot "packaging/windows/sessionprep.iss")
+          Copy-Item -LiteralPath "packaging/windows/sessionprep-signed.iss" -Destination (Join-Path $stagingRoot "packaging/windows/sessionprep-signed.iss")
+          Copy-Item -LiteralPath "packaging/windows/sessionprep-common.isinc" -Destination (Join-Path $stagingRoot "packaging/windows/sessionprep-common.isinc")
+          Copy-Item -LiteralPath "sessionprepgui/res/sessionprep.ico" -Destination (Join-Path $stagingRoot "sessionprepgui/res/sessionprep.ico")
+
+          $signedRebuildCommandLines = @(
+            '& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" `',
+            '  ''/SsessionprepSignTool=signtool.exe sign /a /fd SHA256 /t http://time.certum.pl/ $f'' `',
+            '  "/DAPP_VERSION=' + $ver + '" `',
+            '  "/DDIST_DIR=dist_nuitka" `',
+            '  "/DARCH_SUFFIX=' + $archSuffix + '" `',
+            '  "packaging\windows\sessionprep-signed.iss"'
+          )
+          $signedRebuildCommand = $signedRebuildCommandLines -join [Environment]::NewLine
+
+          $unsignedRebuildCommandLines = @(
+            '& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" `',
+            '  "/DAPP_VERSION=' + $ver + '" `',
+            '  "/DDIST_DIR=dist_nuitka" `',
+            '  "/DARCH_SUFFIX=' + $archSuffix + '" `',
+            '  "packaging\windows\sessionprep.iss"'
+          )
+          $unsignedRebuildCommand = $unsignedRebuildCommandLines -join [Environment]::NewLine
+
+          $manifest = [ordered]@{
+            version = $ver
+            archSuffix = $archSuffix
+            sourceSha = "${{ github.sha }}"
+            runId = "${{ github.run_id }}"
+            rebuildCommand = $signedRebuildCommand
+            signedRebuildCommand = $signedRebuildCommand
+            unsignedRebuildCommand = $unsignedRebuildCommand
+          }
+          $manifest | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $stagingRoot "innosetup-rebuild.json") -Encoding UTF8
+
+          $readme = @"
+          SessionPrep Inno Setup rebuild kit
+          ==================================
+
+          This archive contains the compiled Nuitka distribution folders and the
+          installer definition needed to rebuild the Windows installer locally.
+
+          Extract the archive and open PowerShell in the extracted root directory.
+
+          Signed Certum rebuild
+          ---------------------
+
+          Requirements:
+
+          - Inno Setup 6
+          - signtool.exe available on PATH
+          - Certum certificate/token available to signtool.exe
+
+          Run:
+
+          $signedRebuildCommand
+
+          Unsigned fallback rebuild
+          -------------------------
+
+          Run:
+
+          $unsignedRebuildCommand
+
+          The signed rebuild signs the setup executable and generated uninstaller.
+          The unsigned fallback produces the same unsigned installer shape as CI.
+          "@
+          $readme.Trim() | Set-Content -LiteralPath (Join-Path $stagingRoot "README-INNOSETUP-REBUILD.txt") -Encoding UTF8
+
+          if (Test-Path -LiteralPath $zipPath) {
+            Remove-Item -LiteralPath $zipPath -Force
+          }
+          Compress-Archive -Path (Join-Path $stagingRoot "*") -DestinationPath $zipPath -CompressionLevel Optimal
+
+          if (-not (Test-Path -LiteralPath $zipPath)) {
+            throw "Expected InnoSetup rebuild input zip was not created: $zipPath"
+          }
+          Write-Host "Created InnoSetup rebuild input zip: $zipPath"
+
       # -----------------------------------------------------------------------
       # macOS packaging
       # -----------------------------------------------------------------------
