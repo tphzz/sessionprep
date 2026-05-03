@@ -613,12 +613,6 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
         self._analysis_toolbar.setMovable(False)
         self._analysis_toolbar.setFloatable(False)
 
-        self._open_action = QAction("Open Folder", self)
-        self._open_action.triggered.connect(self._on_open_path)
-        self._analysis_toolbar.addAction(self._open_action)
-
-        self._analysis_toolbar.addSeparator()
-
         self._analyze_action = QAction("Reanalyze", self)
         self._analyze_action.setEnabled(False)
         self._analyze_action.triggered.connect(self._on_analyze)
