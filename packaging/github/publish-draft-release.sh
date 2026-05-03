@@ -21,6 +21,8 @@ TARGET_SHA=""
 REPO=""
 RELEASE_TAG=""
 RELEASE_TITLE=""
+RELEASE_BODY=""
+RELEASE_KEY=""
 DRY_RUN=0
 
 PATTERNS=()
@@ -42,7 +44,7 @@ Required:
   --ref-name NAME          GitHub ref name. Branch name in branch mode,
                            existing Git tag name in tag mode.
   --target SHA             Commit SHA this build/release represents. In branch
-                           mode the synthetic release tag is created at this
+                           mode the technical release tag_name points at this
                            commit. In tag mode it is logged for traceability;
                            the existing Git tag selected by --ref-name is used
                            and verified by GitHub before publishing.
@@ -60,13 +62,14 @@ Options:
   --allowlist FILE         Glob allowlist. Default: release-assets.allowlist
                            next to this script.
   --staging-dir DIR        Clean output directory for selected release assets. Default: release-assets
-  --release-tag TAG        Override generated release tag.
+  --release-tag TAG        Override generated technical release tag_name.
   --release-title TITLE    Override generated release title.
   --dry-run                Select and stage files, but do not call GitHub.
   -h, --help               Show this help.
 
 Branch mode:
-  Replaces a synthetic draft release/tag derived from the branch name.
+  Replaces draft releases matching a stable branch release key derived from
+  the branch name. Published releases are never modified.
 
 Tag mode:
   Replaces only an existing draft release for the real tag, or creates one.
@@ -203,11 +206,14 @@ sanitize_ref_name() {
 }
 
 derive_release_metadata() {
+    local sanitized_ref
+
     if [[ -z "$RELEASE_TAG" ]]; then
         if [[ "$MODE" == "tag" ]]; then
             RELEASE_TAG="$REF_NAME"
         else
-            RELEASE_TAG="branch-build-$(sanitize_ref_name "$REF_NAME")"
+            sanitized_ref="$(sanitize_ref_name "$REF_NAME")"
+            RELEASE_TAG="branch-build-$sanitized_ref"
         fi
     fi
 
@@ -221,6 +227,15 @@ derive_release_metadata() {
         else
             RELEASE_TITLE="Branch build: $REF_NAME"
         fi
+    fi
+
+    RELEASE_KEY="$MODE:$REF_NAME"
+    if [[ "$MODE" == "branch" ]]; then
+        RELEASE_BODY="<!-- github-draft-release-key: $RELEASE_KEY -->
+
+Automated draft release generated from $REF_NAME at $TARGET_SHA."
+    else
+        RELEASE_BODY="Automated draft release generated from $REF_NAME at $TARGET_SHA."
     fi
 }
 
@@ -343,26 +358,58 @@ select_assets() {
 
 validate_publish_environment() {
     validate_gh_environment
+    require_command curl
+    require_command tr
+    require_command wc
 }
 
-release_json_field() {
-    local tag="$1"
-    local jq_expr="$2"
-    gh api "repos/$REPO/releases/tags/$tag" --jq "$jq_expr" 2>/dev/null || return 1
+jq_string() {
+    local value="$1"
+    value="${value//\\/\\\\}"
+    value="${value//\"/\\\"}"
+    value="${value//$'\n'/\\n}"
+    value="${value//$'\r'/\\r}"
+    value="${value//$'\t'/\\t}"
+    printf '"%s"' "$value"
 }
 
-release_exists() {
-    release_json_field "$1" '.id' >/dev/null
+github_token() {
+    if [[ -n "${GH_TOKEN:-}" ]]; then
+        printf '%s' "$GH_TOKEN"
+        return 0
+    fi
+    if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+        printf '%s' "$GITHUB_TOKEN"
+        return 0
+    fi
+    gh auth token
 }
 
-release_is_draft() {
-    [[ "$(release_json_field "$1" '.draft')" == "true" ]]
+urlencode() {
+    local value="$1"
+    local encoded=""
+    local i
+    local char
+    local hex
+
+    LC_ALL=C
+    for ((i = 0; i < ${#value}; i++)); do
+        char="${value:i:1}"
+        case "$char" in
+            [a-zA-Z0-9.~_-])
+                encoded+="$char"
+                ;;
+            *)
+                printf -v hex '%%%02X' "'$char"
+                encoded+="$hex"
+                ;;
+        esac
+    done
+    printf '%s' "$encoded"
 }
 
-delete_release_if_exists() {
-    local tag="$1"
-    local release_id
-    release_id="$(release_json_field "$tag" '.id')" || return 0
+delete_release_by_id() {
+    local release_id="$1"
     gh api -X DELETE "repos/$REPO/releases/$release_id" --silent
 }
 
@@ -371,52 +418,189 @@ delete_tag_ref_if_exists() {
     gh api -X DELETE "repos/$REPO/git/refs/tags/$tag" --silent >/dev/null 2>&1 || true
 }
 
+matching_releases_tsv() {
+    local jq_expr="$1"
+    gh api --paginate "repos/$REPO/releases?per_page=100" --jq "$jq_expr"
+}
+
+delete_matching_branch_drafts() {
+    local marker="<!-- github-draft-release-key: $RELEASE_KEY -->"
+    local marker_lit
+    local title_lit
+    local tag_lit
+    local jq_expr
+    local release_id
+    local is_draft
+    local release_name
+    local tag_name
+    local deleted=0
+    local list_file
+
+    marker_lit="$(jq_string "$marker")"
+    title_lit="$(jq_string "$RELEASE_TITLE")"
+    tag_lit="$(jq_string "$RELEASE_TAG")"
+    jq_expr=".[] | select((((.body // \"\") | contains($marker_lit)) or (.name == $title_lit) or (.tag_name == $tag_lit))) | [.id, .draft, (.name // \"\"), (.tag_name // \"\")] | @tsv"
+
+    list_file="$(mktemp "${TMPDIR:-/tmp}/github-release-list.XXXXXX")"
+    if ! matching_releases_tsv "$jq_expr" > "$list_file"; then
+        rm -f "$list_file"
+        die "Could not list existing releases for branch cleanup."
+    fi
+
+    while IFS=$'\t' read -r release_id is_draft release_name tag_name; do
+        [[ -n "$release_id" ]] || continue
+        if [[ "$is_draft" != "true" ]]; then
+            rm -f "$list_file"
+            die "Refusing to replace published branch release: id=$release_id title='$release_name' tag='$tag_name'"
+        fi
+        log "Deleting existing draft branch release: id=$release_id title='$release_name' tag='$tag_name'"
+        delete_release_by_id "$release_id"
+        deleted=$((deleted + 1))
+    done < "$list_file"
+    rm -f "$list_file"
+
+    if [[ "$deleted" -gt 0 ]]; then
+        log "Deleted $deleted existing draft branch release(s)."
+    fi
+}
+
+delete_matching_tag_draft() {
+    local tag_lit
+    local jq_expr
+    local release_id
+    local is_draft
+    local release_name
+    local tag_name
+    local deleted=0
+    local list_file
+
+    tag_lit="$(jq_string "$RELEASE_TAG")"
+    jq_expr=".[] | select(.tag_name == $tag_lit) | [.id, .draft, (.name // \"\"), (.tag_name // \"\")] | @tsv"
+
+    list_file="$(mktemp "${TMPDIR:-/tmp}/github-release-list.XXXXXX")"
+    if ! matching_releases_tsv "$jq_expr" > "$list_file"; then
+        rm -f "$list_file"
+        die "Could not list existing releases for tag cleanup."
+    fi
+
+    while IFS=$'\t' read -r release_id is_draft release_name tag_name; do
+        [[ -n "$release_id" ]] || continue
+        if [[ "$is_draft" != "true" ]]; then
+            rm -f "$list_file"
+            die "Refusing to modify published tag release: id=$release_id title='$release_name' tag='$tag_name'"
+        fi
+        log "Deleting existing draft tag release: id=$release_id title='$release_name' tag='$tag_name'"
+        delete_release_by_id "$release_id"
+        deleted=$((deleted + 1))
+    done < "$list_file"
+    rm -f "$list_file"
+
+    if [[ "$deleted" -gt 0 ]]; then
+        log "Deleted $deleted existing draft tag release(s)."
+    fi
+}
+
+verify_tag_exists() {
+    local tag_lit
+    local match_count
+
+    tag_lit="$(jq_string "refs/tags/$RELEASE_TAG")"
+    match_count="$(gh api "repos/$REPO/git/matching-refs/tags/$RELEASE_TAG" --jq "map(select(.ref == $tag_lit)) | length")"
+    [[ "$match_count" != "0" ]] || die "Tag mode requires an existing Git tag: $RELEASE_TAG"
+}
+
 create_draft_release() {
-    local notes
-    notes="Automated draft release generated from $REF_NAME at $TARGET_SHA."
+    local result
+    local release_id
+    local release_url
+    local upload_url
 
     if [[ "$MODE" == "tag" ]]; then
-        gh release create "$RELEASE_TAG" \
-            --repo "$REPO" \
-            --draft \
-            --verify-tag \
-            --title "$RELEASE_TITLE" \
-            --notes "$notes"
+        result="$(gh api -X POST "repos/$REPO/releases" \
+            -f "tag_name=$RELEASE_TAG" \
+            -f "name=$RELEASE_TITLE" \
+            -f "body=$RELEASE_BODY" \
+            -F draft=true \
+            --jq '[.id, .html_url, .upload_url] | @tsv')"
     else
-        gh release create "$RELEASE_TAG" \
-            --repo "$REPO" \
-            --draft \
-            --target "$TARGET_SHA" \
-            --title "$RELEASE_TITLE" \
-            --notes "$notes"
+        result="$(gh api -X POST "repos/$REPO/releases" \
+            -f "tag_name=$RELEASE_TAG" \
+            -f "target_commitish=$TARGET_SHA" \
+            -f "name=$RELEASE_TITLE" \
+            -f "body=$RELEASE_BODY" \
+            -F draft=true \
+            --jq '[.id, .html_url, .upload_url] | @tsv')"
     fi
+
+    IFS=$'\t' read -r release_id release_url upload_url <<< "$result"
+    [[ -n "$release_id" && -n "$upload_url" ]] || die "GitHub did not return a release id and upload URL."
+
+    printf '%s\t%s\t%s\n' "$release_id" "$release_url" "$upload_url"
+}
+
+upload_asset_to_release() {
+    local upload_url="$1"
+    local asset_path="$2"
+    local asset_name
+    local encoded_name
+    local upload_base
+    local token
+
+    asset_name="$(basename "$asset_path")"
+    encoded_name="$(urlencode "$asset_name")"
+    upload_base="${upload_url%%\{*}"
+    token="$(github_token)"
+
+    log "Uploading asset to release id endpoint: $asset_name"
+    curl --fail --silent --show-error \
+        -X POST \
+        -H "Authorization: Bearer $token" \
+        -H "Accept: application/vnd.github+json" \
+        -H "Content-Type: application/octet-stream" \
+        --data-binary "@$asset_path" \
+        "$upload_base?name=$encoded_name" >/dev/null
+}
+
+upload_assets_to_release() {
+    local release_id="$1"
+    local upload_url="$2"
+    local asset_path
+    local uploaded_count
+
+    log "Uploading ${#ASSET_PATHS[@]} asset(s) to release id $release_id"
+    for asset_path in "${ASSET_PATHS[@]}"; do
+        upload_asset_to_release "$upload_url" "$asset_path"
+    done
+
+    uploaded_count="$(gh api --paginate "repos/$REPO/releases/$release_id/assets?per_page=100" --jq '.[].name' | wc -l | tr -d '[:space:]')"
+    [[ "$uploaded_count" == "${#ASSET_PATHS[@]}" ]] \
+        || die "Uploaded asset count mismatch for release $release_id: expected ${#ASSET_PATHS[@]}, got $uploaded_count"
+
+    log "Verified $uploaded_count uploaded asset(s) on release id $release_id."
 }
 
 publish_release() {
     validate_publish_environment
+    local release_result
+    local release_id
+    local release_url
+    local upload_url
 
     if [[ "$MODE" == "branch" ]]; then
-        if release_exists "$RELEASE_TAG"; then
-            release_is_draft "$RELEASE_TAG" || die "Refusing to replace published branch release: $RELEASE_TAG"
-            log "Deleting existing draft branch release: $RELEASE_TAG"
-            delete_release_if_exists "$RELEASE_TAG"
-        fi
-        log "Deleting existing synthetic branch tag if present: $RELEASE_TAG"
+        delete_matching_branch_drafts
+        log "Deleting existing synthetic branch tag if present after draft cleanup: $RELEASE_TAG"
         delete_tag_ref_if_exists "$RELEASE_TAG"
     else
-        if release_exists "$RELEASE_TAG"; then
-            release_is_draft "$RELEASE_TAG" || die "Refusing to modify published tag release: $RELEASE_TAG"
-            log "Deleting existing draft tag release while preserving real tag: $RELEASE_TAG"
-            delete_release_if_exists "$RELEASE_TAG"
-        fi
+        verify_tag_exists
+        delete_matching_tag_draft
     fi
 
     log "Creating draft release: $RELEASE_TAG"
-    create_draft_release
+    release_result="$(create_draft_release)"
+    IFS=$'\t' read -r release_id release_url upload_url <<< "$release_result"
 
-    log "Uploading ${#ASSET_PATHS[@]} asset(s)"
-    gh release upload "$RELEASE_TAG" "${ASSET_PATHS[@]}" --repo "$REPO" --clobber
-    log "Draft release ready: $RELEASE_TAG"
+    upload_assets_to_release "$release_id" "$upload_url"
+    log "Draft release ready: id=$release_id url=$release_url"
 }
 
 main() {

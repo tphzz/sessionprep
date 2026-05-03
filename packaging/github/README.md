@@ -66,25 +66,28 @@ the draft release.
 
 `--mode branch|tag` selects the release replacement policy. Use `branch` for
 ordinary branch builds: the script creates and replaces a synthetic draft
-release tag derived from `--ref-name`. Use `tag` for real release tag builds:
-the script uses the existing Git tag from `--ref-name`, replaces only a draft
-release for that tag, and refuses to modify an already published release. In a
-real publish, `tag` mode verifies that the tag exists before creating the draft
-release.
+release identified by a stable branch key derived from `--ref-name`. Use `tag`
+for real release tag builds: the script uses the existing Git tag from
+`--ref-name`, replaces only a draft release for that tag, and refuses to modify
+an already published release. In a real publish, `tag` mode verifies that the
+tag exists before creating the draft release.
 
 `--ref-name NAME` is the source Git ref name and is used in both modes. In
 `branch` mode, it is the branch name and is sanitized into the default synthetic
-release tag, for example `feature/test-release` becomes
-`branch-build-feature-test-release`. In `tag` mode, it is the real Git tag name
-used for the draft release. The script cannot infer this value from
+technical `tag_name`, for example `feature/test-release` becomes
+`branch-build-feature-test-release`. Branch draft replacement does not rely on
+looking up that tag; it uses a hidden release key and a legacy title fallback.
+In `tag` mode, it is the real Git tag name used for the draft release. The
+script cannot infer this value from
 `--download-run-id`; pass the same ref name that triggered the workflow, usually
 `${{ github.ref_name }}` in GitHub Actions.
 
 `--target SHA` is the commit SHA for the workflow run being published. In
-`branch` mode, the script creates the synthetic branch-build release tag at
-that exact commit. In `tag` mode, GitHub already has a real tag from
-`--ref-name`; the script uses `--target` for validation, logging, and release
-notes so the draft is traceable to the build run.
+`branch` mode, the script sends this as the `target_commitish` for the
+technical branch release `tag_name` required by GitHub. In `tag` mode, GitHub
+already has a real tag from `--ref-name`; the script uses `--target` for
+validation, logging, and release notes so the draft is traceable to the build
+run.
 
 `--download-run-id ID` tells the script to download artifacts from a GitHub
 Actions run before filtering. This is useful in CI and for local reproduction.
@@ -110,10 +113,11 @@ matching. When `--allowlist` is omitted, the script uses
 are copied before upload. The default is `release-assets`. The script refuses to
 place this directory inside the artifact root.
 
-`--release-tag TAG` overrides the release tag the script would normally use. By
-default, `branch` mode uses a synthetic `branch-build-...` tag derived from
-`--ref-name`, while `tag` mode uses `--ref-name` directly. Use this override
-only when the default tag naming policy is not appropriate for a repository.
+`--release-tag TAG` overrides the technical release `tag_name` the script would
+normally use. By default, `branch` mode uses a synthetic `branch-build-...`
+name derived from `--ref-name`, while `tag` mode uses `--ref-name` directly.
+Use this override only when the default tag naming policy is not appropriate
+for a repository.
 
 `--release-title TITLE` overrides the draft release title. By default, `branch`
 mode uses `Branch build: <ref-name>` and `tag` mode uses the release tag.
@@ -196,16 +200,21 @@ publish-draft-release:
 
 ### Branch Mode
 
-Branch mode creates a synthetic draft release tag derived from the branch name,
-for example `branch-build-feature-test-release`.
+Branch mode creates one replaceable draft release per branch/ref name. GitHub
+requires every release to have a `tag_name`, so the script still sends a
+technical synthetic name such as `branch-build-feature-test-release`, but branch
+replacement is not based on tag lookup. Instead, the script lists releases,
+matches a hidden release key in the draft body, and also deletes legacy drafts
+with the same title or technical tag.
 
 On every successful branch build, the script:
 
 1. refuses to touch the release if it has already been published,
-2. deletes the existing draft release if present,
-3. deletes the existing synthetic tag if present,
-4. recreates the synthetic draft release at `--target`,
-5. uploads the selected assets.
+2. deletes matching draft releases if present,
+3. deletes the old synthetic tag ref if present,
+4. creates a new draft release and captures its release ID,
+5. uploads selected assets directly to that release ID,
+6. verifies that the created release has the expected number of assets.
 
 ### Tag Mode
 
@@ -223,6 +232,14 @@ On a tag build, the script:
 
 This means re-running a tag workflow replaces generated draft assets, but
 published releases are protected from accidental mutation.
+
+## Asset Uploads
+
+Assets are uploaded to the release ID returned by the create-release API call,
+not by release tag. This matters for drafts because GitHub can show draft
+release URLs as `untagged-*`, and tag-based lookup can miss drafts. The script
+URL-encodes asset names, uploads each staged file to the release asset endpoint,
+and then verifies the uploaded asset count before reporting success.
 
 ## Allowlist Format
 

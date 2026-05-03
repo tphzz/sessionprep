@@ -91,9 +91,11 @@ For a tag build, use:
 
 ## Release Behavior
 
-Branch builds use a synthetic draft release tag such as
-`branch-build-0.3.5`. Re-running a branch workflow replaces that draft release
-and synthetic tag.
+Branch builds use a release title such as `SessionPrep branch build: 0.3.5`.
+Re-running a branch workflow replaces any matching draft release for that branch
+and uploads assets to the newly created release by release ID. The script also
+cleans up older duplicate draft releases that used the same title before the
+hidden branch release key was introduced.
 
 Tag builds use the real Git tag, such as `0.3.5`. Re-running a tag workflow
 replaces the draft release for that tag, but published releases are protected
