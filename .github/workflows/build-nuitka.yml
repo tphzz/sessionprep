@@ -232,3 +232,34 @@ jobs:
             !dist_nuitka/sessionprep-*.dist
             !dist_nuitka/sessionprep-*.dist/**
           if-no-files-found: error
+
+  publish-draft-release:
+    name: Publish draft release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    concurrency:
+      group: draft-release-${{ github.repository }}-${{ github.ref }}
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_MODE: ${{ github.ref_type == 'tag' && 'tag' || 'branch' }}
+      REF_NAME: ${{ github.ref_name }}
+      TARGET_SHA: ${{ github.sha }}
+      REPOSITORY: ${{ github.repository }}
+      RUN_ID: ${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Publish draft release
+        shell: bash
+        run: |
+          packaging/github/publish-draft-release.sh \
+            --download-run-id "$RUN_ID" \
+            --artifact-root downloaded-artifacts \
+            --mode "$RELEASE_MODE" \
+            --ref-name "$REF_NAME" \
+            --target "$TARGET_SHA" \
+            --repo "$REPOSITORY"

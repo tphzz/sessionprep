@@ -1,0 +1,19 @@
+# Release asset allowlist for packaging/github/publish-draft-release.sh.
+#
+# Patterns are matched against file basenames after GitHub Actions artifacts
+# have been downloaded. Keep this intentionally narrow: only end-user
+# installers/packages belong in GitHub Releases.
+
+# macOS notarized or development DMGs
+sessionprep-*-macos-arm64.dmg
+sessionprep-*-macos-x64.dmg
+
+# Linux archives and native packages
+sessionprep-*-linux-x64.tar.gz
+sessionprep-*-linux-arm64.tar.gz
+sessionprep_*.deb
+sessionprep-*.rpm
+
+# Windows installers
+sessionprep-*-win-x64-setup.exe
+sessionprep-*-win-arm64-setup.exe
