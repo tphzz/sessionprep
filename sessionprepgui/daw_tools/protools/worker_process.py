@@ -11,11 +11,10 @@ import traceback
 from typing import Any
 
 from sessionpreplib.daw_processors import ptsl_helpers as ptslh
-
-from .connection_common import (
-    PTSL_HOST_READY_TIMEOUT_SECONDS,
+from sessionpreplib.daw_processors.ptsl_connection import (
+    ProToolsConnectionSettings,
     connection_failure_message,
-    create_ptsl_engine_with_timeout,
+    create_ptsl_engine,
 )
 
 
@@ -57,6 +56,7 @@ class ProToolsWorker:
 
     def __init__(self):
         self._engine = None
+        self._settings: ProToolsConnectionSettings | None = None
         log.debug("Pro Tools worker object created")
 
     def close(self):
@@ -70,22 +70,35 @@ class ProToolsWorker:
                     traceback.format_exc(),
                 )
             self._engine = None
+            self._settings = None
 
     def handle(self, method: str, params: dict[str, Any]) -> Any:
         log.debug("Handling Pro Tools worker request: method=%s", method)
         if method == "connect":
+            settings_payload = (
+                params.get("settings")
+                if isinstance(params.get("settings"), dict)
+                else params
+            )
+            settings = ProToolsConnectionSettings.from_config(
+                settings_payload
+            )
+            if self._engine is not None and settings != self._settings:
+                log.debug("Pro Tools worker connection settings changed; reconnecting")
+                self.close()
             if self._engine is None:
                 log.debug("Creating Pro Tools PTSL engine")
-                self._engine = create_ptsl_engine_with_timeout()
+                self._engine = create_ptsl_engine(settings)
+                self._settings = settings
                 log.debug("Created Pro Tools PTSL engine")
             log.debug(
                 "Waiting for Pro Tools host readiness: timeout=%.1fs",
-                PTSL_HOST_READY_TIMEOUT_SECONDS,
+                settings.host_ready_timeout,
             )
             if not ptslh.wait_for_host_ready(
                 self._engine,
-                timeout=PTSL_HOST_READY_TIMEOUT_SECONDS,
-                sleep_time=0.25,
+                timeout=settings.host_ready_timeout,
+                sleep_time=min(settings.command_delay, 0.25),
             ):
                 log.debug("Pro Tools host readiness check did not complete")
                 raise RuntimeError("Pro Tools is still starting.")

@@ -13,6 +13,11 @@ from ..daw_processor import DawProcessor
 from ..models import DawCommand, DawCommandResult, SessionContext
 from ..log import dbg
 from . import ptsl_helpers as ptslh
+from .ptsl_connection import (
+    ProToolsConnectionSettings,
+    check_connectivity as check_ptsl_connectivity,
+    create_ptsl_engine,
+)
 
 import logging
 
@@ -173,49 +178,15 @@ class ProToolsDawProcessor(DawProcessor):
         self._template_create_timeout: float = config.get(
             "protools_template_create_timeout", 60.0
         )
+        self._connection_settings = ProToolsConnectionSettings.from_config(config)
 
     def check_connectivity(self) -> tuple[bool, str]:
-        try:
-            from ptsl import Engine
-        except ImportError:
-            self._connected = False
-            return False, "py-ptsl package not installed"
-
-        engine = None
-        try:
-            address = f"{self._host}:{self._port}"
-            engine = Engine(
-                company_name=self._company_name,
-                application_name=self._application_name,
-                address=address,
-            )
-            version = engine.ptsl_version()
-            if version < 2025:
-                self._connected = False
-                return False, "Protocol 2025 or newer required"
-
-            from . import ptsl_helpers as ptslh
-
-            if not ptslh.wait_for_host_ready(
-                engine, timeout=25.0, sleep_time=self._command_delay
-            ):
-                self._connected = False
-                return (
-                    False,
-                    "Connected, but Pro Tools is busy or not ready. Please bring its window to the front.",
-                )
-
-            self._connected = True
-            return True, f"Protocol: {version}"
-        except Exception as e:
-            self._connected = False
-            return False, str(e)
-        finally:
-            if engine is not None:
-                try:
-                    engine.close()
-                except Exception:
-                    pass
+        ok, message = check_ptsl_connectivity(
+            self._connection_settings,
+            ready_timeout=25.0,
+        )
+        self._connected = ok
+        return ok, message
 
     def _track_list_with_retry(self, engine, *, timeout: float, sleep_time: float):
         """Return the Pro Tools track list, retrying while a new session settles."""
@@ -349,7 +320,6 @@ class ProToolsDawProcessor(DawProcessor):
         )
 
         try:
-            from ptsl import Engine
             from ptsl import PTSL_pb2 as pt
         except ImportError:
             return session
@@ -360,13 +330,11 @@ class ProToolsDawProcessor(DawProcessor):
             if progress_cb:
                 progress_cb(10, 100, "Connecting to Pro Tools...")
 
-            address = f"{self._host}:{self._port}"
-            dbg(f"Opening Pro Tools engine for fetch: address={address!r}")
-            engine = Engine(
-                company_name=self._company_name,
-                application_name=self._application_name,
-                address=address,
+            dbg(
+                "Opening Pro Tools engine for fetch: "
+                f"address={self._connection_settings.address!r}"
             )
+            engine = self._open_engine()
             dbg("Pro Tools engine opened for fetch")
 
             if progress_cb:
@@ -563,14 +531,7 @@ class ProToolsDawProcessor(DawProcessor):
 
     def _open_engine(self):
         """Create and return a connected PTSL Engine."""
-        from ptsl import Engine
-
-        address = f"{self._host}:{self._port}"
-        return Engine(
-            company_name=self._company_name,
-            application_name=self._application_name,
-            address=address,
-        )
+        return create_ptsl_engine(self._connection_settings)
 
     def _get_optimal_session_specs(self, session: SessionContext) -> tuple[str, str]:
         """Determine most common sample rate and bit depth from output tracks.

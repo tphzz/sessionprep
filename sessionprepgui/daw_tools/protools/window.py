@@ -5,6 +5,8 @@ Hosts per-tool tabs and manages a shared PTSL engine connection.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from PySide6.QtGui import QFont
 from PySide6.QtCore import QRect, QSize, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
@@ -20,6 +22,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+from sessionpreplib.daw_processors.ptsl_connection import ProToolsConnectionSettings
 
 from ...theme import apply_dark_theme
 from ...window_geometry import (
@@ -377,13 +381,17 @@ class ProToolsUtilsWindow(QDialog):
         self._client.worker_failed.connect(self._on_worker_failed)
         self._client.request(
             "connect",
-            {},
+            {"settings": self._connection_settings().to_dict()},
             lambda response, current_attempt=attempt_id: self._on_connect_response(
                 response,
                 current_attempt,
             ),
             timeout_ms=PTSL_CONNECT_TIMEOUT_MS,
         )
+
+    def _connection_settings(self) -> ProToolsConnectionSettings:
+        settings = ProToolsConnectionSettings.from_config(self._config)
+        return replace(settings, host_ready_timeout=5.0)
 
     def _on_connect_response(self, response: dict, attempt_id: int):
         if self._is_stale_connect_result(attempt_id):
