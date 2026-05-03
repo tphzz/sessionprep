@@ -57,6 +57,7 @@ jobs:
 
       - name: Cache Nuitka & CCache
         uses: actions/cache@v5
+        continue-on-error: true
         with:
           path: |
             ~/.cache/Nuitka
@@ -65,10 +66,10 @@ jobs:
             ~/.cache/ccache
             ~/Library/Caches/ccache
             ~/AppData/Local/ccache
-          key: ${{ runner.os }}-${{ matrix.suffix }}-nuitka-${{ hashFiles('**/uv.lock') }}-${{ github.run_id }}
+          key: ${{ runner.os }}-${{ matrix.suffix }}-nuitka-v2-${{ hashFiles('**/uv.lock') }}-${{ github.run_id }}
           restore-keys: |
-            ${{ runner.os }}-${{ matrix.suffix }}-nuitka-${{ hashFiles('**/uv.lock') }}-
-            ${{ runner.os }}-${{ matrix.suffix }}-nuitka-
+            ${{ runner.os }}-${{ matrix.suffix }}-nuitka-v2-${{ hashFiles('**/uv.lock') }}-
+            ${{ runner.os }}-${{ matrix.suffix }}-nuitka-v2-
 
       - name: Install Dependencies
         run: uv sync --extra cli --extra gui
