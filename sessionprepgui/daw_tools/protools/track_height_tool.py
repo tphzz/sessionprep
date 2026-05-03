@@ -208,13 +208,13 @@ class TrackHeightTool(QWidget):
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
 
-        desc = QLabel(
+        self._desc = QLabel(
             "Configure Pro Tools track heights by track type, then apply the "
             "active preset to selected, visible, or all tracks."
         )
-        desc.setWordWrap(True)
-        desc.setStyleSheet("color: #aaa; font-size: 9pt;")
-        layout.addWidget(desc)
+        self._desc.setWordWrap(True)
+        self._desc.setStyleSheet("color: #aaa; font-size: 9pt;")
+        layout.addWidget(self._desc)
 
         self._preset_panel = NamedPresetPanel([], label="Preset:", parent=self)
         self._preset_panel.preset_switching.connect(self._on_preset_switching)
@@ -232,6 +232,7 @@ class TrackHeightTool(QWidget):
         preset_layout.addWidget(self._reset_btn)
 
         controls = QHBoxLayout()
+        self._controls_layout = controls
         controls.addWidget(QLabel("Mode:"))
         self._mode_combo = QComboBox()
         for value, label in MODE_CHOICES:
@@ -317,6 +318,51 @@ class TrackHeightTool(QWidget):
         layout.addItem(self._bottom_stretch)
         self._update_mode_visibility()
         self._update_dirty_state()
+
+    def preferred_expanded_height_for_width(self, width: int) -> int:
+        """Return the height needed to show the controls and table comfortably."""
+        layout = self.layout()
+        if layout is None:
+            return self.sizeHint().height()
+
+        margins = layout.contentsMargins()
+        spacing = layout.spacing()
+        inner_width = max(1, width - margins.left() - margins.right())
+        parts: list[int] = []
+
+        desc_height = (
+            self._desc.heightForWidth(inner_width)
+            if self._desc.hasHeightForWidth()
+            else self._desc.sizeHint().height()
+        )
+        parts.append(desc_height)
+        parts.append(self._preset_panel.sizeHint().height())
+
+        controls_height = 0
+        for index in range(self._controls_layout.count()):
+            item = self._controls_layout.itemAt(index)
+            widget = item.widget() if item is not None else None
+            if widget is not None and not widget.isHidden():
+                controls_height = max(controls_height, widget.sizeHint().height())
+        parts.append(controls_height)
+
+        if self._mode_combo.currentData() != "all":
+            header_height = self._table.horizontalHeader().height()
+            row_height = self._table.verticalHeader().defaultSectionSize()
+            rows_height = sum(
+                self._table.rowHeight(row) or row_height
+                for row in range(self._table.rowCount())
+            )
+            parts.append(header_height + rows_height + self._table.frameWidth() * 2 + 4)
+
+        parts.append(self._status.sizeHint().height())
+        visible_part_count = len([height for height in parts if height > 0])
+        return (
+            margins.top()
+            + margins.bottom()
+            + sum(parts)
+            + spacing * max(0, visible_part_count - 1)
+        )
 
     def _set_status(self, text: str, color: str):
         self._status.setText(text)

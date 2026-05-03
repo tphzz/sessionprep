@@ -10,6 +10,7 @@ from sessionprepgui.daw_tools.protools.connection_common import (
     connection_timeout_message,
 )
 from sessionprepgui.daw_tools.protools.worker_client import JsonLineBuffer
+from sessionprepgui.widgets import _aspect_limited_grid_height
 
 
 def test_connection_failure_message_for_grpc_unavailable():
@@ -103,3 +104,39 @@ def test_json_line_buffer_handles_multiple_messages():
         {"id": 1, "ok": True},
         {"id": 2, "ok": False},
     ]
+
+
+def test_color_grid_aspect_limit_keeps_cells_square_or_wide():
+    height = _aspect_limited_grid_height(
+        2308,
+        columns=23,
+        row_count=3,
+        cell_height=28,
+        max_cell_height_to_width=1.0,
+    )
+
+    assert height == 307
+
+
+def test_color_grid_aspect_limit_never_goes_below_min_cell_height():
+    height = _aspect_limited_grid_height(
+        300,
+        columns=23,
+        row_count=3,
+        cell_height=28,
+        max_cell_height_to_width=1.0,
+    )
+
+    assert height == 94
+
+
+def test_color_grid_minimum_height_uses_min_cell_height():
+    height = _aspect_limited_grid_height(
+        1,
+        columns=23,
+        row_count=3,
+        cell_height=28,
+        max_cell_height_to_width=0.0,
+    )
+
+    assert height == 94

@@ -29,22 +29,25 @@ class ColorTool(QWidget):
     def _init_ui(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
 
-        desc = QLabel(
+        self._desc = QLabel(
             "Click a color to apply it to the selected track(s) in Pro Tools. "
             "Colors are perceptually matched to the Pro Tools palette."
         )
-        desc.setWordWrap(True)
-        desc.setStyleSheet("color: #aaa; font-size: 9pt; margin-bottom: 6px;")
-        layout.addWidget(desc)
+        self._desc.setWordWrap(True)
+        self._desc.setStyleSheet("color: #aaa; font-size: 9pt; margin-bottom: 6px;")
+        layout.addWidget(self._desc)
 
         self._grid = ColorGridPanel(
             cell_height=28,
             stretch_vertical=True,
+            max_cell_height_to_width=1.0,
             parent=self,
         )
         self._grid.colorClicked.connect(self._on_color_clicked)
         layout.addWidget(self._grid)
+        layout.addStretch(1)
 
         status_row = QHBoxLayout()
         self._status = QLabel("")
@@ -52,6 +55,39 @@ class ColorTool(QWidget):
         status_row.addWidget(self._status)
         status_row.addStretch()
         layout.addLayout(status_row)
+
+    def preferred_compact_height_for_width(
+        self,
+        width: int,
+        *,
+        use_minimum_grid_height: bool = False,
+    ) -> int:
+        """Return a compact height that keeps the palette cells square-to-wide."""
+        layout = self.layout()
+        if layout is None:
+            return self.sizeHint().height()
+        margins = layout.contentsMargins()
+        spacing = layout.spacing()
+        inner_width = max(1, width - margins.left() - margins.right())
+        desc_height = (
+            self._desc.heightForWidth(inner_width)
+            if self._desc.hasHeightForWidth()
+            else self._desc.sizeHint().height()
+        )
+        grid_height = (
+            self._grid.minimum_grid_height()
+            if use_minimum_grid_height
+            else self._grid.aspect_limited_height_for_width(inner_width)
+        )
+        status_height = self._status.sizeHint().height()
+        return (
+            margins.top()
+            + margins.bottom()
+            + desc_height
+            + grid_height
+            + status_height
+            + spacing * 3
+        )
 
     def set_engine(self, engine):
         """Compatibility shim for older callers."""

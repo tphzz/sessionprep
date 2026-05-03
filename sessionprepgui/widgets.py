@@ -529,6 +529,30 @@ class ColorPickerButton(QPushButton):
             self.colorChanged.emit(name)
 
 
+def _aspect_limited_grid_height(
+    width: int,
+    *,
+    columns: int,
+    row_count: int,
+    cell_height: int,
+    max_cell_height_to_width: float,
+    margins: tuple[int, int, int, int] = (4, 4, 4, 4),
+    spacing: int = 1,
+) -> int:
+    left, top, right, bottom = margins
+    horizontal_margins = left + right
+    vertical_margins = top + bottom
+    column_gaps = max(0, columns - 1) * spacing
+    row_gaps = max(0, row_count - 1) * spacing
+    usable_width = max(1, width - horizontal_margins - column_gaps)
+    cell_width = usable_width / columns
+    max_cell_height = max(
+        cell_height,
+        int(cell_width * max_cell_height_to_width),
+    )
+    return vertical_margins + row_count * max_cell_height + row_gaps
+
+
 class ColorGridPanel(QWidget):
     """Embeddable read-only color grid preview.
 
@@ -543,10 +567,13 @@ class ColorGridPanel(QWidget):
 
     def __init__(self, colors: list[dict[str, str]] | None = None,
                  cell_height: int = 22, stretch_vertical: bool = False,
+                 max_cell_height_to_width: float | None = None,
                  parent=None):
         super().__init__(parent)
         self._cell_height = cell_height
         self._stretch_vertical = stretch_vertical
+        self._max_cell_height_to_width = max_cell_height_to_width
+        self._row_count = 0
         self._layout = QGridLayout(self)
         self._layout.setContentsMargins(4, 4, 4, 4)
         self._layout.setSpacing(1)
@@ -560,6 +587,66 @@ class ColorGridPanel(QWidget):
             if item.widget():
                 item.widget().deleteLater()
         self._populate(colors)
+
+    def aspect_limited_height_for_width(self, width: int) -> int:
+        """Return the grid height allowed by the configured cell aspect cap."""
+        if (
+            not self._stretch_vertical
+            or self._max_cell_height_to_width is None
+            or self._row_count <= 0
+            or width <= 0
+        ):
+            return self.sizeHint().height()
+
+        margins = self._layout.contentsMargins()
+        return _aspect_limited_grid_height(
+            width,
+            columns=self.COLUMNS,
+            row_count=self._row_count,
+            cell_height=self._cell_height,
+            max_cell_height_to_width=self._max_cell_height_to_width,
+            margins=(
+                margins.left(),
+                margins.top(),
+                margins.right(),
+                margins.bottom(),
+            ),
+            spacing=self._layout.spacing(),
+        )
+
+    def minimum_grid_height(self) -> int:
+        """Return the grid height using the configured minimum cell height."""
+        if self._row_count <= 0:
+            return self.sizeHint().height()
+        margins = self._layout.contentsMargins()
+        return _aspect_limited_grid_height(
+            1,
+            columns=self.COLUMNS,
+            row_count=self._row_count,
+            cell_height=self._cell_height,
+            max_cell_height_to_width=0.0,
+            margins=(
+                margins.left(),
+                margins.top(),
+                margins.right(),
+                margins.bottom(),
+            ),
+            spacing=self._layout.spacing(),
+        )
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._update_aspect_height_cap()
+
+    def _update_aspect_height_cap(self):
+        if (
+            self._stretch_vertical
+            and self._max_cell_height_to_width is not None
+            and self._row_count > 0
+        ):
+            self.setMaximumHeight(self.aspect_limited_height_for_width(self.width()))
+        else:
+            self.setMaximumHeight(16777215)
 
     def _populate(self, colors: list[dict[str, str]]):
         from PySide6.QtWidgets import QSizePolicy
@@ -588,3 +675,5 @@ class ColorGridPanel(QWidget):
                 self._layout.setRowStretch(r, 1)
             for c in range(self.COLUMNS):
                 self._layout.setColumnStretch(c, 1)
+        self._row_count = num_rows
+        self._update_aspect_height_cap()

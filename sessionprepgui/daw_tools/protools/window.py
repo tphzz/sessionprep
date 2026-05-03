@@ -6,7 +6,7 @@ Hosts per-tool tabs and manages a shared PTSL engine connection.
 from __future__ import annotations
 
 from PySide6.QtGui import QFont
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QRect, QSize, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -15,11 +15,18 @@ from PySide6.QtWidgets import (
     QLabel,
     QPlainTextEdit,
     QPushButton,
-    QTabWidget,
+    QSizePolicy,
+    QTabBar,
     QVBoxLayout,
+    QWidget,
 )
 
 from ...theme import apply_dark_theme
+from ...window_geometry import (
+    STARTUP_SCREEN_MARGIN,
+    calculate_startup_geometry,
+    screen_for_startup,
+)
 
 from .color_tool import ColorTool
 from .connection_common import (
@@ -28,6 +35,109 @@ from .connection_common import (
 )
 from .track_height_tool import TrackHeightTool
 from .worker_client import ProToolsWorkerClient
+
+PT_UTILS_WIDTH_FRACTION = 0.82
+PT_UTILS_COLOR_HEIGHT_FRACTION = 0.45
+PT_UTILS_COMFORT_HEIGHT = 16
+
+
+class _ToolTabs(QWidget):
+    """Tab bar plus one active tool widget.
+
+    Unlike QTabWidget, inactive tools are not kept in a stacked layout, so
+    they cannot contribute hidden-page minimum sizes.
+    """
+
+    currentChanged = Signal(int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._widgets: list[QWidget] = []
+        self._current_index = -1
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        self._tab_bar = QTabBar()
+        self._tab_bar.setDocumentMode(True)
+        self._tab_bar.currentChanged.connect(self._on_tab_changed)
+        layout.addWidget(self._tab_bar)
+
+        self._content = QWidget()
+        self._content_layout = QVBoxLayout(self._content)
+        self._content_layout.setContentsMargins(0, 0, 0, 0)
+        self._content_layout.setSpacing(0)
+        layout.addWidget(self._content, 1)
+
+    def setDocumentMode(self, enabled: bool):
+        self._tab_bar.setDocumentMode(enabled)
+
+    def tabBar(self) -> QTabBar:
+        return self._tab_bar
+
+    def addTab(self, widget: QWidget, label: str):
+        index = len(self._widgets)
+        self._widgets.append(widget)
+        widget.setParent(None)
+        self._tab_bar.addTab(label)
+        if self._current_index < 0:
+            self._tab_bar.setCurrentIndex(index)
+            self._set_current_index(index)
+        return index
+
+    def currentWidget(self) -> QWidget | None:
+        if 0 <= self._current_index < len(self._widgets):
+            return self._widgets[self._current_index]
+        return None
+
+    def setCurrentWidget(self, widget: QWidget):
+        try:
+            index = self._widgets.index(widget)
+        except ValueError:
+            return
+        self._tab_bar.setCurrentIndex(index)
+        self._set_current_index(index)
+
+    def _on_tab_changed(self, index: int):
+        self._set_current_index(index)
+        self.currentChanged.emit(index)
+
+    def _set_current_index(self, index: int):
+        if index == self._current_index or not (0 <= index < len(self._widgets)):
+            return
+
+        current = self.currentWidget()
+        if current is not None:
+            self._content_layout.removeWidget(current)
+            current.setParent(None)
+
+        self._current_index = index
+        widget = self._widgets[index]
+        widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self._content_layout.addWidget(widget)
+        widget.show()
+        self.updateGeometry()
+
+    def minimumSizeHint(self) -> QSize:
+        return self._current_tool_hint(super().minimumSizeHint(), minimum=True)
+
+    def sizeHint(self) -> QSize:
+        return self._current_tool_hint(super().sizeHint(), minimum=False)
+
+    def _current_tool_hint(self, base: QSize, *, minimum: bool) -> QSize:
+        current = self.currentWidget()
+        if current is None:
+            return base
+        page_hint = current.minimumSizeHint() if minimum else current.sizeHint()
+        tab_hint = (
+            self._tab_bar.minimumSizeHint()
+            if minimum else self._tab_bar.sizeHint()
+        )
+        return QSize(
+            max(page_hint.width(), tab_hint.width()),
+            page_hint.height() + tab_hint.height(),
+        )
 
 
 class ProToolsUtilsWindow(QDialog):
@@ -39,7 +149,7 @@ class ProToolsUtilsWindow(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Pro Tools Utils")
         self.setWindowFlag(Qt.Window, True)
-        self.setMinimumSize(600, 300)
+        self.setMinimumSize(600, 220)
         self.setAttribute(Qt.WA_DeleteOnClose, False)  # reuse window
 
         self._config = config
@@ -52,6 +162,8 @@ class ProToolsUtilsWindow(QDialog):
         self._client: ProToolsWorkerClient | None = None
         self._closing = False
         self._suppress_next_show_connect = False
+        self._initial_geometry_applied = False
+        self._applying_geometry = False
 
         self._init_ui()
         apply_dark_theme(self)
@@ -80,7 +192,7 @@ class ProToolsUtilsWindow(QDialog):
         layout.addLayout(header)
 
         # Tab widget for tools
-        self._tabs = QTabWidget()
+        self._tabs = _ToolTabs()
         self._tabs.setDocumentMode(True)
         layout.addWidget(self._tabs, 1)
 
@@ -89,7 +201,137 @@ class ProToolsUtilsWindow(QDialog):
         self._tabs.addTab(self._color_tool, "Color Picker")
         self._track_height_tool = TrackHeightTool(self._config, self)
         self._tabs.addTab(self._track_height_tool, "Track Heights")
+        self._tabs.currentChanged.connect(self._on_tool_tab_changed)
         self._update_connection_button()
+
+    # ── Window sizing ────────────────────────────────────────
+
+    def _available_geometry(self):
+        screen = self.screen() or screen_for_startup()
+        if screen is None:
+            return None
+        return screen.availableGeometry()
+
+    def _tool_content_width(self, window_width: int) -> int:
+        layout = self.layout()
+        if layout is None:
+            return max(1, window_width)
+        margins = layout.contentsMargins()
+        return max(1, window_width - margins.left() - margins.right())
+
+    def _chrome_height_for_tool(self, tool_height: int) -> int:
+        layout = self.layout()
+        if layout is None:
+            return tool_height
+        margins = layout.contentsMargins()
+        spacing = layout.spacing()
+        header_height = max(
+            self._connection_btn.sizeHint().height(),
+            self._on_top_cb.sizeHint().height(),
+        )
+        tab_height = self._tabs.tabBar().sizeHint().height()
+        return (
+            margins.top()
+            + margins.bottom()
+            + header_height
+            + tab_height
+            + tool_height
+            + spacing * 2
+            + PT_UTILS_COMFORT_HEIGHT
+        )
+
+    def _color_picker_window_height(self, window_width: int) -> int:
+        content_width = self._tool_content_width(window_width)
+        tool_height = self._color_tool.preferred_compact_height_for_width(
+            content_width,
+            use_minimum_grid_height=True,
+        )
+        return self._chrome_height_for_tool(tool_height)
+
+    def _track_heights_window_height(self, window_width: int) -> int:
+        content_width = self._tool_content_width(window_width)
+        tool_height = self._track_height_tool.preferred_expanded_height_for_width(
+            content_width
+        )
+        return self._chrome_height_for_tool(tool_height)
+
+    def _clamp_window_height(self, height: int, available) -> int:
+        if available is None:
+            return max(self.minimumHeight(), height)
+        max_height = max(1, available.height() - STARTUP_SCREEN_MARGIN * 2)
+        return min(max(self.minimumHeight(), height), max_height)
+
+    def _apply_initial_geometry(self):
+        available = self._available_geometry()
+        if available is None:
+            self._set_geometry_programmatically(QRect(0, 0, 1280, 420))
+            self._initial_geometry_applied = True
+            return
+
+        base = calculate_startup_geometry(
+            available,
+            self.minimumSizeHint(),
+            width_fraction=PT_UTILS_WIDTH_FRACTION,
+            height_fraction=PT_UTILS_COLOR_HEIGHT_FRACTION,
+        )
+        width = base.width()
+        height = self._clamp_window_height(
+            self._color_picker_window_height(width),
+            available,
+        )
+        geometry = QRect(
+            available.x() + (available.width() - width) // 2,
+            available.y() + (available.height() - height) // 2,
+            width,
+            height,
+        )
+        self._set_geometry_programmatically(geometry)
+        self._initial_geometry_applied = True
+
+    def _on_tool_tab_changed(self, _index: int):
+        if not self._closing:
+            QTimer.singleShot(0, self._resize_for_current_tab)
+
+    def _resize_for_current_tab(self):
+        if self._closing:
+            return
+
+        available = self._available_geometry()
+        current = self.geometry()
+        current_tool = self._tabs.currentWidget()
+        if current_tool is self._track_height_tool:
+            target_height = self._track_heights_window_height(current.width())
+        else:
+            target_height = self._color_picker_window_height(current.width())
+
+        desired_height = self._clamp_window_height(
+            target_height,
+            available,
+        )
+        if desired_height == current.height():
+            return
+
+        new_geometry = QRect(current)
+        new_geometry.setHeight(desired_height)
+        if available is not None:
+            max_bottom = available.bottom() - STARTUP_SCREEN_MARGIN
+            if new_geometry.bottom() > max_bottom:
+                new_geometry.moveTop(
+                    max(available.top(), max_bottom - desired_height + 1)
+                )
+            if new_geometry.left() < available.left():
+                new_geometry.moveLeft(available.left())
+            if new_geometry.right() > available.right():
+                new_geometry.moveRight(available.right())
+        self._set_geometry_programmatically(new_geometry)
+
+    def _set_geometry_programmatically(self, geometry: QRect):
+        self._applying_geometry = True
+        self.setGeometry(geometry)
+        QTimer.singleShot(150, self._clear_programmatic_geometry_flag)
+
+    def _clear_programmatic_geometry_flag(self):
+        self._applying_geometry = False
 
     # ── Connection management ────────────────────────────────────────
 
@@ -105,7 +347,7 @@ class ProToolsUtilsWindow(QDialog):
         flags |= Qt.WindowCloseButtonHint | Qt.WindowMinMaxButtonsHint
         self.setWindowFlags(flags)
         if was_visible:
-            self.setGeometry(geo)
+            self._set_geometry_programmatically(geo)
             self._suppress_next_show_connect = True
             self.show()
 
@@ -225,6 +467,8 @@ class ProToolsUtilsWindow(QDialog):
     def showEvent(self, event):
         super().showEvent(event)
         self._closing = False
+        if not self._initial_geometry_applied:
+            self._apply_initial_geometry()
         if self._suppress_next_show_connect:
             self._suppress_next_show_connect = False
             return
@@ -237,7 +481,16 @@ class ProToolsUtilsWindow(QDialog):
     def closeEvent(self, event):
         self._closing = True
         self._disconnect()
+        self._reset_layout_state_for_next_show()
         super().closeEvent(event)
+
+    def _reset_layout_state_for_next_show(self):
+        self._applying_geometry = True
+        try:
+            self._tabs.setCurrentWidget(self._color_tool)
+            self._initial_geometry_applied = False
+        finally:
+            self._applying_geometry = False
 
 
 class _ConnectionDialog(QDialog):
