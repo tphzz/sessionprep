@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
+import platform
 import sys
+import traceback
 from typing import Any
 
 from sessionpreplib.daw_processors import ptsl_helpers as ptslh
@@ -15,30 +19,77 @@ from .connection_common import (
 )
 
 
+log = logging.getLogger(__name__)
+
+
+def _worker_log_level() -> int | None:
+    raw = os.environ.get("SP_LOG_LEVEL", "").strip().upper()
+    if raw == "NONE":
+        return None
+    if raw:
+        level = getattr(logging, raw, None)
+        if isinstance(level, int):
+            return level
+    return logging.INFO
+
+
+def _configure_worker_logging() -> None:
+    """Configure worker diagnostics on stderr without touching stdout."""
+    level = _worker_log_level()
+    if level is None:
+        logging.disable(logging.CRITICAL)
+        return
+
+    logging.disable(logging.NOTSET)
+    root = logging.getLogger()
+    root.setLevel(level)
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setLevel(level)
+    handler.setFormatter(
+        logging.Formatter("[worker %(levelname)s] %(name)s: %(message)s")
+    )
+    root.handlers.clear()
+    root.addHandler(handler)
+
+
 class ProToolsWorker:
     """Owns the py-ptsl engine outside the Qt GUI process."""
 
     def __init__(self):
         self._engine = None
+        log.debug("Pro Tools worker object created")
 
     def close(self):
         if self._engine is not None:
+            log.debug("Closing Pro Tools worker engine")
             try:
                 self._engine.close()
             except Exception:
-                pass
+                log.debug(
+                    "Failed to close Pro Tools worker engine:\n%s",
+                    traceback.format_exc(),
+                )
             self._engine = None
 
     def handle(self, method: str, params: dict[str, Any]) -> Any:
+        log.debug("Handling Pro Tools worker request: method=%s", method)
         if method == "connect":
             if self._engine is None:
+                log.debug("Creating Pro Tools PTSL engine")
                 self._engine = create_ptsl_engine_with_timeout()
+                log.debug("Created Pro Tools PTSL engine")
+            log.debug(
+                "Waiting for Pro Tools host readiness: timeout=%.1fs",
+                PTSL_HOST_READY_TIMEOUT_SECONDS,
+            )
             if not ptslh.wait_for_host_ready(
                 self._engine,
                 timeout=PTSL_HOST_READY_TIMEOUT_SECONDS,
                 sleep_time=0.25,
             ):
+                log.debug("Pro Tools host readiness check did not complete")
                 raise RuntimeError("Pro Tools is still starting.")
+            log.debug("Pro Tools host readiness confirmed")
             return {"connected": True}
         if method == "disconnect":
             self.close()
@@ -48,6 +99,10 @@ class ProToolsWorker:
             return {"connected": True}
         if method == "run_command":
             self._require_engine()
+            log.debug(
+                "Running Pro Tools command through worker: command=%r",
+                params.get("command"),
+            )
             return ptslh.run_command(
                 self._engine,
                 params.get("command"),
@@ -58,12 +113,15 @@ class ProToolsWorker:
         if method == "get_color_palette":
             self._require_engine()
             target = params.get("target") or "CPTarget_Tracks"
+            log.debug("Fetching Pro Tools color palette: target=%s", target)
             return ptslh.get_color_palette(self._engine, target=target)
         if method == "get_selected_track_names":
             self._require_engine()
+            log.debug("Fetching selected Pro Tools track names")
             return ptslh.get_selected_track_names(self._engine)
         if method == "set_track_color":
             self._require_engine()
+            log.debug("Setting Pro Tools track color through worker")
             return ptslh.set_track_color(
                 self._engine,
                 color_index=int(params["color_index"]),
@@ -72,6 +130,7 @@ class ProToolsWorker:
             )
         if method == "get_track_list":
             self._require_engine()
+            log.debug("Fetching Pro Tools track list")
             resp = ptslh.run_command(
                 self._engine,
                 "CId_GetTrackList",
@@ -80,6 +139,7 @@ class ProToolsWorker:
             return list((resp or {}).get("track_list", []))
         if method == "set_track_height":
             self._require_engine()
+            log.debug("Setting Pro Tools track height through worker")
             return ptslh.set_track_height(
                 self._engine,
                 params["height"],
@@ -99,6 +159,14 @@ def _write_response(payload: dict[str, Any]):
 
 
 def main() -> int:
+    _configure_worker_logging()
+    log.debug(
+        "Pro Tools worker process started: executable=%r argv=%r platform=%s cwd=%r",
+        sys.executable,
+        sys.argv,
+        platform.platform(),
+        os.getcwd(),
+    )
     worker = ProToolsWorker()
     try:
         for line in sys.stdin:
@@ -109,12 +177,28 @@ def main() -> int:
             try:
                 request = json.loads(line)
                 request_id = request.get("id")
+                log.debug(
+                    "Received Pro Tools worker JSON request: id=%r method=%r",
+                    request_id,
+                    request.get("method"),
+                )
                 result = worker.handle(
                     str(request.get("method") or ""),
                     request.get("params") or {},
                 )
+                log.debug(
+                    "Completed Pro Tools worker JSON request: id=%r method=%r",
+                    request_id,
+                    request.get("method"),
+                )
                 _write_response({"id": request_id, "ok": True, "result": result})
             except Exception as exc:
+                log.error(
+                    "Pro Tools worker request failed: request_id=%r error=%s\n%s",
+                    request.get("id"),
+                    exc,
+                    traceback.format_exc(),
+                )
                 title, hint = connection_failure_message(exc)
                 _write_response(
                     {
@@ -126,6 +210,7 @@ def main() -> int:
                     }
                 )
     finally:
+        log.debug("Pro Tools worker process shutting down")
         worker.close()
     return 0
 

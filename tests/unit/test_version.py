@@ -57,6 +57,22 @@ def test_git_branch_appends_dev_hash(monkeypatch):
     assert _version.get_version(strict=True) == "0.3.5.dev0+gb2f7cf6"
 
 
+def test_invalid_exact_git_tag_falls_back_to_branch(monkeypatch):
+    _no_build_version(monkeypatch)
+    _no_metadata(monkeypatch)
+    monkeypatch.setattr(
+        _version.subprocess,
+        "run",
+        _git_runner({
+            ("describe", "--tags", "--exact-match", "HEAD"): "branch-build-0.3.5",
+            ("branch", "--show-current"): "0.3.5",
+            ("rev-parse", "--short=7", "HEAD"): "b2f7cf6",
+        }),
+    )
+
+    assert _version.get_version(strict=True) == "0.3.5.dev0+gb2f7cf6"
+
+
 def test_invalid_branch_base_fails(monkeypatch):
     _no_build_version(monkeypatch)
     _no_metadata(monkeypatch)

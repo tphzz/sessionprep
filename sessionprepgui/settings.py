@@ -65,7 +65,7 @@ _APP_DEFAULTS: dict[str, Any] = {
     "active_protools_track_height_preset": "Default",
     "protools_track_height_presets": {
         "Default": {
-            "scope": "selected",
+            "scope": "all",
             "mode": "track_type",
             "all_height": "THeight_Small",
             "heights": {

@@ -6,6 +6,8 @@ by the isolated connection probe process.
 
 from __future__ import annotations
 
+import logging
+
 PTSL_HOST = "127.0.0.1"
 PTSL_PORT = 31416
 PTSL_PREFLIGHT_TIMEOUT_SECONDS = 1.0
@@ -14,6 +16,8 @@ PTSL_CONNECT_TIMEOUT_MS = 15000
 PTSL_READ_TIMEOUT_MS = 10000
 PTSL_MUTATION_TIMEOUT_MS = 15000
 PTSL_HOST_READY_TIMEOUT_SECONDS = 5.0
+
+log = logging.getLogger(__name__)
 
 
 def connection_failure_message(exc: Exception) -> tuple[str, str]:
@@ -76,12 +80,25 @@ def connection_button_state(state: str) -> tuple[str, str]:
 
 def create_ptsl_engine_with_timeout():
     """Create a PTSL engine with bounded synchronous gRPC request timeouts."""
+    log.debug(
+        "Creating PTSL engine with handshake timeout: host=%s port=%s timeout=%.1fs",
+        PTSL_HOST,
+        PTSL_PORT,
+        PTSL_HANDSHAKE_TIMEOUT_SECONDS,
+    )
     import ptsl
     from ptsl import Engine
 
     original_send = ptsl.Client._send_sync_request
 
     def send_with_timeout(client, command_id, request_body_json, task_id=""):
+        log.debug(
+            "Sending PTSL handshake/request with timeout: command_id=%r "
+            "task_id=%r timeout=%.1fs",
+            command_id,
+            task_id,
+            PTSL_HANDSHAKE_TIMEOUT_SECONDS,
+        )
         request = ptsl.PTSL_pb2.Request(
             header=ptsl.PTSL_pb2.RequestHeader(
                 task_id=task_id,
@@ -98,9 +115,11 @@ def create_ptsl_engine_with_timeout():
 
     try:
         ptsl.Client._send_sync_request = send_with_timeout
-        return Engine(
+        engine = Engine(
             company_name="SessionPrep",
             application_name="Pro Tools Utils",
         )
+        log.debug("Created PTSL engine for Pro Tools Utils")
+        return engine
     finally:
         ptsl.Client._send_sync_request = original_send

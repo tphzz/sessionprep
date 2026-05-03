@@ -103,10 +103,14 @@ def _build_version_from_file() -> str | None:
 
 def _git_version(*, strict: bool) -> str | None:
     root = _repo_root()
+    invalid_exact_tag_error: VersionResolutionError | None = None
 
     tag = _git(["describe", "--tags", "--exact-match", "HEAD"], cwd=root)
     if tag:
-        return _normalize_version(tag, source="git tag")
+        try:
+            return _normalize_version(tag, source="git tag")
+        except VersionResolutionError as exc:
+            invalid_exact_tag_error = exc
 
     branch = _git(["branch", "--show-current"], cwd=root)
     commit = _git(["rev-parse", "--short=7", "HEAD"], cwd=root)
@@ -116,6 +120,9 @@ def _git_version(*, strict: bool) -> str | None:
             f"{base}.dev0+g{commit}",
             source="git branch and commit",
         )
+
+    if invalid_exact_tag_error is not None and strict:
+        raise invalid_exact_tag_error
 
     if strict:
         raise VersionResolutionError(

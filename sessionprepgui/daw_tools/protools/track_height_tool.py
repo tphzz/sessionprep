@@ -156,6 +156,12 @@ def _default_preset() -> dict[str, Any]:
     }
 
 
+def _old_default_preset() -> dict[str, Any]:
+    preset = _default_preset()
+    preset["scope"] = "selected"
+    return preset
+
+
 def _normalize_track_type(value: Any) -> str:
     if isinstance(value, int):
         return _INT_TRACK_TYPES.get(value, "TT_Unknown")
@@ -184,6 +190,13 @@ def _normalize_preset(data: Any) -> dict[str, Any]:
         for track_type, height in heights.items():
             if isinstance(track_type, str) and height in valid:
                 preset["heights"][track_type] = height
+    return preset
+
+
+def _migrate_default_preset_scope(preset: dict[str, Any]) -> dict[str, Any]:
+    """Migrate the old built-in Default preset from selected to all tracks."""
+    if _normalize_preset(preset) == _old_default_preset():
+        return _default_preset()
     return preset
 
 
@@ -404,6 +417,10 @@ class TrackHeightTool(QWidget):
         }
         if "Default" not in self._presets_data:
             self._presets_data["Default"] = _default_preset()
+        else:
+            self._presets_data["Default"] = _migrate_default_preset_scope(
+                self._presets_data["Default"]
+            )
 
         current = app.get("active_protools_track_height_preset", "Default")
         if current not in self._presets_data:
