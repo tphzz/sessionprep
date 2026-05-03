@@ -99,7 +99,9 @@ class PreferencesDialog(QDialog):
         tabs.addTab(self._build_preset_tab(), "Config Presets")
 
         btn_box = QDialogButtonBox(QDialogButtonBox.Cancel | QDialogButtonBox.Save)
-        btn_box.button(QDialogButtonBox.Save).setDefault(True)
+        save_btn = btn_box.button(QDialogButtonBox.Save)
+        save_btn.setText("Save Preferences")
+        save_btn.setDefault(True)
         btn_box.accepted.connect(self._on_save)
         btn_box.rejected.connect(self.reject)
         root.addWidget(btn_box)

@@ -16,7 +16,6 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QApplication,
-    QComboBox,
     QFileDialog,
     QHeaderView,
     QLabel,
@@ -627,24 +626,7 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
 
         self._analysis_toolbar.addSeparator()
 
-        self._analysis_toolbar.addWidget(QLabel("  Group:"))
-        self._group_preset_combo = QComboBox()
-        self._group_preset_combo.setMinimumWidth(120)
-        self._populate_group_preset_combo()
-        self._group_preset_combo.currentTextChanged.connect(
-            self._on_group_preset_changed)
-        self._analysis_toolbar.addWidget(self._group_preset_combo)
-
-        self._analysis_toolbar.addSeparator()
-
-        self._analysis_toolbar.addWidget(QLabel("  Config:"))
-        self._config_preset_combo = QComboBox()
-        self._config_preset_combo.setMinimumWidth(120)
-        self._populate_config_preset_combo()
-        self._config_preset_combo.currentTextChanged.connect(
-            self._on_toolbar_config_preset_changed)
-        self._analysis_toolbar.addWidget(self._config_preset_combo)
-
+        # Preset selectors live in their respective Phase 2 tabs.
         # ── Spacer ─────────────────────────────────────────────────────
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
@@ -663,6 +645,8 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
 
     def _populate_config_preset_combo(self):
         """Fill the config-preset combo from config, preserving the current selection."""
+        if not hasattr(self, "_config_preset_combo"):
+            return
         presets = self._config.get("config_presets",
                                    build_defaults().get("config_presets", {}))
         active = self._active_config_preset_name
@@ -679,6 +663,8 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
 
     def _populate_group_preset_combo(self):
         """Fill the group-preset combo from config, preserving the current selection."""
+        if not hasattr(self, "_group_preset_combo"):
+            return
         presets = self._config.get("group_presets",
                                    build_defaults().get("group_presets", {}))
         active = self._active_session_preset
@@ -978,9 +964,9 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
                             " has been updated in Preferences.\n\n"
                             "Your current session still uses its own"
                             " config. To apply the new preset defaults,"
-                            " use \u201cReset to Preset Defaults\u201d"
-                            " in the Config tab or switch presets via"
-                            " the toolbar.",
+                            " use \u201cRevert to Preset\u201d"
+                            " in the Config tab or choose another"
+                            " Config Preset.",
                         )
                     else:
                         self._on_analyze()

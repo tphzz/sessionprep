@@ -55,6 +55,24 @@ class GroupsMixin:  # pylint: disable=too-few-public-methods
         desc.setStyleSheet("color: #888; font-size: 9pt;")
         layout.addWidget(desc)
 
+        header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        header.setSpacing(8)
+        header.addWidget(QLabel("Group Preset:"))
+        self._group_preset_combo = QComboBox()
+        self._group_preset_combo.setMinimumWidth(140)
+        self._populate_group_preset_combo()
+        self._group_preset_combo.currentTextChanged.connect(
+            self._on_group_preset_changed)
+        header.addWidget(self._group_preset_combo)
+        header.addStretch()
+        revert_btn = QPushButton("Revert to Preset")
+        revert_btn.setToolTip(
+            "Replace session-local groups with the selected group preset")
+        revert_btn.clicked.connect(self._on_groups_tab_reset)
+        header.addWidget(revert_btn)
+        layout.addLayout(header)
+
         self._groups_tab_table = QTableWidget()
         self._groups_tab_table.setColumnCount(6)
         self._groups_tab_table.setHorizontalHeaderLabels(
@@ -96,10 +114,6 @@ class GroupsMixin:  # pylint: disable=too-few-public-methods
         remove_btn = QPushButton("Remove")
         remove_btn.clicked.connect(self._on_groups_tab_remove)
         btn_row.addWidget(remove_btn)
-
-        reset_btn = QPushButton("Reset from Preset")
-        reset_btn.clicked.connect(self._on_groups_tab_reset)
-        btn_row.addWidget(reset_btn)
 
         btn_row.addStretch()
 
@@ -416,7 +430,7 @@ class GroupsMixin:  # pylint: disable=too-few-public-methods
         self._refresh_group_combos()
 
     def _on_groups_tab_reset(self):
-        """Reset session groups to the active preset from preferences."""
+        """Revert session groups to the selected group preset."""
         self._merge_groups_from_preset()
 
     def _merge_groups_from_preset(self):
@@ -536,11 +550,11 @@ class GroupsMixin:  # pylint: disable=too-few-public-methods
         self._status_bar.showMessage(
             f"Auto-Group: assigned {assigned} of {len(ok_tracks)} tracks")
 
-    # ── Group preset switching (Analysis toolbar) ─────────────────────
+    # ── Group preset switching ────────────────────────────────────────
 
     @Slot(str)
     def _on_group_preset_changed(self, preset_name: str):
-        """Switch the active group preset from the Analysis toolbar combo."""
+        """Switch the active group preset from the Groups tab combo."""
         presets = self._config.get("group_presets",
                                    build_defaults().get("group_presets", {}))
         if preset_name not in presets:
@@ -548,11 +562,11 @@ class GroupsMixin:  # pylint: disable=too-few-public-methods
         self._active_session_preset = preset_name
         self._merge_groups_from_preset()
 
-    # ── Config preset switching (Analysis toolbar) ────────────────────
+    # ── Config preset switching ───────────────────────────────────────
 
     @Slot(str)
-    def _on_toolbar_config_preset_changed(self, name: str):
-        """Switch the active config preset from the Analysis toolbar combo."""
+    def _on_config_preset_changed(self, name: str):
+        """Switch the active config preset from the Config tab combo."""
         presets = self._config.get("config_presets",
                                    build_defaults().get("config_presets", {}))
         if name not in presets:

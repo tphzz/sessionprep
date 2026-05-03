@@ -14,6 +14,7 @@ from typing import Any
 from PySide6.QtCore import Qt, Slot, QSize
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
+    QComboBox,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -65,18 +66,29 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         layout = QVBoxLayout(page)
         layout.setContentsMargins(4, 4, 4, 4)
 
+        desc = QLabel(
+            "Session-local config adjustments. Changes here apply only to "
+            "the current session."
+        )
+        desc.setWordWrap(True)
+        desc.setStyleSheet("color: #888; font-size: 9pt;")
+        layout.addWidget(desc)
+
         # Header row
         header = QHBoxLayout()
         header.setSpacing(8)
-        self._session_preset_label = QLabel("Config Preset: —")
-        self._session_preset_label.setStyleSheet(
-            f"color: {COLORS['dim']}; font-style: italic;")
-        header.addWidget(self._session_preset_label)
+        header.addWidget(QLabel("Config Preset:"))
+        self._config_preset_combo = QComboBox()
+        self._config_preset_combo.setMinimumWidth(140)
+        self._populate_config_preset_combo()
+        self._config_preset_combo.currentTextChanged.connect(
+            self._on_config_preset_changed)
+        header.addWidget(self._config_preset_combo)
         header.addStretch()
-        reset_btn = QPushButton("Reset to Preset Defaults")
+        reset_btn = QPushButton("Revert to Preset")
         reset_btn.setToolTip(
             "Discard all session-specific changes and reload from the "
-            "global config preset.")
+            "selected config preset.")
         reset_btn.clicked.connect(self._on_session_config_reset)
         header.addWidget(reset_btn)
         layout.addLayout(header)
@@ -136,9 +148,7 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
     def _init_session_config(self):
         """Snapshot the active global config preset into session config."""
         self._session_config = copy.deepcopy(self._active_preset())
-        name = self._active_config_preset_name
-        self._session_preset_label.setText(f"Config Preset: {name}")
-        self._session_preset_label.setStyleSheet("")
+        self._populate_config_preset_combo()
         self._load_session_widgets(self._session_config)
         self._detail_tabs.setTabEnabled(_TAB_SESSION, True)
 
@@ -177,12 +187,12 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         self._update_daw_lifecycle_buttons()
 
     def _on_session_config_reset(self):
-        """Reset session config to the global config preset defaults."""
+        """Revert session config to the selected config preset."""
         preset = self._active_preset()
         self._session_config = copy.deepcopy(preset)
         self._load_session_widgets(self._session_config)
         self._on_daw_config_changed()
-        self._status_bar.showMessage("Session config reset to preset defaults.")
+        self._status_bar.showMessage("Session config reverted to preset.")
 
     # ── Slots: file / analysis ────────────────────────────────────────────
 

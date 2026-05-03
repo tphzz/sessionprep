@@ -223,13 +223,16 @@ class TrackHeightTool(QWidget):
         self._preset_panel.preset_renamed.connect(self._on_preset_renamed)
         self._preset_panel.preset_deleted.connect(self._on_preset_deleted)
         layout.addWidget(self._preset_panel)
-        preset_layout = self._preset_panel.layout()
-        self._save_btn = QPushButton("Save")
+        self._save_btn = self._preset_panel.add_trailing_button(
+            "Save Preset",
+            tooltip="Save changes to the active track-height preset",
+        )
         self._save_btn.clicked.connect(self._on_save_preset)
-        preset_layout.insertWidget(3, self._save_btn)
-        self._reset_btn = QPushButton("Reset to Defaults")
+        self._reset_btn = self._preset_panel.add_trailing_button(
+            "Restore Defaults",
+            tooltip="Load the built-in track-height defaults into this preset",
+        )
         self._reset_btn.clicked.connect(self._on_reset_defaults)
-        preset_layout.addWidget(self._reset_btn)
 
         controls = QHBoxLayout()
         self._controls_layout = controls
@@ -514,7 +517,9 @@ class TrackHeightTool(QWidget):
 
     def _on_reset_defaults(self):
         self._load_widgets(_default_preset())
-        self._set_warning_status("Defaults loaded. Press Save to update the preset.")
+        self._set_warning_status(
+            "Defaults restored. Click Save Preset to update the preset."
+        )
 
     def _update_mode_visibility(self):
         is_all = self._mode_combo.currentData() == "all"

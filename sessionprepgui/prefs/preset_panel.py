@@ -92,6 +92,14 @@ class NamedPresetPanel(QWidget):
 
     # ── UI setup ─────────────────────────────────────────────────────────
 
+    def add_trailing_button(self, text: str, *, tooltip: str = "") -> QPushButton:
+        """Add a caller-owned preset action at the end of the preset row."""
+        btn = QPushButton(text)
+        if tooltip:
+            btn.setToolTip(tooltip)
+        self.layout().addWidget(btn)
+        return btn
+
     def _init_ui(self, initial_names: list[str], label: str) -> None:
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)

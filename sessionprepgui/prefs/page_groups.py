@@ -90,17 +90,10 @@ class GroupsPage(QWidget):
         self._panel.preset_deleted.connect(self._on_deleted)
         layout.addWidget(self._panel)
 
-        # Reset-to-default button (groups-specific, not generic)
-        from PySide6.QtWidgets import QHBoxLayout, QPushButton
-        reset_row = QHBoxLayout()
-        reset_row.setContentsMargins(0, 0, 0, 0)
-        reset_btn = QPushButton("Reset to Default")
+        reset_btn = self._panel.add_trailing_button("Restore Defaults")
         reset_btn.setToolTip(
             "Replace the current preset's groups with the built-in defaults")
         reset_btn.clicked.connect(self._on_reset_default)
-        reset_row.addStretch()
-        reset_row.addWidget(reset_btn)
-        layout.addLayout(reset_row)
 
         self._groups_widget = GroupsTableWidget(
             color_provider=self._color_provider,
@@ -152,7 +145,7 @@ class GroupsPage(QWidget):
         from PySide6.QtWidgets import QMessageBox
         current = self._panel.current_name
         reply = QMessageBox.question(
-            self, "Reset to Default",
+            self, "Restore Defaults",
             f"Replace all groups in \u201c{current}\u201d with the "
             f"built-in defaults?\n\nThis cannot be undone.",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
