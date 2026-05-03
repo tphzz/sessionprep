@@ -870,15 +870,7 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
     @Slot(int)
     def _on_phase_tab_changed(self, index: int):
         if index == _PHASE_SETUP:
-            self._setup_table.resizeColumnsToContents()
-            # Shrink the splitter's left pane to fit the table content
-            total = sum(
-                self._setup_table.columnWidth(c)
-                for c in range(self._setup_table.columnCount())
-            ) + self._setup_table.verticalHeader().width() + 30  # margin
-            remaining = self._setup_splitter.width() - total
-            if remaining > 0:
-                self._setup_splitter.setSizes([total, remaining])
+            self._schedule_setup_splitter_fit()
 
     # ── HTML helpers ──────────────────────────────────────────────────────
 

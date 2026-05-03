@@ -9,6 +9,9 @@ import os
 log = logging.getLogger(__name__)
 from typing import Any
 
+_SETUP_TABLE_EXTRA_WIDTH = 30
+_SETUP_RIGHT_MIN_WIDTH = 360
+
 from PySide6.QtCore import Qt, Slot, QSize, QTimer
 from PySide6.QtGui import QAction, QColor, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
@@ -75,8 +78,6 @@ class DawMixin:  # pylint: disable=too-few-public-methods
         self._daw_check_label.setContentsMargins(6, 0, 0, 0)
         self._daw_check_label.setMaximumWidth(260)
         self._setup_toolbar.addWidget(self._daw_check_label)
-
-        self._setup_toolbar.addSeparator()
 
         self._reset_manifest_action = QAction("Reset DAW Track List", self)
         self._reset_manifest_action.setToolTip(
@@ -295,12 +296,63 @@ class DawMixin:  # pylint: disable=too-few-public-methods
         setup_splitter.addWidget(self._setup_right_stack)
         setup_splitter.setStretchFactor(0, 1)
         setup_splitter.setStretchFactor(1, 1)
-        QTimer.singleShot(0, lambda: setup_splitter.setSizes(
-            [setup_splitter.width() // 2, setup_splitter.width() // 2]))
+        self._schedule_setup_splitter_fit()
 
         layout.addWidget(setup_splitter, 1)
 
         return page
+
+    def _setup_table_content_width(self) -> int:
+        """Return the setup table width needed to show all columns."""
+        header = self._setup_table.horizontalHeader()
+        for col in range(self._setup_table.columnCount()):
+            header.setSectionResizeMode(col, QHeaderView.ResizeToContents)
+        self._setup_table.resizeColumnsToContents()
+        width = sum(
+            header.sectionSize(col)
+            for col in range(self._setup_table.columnCount())
+        )
+        self._apply_setup_table_column_modes()
+        return (
+            width
+            + self._setup_table.verticalHeader().width()
+            + _SETUP_TABLE_EXTRA_WIDTH
+        )
+
+    def _fit_setup_splitter_to_table(self):
+        """Fit the setup splitter so the left table starts without clipping."""
+        if not hasattr(self, "_setup_splitter"):
+            return
+        total_width = self._setup_splitter.width()
+        if total_width <= 0:
+            return
+
+        table_width = self._setup_table_content_width()
+        max_left_width = max(
+            self._setup_table.minimumWidth(),
+            total_width - _SETUP_RIGHT_MIN_WIDTH,
+        )
+        left_width = min(
+            max(table_width, self._setup_table.minimumWidth()),
+            max_left_width,
+        )
+        right_width = max(0, total_width - left_width)
+        self._setup_splitter.setSizes([left_width, right_width])
+
+    def _schedule_setup_splitter_fit(self):
+        """Fit after Qt finishes the current layout pass."""
+        QTimer.singleShot(0, self._fit_setup_splitter_to_table)
+
+    def _apply_setup_table_column_modes(self):
+        """Restore the intended setup-table resize behavior after auto-fit."""
+        header = self._setup_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.Fixed)
+        header.resizeSection(1, 24)
+        header.setSectionResizeMode(2, QHeaderView.Interactive)
+        header.setSectionResizeMode(3, QHeaderView.Fixed)
+        for col in range(4, self._setup_table.columnCount()):
+            header.setSectionResizeMode(col, QHeaderView.Interactive)
 
     # ── DAW processor helpers ─────────────────────────────────────────────
 

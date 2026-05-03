@@ -125,6 +125,7 @@ STYLESHEET = """
     QMenu { background-color: #2d2d2d; color: #dddddd; border: 1px solid #555; }
     QMenu::item:selected { background-color: #2a6db5; }
     QToolBar { background-color: #2d2d2d; border-bottom: 1px solid #555; spacing: 6px; padding: 2px; }
+    QToolBar::separator { background-color: #888888; width: 1px; margin: 5px 6px; }
     QToolBar QToolButton { color: #dddddd; padding: 4px 8px; background: transparent; border: none; }
     QToolBar QToolButton:hover { background-color: #3a3a3a; }
     QToolBar QToolButton:disabled { color: #666666; }

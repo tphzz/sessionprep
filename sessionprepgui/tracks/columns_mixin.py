@@ -313,18 +313,13 @@ class TrackColumnsMixin:  # pylint: disable=too-few-public-methods
         self._setup_table.setSortingEnabled(True)
         self._setup_table_populating = False
 
-        # Auto-fit columns to content
+        # Auto-fit columns to content, then restore interactive behavior.
         sh = self._setup_table.horizontalHeader()
         for col in range(self._setup_table.columnCount()):
             sh.setSectionResizeMode(col, QHeaderView.ResizeToContents)
         self._setup_table.resizeColumnsToContents()
-        sh.setSectionResizeMode(0, QHeaderView.Stretch)
-        sh.setSectionResizeMode(1, QHeaderView.Fixed)
-        sh.resizeSection(1, 24)
-        sh.setSectionResizeMode(2, QHeaderView.Interactive)
-        sh.setSectionResizeMode(3, QHeaderView.Fixed)
-        for col in range(4, self._setup_table.columnCount()):
-            sh.setSectionResizeMode(col, QHeaderView.Interactive)
+        self._apply_setup_table_column_modes()
+        self._schedule_setup_splitter_fit()
 
     # ── Classification override helpers ───────────────────────────────────
 
