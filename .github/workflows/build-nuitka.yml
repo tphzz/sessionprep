@@ -256,10 +256,18 @@ jobs:
       - name: Publish draft release
         shell: bash
         run: |
+          if [ "$RELEASE_MODE" = "tag" ]; then
+            RELEASE_TITLE="SessionPrep $REF_NAME"
+          else
+            RELEASE_TITLE="SessionPrep branch build: $REF_NAME"
+          fi
+
           packaging/github/publish-draft-release.sh \
             --download-run-id "$RUN_ID" \
             --artifact-root downloaded-artifacts \
+            --artifact-pattern "sessionprep-*" \
             --mode "$RELEASE_MODE" \
             --ref-name "$REF_NAME" \
             --target "$TARGET_SHA" \
-            --repo "$REPOSITORY"
+            --repo "$REPOSITORY" \
+            --release-title "$RELEASE_TITLE"

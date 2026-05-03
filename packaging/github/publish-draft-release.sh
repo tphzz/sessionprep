@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Publish SessionPrep build artifacts to a GitHub draft release.
+# Publish GitHub Actions build artifacts to a GitHub draft release.
 #
 # The script is intentionally usable outside GitHub Actions. In --dry-run mode
 # it validates inputs, filters artifacts, and stages selected files without
@@ -12,7 +12,7 @@ DEFAULT_ALLOWLIST="$SCRIPT_DIR/release-assets.allowlist"
 
 ARTIFACT_ROOT=""
 DOWNLOAD_RUN_ID=""
-ARTIFACT_PATTERN="sessionprep-*"
+ARTIFACT_PATTERN="*"
 ALLOWLIST="$DEFAULT_ALLOWLIST"
 STAGING_DIR="release-assets"
 MODE=""
@@ -52,7 +52,7 @@ Artifact source:
                            Default with --download-run-id: downloaded-artifacts
   --download-run-id ID     Download artifacts from this GitHub Actions run first.
   --artifact-pattern GLOB  Artifact name pattern used for downloads.
-                           Default: sessionprep-*
+                           Default: *
 
 Options:
   --allowlist FILE         Glob allowlist. Default: packaging/github/release-assets.allowlist
@@ -214,9 +214,9 @@ derive_release_metadata() {
 
     if [[ -z "$RELEASE_TITLE" ]]; then
         if [[ "$MODE" == "tag" ]]; then
-            RELEASE_TITLE="SessionPrep $RELEASE_TAG"
+            RELEASE_TITLE="$RELEASE_TAG"
         else
-            RELEASE_TITLE="SessionPrep branch build: $REF_NAME"
+            RELEASE_TITLE="Branch build: $REF_NAME"
         fi
     fi
 }
@@ -289,7 +289,7 @@ scan_zip_file() {
     local list_file
     log "Inspecting ZIP artifact: $zip_file"
 
-    list_file="$(mktemp "${TMPDIR:-/tmp}/sessionprep-release-zip-list.XXXXXX")"
+    list_file="$(mktemp "${TMPDIR:-/tmp}/github-release-zip-list.XXXXXX")"
     if ! unzip -Z1 "$zip_file" > "$list_file" 2>/dev/null; then
         rm -f "$list_file"
         die "Could not read ZIP artifact: $zip_file"
@@ -302,7 +302,7 @@ scan_zip_file() {
         name="$(basename "$entry")"
         matches_allowlist "$name" || continue
         local tmp_entry
-        tmp_entry="$(mktemp "${TMPDIR:-/tmp}/sessionprep-release-asset.XXXXXX")"
+        tmp_entry="$(mktemp "${TMPDIR:-/tmp}/github-release-asset.XXXXXX")"
         if ! unzip -p "$zip_file" "$entry" > "$tmp_entry"; then
             rm -f "$tmp_entry"
             die "Could not extract '$entry' from ZIP artifact: $zip_file"

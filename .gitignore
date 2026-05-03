@@ -38,6 +38,9 @@ sessionpreplib/_build_version.py
 _private/
 _private/*
 
+downloaded-artifacts
+downloaded-artifacts/*
+
 GEMINI.md
 
 # Temporary build directories

@@ -53,41 +53,41 @@ def test_release_script_selects_allowed_files_from_dirs_and_zips(tmp_path):
     artifact_root.mkdir()
     allowlist = write_allowlist(
         tmp_path / "allowlist.txt",
-        "sessionprep-*-macos-arm64.dmg",
-        "sessionprep-*-linux-x64.tar.gz",
+        "example-*-macos-arm64.dmg",
+        "example-*-linux-x64.tar.gz",
     )
 
-    direct_dir = artifact_root / "sessionprep-linux-x64"
+    direct_dir = artifact_root / "example-linux-x64"
     direct_dir.mkdir()
-    (direct_dir / "sessionprep-0.3.5-linux-x64.tar.gz").write_bytes(b"tarball")
-    (direct_dir / "sessionprep-linux-x64").write_bytes(b"loose binary")
+    (direct_dir / "example-1.2.3-linux-x64.tar.gz").write_bytes(b"tarball")
+    (direct_dir / "example-linux-x64").write_bytes(b"loose binary")
 
-    zip_path = artifact_root / "sessionprep-macos-arm64.zip"
+    zip_path = artifact_root / "example-macos-arm64.zip"
     with zipfile.ZipFile(zip_path, "w") as zf:
-        zf.writestr("dist/sessionprep-0.3.5-macos-arm64.dmg", b"dmg")
-        zf.writestr("dist/sessionprep-0.3.5-macos-arm64.build", b"build")
+        zf.writestr("dist/example-1.2.3-macos-arm64.dmg", b"dmg")
+        zf.writestr("dist/example-1.2.3-macos-arm64.build", b"build")
 
     result = run_script(tmp_path, *base_args(tmp_path, artifact_root, allowlist))
 
     assert result.returncode == 0, result.stderr + result.stdout
     staging = tmp_path / "release-assets"
-    assert (staging / "sessionprep-0.3.5-linux-x64.tar.gz").read_bytes() == b"tarball"
-    assert (staging / "sessionprep-0.3.5-macos-arm64.dmg").read_bytes() == b"dmg"
-    assert not (staging / "sessionprep-linux-x64").exists()
+    assert (staging / "example-1.2.3-linux-x64.tar.gz").read_bytes() == b"tarball"
+    assert (staging / "example-1.2.3-macos-arm64.dmg").read_bytes() == b"dmg"
+    assert not (staging / "example-linux-x64").exists()
     assert "Dry run complete" in result.stdout
 
 
 def test_release_script_fails_on_duplicate_asset_names(tmp_path):
     artifact_root = tmp_path / "artifacts"
     artifact_root.mkdir()
-    allowlist = write_allowlist(tmp_path / "allowlist.txt", "sessionprep-*.dmg")
+    allowlist = write_allowlist(tmp_path / "allowlist.txt", "example-*.dmg")
 
     first = artifact_root / "first"
     second = artifact_root / "second"
     first.mkdir()
     second.mkdir()
-    (first / "sessionprep-0.3.5-macos-arm64.dmg").write_bytes(b"first")
-    (second / "sessionprep-0.3.5-macos-arm64.dmg").write_bytes(b"second")
+    (first / "example-1.2.3-macos-arm64.dmg").write_bytes(b"first")
+    (second / "example-1.2.3-macos-arm64.dmg").write_bytes(b"second")
 
     result = run_script(tmp_path, *base_args(tmp_path, artifact_root, allowlist))
 
@@ -98,8 +98,8 @@ def test_release_script_fails_on_duplicate_asset_names(tmp_path):
 def test_release_script_fails_when_no_assets_match(tmp_path):
     artifact_root = tmp_path / "artifacts"
     artifact_root.mkdir()
-    allowlist = write_allowlist(tmp_path / "allowlist.txt", "sessionprep-*.dmg")
-    (artifact_root / "sessionprep-linux-x64").write_bytes(b"loose binary")
+    allowlist = write_allowlist(tmp_path / "allowlist.txt", "example-*.dmg")
+    (artifact_root / "example-linux-x64").write_bytes(b"loose binary")
 
     result = run_script(tmp_path, *base_args(tmp_path, artifact_root, allowlist))
 
@@ -110,7 +110,7 @@ def test_release_script_fails_when_no_assets_match(tmp_path):
 def test_release_script_rejects_invalid_mode(tmp_path):
     artifact_root = tmp_path / "artifacts"
     artifact_root.mkdir()
-    allowlist = write_allowlist(tmp_path / "allowlist.txt", "sessionprep-*.dmg")
+    allowlist = write_allowlist(tmp_path / "allowlist.txt", "example-*.dmg")
 
     args = base_args(tmp_path, artifact_root, allowlist)
     args[args.index("--mode") + 1] = "invalid"
@@ -124,7 +124,7 @@ def test_release_script_rejects_invalid_mode(tmp_path):
 def test_release_script_rejects_invalid_download_run_id(tmp_path):
     artifact_root = tmp_path / "artifacts"
     artifact_root.mkdir()
-    allowlist = write_allowlist(tmp_path / "allowlist.txt", "sessionprep-*.dmg")
+    allowlist = write_allowlist(tmp_path / "allowlist.txt", "example-*.dmg")
 
     args = base_args(tmp_path, artifact_root, allowlist)
     args[args.index("--artifact-root") : args.index("--artifact-root") + 2] = []
@@ -161,8 +161,8 @@ if [[ "$1 $2 $3" == "run download 12345" ]]; then
         ;;
     esac
   done
-  mkdir -p "$out_dir/sessionprep-linux-x64"
-  printf artifact > "$out_dir/sessionprep-linux-x64/sessionprep-0.3.5-linux-x64.tar.gz"
+  mkdir -p "$out_dir/example-linux-x64"
+  printf artifact > "$out_dir/example-linux-x64/example-1.2.3-linux-x64.tar.gz"
   exit 0
 fi
 exit 2
@@ -172,7 +172,7 @@ exit 2
     fake_gh.chmod(0o755)
 
     artifact_root = tmp_path / "downloaded-artifacts"
-    allowlist = write_allowlist(tmp_path / "allowlist.txt", "sessionprep-*-linux-x64.tar.gz")
+    allowlist = write_allowlist(tmp_path / "allowlist.txt", "example-*-linux-x64.tar.gz")
     args = base_args(tmp_path, artifact_root, allowlist)
     args.extend(["--download-run-id", "12345"])
 
@@ -183,14 +183,14 @@ exit 2
     )
 
     assert result.returncode == 0, result.stderr + result.stdout
-    assert (tmp_path / "release-assets" / "sessionprep-0.3.5-linux-x64.tar.gz").read_bytes() == b"artifact"
+    assert (tmp_path / "release-assets" / "example-1.2.3-linux-x64.tar.gz").read_bytes() == b"artifact"
     assert "--pattern" in gh_log.read_text(encoding="utf-8")
 
 
 def test_release_script_rejects_staging_dir_inside_artifact_root(tmp_path):
     artifact_root = tmp_path / "artifacts"
     artifact_root.mkdir()
-    allowlist = write_allowlist(tmp_path / "allowlist.txt", "sessionprep-*.dmg")
+    allowlist = write_allowlist(tmp_path / "allowlist.txt", "example-*.dmg")
 
     args = base_args(tmp_path, artifact_root, allowlist)
     args[args.index("--staging-dir") + 1] = str(artifact_root / "release-assets")
@@ -204,8 +204,8 @@ def test_release_script_rejects_staging_dir_inside_artifact_root(tmp_path):
 def test_release_script_fails_on_corrupt_zip(tmp_path):
     artifact_root = tmp_path / "artifacts"
     artifact_root.mkdir()
-    allowlist = write_allowlist(tmp_path / "allowlist.txt", "sessionprep-*.dmg")
-    (artifact_root / "sessionprep-macos-arm64.zip").write_bytes(b"not a zip")
+    allowlist = write_allowlist(tmp_path / "allowlist.txt", "example-*.dmg")
+    (artifact_root / "example-macos-arm64.zip").write_bytes(b"not a zip")
 
     result = run_script(tmp_path, *base_args(tmp_path, artifact_root, allowlist))
 
