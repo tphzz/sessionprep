@@ -78,13 +78,12 @@ class DawMixin:  # pylint: disable=too-few-public-methods
 
         self._setup_toolbar.addSeparator()
 
-        self._reset_manifest_action = QAction("Reset to Default", self)
+        self._reset_manifest_action = QAction("Reset DAW Track List", self)
         self._reset_manifest_action.setToolTip(
-            "Remove all duplicates and restore default track names")
+            "Remove duplicate DAW tracks and restore default DAW track names")
         self._reset_manifest_action.setEnabled(False)
         self._reset_manifest_action.triggered.connect(
             self._on_reset_manifest)
-        self._setup_toolbar.addAction(self._reset_manifest_action)
 
         self._setup_toolbar.addSeparator()
 
@@ -95,6 +94,7 @@ class DawMixin:  # pylint: disable=too-few-public-methods
         self._use_processed_cb.setEnabled(False)
         self._use_processed_cb.toggled.connect(self._on_use_processed_toggled)
         self._setup_toolbar.addWidget(self._use_processed_cb)
+        self._setup_toolbar.addAction(self._reset_manifest_action)
 
         # ── Spacer ─────────────────────────────────────────────────────
         spacer = QWidget()
@@ -164,6 +164,13 @@ class DawMixin:  # pylint: disable=too-few-public-methods
         self._auto_assign_action.setEnabled(False)
         self._auto_assign_action.triggered.connect(self._on_auto_assign)
         self._setup_toolbar.addAction(self._auto_assign_action)
+
+        self._unassign_all_action = QAction("Unassign All", self)
+        self._unassign_all_action.setToolTip(
+            "Clear all local DAW folder assignments")
+        self._unassign_all_action.setEnabled(False)
+        self._unassign_all_action.triggered.connect(self._on_unassign_all)
+        self._setup_toolbar.addAction(self._unassign_all_action)
 
         self._transfer_action = QAction("Create", self)
         self._transfer_action.setEnabled(False)
@@ -330,6 +337,7 @@ class DawMixin:  # pylint: disable=too-few-public-methods
             self._fetch_action.setEnabled(False)
             self._fetch_menu_button.setEnabled(False)
             self._auto_assign_action.setEnabled(False)
+            self._unassign_all_action.setEnabled(False)
             self._transfer_action.setEnabled(False)
             self._reset_manifest_action.setEnabled(False)
             return
@@ -345,6 +353,7 @@ class DawMixin:  # pylint: disable=too-few-public-methods
         has_folders = bool(dp_state.get("folders"))
         has_assignments = bool(dp_state.get("assignments"))
         self._auto_assign_action.setEnabled(has_folders)
+        self._unassign_all_action.setEnabled(has_assignments)
         self._transfer_action.setEnabled(has_processor and has_assignments)
 
         batch_mode = getattr(self, "_batch_mode_action", None)
@@ -616,6 +625,7 @@ class DawMixin:  # pylint: disable=too-few-public-methods
         self._transfer_action.setEnabled(False)
         self._fetch_action.setEnabled(False)
         self._fetch_menu_button.setEnabled(False)
+        self._unassign_all_action.setEnabled(False)
         self._run_daw_check_then(self._do_daw_transfer)
 
     def _do_daw_transfer(self):
@@ -861,6 +871,38 @@ class DawMixin:  # pylint: disable=too-few-public-methods
     # ── Auto-Assign ──────────────────────────────────────────────────────
 
     @Slot()
+    def _on_unassign_all(self):
+        """Clear all local DAW folder assignments after confirmation."""
+        if not self._session or not self._active_daw_processor:
+            return
+        dp_state = self._session.daw_state.get(self._active_daw_processor.id)
+        if not dp_state:
+            return
+        assignments = dp_state.get("assignments", {})
+        track_order = dp_state.get("track_order", {})
+        if not assignments and not track_order:
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "Unassign All",
+            "Clear all DAW folder assignments?\n\n"
+            "This only changes SessionPrep's local assignment state. "
+            "It does not change the DAW project until you create again.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        assignments.clear()
+        track_order.clear()
+        self._populate_folder_tree()
+        self._populate_setup_table()
+        self._update_daw_lifecycle_buttons()
+        self._status_bar.showMessage("All DAW folder assignments cleared.")
+
+    @Slot()
     def _on_auto_assign(self):
         """Auto-assign unassigned tracks to folders based on group DAW targets."""
         if not self._session or not self._active_daw_processor:
@@ -1090,8 +1132,7 @@ class DawMixin:  # pylint: disable=too-few-public-methods
                 return
 
     def _on_reset_manifest(self):
-        """Reset the transfer manifest to default: one entry per output file,
-        default track names, no user-added duplicates."""
+        """Reset the local DAW track list to one entry per output file."""
         if not self._session:
             return
         import copy
@@ -1107,10 +1148,36 @@ class DawMixin:  # pylint: disable=too-few-public-methods
             )
         else:
             return
+        self._prune_assignments_to_manifest()
         self._populate_setup_table()
         self._populate_folder_tree()
         self._update_daw_lifecycle_buttons()
-        self._status_bar.showMessage("Transfer manifest reset to default")
+        self._status_bar.showMessage("DAW track list reset.")
+
+    def _prune_assignments_to_manifest(self):
+        """Remove local assignment references for tracks no longer in the manifest."""
+        if not self._session or not self._active_daw_processor:
+            return
+        dp_state = self._session.daw_state.get(self._active_daw_processor.id)
+        if not dp_state:
+            return
+
+        valid_ids = {entry.entry_id for entry in self._session.transfer_manifest}
+        assignments = dp_state.get("assignments", {})
+        for entry_id in list(assignments):
+            if entry_id not in valid_ids:
+                assignments.pop(entry_id, None)
+
+        track_order = dp_state.get("track_order", {})
+        for folder_id in list(track_order):
+            kept_entry_ids = [
+                entry_id for entry_id in track_order[folder_id]
+                if entry_id in valid_ids
+            ]
+            if kept_entry_ids:
+                track_order[folder_id] = kept_entry_ids
+            else:
+                track_order.pop(folder_id, None)
 
     def _remove_transfer_entry(self, entry_id: str):
         """Remove a user-added duplicate transfer entry."""
