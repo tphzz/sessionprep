@@ -31,10 +31,10 @@ jobs:
             suffix: win-arm64
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@v8
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -248,7 +248,7 @@ jobs:
       REPOSITORY: ${{ github.repository }}
       RUN_ID: ${{ github.run_id }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - name: Publish draft release
         shell: bash
