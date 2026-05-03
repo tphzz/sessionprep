@@ -72,6 +72,8 @@ from .batch import BatchQueueDock, BatchManager
 
 log = logging.getLogger(__name__)
 
+MAIN_WINDOW_MIN_HEIGHT_HINT = 360
+
 
 def _size_text(size: QSize) -> str:
     return f"{size.width()}x{size.height()}"
@@ -96,7 +98,8 @@ class _CurrentPageTabWidget(QTabWidget):
         self.currentChanged.connect(lambda _index: self.updateGeometry())
 
     def minimumSizeHint(self) -> QSize:
-        return self._current_page_hint(super().minimumSizeHint(), minimum=True)
+        hint = self._current_page_hint(super().minimumSizeHint(), minimum=True)
+        return QSize(hint.width(), min(hint.height(), MAIN_WINDOW_MIN_HEIGHT_HINT))
 
     def sizeHint(self) -> QSize:
         return self._current_page_hint(super().sizeHint(), minimum=False)
