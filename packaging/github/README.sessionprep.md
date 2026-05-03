@@ -64,6 +64,11 @@ packaging/github/publish-draft-release.sh \
   --release-title "$RELEASE_TITLE"
 ```
 
+The workflow has a manual `notarize` input. It defaults to `false`, so branch
+builds produce signed, non-notarized macOS development DMGs by default. If a
+manual branch run is started with `notarize=true`, the macOS jobs use the same
+notarized DMG packaging path as tag builds. Tag builds always notarize.
+
 ## Local Dry Run
 
 Dry-run against an existing workflow run:
@@ -95,8 +100,9 @@ Branch builds use a release title such as `SessionPrep branch build: 0.3.5`.
 Re-running a branch workflow replaces any matching draft release for that branch
 and uploads assets to the newly created release by release ID. The script also
 cleans up older duplicate draft releases that used the same title before the
-hidden branch release key was introduced.
+hidden branch release key was introduced. Branch macOS DMGs are non-notarized
+unless the manual workflow run explicitly enables `notarize`.
 
 Tag builds use the real Git tag, such as `0.3.5`. Re-running a tag workflow
 replaces the draft release for that tag, but published releases are protected
-and are not modified by the automation.
+and are not modified by the automation. Tag macOS DMGs are always notarized.

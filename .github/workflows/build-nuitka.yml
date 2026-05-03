@@ -2,6 +2,12 @@ name: Build (Nuitka)
 
 on:
   workflow_dispatch:
+    inputs:
+      notarize:
+        description: "Notarize macOS DMGs for this manual run"
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   build:
@@ -84,6 +90,19 @@ jobs:
         run: |
           VER=$(uv run python -c "from build_conf import get_version; print(get_version(strict=True))")
           echo "ver=$VER" >> "$GITHUB_OUTPUT"
+
+      - name: Determine macOS notarization mode
+        id: notarization
+        shell: bash
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          NOTARIZE_INPUT: ${{ inputs.notarize }}
+        run: |
+          if [ "$REF_TYPE" = "tag" ] || [ "$NOTARIZE_INPUT" = "true" ]; then
+            echo "should_notarize=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_notarize=false" >> "$GITHUB_OUTPUT"
+          fi
 
       # -----------------------------------------------------------------------
       # Linux packaging
@@ -289,7 +308,7 @@ jobs:
             -c "$MACOS_DEV_ID_CERT_NAME"
 
       - name: Package macOS development DMG
-        if: runner.os == 'macOS' && github.ref_type != 'tag'
+        if: runner.os == 'macOS' && steps.notarization.outputs.should_notarize != 'true'
         shell: bash
         run: |
           brew install create-dmg
@@ -310,7 +329,7 @@ jobs:
           rm -f dist_nuitka/rw.*.dmg
 
       - name: Notarize and package macOS release DMG
-        if: runner.os == 'macOS' && github.ref_type == 'tag'
+        if: runner.os == 'macOS' && steps.notarization.outputs.should_notarize == 'true'
         shell: bash
         env:
           MACOS_DEV_ID_CERT_NAME: ${{ secrets.MACOS_DEV_ID_CERT_NAME }}
