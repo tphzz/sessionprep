@@ -3,9 +3,6 @@ name: Build (Nuitka)
 on:
   workflow_dispatch:
 
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-
 jobs:
   build:
     name: ${{ matrix.name }}
@@ -150,7 +147,7 @@ jobs:
       # -----------------------------------------------------------------------
       - name: Import macOS Code Signing Certificate
         if: runner.os == 'macOS'
-        uses: apple-actions/import-codesign-certs@v5.0.3
+        uses: apple-actions/import-codesign-certs@v7.0.0
         with:
           p12-file-base64: ${{ secrets.P12_BASE64 }}
           p12-password: ${{ secrets.P12_PASSWORD }}

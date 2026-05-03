@@ -71,7 +71,7 @@ Add the following to your GitHub Repository Secrets:
 
 ### Step 2: Workflow Logic
 1.  **Build:** Create the `.app` bundle (e.g., via PyInstaller).
-2.  **Certificate Import:** Use a GitHub Action (like `apple-actions/import-codesign-certs`) to load your certificate into the runner's keychain.
+2.  **Certificate Import:** Use `apple-actions/import-codesign-certs@v7.0.0` to load your certificate into the runner's keychain.
 3.  **Signing:** Run `appbundle-sign.sh` for all builds to verify structural integrity.
 4.  **Release:** On **Tags** or **Main** branch merges, run `appbundle-release.sh` to generate the notarized DMG.
 
@@ -84,4 +84,3 @@ Add the following to your GitHub Repository Secrets:
 > **Notarization Rejected:** > If Apple rejects the submission, check the logs. Common reasons include unsigned third-party libraries or resources still residing in the `Contents/MacOS` folder. The `appbundle-sign.sh` script is designed to prevent these issues.
 
 > **DMG Assessment Failed:** > If the final `spctl` check fails, ensure your certificate is a **Developer ID Application** type. Standard "Apple Development" or "Mac App Store" certificates are not valid for notarized direct distribution.
-
