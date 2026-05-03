@@ -77,3 +77,39 @@ def test_clear_list_clears_table_without_deleting_log(monkeypatch, tmp_path):
     assert harness._partial_line == ""
     assert harness._offset == path.stat().st_size
     assert harness.copy_updated is True
+
+
+def test_table_rows_text_copies_requested_rows_only():
+    from sessionprepgui import log_viewer
+
+    class Item:
+        def __init__(self, text):
+            self._text = text
+
+        def text(self):
+            return self._text
+
+    class FakeTable:
+        def __init__(self):
+            self._data = [
+                ["t0", "DEBUG", "logger.a", "first"],
+                ["t1", "INFO", "logger.b", "second"],
+                ["t2", "ERROR", "logger.c", "third"],
+            ]
+
+        def columnCount(self):
+            return 4
+
+        def item(self, row, column):
+            return Item(self._data[row][column])
+
+    class Harness:
+        def __init__(self):
+            self._table = FakeTable()
+
+    text = log_viewer.LogViewerWindow._table_rows_text(Harness(), [0, 2])
+
+    assert text == (
+        "t0\tDEBUG\tlogger.a\tfirst\n"
+        "t2\tERROR\tlogger.c\tthird"
+    )

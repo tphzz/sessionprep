@@ -177,12 +177,16 @@ class LogViewerWindow(QDialog):
         spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         bottom.addWidget(spacer)
 
-        self._copy_btn = QPushButton("Copy Selection", self)
+        self._copy_all_btn = QPushButton("Copy All Rows", self)
+        self._copy_all_btn.clicked.connect(self._copy_all_rows)
+        bottom.addWidget(self._copy_all_btn)
+
+        self._copy_btn = QPushButton("Copy Selected Rows", self)
         self._copy_btn.setEnabled(False)
         self._copy_btn.clicked.connect(self._copy_selection)
         bottom.addWidget(self._copy_btn)
 
-        self._clear_btn = QPushButton("Clear List", self)
+        self._clear_btn = QPushButton("Clear Rows", self)
         self._clear_btn.clicked.connect(self._clear_list)
         bottom.addWidget(self._clear_btn)
 
@@ -294,6 +298,15 @@ class LogViewerWindow(QDialog):
         rows = self._selected_rows()
         if not rows:
             return
+        QApplication.clipboard().setText(self._table_rows_text(rows))
+
+    def _copy_all_rows(self) -> None:
+        rows = list(range(self._table.rowCount()))
+        if not rows:
+            return
+        QApplication.clipboard().setText(self._table_rows_text(rows))
+
+    def _table_rows_text(self, rows: list[int]) -> str:
         lines = []
         for row in rows:
             values = []
@@ -301,7 +314,7 @@ class LogViewerWindow(QDialog):
                 item = self._table.item(row, column)
                 values.append(item.text() if item else "")
             lines.append("\t".join(values))
-        QApplication.clipboard().setText("\n".join(lines))
+        return "\n".join(lines)
 
     def _clear_list(self) -> None:
         self._table.setRowCount(0)

@@ -158,6 +158,47 @@ def _write_response(payload: dict[str, Any]):
     sys.stdout.flush()
 
 
+def self_test(*, require_ptsl: bool = True, configure_logging: bool = True) -> int:
+    """Run a lightweight worker startup/protocol self-test."""
+    if configure_logging:
+        _configure_worker_logging()
+    log.debug(
+        "Pro Tools worker self-test started: executable=%r argv=%r platform=%s cwd=%r",
+        sys.executable,
+        sys.argv,
+        platform.platform(),
+        os.getcwd(),
+    )
+    try:
+        if require_ptsl:
+            __import__("ptsl")
+        payload = {
+            "id": 0,
+            "ok": True,
+            "result": {
+                "self_test": True,
+                "ptsl_imported": require_ptsl,
+            },
+        }
+        _write_response(payload)
+        log.debug("Pro Tools worker self-test completed")
+        return 0
+    except Exception as exc:
+        log.error(
+            "Pro Tools worker self-test failed: error=%s\n%s",
+            exc,
+            traceback.format_exc(),
+        )
+        _write_response(
+            {
+                "id": 0,
+                "ok": False,
+                "error": str(exc),
+            }
+        )
+        return 2
+
+
 def main() -> int:
     _configure_worker_logging()
     log.debug(

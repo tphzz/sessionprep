@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import json
 
 import pytest
 
@@ -15,12 +16,15 @@ from sessionprepgui.daw_tools.protools.track_height_tool import (
     _default_preset,
     _migrate_default_preset_scope,
 )
+from sessionprepgui.daw_tools.protools.worker_process import self_test
 from sessionprepgui.daw_tools.protools.worker_client import (
     JsonLineBuffer,
     ProToolsWorkerClient,
     _complete_stderr_lines,
+    _macos_bundle_executable_from_path,
     _stderr_summary,
     _tail_text,
+    _worker_launch_command,
 )
 from sessionprepgui.widgets import _aspect_limited_grid_height
 
@@ -190,6 +194,108 @@ def test_worker_client_tail_text_bounds_large_diagnostics():
 
     assert text.endswith("xxxxx")
     assert "truncated 15 chars" in text
+
+
+def test_worker_resolves_macos_bundle_executable_from_info_plist(tmp_path):
+    macos_dir = tmp_path / "SessionPrep.app" / "Contents" / "MacOS"
+    macos_dir.mkdir(parents=True)
+    (macos_dir.parent / "Info.plist").write_text(
+        """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+ "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleExecutable</key>
+  <string>sessionprep-gui-macos-arm64</string>
+</dict>
+</plist>
+""",
+        encoding="utf-8",
+    )
+    executable = macos_dir / "sessionprep-gui-macos-arm64"
+    executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    executable.chmod(0o755)
+
+    resolved = _macos_bundle_executable_from_path(str(macos_dir / "python3"))
+
+    assert resolved == executable
+
+
+def test_worker_launch_uses_bundle_executable_when_sys_executable_is_missing(
+    monkeypatch,
+    tmp_path,
+):
+    macos_dir = tmp_path / "SessionPrep.app" / "Contents" / "MacOS"
+    macos_dir.mkdir(parents=True)
+    executable = macos_dir / "sessionprep-gui-macos-arm64"
+    executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    executable.chmod(0o755)
+    monkeypatch.setattr(
+        "sessionprepgui.daw_tools.protools.worker_client.sys.executable",
+        str(macos_dir / "python3"),
+    )
+    monkeypatch.setattr(
+        "sessionprepgui.daw_tools.protools.worker_client.sys.argv",
+        [str(macos_dir / "python3")],
+    )
+
+    program, args, mode = _worker_launch_command()
+
+    assert program == str(executable)
+    assert args == ["--ptsl-worker"]
+    assert mode == "compiled-app"
+
+
+def test_worker_launch_prefers_qt_application_path_when_sys_executable_is_missing(
+    monkeypatch,
+    tmp_path,
+):
+    executable = tmp_path / "sessionprep-gui-linux-x64"
+    executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    executable.chmod(0o755)
+    monkeypatch.setattr(
+        "sessionprepgui.daw_tools.protools.worker_client._qt_application_file_path",
+        lambda: executable,
+    )
+    monkeypatch.setattr(
+        "sessionprepgui.daw_tools.protools.worker_client.sys.executable",
+        str(tmp_path / "missing-python"),
+    )
+    monkeypatch.setattr(
+        "sessionprepgui.daw_tools.protools.worker_client.sys.argv",
+        [str(tmp_path / "missing-python")],
+    )
+
+    program, args, mode = _worker_launch_command()
+
+    assert program == str(executable)
+    assert args == ["--ptsl-worker"]
+    assert mode == "compiled-app"
+
+
+def test_worker_launch_keeps_source_mode_for_uv_execution(monkeypatch):
+    monkeypatch.setattr(
+        "sessionprepgui.daw_tools.protools.worker_client._qt_application_file_path",
+        lambda: None,
+    )
+
+    program, args, mode = _worker_launch_command()
+
+    assert program
+    assert args == ["-m", "sessionprepgui.daw_tools.protools.worker_process"]
+    assert mode == "python-module"
+
+
+def test_worker_self_test_writes_single_json_response(capsys):
+    exit_code = self_test(require_ptsl=False, configure_logging=False)
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+
+    assert exit_code == 0
+    assert payload["ok"] is True
+    assert payload["result"]["self_test"] is True
+    assert captured.out.count("\n") == 1
 
 
 def test_track_height_default_scope_is_all_tracks():
