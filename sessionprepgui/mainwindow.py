@@ -153,6 +153,7 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
         self._session_config: dict[str, Any] | None = None
         self._session_widgets: dict[str, list[tuple[str, QWidget]]] = {}
         self._pt_utils_window = None  # singleton Pro Tools Utils window
+        self._log_viewer_window = None  # singleton detached log viewer
 
         t0 = time.perf_counter()
         self._detector_help = detector_help_map()
@@ -457,6 +458,12 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
 
         # ── Tools menu ────────────────────────────────────────────────
         tools_menu = self.menuBar().addMenu("&Tools")
+
+        self._log_viewer_action = QAction("Log Viewer", self)
+        self._log_viewer_action.triggered.connect(self._on_open_log_viewer)
+        tools_menu.addAction(self._log_viewer_action)
+
+        tools_menu.addSeparator()
 
         self._pt_utils_action = QAction("Pro Tools Utils\u2026", self)
         self._pt_utils_action.triggered.connect(self._on_open_pt_utils)
@@ -996,6 +1003,16 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
         pt_section = preset.get("daw_processors", {}).get("protools", {})
         pt_enabled = pt_section.get("protools_enabled", False)
         self._pt_utils_action.setEnabled(pt_enabled)
+
+    @Slot()
+    def _on_open_log_viewer(self):
+        """Open (or activate) the detached log viewer window."""
+        from .log_viewer import LogViewerWindow
+        if self._log_viewer_window is None:
+            self._log_viewer_window = LogViewerWindow()
+        self._log_viewer_window.show()
+        self._log_viewer_window.raise_()
+        self._log_viewer_window.activateWindow()
 
     @Slot()
     def _on_open_pt_utils(self):

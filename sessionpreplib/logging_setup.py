@@ -28,8 +28,76 @@ _MAX_BYTES = 5 * 1024 * 1024  # 5 MB
 _BACKUP_COUNT = 3
 _FORMAT = "%(asctime)s.%(msecs)03d [%(levelname)-5s] %(name)s: %(message)s"
 _DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+_NONE_LEVEL = logging.CRITICAL + 10
 
 _initialized = False
+
+
+def get_log_dir() -> str:
+    """Return the directory where SessionPrep writes its log file."""
+    return get_app_dir()
+
+
+def get_log_path() -> str:
+    """Return the active SessionPrep log file path."""
+    return os.path.join(get_log_dir(), LOG_FILENAME)
+
+
+def _make_formatter() -> logging.Formatter:
+    return logging.Formatter(_FORMAT, datefmt=_DATE_FORMAT)
+
+
+def _is_sessionprep_file_handler(handler: logging.Handler) -> bool:
+    return (
+        isinstance(handler, RotatingFileHandler)
+        and os.path.abspath(getattr(handler, "baseFilename", ""))
+        == os.path.abspath(get_log_path())
+    )
+
+
+def ensure_file_logging() -> None:
+    """Ensure the rotating SessionPrep file handler exists."""
+    root = logging.getLogger()
+    if any(_is_sessionprep_file_handler(handler) for handler in root.handlers):
+        return
+
+    try:
+        os.makedirs(get_log_dir(), exist_ok=True)
+        fh = RotatingFileHandler(
+            get_log_path(),
+            maxBytes=_MAX_BYTES,
+            backupCount=_BACKUP_COUNT,
+            encoding="utf-8",
+        )
+    except OSError:
+        return
+    fh.setFormatter(_make_formatter())
+    fh.setLevel(root.level)
+    root.addHandler(fh)
+
+
+def get_current_log_level() -> int | None:
+    """Return the current root log level, or None when logging is off."""
+    if logging.root.manager.disable >= logging.CRITICAL:
+        return None
+    return logging.getLogger().level
+
+
+def set_runtime_log_level(level: int | None) -> None:
+    """Set the process-wide log level for the current runtime only."""
+    root = logging.getLogger()
+    if level is None:
+        logging.disable(logging.CRITICAL)
+        root.setLevel(_NONE_LEVEL)
+        for handler in root.handlers:
+            handler.setLevel(_NONE_LEVEL)
+        return
+
+    logging.disable(logging.NOTSET)
+    root.setLevel(level)
+    ensure_file_logging()
+    for handler in root.handlers:
+        handler.setLevel(level)
 
 
 def setup_logging(level: int | None = None) -> None:
@@ -52,18 +120,20 @@ def setup_logging(level: int | None = None) -> None:
     if level is None:
         level = _level_from_env()
 
-    if level == logging.CRITICAL + 10:  # NONE sentinel
+    if level == _NONE_LEVEL:  # NONE sentinel
+        logging.disable(logging.CRITICAL)
         return
 
     root = logging.getLogger()
+    logging.disable(logging.NOTSET)
     root.setLevel(level)
 
-    formatter = logging.Formatter(_FORMAT, datefmt=_DATE_FORMAT)
+    formatter = _make_formatter()
 
     # ── File handler (always) ────────────────────────────────────────
-    log_dir = get_app_dir()
+    log_dir = get_log_dir()
     os.makedirs(log_dir, exist_ok=True)
-    log_path = os.path.join(log_dir, LOG_FILENAME)
+    log_path = get_log_path()
 
     try:
         fh = RotatingFileHandler(
@@ -93,7 +163,7 @@ def _level_from_env() -> int:
     """Determine log level from ``SP_LOG_LEVEL``."""
     raw = os.environ.get("SP_LOG_LEVEL", "").strip().upper()
     if raw == "NONE":
-        return logging.CRITICAL + 10  # sentinel: skip handler setup
+        return _NONE_LEVEL  # sentinel: skip handler setup
     if raw:
         numeric = getattr(logging, raw, None)
         if isinstance(numeric, int):
