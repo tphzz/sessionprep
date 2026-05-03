@@ -6,7 +6,7 @@ import copy
 from collections import Counter, defaultdict
 from typing import Any
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
@@ -202,6 +202,8 @@ def _migrate_default_preset_scope(preset: dict[str, Any]) -> dict[str, Any]:
 
 class TrackHeightTool(QWidget):
     """Preset-based Pro Tools track height utility."""
+
+    preferred_height_changed = Signal()
 
     def __init__(self, config: dict, parent=None):
         super().__init__(parent)
@@ -500,22 +502,26 @@ class TrackHeightTool(QWidget):
         if self._loading:
             return
         self._update_dirty_state()
+        self.preferred_height_changed.emit()
 
     def _on_mode_changed(self):
         if self._loading:
             return
         self._update_mode_visibility()
         self._update_dirty_state()
+        self.preferred_height_changed.emit()
 
     def _on_all_height_changed(self):
         if self._loading:
             return
         self._update_dirty_state()
+        self.preferred_height_changed.emit()
 
     def _on_height_changed(self, _track_type: str):
         if self._loading:
             return
         self._update_dirty_state()
+        self.preferred_height_changed.emit()
 
     def _update_dirty_state(self):
         if not hasattr(self, "_save_btn"):

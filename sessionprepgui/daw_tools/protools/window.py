@@ -205,6 +205,9 @@ class ProToolsUtilsWindow(QDialog):
         self._tabs.addTab(self._color_tool, "Color Picker")
         self._track_height_tool = TrackHeightTool(self._config, self)
         self._tabs.addTab(self._track_height_tool, "Track Heights")
+        self._track_height_tool.preferred_height_changed.connect(
+            self._on_track_height_preferred_height_changed
+        )
         self._tabs.currentChanged.connect(self._on_tool_tab_changed)
         self._update_connection_button()
 
@@ -295,6 +298,11 @@ class ProToolsUtilsWindow(QDialog):
     def _on_tool_tab_changed(self, _index: int):
         if not self._closing:
             QTimer.singleShot(0, self._resize_for_current_tab)
+
+    def _on_track_height_preferred_height_changed(self):
+        if self._closing or self._tabs.currentWidget() is not self._track_height_tool:
+            return
+        QTimer.singleShot(0, self._resize_for_current_tab)
 
     def _resize_for_current_tab(self):
         if self._closing:

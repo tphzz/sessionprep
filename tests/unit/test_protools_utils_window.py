@@ -12,7 +12,9 @@ from sessionprepgui.daw_tools.protools.connection_common import (
     connection_failure_message,
     connection_timeout_message,
 )
+from sessionprepgui.daw_tools.protools.color_tool import ColorTool
 from sessionprepgui.daw_tools.protools.track_height_tool import (
+    TrackHeightTool,
     _default_preset,
     _migrate_default_preset_scope,
 )
@@ -322,6 +324,24 @@ def test_track_height_does_not_migrate_custom_selected_scope():
     assert migrated["heights"]["TT_Audio"] == "THeight_Large"
 
 
+def test_track_height_mode_dropdown_announces_preferred_height_change():
+    from PySide6.QtWidgets import QApplication
+
+    app = QApplication.instance() or QApplication([])
+    tool = TrackHeightTool({"app": {}})
+    emitted = []
+    tool.preferred_height_changed.connect(lambda: emitted.append(True))
+    try:
+        all_index = tool._mode_combo.findData("all")
+        assert all_index >= 0
+
+        tool._mode_combo.setCurrentIndex(all_index)
+
+        assert emitted
+    finally:
+        tool.deleteLater()
+
+
 def test_color_grid_aspect_limit_keeps_cells_square_or_wide():
     height = _aspect_limited_grid_height(
         2308,
@@ -356,3 +376,25 @@ def test_color_grid_minimum_height_uses_min_cell_height():
     )
 
     assert height == 94
+
+
+def test_color_tool_grid_can_use_extra_vertical_space():
+    from PySide6.QtWidgets import QApplication
+
+    app = QApplication.instance() or QApplication([])
+    tool = ColorTool(
+        {
+            "colors": [
+                {"name": f"Color {index}", "argb": "#ff336699"}
+                for index in range(69)
+            ]
+        }
+    )
+    try:
+        layout = tool.layout()
+        grid_index = layout.indexOf(tool._grid)
+
+        assert layout.stretch(grid_index) == 1
+        assert tool._grid.maximumHeight() >= 1000000
+    finally:
+        tool.deleteLater()

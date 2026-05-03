@@ -15,6 +15,9 @@ from ...widgets import ColorGridPanel
 from .connection_common import PTSL_MUTATION_TIMEOUT_MS, PTSL_READ_TIMEOUT_MS
 
 
+COLOR_PICKER_EXTRA_PREFERRED_HEIGHT = 36
+
+
 class ColorTool(QWidget):
     """Interactive color picker that pushes colors to Pro Tools."""
 
@@ -42,12 +45,10 @@ class ColorTool(QWidget):
         self._grid = ColorGridPanel(
             cell_height=28,
             stretch_vertical=True,
-            max_cell_height_to_width=1.0,
             parent=self,
         )
         self._grid.colorClicked.connect(self._on_color_clicked)
-        layout.addWidget(self._grid)
-        layout.addStretch(1)
+        layout.addWidget(self._grid, 1)
 
         status_row = QHBoxLayout()
         self._status = QLabel("")
@@ -87,6 +88,7 @@ class ColorTool(QWidget):
             + grid_height
             + status_height
             + spacing * 3
+            + COLOR_PICKER_EXTRA_PREFERRED_HEIGHT
         )
 
     def set_engine(self, engine):
