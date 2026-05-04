@@ -4,7 +4,8 @@ Call :func:`setup_logging` once at application startup (CLI or GUI) to
 configure the root logger with:
 
 * A **RotatingFileHandler** writing to ``sessionprep.log`` in the
-  OS-specific app-data directory (always active, append mode).
+  OS-specific app-data directory.  Logs are size-rotated to keep disk
+  usage bounded.
 * A **StreamHandler** writing to *stderr* (only when a terminal is
   attached — suppressed in compiled / GUI-only builds).
 
@@ -24,8 +25,8 @@ from logging.handlers import RotatingFileHandler
 from .config import get_app_dir
 
 LOG_FILENAME = "sessionprep.log"
-_MAX_BYTES = 5 * 1024 * 1024  # 5 MB
-_BACKUP_COUNT = 3
+_MAX_BYTES = 1 * 1024 * 1024  # 1 MB
+_BACKUP_COUNT = 5
 _FORMAT = "%(asctime)s.%(msecs)03d [%(levelname)-5s] %(name)s: %(message)s"
 _DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 _NONE_LEVEL = logging.CRITICAL + 10
