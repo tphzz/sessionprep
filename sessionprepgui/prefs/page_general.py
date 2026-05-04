@@ -2,8 +2,14 @@
 
 from __future__ import annotations
 
+from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
+    QCheckBox,
+    QComboBox,
+    QDoubleSpinBox,
+    QLineEdit,
     QVBoxLayout,
+    QSpinBox,
     QWidget,
 )
 
@@ -98,6 +104,8 @@ class GeneralPage(QWidget):
         validate()     — returns error string or None
     """
 
+    preferencesChanged = Signal()
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._widgets: list[tuple[str, QWidget]] = []
@@ -113,8 +121,11 @@ class GeneralPage(QWidget):
 
     def commit(self, config: dict) -> None:
         app = config.setdefault("app", {})
-        for key, widget in self._widgets:
-            app[key] = _read_widget(widget)
+        app.update(self.current_values())
+
+    def current_values(self) -> dict:
+        """Return the current app preference values managed by this page."""
+        return {key: _read_widget(widget) for key, widget in self._widgets}
 
     def validate(self) -> str | None:
         """Return an error message if any output folder name is invalid."""
@@ -138,3 +149,18 @@ class GeneralPage(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(page)
+        for _key, widget in self._widgets:
+            self._connect_change_signal(widget)
+
+    def _connect_change_signal(self, widget: QWidget) -> None:
+        if hasattr(widget, "path_changed"):
+            widget.path_changed.connect(lambda *_: self.preferencesChanged.emit())
+        elif isinstance(widget, QComboBox):
+            widget.currentIndexChanged.connect(
+                lambda *_: self.preferencesChanged.emit())
+        elif isinstance(widget, QCheckBox):
+            widget.toggled.connect(lambda *_: self.preferencesChanged.emit())
+        elif isinstance(widget, (QSpinBox, QDoubleSpinBox)):
+            widget.valueChanged.connect(lambda *_: self.preferencesChanged.emit())
+        elif isinstance(widget, QLineEdit):
+            widget.textChanged.connect(lambda *_: self.preferencesChanged.emit())

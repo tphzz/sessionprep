@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 from typing import Callable
 
+from PySide6.QtCore import Signal
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QLabel,
@@ -31,6 +32,8 @@ class GroupsPage(QWidget):
         from ColorsPage so the group color dropdowns always reflect the
         live color table.
     """
+
+    groupsChanged = Signal()
 
     def __init__(self, color_provider: Callable,
                  all_colors_provider: Callable | None = None, parent=None):
@@ -59,6 +62,17 @@ class GroupsPage(QWidget):
         config["group_presets"] = copy.deepcopy(self._presets_data)
         config.setdefault("app", {})["active_group_preset"] = (
             self._panel.current_name)
+
+    def current_values(self) -> dict:
+        """Return the current group preset state, including visible edits."""
+        presets = copy.deepcopy(self._presets_data)
+        current = self._panel.current_name
+        if current:
+            presets[current] = self._groups_widget.get_groups()
+        return {
+            "group_presets": presets,
+            "active_group_preset": current,
+        }
 
     def active_preset_name(self) -> str:
         return self._panel.current_name
@@ -98,6 +112,7 @@ class GroupsPage(QWidget):
         self._groups_widget = GroupsTableWidget(
             color_provider=self._color_provider,
             all_colors_provider=self._all_colors_provider)
+        self._groups_widget.groups_changed.connect(self.groupsChanged.emit)
         layout.addWidget(self._groups_widget, 1)
 
     # ── Color refresh ─────────────────────────────────────────────────
@@ -123,22 +138,27 @@ class GroupsPage(QWidget):
         if old and old in self._presets_data:
             self._presets_data[old] = self._groups_widget.get_groups()
         self._load_preset(new)
+        self.groupsChanged.emit()
 
     def _on_added(self, name: str) -> None:
         self._presets_data[name] = []
         self._load_preset(name)
+        self.groupsChanged.emit()
 
     def _on_duplicated(self, source: str, new: str) -> None:
         self._presets_data[new] = copy.deepcopy(
             self._presets_data.get(source, []))
         self._load_preset(new)
+        self.groupsChanged.emit()
 
     def _on_renamed(self, old: str, new: str) -> None:
         self._presets_data[new] = self._presets_data.pop(old, [])
+        self.groupsChanged.emit()
 
     def _on_deleted(self, name: str) -> None:
         self._presets_data.pop(name, None)
         self._load_preset(self._panel.current_name)
+        self.groupsChanged.emit()
 
     def _on_reset_default(self) -> None:
         from ..settings import _DEFAULT_GROUPS
@@ -153,3 +173,4 @@ class GroupsPage(QWidget):
             return
         self._presets_data[current] = copy.deepcopy(_DEFAULT_GROUPS)
         self._load_preset(current)
+        self.groupsChanged.emit()

@@ -126,7 +126,7 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
     def _build_session_pages(self):
         """Populate the session config tree + stack from the active preset."""
 
-        def _register_page(tree_item, page):
+        def _register_page(tree_item, page, _dirty_key=None):
             scroll = QScrollArea()
             scroll.setWidgetResizable(True)
             scroll.setFrameShape(QScrollArea.NoFrame)

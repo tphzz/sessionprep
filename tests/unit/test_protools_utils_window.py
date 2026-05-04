@@ -254,6 +254,10 @@ def test_worker_launch_uses_bundle_executable_when_sys_executable_is_missing(
         "sessionprepgui.daw_tools.protools.worker_client.sys.argv",
         [str(macos_dir / "python3")],
     )
+    monkeypatch.setattr(
+        "sessionprepgui.daw_tools.protools.worker_client._qt_application_file_path",
+        lambda: None,
+    )
 
     program, args, mode = _worker_launch_command()
 

@@ -155,10 +155,12 @@ class GroupsTableWidget(QWidget):
                       for cn in color_names]
         color_picker = ColorPickerButton(colors, self._table)
         color_picker.setCurrentColor(color)
+        color_picker.colorChanged.connect(lambda *_: self.groups_changed.emit())
         self._table.setCellWidget(row, 1, color_picker)
 
         chk = QCheckBox()
         chk.setChecked(gain_linked)
+        chk.toggled.connect(lambda *_: self.groups_changed.emit())
         chk_container = QWidget()
         chk_layout = QHBoxLayout(chk_container)
         chk_layout.setContentsMargins(0, 0, 0, 0)
@@ -175,6 +177,8 @@ class GroupsTableWidget(QWidget):
             match_combo.setCurrentIndex(mi)
         match_combo.currentTextChanged.connect(
             lambda _text, r=row: self._validate_pattern_cell(r))
+        match_combo.currentTextChanged.connect(
+            lambda *_: self.groups_changed.emit())
         self._table.setCellWidget(row, 4, match_combo)
 
         pattern_item = QTableWidgetItem(match_pattern)
@@ -268,6 +272,7 @@ class GroupsTableWidget(QWidget):
                     current = ""
             new_picker = ColorPickerButton(colors, self._table)
             new_picker.setCurrentColor(current)
+            new_picker.colorChanged.connect(lambda *_: self.groups_changed.emit())
             self._table.setCellWidget(row, 1, new_picker)
 
     # ── Name dedup ────────────────────────────────────────────────────
@@ -415,6 +420,7 @@ class DawProjectTemplatesWidget(QWidget):
         gh.resizeSection(2, 120)
         self._table.setSelectionBehavior(QTableWidget.SelectRows)
         self._table.setSelectionMode(QTableWidget.SingleSelection)
+        self._table.cellChanged.connect(lambda r, c: self.templates_changed.emit())
         layout.addWidget(self._table, 1)
 
         btn_row = QHBoxLayout()
@@ -471,6 +477,7 @@ class DawProjectTemplatesWidget(QWidget):
         path_layout.setSpacing(4)
         path_edit = QLineEdit(template_path)
         path_edit.setPlaceholderText("Path to .dawproject file")
+        path_edit.textChanged.connect(lambda *_: self.templates_changed.emit())
         path_layout.addWidget(path_edit, 1)
         browse_btn = QPushButton("Browse\u2026")
         browse_btn.setFixedWidth(80)
@@ -484,6 +491,7 @@ class DawProjectTemplatesWidget(QWidget):
         ceiling_spin.setDecimals(1)
         ceiling_spin.setSuffix(" dB")
         ceiling_spin.setValue(fader_ceiling_db)
+        ceiling_spin.valueChanged.connect(lambda *_: self.templates_changed.emit())
         self._table.setCellWidget(row, 2, ceiling_spin)
 
     def _browse_template(self, line_edit: QLineEdit):
@@ -602,7 +610,7 @@ def build_config_pages(
     tree,
     preset: dict[str, Any],
     widgets_dict: dict,
-    register_page: Callable[[QTreeWidgetItem, QWidget], None],
+    register_page: Callable[[QTreeWidgetItem, QWidget, str | None], None],
     *,
     on_processor_enabled: Callable | None = None,
     on_daw_config_changed: Callable | None = None,
@@ -622,13 +630,13 @@ def build_config_pages(
     item.setFont(0, QFont("", -1, QFont.Bold))
     pg, wdg = _build_param_page(ANALYSIS_PARAMS, preset.get("analysis", {}))
     widgets_dict["analysis"] = wdg
-    register_page(item, pg)
+    register_page(item, pg, "analysis")
 
     det_parent = QTreeWidgetItem(tree, ["Detectors"])
     det_parent.setFont(0, QFont("", -1, QFont.Bold))
     pg, wdg = _build_param_page(PRESENTATION_PARAMS, preset.get("presentation", {}))
     widgets_dict["_presentation"] = wdg
-    register_page(det_parent, pg)
+    register_page(det_parent, pg, "_presentation")
 
     det_sections = preset.get("detectors", {})
     for det in default_detectors():
@@ -638,7 +646,7 @@ def build_config_pages(
         child = QTreeWidgetItem(det_parent, [det.name])
         pg, wdg = _build_param_page(params, det_sections.get(det.id, {}))
         widgets_dict[f"detectors.{det.id}"] = wdg
-        register_page(child, pg)
+        register_page(child, pg, f"detectors.{det.id}")
 
     proc_parent = QTreeWidgetItem(tree, ["Processors"])
     proc_parent.setFont(0, QFont("", -1, QFont.Bold))
@@ -647,7 +655,7 @@ def build_config_pages(
     pl.setContentsMargins(12, 12, 12, 12)
     pl.addWidget(QLabel("Select a processor from the tree to configure."))
     pl.addStretch()
-    register_page(proc_parent, placeholder)
+    register_page(proc_parent, placeholder, "_processors")
 
     proc_sections = preset.get("processors", {})
     for proc in default_processors():
@@ -657,7 +665,7 @@ def build_config_pages(
         child = QTreeWidgetItem(proc_parent, [proc.name])
         pg, wdg = _build_param_page(params, proc_sections.get(proc.id, {}))
         widgets_dict[f"processors.{proc.id}"] = wdg
-        register_page(child, pg)
+        register_page(child, pg, f"processors.{proc.id}")
         if on_processor_enabled is not None:
             enabled_key = f"{proc.id}_enabled"
             for key, widget in wdg:
@@ -672,7 +680,7 @@ def build_config_pages(
     pl2.setContentsMargins(12, 12, 12, 12)
     pl2.addWidget(QLabel("Select a DAW processor from the tree to configure."))
     pl2.addStretch()
-    register_page(daw_parent, placeholder2)
+    register_page(daw_parent, placeholder2, "_daw_processors")
 
     dp_sections = preset.get("daw_processors", {})
     for dp in default_daw_processors():
@@ -704,7 +712,7 @@ def build_config_pages(
                 pt_widget.templates_changed.connect(on_daw_config_changed)
             pg.layout().insertWidget(3, pt_widget)
 
-        register_page(child, pg)
+        register_page(child, pg, f"daw_processors.{dp.id}")
 
     return daw_custom_widgets
 

@@ -55,7 +55,11 @@ class ColorsPage(QWidget):
         self._refresh_preview()
 
     def commit(self, config: dict) -> None:
-        config["colors"] = self._read_all_colors()
+        config["colors"] = self.current_values()
+
+    def current_values(self) -> list[dict[str, str]]:
+        """Return the current color palette, including empty-name rows."""
+        return self._read_all_colors()
 
     # ── Color provider (for GroupsPage) ───────────────────────────────
 
