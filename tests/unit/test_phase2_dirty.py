@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QSpinBox,
 )
 
+from sessionprepgui.settings import build_defaults
 from sessionprepgui.mainwindow import SessionPrepWindow
 from sessionprepgui.tracks.table_widgets import _TAB_GROUPS, _TAB_SESSION
 
@@ -101,6 +102,60 @@ def test_phase2_dirty_indicators_are_clean_on_preset_values(qapp):
         assert window._detail_tabs.tabText(_TAB_SESSION) == "Config"
         for item in window._session_dirty_items.values():
             assert item.icon(1).isNull()
+    finally:
+        window.close()
+
+
+def test_default_group_preset_uses_existing_color_names(qapp):
+    defaults = build_defaults()
+    color_names = {color["name"] for color in defaults["colors"]}
+
+    assert {
+        group["name"]: group["color"]
+        for group in defaults["group_presets"]["Default"]
+        if group["name"] in {"Loops", "A.Gtr", "VOX"}
+    } == {
+        "Loops": "Cafe Royale",
+        "A.Gtr": "Lima",
+        "VOX": "Dodger Blue",
+    }
+    assert all(
+        group["color"] in color_names
+        for group in defaults["group_presets"]["Default"]
+    )
+
+
+def test_legacy_group_color_names_resolve_to_current_palette(qapp):
+    window = SessionPrepWindow()
+    try:
+        window._session = SimpleNamespace(
+            tracks=[],
+            processors=[],
+            transfer_manifest=[],
+            output_tracks=[],
+            daw_state={},
+            prepare_state="none",
+            config={},
+        )
+        window._detail_tabs.setTabEnabled(_TAB_GROUPS, True)
+        window._session_groups = [
+            {"name": "Loops", "color": "Cafe Royale Light"},
+            {"name": "A.Gtr", "color": "Lima Dark"},
+            {"name": "VOX", "color": "Dodger Blue Dark"},
+            {"name": "Unknown", "color": "Not A Color"},
+        ]
+        window._populate_groups_tab()
+
+        assert window._groups_tab_table.cellWidget(0, 1).currentColor() == (
+            "Cafe Royale")
+        assert window._groups_tab_table.cellWidget(1, 1).currentColor() == (
+            "Lima")
+        assert window._groups_tab_table.cellWidget(2, 1).currentColor() == (
+            "Dodger Blue")
+        assert window._groups_tab_table.cellWidget(3, 1).currentColor() == (
+            window._config["colors"][0]["name"])
+        assert set(window._group_color_map()) == {
+            "Loops", "A.Gtr", "VOX", "Unknown"}
     finally:
         window.close()
 

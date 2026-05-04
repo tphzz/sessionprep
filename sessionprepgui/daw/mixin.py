@@ -643,7 +643,8 @@ class DawMixin:  # pylint: disable=too-few-public-methods
 
             # Update config like we do in _do_daw_transfer
             self._session.config.update(self._flat_config())
-            self._session.config.setdefault("gui", {})["groups"] = list(self._session_groups)
+            self._session.config.setdefault("gui", {})["groups"] = (
+                self._normalize_session_groups(self._session_groups))
             colors = self._config.get("colors", PT_DEFAULT_COLORS)
             self._session.config["gui"]["colors"] = colors
             self._session.config["_source_dir"] = self._source_dir
@@ -689,8 +690,8 @@ class DawMixin:  # pylint: disable=too-few-public-methods
         self._session.config.update(self._flat_config())
         # Inject GUI config (groups + colors) into session.config so
         # transfer() can resolve group → color ARGB
-        self._session.config.setdefault("gui", {})["groups"] = list(
-            self._session_groups)
+        self._session.config.setdefault("gui", {})["groups"] = (
+            self._normalize_session_groups(self._session_groups))
         colors = self._config.get("colors", PT_DEFAULT_COLORS)
         self._session.config["gui"]["colors"] = colors
         # Keep source dir / output folder in config for processor.resolve_output_path()

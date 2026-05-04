@@ -27,7 +27,7 @@ from PySide6.QtWidgets import (
 from ..prefs.param_form import _argb_to_qcolor
 from ..settings import build_defaults, save_config
 from .table_widgets import _SortableItem, _TAB_GROUPS
-from ..theme import COLORS, PT_DEFAULT_COLORS
+from ..theme import COLORS, PT_DEFAULT_COLORS, normalize_color_name
 from ..widgets import BatchComboBox, ColorPickerButton
 
 
@@ -137,6 +137,7 @@ class GroupsMixin:  # pylint: disable=too-few-public-methods
     def _color_argb_by_name(self, name: str) -> str | None:
         """Look up ARGB hex by color name from config, falling back to defaults."""
         colors = self._config.get("colors", PT_DEFAULT_COLORS)
+        name = normalize_color_name(name, colors)
         for c in colors:
             if c.get("name") == name:
                 return c.get("argb")
@@ -234,6 +235,8 @@ class GroupsMixin:  # pylint: disable=too-few-public-methods
 
     def _populate_groups_tab(self):
         """Populate the groups tab table from self._session_groups."""
+        self._session_groups = self._normalize_session_groups(
+            self._session_groups)
         self._groups_tab_table.blockSignals(True)
         self._groups_tab_table.setRowCount(0)
         self._groups_tab_table.setRowCount(len(self._session_groups))
@@ -450,7 +453,7 @@ class GroupsMixin:  # pylint: disable=too-few-public-methods
                                    build_defaults().get("group_presets", {}))
         preset = presets.get(self._active_session_preset,
                              presets.get("Default", []))
-        new_groups = copy.deepcopy(preset)
+        new_groups = self._normalize_session_groups(copy.deepcopy(preset))
         new_names = {g["name"].strip().lower() for g in new_groups}
 
         if self._session:
@@ -476,16 +479,16 @@ class GroupsMixin:  # pylint: disable=too-few-public-methods
                              presets.get("Default", []))
         return self._normalize_session_groups(preset)
 
-    @staticmethod
-    def _normalize_session_groups(groups: list[dict]) -> list[dict]:
+    def _normalize_session_groups(self, groups: list[dict]) -> list[dict]:
         normalized: list[dict] = []
+        colors = self._config.get("colors", PT_DEFAULT_COLORS)
         for group in groups:
             name = str(group.get("name", "")).strip()
             if not name:
                 continue
             normalized.append({
                 "name": name,
-                "color": group.get("color", ""),
+                "color": normalize_color_name(group.get("color", ""), colors),
                 "gain_linked": bool(group.get("gain_linked", False)),
                 "daw_target": group.get("daw_target", ""),
                 "match_method": group.get("match_method", "contains"),

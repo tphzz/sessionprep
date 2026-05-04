@@ -55,7 +55,7 @@ from PySide6.QtWidgets import (
 )
 
 from .prefs.param_form import _argb_to_qcolor
-from .theme import COLORS
+from .theme import COLORS, normalize_color_name
 
 
 _SELECTION_COLOR = QColor(42, 109, 181, 160)  # semi-transparent blue
@@ -471,7 +471,7 @@ class ColorPickerButton(QPushButton):
 
     def setCurrentColor(self, name: str):
         """Set the current color by name (no signal emitted)."""
-        self._current = name
+        self._current = normalize_color_name(name, self._colors)
         self._update_appearance()
 
     def setDirtyIndicator(self, dirty: bool) -> None:

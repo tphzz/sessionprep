@@ -114,6 +114,29 @@ PT_DEFAULT_COLORS: list[dict[str, str]] = [
 ]
 
 
+PT_COLOR_NAME_ALIASES = {
+    "Cafe Royale Light": "Cafe Royale",
+    "Caafe Royale Light": "Cafe Royale",
+    "Lima Dark": "Lima",
+    "Dodger Blue Dark": "Dodger Blue",
+}
+
+
+def normalize_color_name(
+    name: str,
+    colors: list[dict[str, str]] | None = None,
+) -> str:
+    """Return a known color name, resolving legacy names and falling back."""
+    palette = colors or PT_DEFAULT_COLORS
+    names = [c.get("name", "") for c in palette if c.get("name")]
+    if name in names:
+        return name
+    alias = PT_COLOR_NAME_ALIASES.get(name, name)
+    if alias in names:
+        return alias
+    return names[0] if names else ""
+
+
 # ---------------------------------------------------------------------------
 # Dark theme
 # ---------------------------------------------------------------------------

@@ -145,7 +145,7 @@ _DEFAULT_GROUPS: list[dict[str, Any]] = [
     },
     {
         "name": "Loops",
-        "color": "Cafe Royale Light",
+        "color": "Cafe Royale",
         "gain_linked": False,
         "daw_target": "Loops",
         "match_method": "contains",
@@ -171,7 +171,7 @@ _DEFAULT_GROUPS: list[dict[str, Any]] = [
     },
     {
         "name": "A.Gtr",
-        "color": "Lima Dark",
+        "color": "Lima",
         "gain_linked": False,
         "daw_target": "A.Gtr",
         "match_method": "contains",
@@ -230,7 +230,7 @@ _DEFAULT_GROUPS: list[dict[str, Any]] = [
     # Vocals
     {
         "name": "VOX",
-        "color": "Dodger Blue Dark",
+        "color": "Dodger Blue",
         "gain_linked": False,
         "daw_target": "VOX",
         "match_method": "contains",
