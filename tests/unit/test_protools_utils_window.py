@@ -7,6 +7,11 @@ import pytest
 
 pytest.importorskip("PySide6")
 
+from PySide6.QtCore import QRect
+from PySide6.QtGui import QShowEvent
+from PySide6.QtWidgets import QApplication
+
+import sessionprepgui.daw_tools.protools.window as pt_utils_window
 from sessionprepgui.daw_tools.protools.connection_common import (
     connection_button_state,
     connection_failure_message,
@@ -18,6 +23,7 @@ from sessionprepgui.daw_tools.protools.track_height_tool import (
     _default_preset,
     _migrate_default_preset_scope,
 )
+from sessionprepgui.daw_tools.protools.window import ProToolsUtilsWindow
 from sessionprepgui.daw_tools.protools.worker_process import self_test
 from sessionprepgui.daw_tools.protools.worker_client import (
     JsonLineBuffer,
@@ -29,6 +35,14 @@ from sessionprepgui.daw_tools.protools.worker_client import (
     _worker_launch_command,
 )
 from sessionprepgui.widgets import _aspect_limited_grid_height
+
+
+@pytest.fixture(scope="module")
+def qapp():
+    app = QApplication.instance()
+    if app is None:
+        app = QApplication([])
+    return app
 
 
 def test_connection_failure_message_for_grpc_unavailable():
@@ -378,9 +392,65 @@ def test_color_grid_minimum_height_uses_min_cell_height():
     assert height == 94
 
 
-def test_color_tool_grid_can_use_extra_vertical_space():
-    from PySide6.QtWidgets import QApplication
+def test_protools_utils_prepare_for_show_applies_geometry_once(qapp, monkeypatch):
+    window = ProToolsUtilsWindow({"colors": []})
+    geometries = []
+    try:
+        monkeypatch.setattr(window, "_available_geometry", lambda: None)
+        monkeypatch.setattr(
+            window,
+            "_set_geometry_programmatically",
+            lambda geometry: geometries.append(QRect(geometry)),
+        )
 
+        window.prepare_for_show()
+        window.prepare_for_show()
+
+        assert geometries == [QRect(0, 0, 1280, 420)]
+        assert window._initial_geometry_applied
+    finally:
+        window.close()
+
+
+def test_protools_utils_show_event_does_not_apply_geometry_or_connect_sync(
+    qapp,
+    monkeypatch,
+):
+    window = ProToolsUtilsWindow({"colors": []})
+    geometry_calls = []
+    start_calls = []
+    scheduled = []
+
+    class FakeTimer:
+        @staticmethod
+        def singleShot(delay_ms, callback):
+            scheduled.append((delay_ms, callback))
+
+    try:
+        window._initial_geometry_applied = True
+        monkeypatch.setattr(
+            window,
+            "_apply_initial_geometry",
+            lambda: geometry_calls.append("geometry"),
+        )
+        monkeypatch.setattr(
+            window,
+            "_start_connect",
+            lambda: start_calls.append("connect"),
+        )
+        monkeypatch.setattr(pt_utils_window, "QTimer", FakeTimer)
+
+        window.showEvent(QShowEvent())
+
+        assert geometry_calls == []
+        assert start_calls == []
+        assert len(scheduled) == 1
+        assert scheduled[0][0] == 0
+    finally:
+        window.close()
+
+
+def test_color_tool_grid_can_use_extra_vertical_space():
     app = QApplication.instance() or QApplication([])
     tool = ColorTool(
         {

@@ -1014,6 +1014,7 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
             self._pt_utils_window = ProToolsUtilsWindow(self._config)
         else:
             self._pt_utils_window.update_config(self._config)
+        self._pt_utils_window.prepare_for_show()
         self._pt_utils_window.show()
         self._pt_utils_window.raise_()
         self._pt_utils_window.activateWindow()

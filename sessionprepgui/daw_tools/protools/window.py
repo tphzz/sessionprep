@@ -268,6 +268,11 @@ class ProToolsUtilsWindow(QDialog):
         max_height = max(1, available.height() - STARTUP_SCREEN_MARGIN * 2)
         return min(max(self.minimumHeight(), height), max_height)
 
+    def prepare_for_show(self):
+        """Apply first-show geometry before the window becomes visible."""
+        if not self._initial_geometry_applied:
+            self._apply_initial_geometry()
+
     def _apply_initial_geometry(self):
         available = self._available_geometry()
         if available is None:
@@ -296,16 +301,21 @@ class ProToolsUtilsWindow(QDialog):
         self._initial_geometry_applied = True
 
     def _on_tool_tab_changed(self, _index: int):
-        if not self._closing:
+        if not self._closing and not self._applying_geometry and self.isVisible():
             QTimer.singleShot(0, self._resize_for_current_tab)
 
     def _on_track_height_preferred_height_changed(self):
-        if self._closing or self._tabs.currentWidget() is not self._track_height_tool:
+        if (
+            self._closing
+            or self._applying_geometry
+            or not self.isVisible()
+            or self._tabs.currentWidget() is not self._track_height_tool
+        ):
             return
         QTimer.singleShot(0, self._resize_for_current_tab)
 
     def _resize_for_current_tab(self):
-        if self._closing:
+        if self._closing or self._applying_geometry or not self.isVisible():
             return
 
         available = self._available_geometry()
@@ -367,6 +377,22 @@ class ProToolsUtilsWindow(QDialog):
         if self._connection_state == "connected":
             self._disconnect()
         else:
+            self._start_connect()
+
+    def _schedule_start_connect(self):
+        if (
+            self._engine is None
+            and self._connection_state != "connecting"
+        ):
+            QTimer.singleShot(0, self._start_connect_if_needed)
+
+    def _start_connect_if_needed(self):
+        if (
+            not self._closing
+            and self.isVisible()
+            and self._engine is None
+            and self._connection_state != "connecting"
+        ):
             self._start_connect()
 
     def _start_connect(self):
@@ -483,16 +509,10 @@ class ProToolsUtilsWindow(QDialog):
     def showEvent(self, event):
         super().showEvent(event)
         self._closing = False
-        if not self._initial_geometry_applied:
-            self._apply_initial_geometry()
         if self._suppress_next_show_connect:
             self._suppress_next_show_connect = False
             return
-        if (
-            self._engine is None
-            and self._connection_state != "connecting"
-        ):
-            self._start_connect()
+        self._schedule_start_connect()
 
     def closeEvent(self, event):
         self._closing = True
