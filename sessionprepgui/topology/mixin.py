@@ -77,6 +77,7 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
 
         self._recursive_cb = QCheckBox("Scan subfolders")
         tune_toolbar_checkbox(self._recursive_cb)
+        self._recursive_cb.setLayoutDirection(Qt.RightToLeft)
         self._recursive_cb.setToolTip(
             "When checked, Open Folder will recursively discover "
             "audio files in all subdirectories")
@@ -113,8 +114,6 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
         self._topo_remove_empty_action.triggered.connect(
             self._on_topo_remove_empty)
         toolbar.addAction(self._topo_remove_empty_action)
-
-        toolbar.addSeparator()
 
         self._topo_status_label = QLabel("")
         self._topo_status_label.setStyleSheet(
