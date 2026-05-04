@@ -8,7 +8,7 @@ import re
 from typing import Any
 
 from PySide6.QtCore import Qt, Slot, QSize
-from PySide6.QtGui import QColor, QIcon, QPixmap
+from PySide6.QtGui import QBrush, QColor, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -26,7 +26,7 @@ from PySide6.QtWidgets import (
 
 from ..prefs.param_form import _argb_to_qcolor
 from ..settings import build_defaults, save_config
-from .table_widgets import _SortableItem
+from .table_widgets import _SortableItem, _TAB_GROUPS
 from ..theme import COLORS, PT_DEFAULT_COLORS
 from ..widgets import BatchComboBox, ColorPickerButton
 
@@ -38,6 +38,8 @@ class GroupsMixin:  # pylint: disable=too-few-public-methods
     """
 
     # ── Groups tab (session-local group editor) ─────────────────────────
+
+    _GROUP_DIRTY_BG = QColor("#3a3121")
 
     def _build_groups_tab(self) -> QWidget:
         """Build the session-local Groups editor tab."""
@@ -193,11 +195,14 @@ class GroupsMixin:  # pylint: disable=too-few-public-methods
         colors = self._config.get("colors", PT_DEFAULT_COLORS)
         color_picker = ColorPickerButton(colors, self._groups_tab_table)
         color_picker.setCurrentColor(color)
+        color_picker.colorChanged.connect(
+            lambda *_: self._sync_session_groups())
         self._groups_tab_table.setCellWidget(row, 1, color_picker)
 
         # Gain-linked checkbox (centered)
         chk = QCheckBox()
         chk.setChecked(gain_linked)
+        chk.toggled.connect(lambda *_: self._sync_session_groups())
         chk_container = QWidget()
         chk_layout = QHBoxLayout(chk_container)
         chk_layout.setContentsMargins(0, 0, 0, 0)
@@ -218,6 +223,8 @@ class GroupsMixin:  # pylint: disable=too-few-public-methods
         match_combo.setProperty("_row", row)
         match_combo.currentTextChanged.connect(
             lambda _text, r=row: self._validate_groups_tab_pattern(r))
+        match_combo.currentTextChanged.connect(
+            lambda *_: self._sync_session_groups())
         self._groups_tab_table.setCellWidget(row, 4, match_combo)
 
         # Match pattern text
@@ -238,6 +245,7 @@ class GroupsMixin:  # pylint: disable=too-few-public-methods
                 g.get("match_pattern", ""),
             )
         self._groups_tab_table.blockSignals(False)
+        self._refresh_groups_dirty_indicators()
 
     def _read_session_groups(self) -> list[dict]:
         """Read the session groups table back into a list of dicts."""
@@ -353,6 +361,7 @@ class GroupsMixin:  # pylint: disable=too-few-public-methods
         """Read the groups tab table into _session_groups and refresh combos."""
         self._session_groups = self._read_session_groups()
         self._refresh_group_combos()
+        self._refresh_groups_dirty_indicators()
 
     def _on_groups_tab_add(self):
         row = self._groups_tab_table.rowCount()
@@ -421,6 +430,7 @@ class GroupsMixin:  # pylint: disable=too-few-public-methods
         vh.blockSignals(False)
         self._session_groups = ordered
         self._refresh_group_combos()
+        self._refresh_groups_dirty_indicators()
 
     def _on_groups_tab_sort_az(self):
         groups = self._read_session_groups()
@@ -428,6 +438,7 @@ class GroupsMixin:  # pylint: disable=too-few-public-methods
         self._session_groups = groups
         self._populate_groups_tab()
         self._refresh_group_combos()
+        self._refresh_groups_dirty_indicators()
 
     def _on_groups_tab_reset(self):
         """Revert session groups to the selected group preset."""
@@ -452,8 +463,108 @@ class GroupsMixin:  # pylint: disable=too-few-public-methods
         self._populate_groups_tab()
         self._refresh_group_combos()
         self._populate_setup_table()
+        self._refresh_groups_dirty_indicators()
 
     # ── Auto-Group ────────────────────────────────────────────────────
+
+    # Groups preset difference indicators
+
+    def _selected_group_preset_groups(self) -> list[dict]:
+        presets = self._config.get("group_presets",
+                                   build_defaults().get("group_presets", {}))
+        preset = presets.get(self._active_session_preset,
+                             presets.get("Default", []))
+        return self._normalize_session_groups(preset)
+
+    @staticmethod
+    def _normalize_session_groups(groups: list[dict]) -> list[dict]:
+        normalized: list[dict] = []
+        for group in groups:
+            name = str(group.get("name", "")).strip()
+            if not name:
+                continue
+            normalized.append({
+                "name": name,
+                "color": group.get("color", ""),
+                "gain_linked": bool(group.get("gain_linked", False)),
+                "daw_target": group.get("daw_target", ""),
+                "match_method": group.get("match_method", "contains"),
+                "match_pattern": group.get("match_pattern", ""),
+            })
+        return normalized
+
+    def _groups_dirty_cells(self) -> dict[int, set[int]]:
+        if not getattr(self, "_session", None):
+            return {}
+        current = self._normalize_session_groups(self._read_session_groups())
+        preset = self._selected_group_preset_groups()
+        dirty: dict[int, set[int]] = {}
+        preset_by_name = {group["name"]: group for group in preset}
+        keys_by_column = {
+            0: "name",
+            1: "color",
+            2: "gain_linked",
+            3: "daw_target",
+            4: "match_method",
+            5: "match_pattern",
+        }
+        for row, group in enumerate(current):
+            if row < len(preset) and group == preset[row]:
+                continue
+            baseline = preset_by_name.get(group["name"])
+            if baseline is None:
+                dirty[row] = set(keys_by_column)
+                continue
+            changed = {
+                col for col, key in keys_by_column.items()
+                if group.get(key) != baseline.get(key)
+            }
+            if changed:
+                dirty[row] = changed
+        return dirty
+
+    def _groups_tab_is_dirty(self) -> bool:
+        if not getattr(self, "_session", None):
+            return False
+        current = self._normalize_session_groups(self._read_session_groups())
+        return current != self._selected_group_preset_groups()
+
+    def _refresh_groups_dirty_indicators(self) -> None:
+        if not hasattr(self, "_groups_tab_table"):
+            return
+        dirty_cells = self._groups_dirty_cells()
+        table = self._groups_tab_table
+        table.blockSignals(True)
+        try:
+            for row in range(table.rowCount()):
+                for col in range(table.columnCount()):
+                    dirty = col in dirty_cells.get(row, set())
+                    self._set_groups_cell_dirty(row, col, dirty)
+        finally:
+            table.blockSignals(False)
+        if hasattr(self, "_set_detail_tab_dirty"):
+            self._set_detail_tab_dirty(
+                _TAB_GROUPS, "Groups", self._groups_tab_is_dirty())
+
+    def _set_groups_cell_dirty(self, row: int, col: int, dirty: bool) -> None:
+        table = self._groups_tab_table
+        item = table.item(row, col)
+        brush = QBrush(self._GROUP_DIRTY_BG) if dirty else QBrush()
+        if item is not None:
+            item.setBackground(brush)
+        widget = table.cellWidget(row, col)
+        if widget is None:
+            return
+        widget.setProperty("sessionDirty", dirty)
+        if isinstance(widget, ColorPickerButton):
+            widget.setDirtyIndicator(dirty)
+        else:
+            widget.setStyleSheet(
+                f"background-color: {self._GROUP_DIRTY_BG.name()};"
+                if dirty else "")
+        widget.setToolTip("Changed from selected preset" if dirty else "")
+
+    # Auto-Group
 
     @Slot()
     def _on_auto_group(self):
@@ -602,6 +713,11 @@ class GroupsMixin:  # pylint: disable=too-few-public-methods
         if self._session is not None:
             self._session_config = None  # re-init from new preset
             self._on_analyze()
+        else:
+            if hasattr(self, "_load_session_widgets"):
+                self._load_session_widgets(self._active_preset())
+            if hasattr(self, "_refresh_phase2_dirty_indicators"):
+                self._refresh_phase2_dirty_indicators()
 
     # ── Group column (col 6) ────────────────────────────────────────────
 

@@ -37,7 +37,7 @@ from __future__ import annotations
 import time as _time
 
 from PySide6.QtCore import Qt, QItemSelectionModel, QTimer, Signal, QPoint
-from PySide6.QtGui import QBrush, QColor
+from PySide6.QtGui import QBrush, QColor, QPainter
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -455,6 +455,7 @@ class ColorPickerButton(QPushButton):
         self.setCursor(Qt.PointingHandCursor)
         self.clicked.connect(self._show_popup)
         self._last_popup_close = 0.0
+        self._dirty_indicator = False
         self._update_appearance()
 
     def currentColor(self) -> str:
@@ -465,6 +466,14 @@ class ColorPickerButton(QPushButton):
         """Set the current color by name (no signal emitted)."""
         self._current = name
         self._update_appearance()
+
+    def setDirtyIndicator(self, dirty: bool) -> None:
+        """Show a small trailing dirty dot, painted vertically centered."""
+        dirty = bool(dirty)
+        if self._dirty_indicator == dirty:
+            return
+        self._dirty_indicator = dirty
+        self.update()
 
     def _update_appearance(self):
         """Update button text and background to reflect the current color."""
@@ -491,6 +500,20 @@ class ColorPickerButton(QPushButton):
                 " font-size: 8pt; padding: 2px 6px; text-align: left; }"
                 "QPushButton:hover { border: 1px solid #aaa; }"
             )
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if not self._dirty_indicator:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setBrush(QColor("#e53935"))
+        painter.setPen(Qt.NoPen)
+        size = 6
+        x = max(6, self.width() - 13)
+        y = (self.height() - size) // 2
+        painter.drawEllipse(x, y, size, size)
+        painter.end()
 
     def _show_popup(self):
         # Toggle: suppress reopening if popup just closed (Qt.Popup

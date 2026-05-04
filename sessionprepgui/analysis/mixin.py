@@ -12,16 +12,21 @@ import os
 from typing import Any
 
 from PySide6.QtCore import Qt, Slot, QSize
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
+    QDoubleSpinBox,
     QFileDialog,
+    QHeaderView,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMessageBox,
     QPushButton,
     QScrollArea,
     QSplitter,
+    QSpinBox,
     QStackedWidget,
     QTreeWidget,
     QVBoxLayout,
@@ -98,9 +103,14 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         splitter = QSplitter(Qt.Horizontal)
 
         self._session_tree = QTreeWidget()
+        self._session_tree.setColumnCount(2)
         self._session_tree.setHeaderHidden(True)
         self._session_tree.setMinimumWidth(160)
         self._session_tree.setMaximumWidth(220)
+        self._session_tree.header().setStretchLastSection(False)
+        self._session_tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
+        self._session_tree.header().setSectionResizeMode(1, QHeaderView.Fixed)
+        self._session_tree.setColumnWidth(1, 18)
         self._session_tree.currentItemChanged.connect(
             self._on_session_tree_selection)
         splitter.addWidget(self._session_tree)
@@ -114,6 +124,7 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
 
         # Build initial pages from the active global preset
         self._session_page_index: dict[int, int] = {}
+        self._session_dirty_items: dict[str, Any] = {}
         self._build_session_pages()
 
         self._session_tree.expandAll()
@@ -126,13 +137,15 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
     def _build_session_pages(self):
         """Populate the session config tree + stack from the active preset."""
 
-        def _register_page(tree_item, page, _dirty_key=None):
+        def _register_page(tree_item, page, dirty_key=None):
             scroll = QScrollArea()
             scroll.setWidgetResizable(True)
             scroll.setFrameShape(QScrollArea.NoFrame)
             scroll.setWidget(page)
             idx = self._session_stack.addWidget(scroll)
             self._session_page_index[id(tree_item)] = idx
+            if dirty_key:
+                self._session_dirty_items[dirty_key] = tree_item
 
         self._session_daw_custom_widgets = build_config_pages(
             self._session_tree,
@@ -142,6 +155,7 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
             on_processor_enabled=self._on_processor_enabled_changed,
             on_daw_config_changed=self._on_daw_config_changed,
         )
+        self._connect_session_config_dirty_signals()
 
     def _on_session_tree_selection(self, current, _previous):
         if current is None:
@@ -156,6 +170,7 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         self._populate_config_preset_combo()
         self._load_session_widgets(self._session_config)
         self._detail_tabs.setTabEnabled(_TAB_SESSION, True)
+        self._refresh_phase2_dirty_indicators()
 
     def _load_session_widgets(self, preset: dict[str, Any]):
         """Load values from a config preset dict into session widgets."""
@@ -167,6 +182,7 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         # Single refresh after all widgets are set
         if self._session:
             self._on_processor_enabled_changed(False)
+        self._refresh_session_config_dirty_indicators()
 
     def _load_session_widgets_inner(self, preset: dict[str, Any]):
         """Inner loader — sets widget values without triggering column refresh."""
@@ -187,9 +203,11 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         """Refresh Phase 3 DAW combo when session DAW config changes."""
         if getattr(self, "_loading_session_widgets", False):
             return
+        self._session_config = self._read_session_config()
         self._configure_daw_processors()
         self._populate_daw_combo()
         self._update_daw_lifecycle_buttons()
+        self._refresh_session_config_dirty_indicators()
 
     def _on_session_config_reset(self):
         """Revert session config to the selected config preset."""
@@ -197,7 +215,111 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         self._session_config = copy.deepcopy(preset)
         self._load_session_widgets(self._session_config)
         self._on_daw_config_changed()
+        self._refresh_session_config_dirty_indicators()
         self._status_bar.showMessage("Session config reverted to preset.")
+
+    # 哪 Phase-2 preset difference indicators 哪哪哪哪哪哪哪哪哪哪哪哪哪哪
+
+    def _phase2_dirty_icon(self) -> QIcon:
+        icon = getattr(self, "_phase2_dirty_dot_icon", None)
+        if icon is not None:
+            return icon
+        pixmap = QPixmap(12, 12)
+        pixmap.fill(Qt.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setBrush(QColor("#e53935"))
+        painter.setPen(Qt.NoPen)
+        painter.drawEllipse(3, 3, 6, 6)
+        painter.end()
+        self._phase2_dirty_dot_icon = QIcon(pixmap)
+        return self._phase2_dirty_dot_icon
+
+    def _set_detail_tab_dirty(self, index: int, label: str, dirty: bool) -> None:
+        if hasattr(self, "_detail_tabs"):
+            self._detail_tabs.setTabText(
+                index, f"{label} \u25cf" if dirty else label)
+
+    def _connect_session_config_dirty_signals(self) -> None:
+        for widgets in self._session_widgets.values():
+            for _key, widget in widgets:
+                self._connect_session_widget_dirty_signal(widget)
+        for widget in getattr(self, "_session_daw_custom_widgets", {}).values():
+            if hasattr(widget, "templates_changed"):
+                widget.templates_changed.connect(
+                    self._on_session_config_value_changed)
+
+    def _connect_session_widget_dirty_signal(self, widget: QWidget) -> None:
+        if hasattr(widget, "path_changed"):
+            widget.path_changed.connect(self._on_session_config_value_changed)
+        elif isinstance(widget, QComboBox):
+            widget.currentIndexChanged.connect(
+                self._on_session_config_value_changed)
+        elif isinstance(widget, QCheckBox):
+            widget.toggled.connect(self._on_session_config_value_changed)
+        elif isinstance(widget, (QSpinBox, QDoubleSpinBox)):
+            widget.valueChanged.connect(self._on_session_config_value_changed)
+        elif isinstance(widget, QLineEdit):
+            widget.textChanged.connect(self._on_session_config_value_changed)
+
+    def _on_session_config_value_changed(self, *_args) -> None:
+        if getattr(self, "_loading_session_widgets", False):
+            return
+        self._session_config = self._read_session_config()
+        self._refresh_session_config_dirty_indicators()
+
+    def _refresh_phase2_dirty_indicators(self) -> None:
+        if hasattr(self, "_refresh_groups_dirty_indicators"):
+            self._refresh_groups_dirty_indicators()
+        self._refresh_session_config_dirty_indicators()
+
+    def _refresh_session_config_dirty_indicators(self) -> None:
+        if not hasattr(self, "_session_dirty_items"):
+            return
+        dirty_keys = self._session_config_dirty_keys()
+        icon = self._phase2_dirty_icon()
+        for key, item in self._session_dirty_items.items():
+            item.setIcon(1, icon if key in dirty_keys else QIcon())
+        self._set_detail_tab_dirty(_TAB_SESSION, "Config", bool(dirty_keys))
+
+    def _session_config_dirty_keys(self) -> set[str]:
+        if not getattr(self, "_session", None):
+            return set()
+        if not getattr(self, "_session_widgets", None):
+            return set()
+        current = self._read_session_config()
+        preset = self._active_preset()
+        dirty_keys: set[str] = set()
+
+        if current.get("analysis") != preset.get("analysis"):
+            dirty_keys.add("analysis")
+        if current.get("presentation") != preset.get("presentation"):
+            dirty_keys.add("_presentation")
+
+        for key in self._session_widgets:
+            if key.startswith("detectors."):
+                section_id = key.removeprefix("detectors.")
+                if current.get("detectors", {}).get(section_id) != (
+                        preset.get("detectors", {}).get(section_id)):
+                    dirty_keys.add(key)
+            elif key.startswith("processors."):
+                section_id = key.removeprefix("processors.")
+                if current.get("processors", {}).get(section_id) != (
+                        preset.get("processors", {}).get(section_id)):
+                    dirty_keys.add(key)
+            elif key.startswith("daw_processors."):
+                section_id = key.removeprefix("daw_processors.")
+                if current.get("daw_processors", {}).get(section_id) != (
+                        preset.get("daw_processors", {}).get(section_id)):
+                    dirty_keys.add(key)
+
+        if any(key.startswith("detectors.") for key in dirty_keys):
+            dirty_keys.add("_presentation")
+        if any(key.startswith("processors.") for key in dirty_keys):
+            dirty_keys.add("_processors")
+        if any(key.startswith("daw_processors.") for key in dirty_keys):
+            dirty_keys.add("_daw_processors")
+        return dirty_keys
 
     # ── Slots: file / analysis ────────────────────────────────────────────
 
@@ -285,6 +407,7 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         self._detail_tabs.setTabEnabled(_TAB_GROUPS, False)
         self._detail_tabs.setTabEnabled(_TAB_SESSION, False)
         self._detail_tabs.setCurrentIndex(_TAB_SUMMARY)
+        self._refresh_phase2_dirty_indicators()
         self._right_stack.setCurrentIndex(_PAGE_TABS)
         self._session_config = None
         self._session_groups = []
@@ -674,6 +797,7 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         self._detail_tabs.setCurrentIndex(_TAB_SUMMARY)
         self._detail_tabs.setTabEnabled(_TAB_GROUPS, True)
         self._detail_tabs.setTabEnabled(_TAB_SESSION, True)
+        self._refresh_phase2_dirty_indicators()
         self._populate_topology_tab()
         self._phase_tabs.setTabEnabled(_PHASE_ANALYSIS, True)
         self._phase_tabs.setCurrentIndex(_PHASE_ANALYSIS)
@@ -986,6 +1110,7 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         self._detail_tabs.setCurrentIndex(_TAB_SUMMARY)
         self._detail_tabs.setTabEnabled(_TAB_GROUPS, True)
         self._detail_tabs.setTabEnabled(_TAB_SESSION, True)
+        self._refresh_phase2_dirty_indicators()
 
         # Refresh topology tab (always enabled as Phase 1 landing page)
         self._populate_topology_tab()

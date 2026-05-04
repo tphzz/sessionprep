@@ -625,8 +625,6 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
         self._analyze_action.triggered.connect(self._on_analyze)
         self._analysis_toolbar.addAction(self._analyze_action)
 
-        self._analysis_toolbar.addSeparator()
-
         # Preset selectors live in their respective Phase 2 tabs.
         # ── Spacer ─────────────────────────────────────────────────────
         spacer = QWidget()
