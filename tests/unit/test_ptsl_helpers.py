@@ -120,6 +120,16 @@ def test_extract_track_id():
     with pytest.raises(RuntimeError):
         ptsl_helpers.extract_track_id({"created_track_ids": []})
 
+
+def test_extract_track_name_falls_back():
+    assert (
+        ptsl_helpers.extract_track_name(
+            {"created_track_names": ["Audio 1.01"]}, fallback="Audio 1"
+        )
+        == "Audio 1.01"
+    )
+    assert ptsl_helpers.extract_track_name({}, fallback="Audio 1") == "Audio 1"
+
 def test_set_track_volume_body_construction(mock_engine, ptsl_factory):
     mock_engine.client.raw_client.SendGrpcRequest.return_value = ptsl_factory.ok()
     
@@ -168,6 +178,31 @@ def test_create_track_with_folder(mock_engine, ptsl_factory):
     assert body["track_format"] == "TF_Stereo"
     assert body["insertion_point_track_name"] == "Drums Folder"
     assert body["insertion_point_position"] == "TIPoint_Last"
+
+
+def test_create_track_with_explicit_insertion_point(mock_engine, ptsl_factory):
+    mock_engine.client.raw_client.SendGrpcRequest.return_value = ptsl_factory.ok({
+        "created_track_ids": ["t-uuid-003"],
+        "created_track_names": ["Bass.01"],
+    })
+
+    track_id, track_name = ptsl_helpers.create_track_with_name(
+        mock_engine,
+        "Bass",
+        "TF_Mono",
+        insertion_point_track_name="Routing Folder",
+        insertion_point_position="TIPoint_First",
+    )
+
+    assert track_id == "t-uuid-003"
+    assert track_name == "Bass.01"
+    req = mock_engine.client.raw_client.SendGrpcRequest.call_args[0][0]
+    body = json.loads(req.request_body_json)
+
+    assert body["track_name"] == "Bass"
+    assert body["track_format"] == "TF_Mono"
+    assert body["insertion_point_track_name"] == "Routing Folder"
+    assert body["insertion_point_position"] == "TIPoint_First"
 
 def test_create_track_without_folder(mock_engine, ptsl_factory):
     mock_engine.client.raw_client.SendGrpcRequest.return_value = ptsl_factory.ok({

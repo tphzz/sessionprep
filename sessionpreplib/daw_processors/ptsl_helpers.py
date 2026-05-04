@@ -180,6 +180,18 @@ def extract_track_id(resp: dict) -> str:
             f"Failed to extract track_id from create response: {resp}"
         ) from e
 
+def extract_track_name(resp: dict, fallback: str = "") -> str:
+    """Extract the created track name from a CId_CreateNewTracks response."""
+    try:
+        return resp['created_track_names'][0] or fallback
+    except (KeyError, IndexError, TypeError):
+        return fallback
+
+
+def extract_created_track(resp: dict, fallback_name: str = "") -> tuple[str, str]:
+    """Extract the created track ID and display name from a create response."""
+    return extract_track_id(resp), extract_track_name(resp, fallback_name)
+
 
 # ── Session queries ──────────────────────────────────────────────────
 
@@ -440,17 +452,20 @@ def batch_import_audio(
 
 # ── Track operations ─────────────────────────────────────────────────
 
-def create_track(  # pylint: disable=too-many-positional-arguments
+def create_track_with_name(  # pylint: disable=too-many-positional-arguments
     engine, name: str, track_format: str,
     track_type: str = "TT_Audio",
     timebase: str = "TTB_Samples",
     folder_name: str | None = None,
     batch_job_id: str | None = None, progress: int = 0,
-) -> str:
-    """Create a new track and return its track ID.
+    insertion_point_track_name: str | None = None,
+    insertion_point_position: str | None = None,
+) -> tuple[str, str]:
+    """Create a new track and return ``(track_id, created_track_name)``.
 
     When *folder_name* is given the track is inserted as the last child
-    of that folder.
+    of that folder.  Explicit insertion point arguments can override this
+    for order-sensitive workflows.
     """
     from ptsl import PTSL_pb2 as pt
     body: dict[str, Any] = {
@@ -460,13 +475,48 @@ def create_track(  # pylint: disable=too-many-positional-arguments
         "track_type": track_type,
         "track_timebase": timebase,
     }
-    if folder_name is not None:
+    if insertion_point_track_name is not None:
+        body["insertion_point_track_name"] = insertion_point_track_name
+        body["insertion_point_position"] = (
+            insertion_point_position or "TIPoint_Last"
+        )
+    elif folder_name is not None:
         body["insertion_point_track_name"] = folder_name
         body["insertion_point_position"] = "TIPoint_Last"
     resp = run_command(
         engine, pt.CommandId.CId_CreateNewTracks, body,
         batch_job_id=batch_job_id, progress=progress)
-    return extract_track_id(resp or {})
+    return extract_created_track(resp or {}, name)
+
+
+def create_track(  # pylint: disable=too-many-positional-arguments
+    engine, name: str, track_format: str,
+    track_type: str = "TT_Audio",
+    timebase: str = "TTB_Samples",
+    folder_name: str | None = None,
+    batch_job_id: str | None = None, progress: int = 0,
+    insertion_point_track_name: str | None = None,
+    insertion_point_position: str | None = None,
+) -> str:
+    """Create a new track and return its track ID.
+
+    When *folder_name* is given the track is inserted as the last child
+    of that folder.  Explicit insertion point arguments can override this
+    for order-sensitive workflows.
+    """
+    track_id, _ = create_track_with_name(
+        engine,
+        name,
+        track_format,
+        track_type=track_type,
+        timebase=timebase,
+        folder_name=folder_name,
+        batch_job_id=batch_job_id,
+        progress=progress,
+        insertion_point_track_name=insertion_point_track_name,
+        insertion_point_position=insertion_point_position,
+    )
+    return track_id
 
 
 def spot_clips(

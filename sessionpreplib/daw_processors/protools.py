@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import os
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 from ..models import ParamSpec
@@ -811,7 +810,7 @@ class ProToolsDawProcessor(DawProcessor):
                     )
                 ]
 
-            # ── 3. Parallel Track Creation + Spot ────────────────
+            # ── 3. Ordered Track Creation + Spot ────────────────
 
             color_groups: dict[int, list[str]] = {}
             created_tracks: list[tuple[str, str, Any]] = []
@@ -826,58 +825,68 @@ class ProToolsDawProcessor(DawProcessor):
                     (step, fid, filepath_val, track_stem, track_format, tc, clip_ids)
                 )
 
-            def _create_and_spot(item):
-                (
-                    step_val,
-                    fid_val,
-                    _,
-                    track_stem_val,
-                    track_format_val,
-                    tc_val,
-                    clip_ids_val,
-                ) = item
-                folder_name = folder_map[fid_val]["name"]
-                pct = 30 + int(50 * step_val / max(len(valid_work), 1))
+            work_by_folder: dict[str, list[tuple[Any, ...]]] = {}
+            for item in spot_work:
+                work_by_folder.setdefault(item[1], []).append(item)
 
-                try:
-                    tid = ptslh.create_track(
-                        engine,
+            created_count = 0
+            total_spot = len(spot_work)
+            for fid, folder_items in work_by_folder.items():
+                folder_name = folder_map[fid]["name"]
+
+                # PTSL can insert at the first child of a routing folder but
+                # cannot reorder tracks after creation. Creating the folder's
+                # tracks in reverse with TIPoint_First preserves SessionPrep's
+                # final order while pushing template tracks to the end.
+                for item in reversed(folder_items):
+                    (
+                        _step_val,
+                        _fid_val,
+                        _,
                         track_stem_val,
                         track_format_val,
-                        folder_name=folder_name,
-                        batch_job_id=batch_job_id,
-                        progress=pct,
-                    )
-                    ptslh.spot_clips(
-                        engine,
+                        tc_val,
                         clip_ids_val,
-                        tid,
-                        batch_job_id=batch_job_id,
-                        progress=pct,
-                    )
+                    ) = item
+                    pct = 30 + int(50 * (created_count + 1) / max(total_spot, 1))
 
-                    cinfo = (
-                        (group_palette_idx[tc_val.group], track_stem_val)
-                        if tc_val.group in group_palette_idx
-                        else None
-                    )
-                    return True, (track_stem_val, tid, tc_val), cinfo, None
-                except Exception as ex:
-                    return False, None, None, str(ex)
+                    try:
+                        tid, created_name = ptslh.create_track_with_name(
+                            engine,
+                            track_stem_val,
+                            track_format_val,
+                            insertion_point_track_name=folder_name,
+                            insertion_point_position="TIPoint_First",
+                            batch_job_id=batch_job_id,
+                            progress=pct,
+                        )
+                        ptslh.spot_clips(
+                            engine,
+                            clip_ids_val,
+                            tid,
+                            batch_job_id=batch_job_id,
+                            progress=pct,
+                        )
 
-            with ThreadPoolExecutor(max_workers=6) as pool:
-                futures = [pool.submit(_create_and_spot, item) for item in spot_work]
-                for i, fut in enumerate(as_completed(futures)):
-                    ok, tinfo, cinfo, _ = fut.result()
-                    if ok:
-                        created_tracks.append(tinfo)
-                        if cinfo:
-                            color_groups.setdefault(cinfo[0], []).append(cinfo[1])
-                    if progress_cb:
+                        created_tracks.append((created_name, tid, tc_val))
+                        if tc_val.group in group_palette_idx:
+                            color_groups.setdefault(
+                                group_palette_idx[tc_val.group], []
+                            ).append(created_name)
+                    except Exception as ex:
+                        log.debug(
+                            "Create/spot failed for %s in %s: %s",
+                            track_stem_val,
+                            folder_name,
+                            ex,
+                        )
+
+                    created_count += 1
+                    if progress_cb and total_spot:
                         progress_cb(
-                            30 + int(50 * i / len(spot_work)),
+                            30 + int(50 * created_count / total_spot),
                             100,
-                            f"Created {i + 1}/{len(spot_work)} tracks",
+                            f"Created {created_count}/{total_spot} tracks",
                         )
 
             # ── 4. Colorize ──────────────────────────────────────
