@@ -105,6 +105,28 @@ def test_phase2_dirty_indicators_are_clean_on_preset_values(qapp):
         window.close()
 
 
+def test_phase2_groups_tab_stays_clean_before_first_analysis_groups_load(qapp):
+    window = SessionPrepWindow()
+    try:
+        window._session = SimpleNamespace(
+            tracks=[],
+            processors=[],
+            transfer_manifest=[],
+            output_tracks=[],
+            daw_state={},
+            prepare_state="none",
+            config={},
+        )
+        window._session_groups = []
+        window._detail_tabs.setTabEnabled(_TAB_GROUPS, False)
+
+        window._refresh_phase2_dirty_indicators()
+
+        assert window._detail_tabs.tabText(_TAB_GROUPS) == "Groups"
+    finally:
+        window.close()
+
+
 def test_phase2_groups_dirty_highlights_cell_and_tab(qapp):
     window = _window(qapp)
     try:

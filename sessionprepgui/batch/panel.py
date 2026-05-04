@@ -13,7 +13,6 @@ from PySide6.QtWidgets import (
     QLabel,
     QMenu,
     QMessageBox,
-    QProgressBar,
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
@@ -23,6 +22,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..theme import COLORS
+from ..widgets import ProgressPanel
 from ..session.io import serialize_session_state, deserialize_session_state
 
 
@@ -254,12 +254,8 @@ class BatchQueueDock(QDockWidget):
 
         layout.addWidget(self._table)
 
-        # Progress bar
-        self._progress_bar = QProgressBar()
-        self._progress_bar.setRange(0, 100)
-        self._progress_bar.setValue(0)
-        self._progress_bar.setVisible(False)
-        layout.addWidget(self._progress_bar)
+        self._progress_panel = ProgressPanel()
+        layout.addWidget(self._progress_panel)
 
         # Bottom bar
         bottom_layout = QHBoxLayout()
@@ -337,15 +333,19 @@ class BatchQueueDock(QDockWidget):
 
     def set_running_state(self, is_running: bool):
         self._is_running = is_running
-        self._progress_bar.setVisible(is_running)
-        if not is_running:
-            self._progress_bar.setValue(0)
+        if is_running:
+            self._progress_panel.start("Batch processing...")
+            self._progress_panel.set_progress(0, 1)
+        else:
+            self._progress_panel.setVisible(False)
         self._clear_btn.setEnabled(not is_running)
         self._run_btn.setEnabled(not is_running and len(self.get_pending_items()) > 0)
 
+    def update_progress_message(self, message: str):
+        self._progress_panel.set_message(message)
+
     def update_progress(self, current: int, total: int):
-        self._progress_bar.setRange(0, total)
-        self._progress_bar.setValue(current)
+        self._progress_panel.set_progress(current, total)
 
     def _refresh_table(self):
         self._table.setRowCount(0)

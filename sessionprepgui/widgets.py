@@ -73,6 +73,13 @@ class ProgressPanel(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setStyleSheet(
+            "ProgressPanel {"
+            f" background-color: {COLORS['bg']};"
+            " border-top: 1px solid #444444;"
+            "}"
+        )
         layout = QVBoxLayout(self)
         layout.setContentsMargins(6, 4, 6, 6)
         layout.setSpacing(3)

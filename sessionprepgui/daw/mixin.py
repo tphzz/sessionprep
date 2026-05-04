@@ -42,9 +42,9 @@ from sessionpreplib.daw_processors import create_runtime_daw_processors
 from ..tracks.table_widgets import (
     _FolderDropTree, _SetupDragTable,
     _SETUP_RIGHT_PLACEHOLDER, _SETUP_RIGHT_TREE,
+    _PHASE_SETUP,
 )
 from ..theme import COLORS, PT_DEFAULT_COLORS, tune_toolbar_checkbox
-from ..widgets import ProgressPanel
 from ..analysis.worker import DawCheckWorker, DawFetchWorker, DawTransferWorker
 
 
@@ -285,10 +285,6 @@ class DawMixin:  # pylint: disable=too-few-public-methods
         self._folder_tree.tracks_unassigned.connect(self._unassign_tracks)
         tree_page_layout.addWidget(self._folder_tree, 1)
 
-        # Transfer progress panel (hidden by default)
-        self._transfer_progress = ProgressPanel()
-        tree_page_layout.addWidget(self._transfer_progress)
-
         self._setup_right_stack.addWidget(tree_page)
 
         self._setup_right_stack.setCurrentIndex(_SETUP_RIGHT_PLACEHOLDER)
@@ -299,6 +295,7 @@ class DawMixin:  # pylint: disable=too-few-public-methods
         self._schedule_setup_splitter_fit()
 
         layout.addWidget(setup_splitter, 1)
+        self._register_phase_progress_layout(_PHASE_SETUP, layout)
 
         return page
 
@@ -486,11 +483,10 @@ class DawMixin:  # pylint: disable=too-few-public-methods
             if ignore_cache
             else "Fetching folder structure..."
         )
-        self._status_bar.showMessage(message)
         # Ensure the progress panel is visible by switching the stack and clearing the tree
         self._setup_right_stack.setCurrentIndex(_SETUP_RIGHT_TREE)
         self._folder_tree.clear()
-        self._transfer_progress.start(message)
+        self._progress_start(message)
 
         self._daw_fetch_worker = DawFetchWorker(
             self._active_daw_processor,
@@ -514,7 +510,7 @@ class DawMixin:  # pylint: disable=too-few-public-methods
         self._fetch_menu_button.setEnabled(True)
 
         if "PRO_TOOLS_SESSION_OPEN" in message:
-            self._transfer_progress.fail("Fetch aborted: Pro Tools session is open.")
+            self._progress_fail("Fetch aborted: Pro Tools session is open.")
             from PySide6.QtWidgets import QMessageBox
             QMessageBox.warning(
                 self,
@@ -535,10 +531,10 @@ class DawMixin:  # pylint: disable=too-few-public-methods
             self._populate_folder_tree()
             self._setup_right_stack.setCurrentIndex(_SETUP_RIGHT_TREE)
             self._populate_setup_table()
-            self._transfer_progress.finish(message)
+            self._progress_finish(message)
             self._status_bar.showMessage(message)
         else:
-            self._transfer_progress.fail(message)
+            self._progress_fail(message)
             from PySide6.QtWidgets import QMessageBox
             QMessageBox.critical(
                 self,
@@ -709,8 +705,7 @@ class DawMixin:  # pylint: disable=too-few-public-methods
             return
 
         dp_name = self._active_daw_processor.name
-        self._status_bar.showMessage(f"Transferring to {dp_name}\u2026")
-        self._transfer_progress.start("Preparing\u2026")
+        self._progress_start(f"Transferring to {dp_name}\u2026")
 
         self._daw_transfer_worker = DawTransferWorker(
             self._active_daw_processor, self._session, output_path, parent=self, close_session=False)
@@ -722,12 +717,11 @@ class DawMixin:  # pylint: disable=too-few-public-methods
 
     @Slot(str)
     def _on_transfer_progress(self, message: str):
-        self._transfer_progress.set_message(message)
-        self._status_bar.showMessage(message)
+        self._progress_message(message)
 
     @Slot(int, int)
     def _on_transfer_progress_value(self, current: int, total: int):
-        self._transfer_progress.set_progress(current, total)
+        self._progress_value(current, total)
 
     @Slot(bool, str, object)
     def _on_daw_transfer_result(self, ok: bool, message: str, results):
@@ -738,11 +732,11 @@ class DawMixin:  # pylint: disable=too-few-public-methods
         self._update_daw_lifecycle_buttons()
         if ok:
             log.info("DAW transfer complete")
-            self._transfer_progress.finish(message)
+            self._progress_finish(message)
             self._status_bar.showMessage(message)
         else:
             log.error("DAW transfer failed: %s", message)
-            self._transfer_progress.fail(message)
+            self._progress_fail(message)
             self._status_bar.showMessage(f"Transfer failed: {message}")
 
     # ── Folder tree ──────────────────────────────────────────────────────

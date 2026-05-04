@@ -20,7 +20,7 @@ from sessionpreplib.utils import protools_sort_key
 
 from ..helpers import track_analysis_label
 from ..detail.report import render_track_detail_html
-from .table_widgets import _SortableItem, _make_analysis_cell
+from .table_widgets import _PAGE_TABS, _SortableItem, _make_analysis_cell
 from ..theme import (
     COLORS,
     FILE_COLOR_OK,
@@ -662,11 +662,8 @@ class TrackColumnsMixin:  # pylint: disable=too-few-public-methods
         # Save filenames for selection restore after worker completes
         self._batch_filenames = batch_keys
 
-        # Show progress UI
-        self._progress_label.setText("Re-analyzing…")
-        self._progress_bar.setRange(0, len(tracks_to_reanalyze))
-        self._progress_bar.setValue(0)
-        self._right_stack.setCurrentIndex(0)  # _PAGE_PROGRESS
+        self._progress_start("Re-analyzing\u2026")
+        self._progress_value(0, len(tracks_to_reanalyze))
         self._analyze_action.setEnabled(False)
 
         # Start async worker
@@ -693,7 +690,8 @@ class TrackColumnsMixin:  # pylint: disable=too-few-public-methods
         """Finalize the batch: restore selection, switch back to tabs."""
         self._batch_worker = None
         self._analyze_action.setEnabled(True)
-        self._right_stack.setCurrentIndex(1)  # _PAGE_TABS
+        self._right_stack.setCurrentIndex(_PAGE_TABS)
+        self._progress_finish("Re-analysis complete")
 
         # Re-enable sorting (was disabled in _batch_apply_combo);
         # rows may reorder, so restore selection by key afterward.
@@ -714,7 +712,8 @@ class TrackColumnsMixin:  # pylint: disable=too-few-public-methods
         self._track_table.setSortingEnabled(True)
         self._track_table.restore_selection(self._batch_filenames)
         self._batch_filenames = set()
-        self._right_stack.setCurrentIndex(1)  # _PAGE_TABS
+        self._right_stack.setCurrentIndex(_PAGE_TABS)
+        self._progress_fail(message)
         self._status_bar.showMessage(f"Batch error: {message}")
 
     # ── Recalculation ────────────────────────────────────────────────────

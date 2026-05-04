@@ -526,6 +526,12 @@ class GroupsMixin:  # pylint: disable=too-few-public-methods
     def _groups_tab_is_dirty(self) -> bool:
         if not getattr(self, "_session", None):
             return False
+        if (
+            hasattr(self, "_detail_tabs")
+            and not self._detail_tabs.isTabEnabled(_TAB_GROUPS)
+            and not self._session_groups
+        ):
+            return False
         current = self._normalize_session_groups(self._read_session_groups())
         return current != self._selected_group_preset_groups()
 

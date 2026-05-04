@@ -31,7 +31,6 @@ from PySide6.QtWidgets import (
 from sessionpreplib.topology import build_default_topology
 from sessionpreplib.utils import protools_sort_key
 
-from ..widgets import ProgressPanel
 from ..theme import COLORS, tune_toolbar_checkbox
 from ..tracks.table_widgets import _PHASE_TOPOLOGY, _PHASE_ANALYSIS, _PHASE_SETUP
 from ..waveform import WaveformPanel
@@ -229,10 +228,7 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
         v_splitter.addWidget(self._topo_wf_panel)
         v_splitter.setSizes([700, 300])
         layout.addWidget(v_splitter, 1)
-
-        # Progress panel for Apply operation
-        self._topo_progress = ProgressPanel()
-        layout.addWidget(self._topo_progress)
+        self._register_phase_progress_layout(_PHASE_TOPOLOGY, layout)
 
         # Worker references
         self._topo_apply_worker = None
@@ -359,8 +355,7 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
         self._topo_apply_action.setEnabled(False)
         self._topo_reset_action.setEnabled(False)
         self._topo_status_label.setText("Applying topology\u2026")
-        self._topo_progress.start("Applying topology\u2026")
-        self._status_bar.setVisible(False)
+        self._progress_start("Applying topology\u2026")
 
         # Put Phase 1 topology on session for the worker to read
         self._session.topology = self._topo_topology
@@ -377,11 +372,11 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
     @Slot(str)
     def _on_topo_apply_progress(self, message: str):
         log.debug("Apply topology: %s", message)
-        self._topo_progress.set_message(message)
+        self._progress_message(message)
 
     @Slot(int, int)
     def _on_topo_apply_progress_value(self, current: int, total: int):
-        self._topo_progress.set_progress(current, total)
+        self._progress_value(current, total)
 
     @Slot()
     def _on_topo_apply_done(self):
@@ -395,15 +390,14 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
         if errors:
             msg = (f"Topology applied: {n_out} file(s) written, "
                    f"{len(errors)} error(s)")
-            self._topo_progress.finish(msg)
+            self._progress_finish(msg)
             detail = "\n".join(f"\u2022 {fn}: {err}" for fn, err in errors)
             QMessageBox.warning(
                 self, "Apply Topology \u2014 errors",
                 f"{msg}\n\n{detail}")
         else:
             msg = f"Topology applied: {n_out} file(s) written"
-            self._topo_progress.finish(msg)
-        self._status_bar.setVisible(True)
+            self._progress_finish(msg)
         self._status_bar.showMessage(msg)
 
         output_folder = self._config.get("app", {}).get(
@@ -420,8 +414,7 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
         self._topo_apply_worker = None
         self._topo_apply_action.setEnabled(True)
         self._topo_reset_action.setEnabled(True)
-        self._topo_progress.fail(message)
-        self._status_bar.setVisible(True)
+        self._progress_fail(message)
         self._status_bar.showMessage(f"Apply topology error: {message}")
 
     # ── Actions ───────────────────────────────────────────────────────

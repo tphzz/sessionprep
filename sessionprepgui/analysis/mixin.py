@@ -50,7 +50,7 @@ from ..tracks.table_widgets import (
     _SETUP_RIGHT_TREE,
     _SortableItem, _make_analysis_cell,
     _TAB_FILE, _TAB_GROUPS, _TAB_SESSION, _TAB_SUMMARY,
-    _PAGE_PROGRESS, _PAGE_TABS,
+    _PAGE_TABS,
     _PHASE_ANALYSIS, _PHASE_TOPOLOGY, _PHASE_SETUP,
 )
 from ..theme import COLORS, FILE_COLOR_OK, FILE_COLOR_ERROR
@@ -488,9 +488,7 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         if getattr(self, "_topo_apply_action", None):
             self._topo_apply_action.setEnabled(False)
 
-        self._progress_label.setText("Analyzing Format & Layout\u2026")
-        self._right_stack.setCurrentIndex(_PAGE_PROGRESS)
-        self._progress_bar.setRange(0, 0)
+        self._progress_start("Analyzing Format & Layout\u2026")
 
         config = self._flat_config()
         config["_source_dir"] = self._source_dir
@@ -525,6 +523,8 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
             f"Discovered {len(session.tracks)} file(s) from {self._source_dir} \u2014 "
             "review layout, then click Apply"
         )
+        self._progress_finish(
+            f"Discovered {len(session.tracks)} file(s)")
         self._right_stack.setCurrentIndex(_PAGE_TABS)
         self._save_session_action.setEnabled(True)
         self.setWindowTitle("SessionPrep")
@@ -892,15 +892,12 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
             self._init_session_config()
 
         # Show progress page
-        self._progress_label.setText("Analyzing…")
-        self._right_stack.setCurrentIndex(_PAGE_PROGRESS)
+        self._progress_start("Analyzing\u2026")
 
         config = self._flat_config()
         config["_source_dir"] = self._source_dir
         if self._active_daw_processor:
             config["_fader_ceiling_db"] = self._active_daw_processor.fader_ceiling_db
-
-        self._progress_bar.setRange(0, 0)  # indeterminate until first value
 
         self._worker = AnalyzeWorker(analyze_dir, config,
                                      recursive=self._recursive_scan)
@@ -914,14 +911,11 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
 
     @Slot(str)
     def _on_worker_progress(self, message: str):
-        self._progress_label.setText(message)
-        self._status_bar.showMessage(message)
+        self._progress_message(message)
 
     @Slot(int, int)
     def _on_worker_progress_value(self, current: int, total: int):
-        if self._progress_bar.maximum() != total:
-            self._progress_bar.setRange(0, total)
-        self._progress_bar.setValue(current)
+        self._progress_value(current, total)
 
     @Slot(str, object)
     def _on_track_analyzed(self, filename: str, track):
@@ -1136,6 +1130,8 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         self._status_bar.showMessage(
             f"Analysis complete: {ok_count}/{len(session.tracks)} tracks OK"
         )
+        self._progress_finish(
+            f"Analysis complete: {ok_count}/{len(session.tracks)} tracks OK")
 
         # Eagerly build peak cache for Phase 2 tracks
         analyze_dir = self._topology_dir or self._source_dir
@@ -1189,13 +1185,19 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         )
 
         self._cancel_worker("_peak_build_worker")
+        self._progress_start(f"Building peak cache: 0/{len(items)}")
         worker = PeakBuildWorker(items)
         worker.file_done.connect(self._on_peak_file_done)
-        worker.progress.connect(self._status_bar.showMessage)
+        worker.progress.connect(self._progress_message)
+        worker.progress_value.connect(self._progress_value)
         worker.all_done.connect(
-            lambda: log.info("Peak cache build complete (%d files)", len(items)))
+            lambda: self._on_peak_build_done(len(items)))
         self._peak_build_worker = worker
         worker.start()
+
+    def _on_peak_build_done(self, count: int) -> None:
+        log.info("Peak cache build complete (%d files)", count)
+        self._progress_finish(f"Peak cache built for {count} file(s)")
 
     @Slot(str, object)
     def _on_peak_file_done(self, filename: str, peak_data):
@@ -1255,6 +1257,7 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
             f'<div style="margin-top:8px;">{esc(message)}</div>'
         ))
         self._status_bar.showMessage(f"Error: {message}")
+        self._progress_fail(message)
 
     # ── Prepare handlers ─────────────────────────────────────────────────
 
@@ -1282,8 +1285,7 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
             return
 
         self._prepare_action.setEnabled(False)
-        self._status_bar.showMessage("Preparing processed files\u2026")
-        self._prepare_progress.start("Preparing\u2026")
+        self._progress_start("Preparing\u2026")
 
         self._prepare_worker = PrepareWorker(
             self._session, processors, output_dir)
@@ -1296,12 +1298,11 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
 
     @Slot(str)
     def _on_prepare_progress(self, message: str):
-        self._prepare_progress.set_message(message)
-        self._status_bar.showMessage(message)
+        self._progress_message(message)
 
     @Slot(int, int)
     def _on_prepare_progress_value(self, current: int, total: int):
-        self._prepare_progress.set_progress(current, total)
+        self._progress_value(current, total)
 
     @Slot()
     def _on_prepare_done(self):
@@ -1323,7 +1324,7 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         errors = self._session.config.get("_prepare_errors", [])
         if errors:
             msg = f"Prepare complete: {prepared} file(s) written, {len(errors)} error(s)"
-            self._prepare_progress.finish(msg)
+            self._progress_finish(msg)
             self._status_bar.showMessage(msg)
             detail = "\n".join(f"• {fn}: {err}" for fn, err in errors)
             QMessageBox.warning(
@@ -1336,7 +1337,7 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         else:
             msg = f"Prepare complete: {prepared} file(s) written"
             log.info("Prepare complete: %d file(s)", prepared)
-            self._prepare_progress.finish(msg)
+            self._progress_finish(msg)
             self._status_bar.showMessage(msg)
         self._populate_setup_table()
 
@@ -1347,7 +1348,7 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
             self._prepare_worker.deleteLater()
             self._prepare_worker = None
         self._prepare_action.setEnabled(True)
-        self._prepare_progress.fail(message)
+        self._progress_fail(message)
         self._status_bar.showMessage(f"Prepare failed: {message}")
 
     def _update_prepare_button(self):

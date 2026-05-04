@@ -21,7 +21,6 @@ from PySide6.QtWidgets import (
     QLabel,
     QMainWindow,
     QMessageBox,
-    QProgressBar,
     QSizePolicy,
     QSplitter,
     QStackedWidget,
@@ -208,6 +207,8 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
 
         self._batch_manager.started.connect(self._on_batch_started)
         self._batch_manager.batch_progress_value.connect(self._batch_dock.update_progress)
+        self._batch_manager.batch_progress_message.connect(
+            self._batch_dock.update_progress_message)
         self._batch_manager.batch_progress_message.connect(self._status_bar.showMessage)
 
         t0 = time.perf_counter()
@@ -356,6 +357,13 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
 
     def _init_ui(self):
         self._init_menus()
+        self._phase_progress_layouts = {}
+        self._phase_progress_panels = {}
+        self._progress_active_phase: int | None = None
+        self._progress_running = False
+        self._progress_text = ""
+        self._progress_current = 0
+        self._progress_total = 1
 
         # ── Top-level phase tabs ──────────────────────────────────────────
         self._phase_tabs = _CurrentPageTabWidget()
@@ -381,6 +389,7 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
         self._main_splitter.setStretchFactor(1, 2)
         self._main_splitter.setSizes([620, 480])
         analysis_layout.addWidget(self._main_splitter, 1)
+        self._register_phase_progress_layout(_PHASE_ANALYSIS, analysis_layout)
         self._phase_tabs.addTab(
             analysis_page, "Phase 2: Analysis && Preparation")
         self._phase_tabs.setTabEnabled(_PHASE_ANALYSIS, False)
@@ -399,6 +408,55 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
             "QStatusBar::item { border: none; }")
         self.setStatusBar(self._status_bar)
         self._status_bar.showMessage("Open a directory containing .wav / .aif files to begin.")
+
+    def _register_phase_progress_layout(self, phase_index: int,
+                                        layout: QVBoxLayout) -> None:
+        self._phase_progress_layouts[phase_index] = layout
+        panel = ProgressPanel()
+        panel.setObjectName(f"phase{phase_index}ProgressPanel")
+        self._phase_progress_panels[phase_index] = panel
+        layout.addWidget(panel)
+
+    def _progress_panel_for_phase(self, phase_index: int | None = None):
+        if phase_index is None:
+            phase_index = self._phase_tabs.currentIndex()
+        return self._phase_progress_panels[phase_index]
+
+    def _show_progress_on_phase(self, phase_index: int) -> None:
+        panel = self._progress_panel_for_phase(phase_index)
+        for other_phase, other_panel in self._phase_progress_panels.items():
+            if other_phase != phase_index:
+                other_panel.setVisible(False)
+        panel.start(self._progress_text)
+        panel.set_progress(self._progress_current, self._progress_total)
+        self._progress_active_phase = phase_index
+
+    def _progress_start(self, text: str) -> None:
+        self._progress_running = True
+        self._progress_text = text
+        self._progress_current = 0
+        self._progress_total = 1
+        self._show_progress_on_phase(self._phase_tabs.currentIndex())
+
+    def _progress_message(self, text: str) -> None:
+        self._progress_text = text
+        self._progress_panel_for_phase(self._progress_active_phase).set_message(text)
+
+    def _progress_value(self, current: int, total: int) -> None:
+        self._progress_current = current
+        self._progress_total = max(total, 1)
+        self._progress_panel_for_phase(
+            self._progress_active_phase).set_progress(current, total)
+
+    def _progress_finish(self, text: str) -> None:
+        self._progress_running = False
+        self._progress_text = text
+        self._progress_panel_for_phase(self._progress_active_phase).finish(text)
+
+    def _progress_fail(self, text: str) -> None:
+        self._progress_running = False
+        self._progress_text = text
+        self._progress_panel_for_phase(self._progress_active_phase).fail(text)
 
     def _init_menus(self):
         file_menu = self.menuBar().addMenu("&File")
@@ -728,36 +786,11 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
         return panel
 
     def _build_right_panel(self) -> QWidget:
-        """Build the right-hand side: a stacked widget that toggles between
-        a progress page (during analysis) and a tab widget (after analysis).
-        """
+        """Build the right-hand side analysis detail tabs."""
         self._right_stack = QStackedWidget()
         self._right_stack.setMinimumWidth(400)
 
-        # ── Page 0: progress ──────────────────────────────────────────────
-        progress_page = QWidget()
-        progress_layout = QVBoxLayout(progress_page)
-        progress_layout.setContentsMargins(40, 0, 40, 0)
-
-        progress_layout.addStretch(2)
-
-        self._progress_label = QLabel("Analyzing\u2026")
-        self._progress_label.setAlignment(Qt.AlignCenter)
-        self._progress_label.setStyleSheet(
-            f"color: {COLORS['dim']}; font-size: 11pt;"
-        )
-        progress_layout.addWidget(self._progress_label)
-
-        self._progress_bar = QProgressBar()
-        self._progress_bar.setRange(0, 0)  # indeterminate
-        self._progress_bar.setTextVisible(False)
-        self._progress_bar.setFixedHeight(6)
-        progress_layout.addWidget(self._progress_bar)
-
-        progress_layout.addStretch(3)
-        self._right_stack.addWidget(progress_page)  # index 0
-
-        # ── Page 1: tabs (Summary / File) ─────────────────────────────────
+        # ── Tabs (Summary / File) ─────────────────────────────────────────
         self._detail_tabs = QTabWidget()
         self._detail_tabs.setDocumentMode(True)
         self._detail_tabs.currentChanged.connect(self._on_detail_tab_changed)
@@ -824,18 +857,14 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
             self._build_session_settings_tab(), "Config")
         self._detail_tabs.setTabEnabled(_TAB_SESSION, False)
 
-        # Container for tabs + prepare progress panel
+        # Container for detail tabs
         tabs_container = QWidget()
         tabs_layout = QVBoxLayout(tabs_container)
         tabs_layout.setContentsMargins(0, 0, 0, 0)
         tabs_layout.setSpacing(0)
         tabs_layout.addWidget(self._detail_tabs, 1)
 
-        # Prepare progress panel (hidden by default)
-        self._prepare_progress = ProgressPanel()
-        tabs_layout.addWidget(self._prepare_progress)
-
-        self._right_stack.addWidget(tabs_container)  # index 1
+        self._right_stack.addWidget(tabs_container)
 
         # Start on the tabs page (summary empty until first analysis)
         self._right_stack.setCurrentIndex(_PAGE_TABS)
@@ -867,6 +896,8 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
 
     @Slot(int)
     def _on_phase_tab_changed(self, index: int):
+        if getattr(self, "_progress_running", False):
+            self._show_progress_on_phase(index)
         if index == _PHASE_SETUP:
             self._schedule_setup_splitter_fit()
 
