@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSplitter,
     QStackedWidget,
     QTreeWidget,
@@ -126,7 +127,11 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         """Populate the session config tree + stack from the active preset."""
 
         def _register_page(tree_item, page):
-            idx = self._session_stack.addWidget(page)
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setFrameShape(QScrollArea.NoFrame)
+            scroll.setWidget(page)
+            idx = self._session_stack.addWidget(scroll)
             self._session_page_index[id(tree_item)] = idx
 
         self._session_daw_custom_widgets = build_config_pages(
