@@ -55,6 +55,25 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
+def _is_compiled_runtime() -> bool:
+    """Return True when running from a freezer/compiled app runtime."""
+    return bool(getattr(sys, "frozen", False)) or "__compiled__" in globals()
+
+
+def _hidden_subprocess_kwargs() -> dict:
+    """Return Windows flags that prevent helper subprocess windows flashing."""
+    if sys.platform != "win32":
+        return {}
+
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startupinfo.wShowWindow = subprocess.SW_HIDE
+    return {
+        "startupinfo": startupinfo,
+        "creationflags": subprocess.CREATE_NO_WINDOW,
+    }
+
+
 def _git(args: list[str], *, cwd: Path) -> str | None:
     try:
         result = subprocess.run(
@@ -64,6 +83,7 @@ def _git(args: list[str], *, cwd: Path) -> str | None:
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
+            **_hidden_subprocess_kwargs(),
         )
     except (OSError, subprocess.CalledProcessError):
         return None
@@ -144,23 +164,28 @@ def _metadata_version() -> str | None:
 def get_version(*, strict: bool = False) -> str:
     """Return the SessionPrep version.
 
-    Resolution order:
-    1. exact Git tag, or branch base plus ``.dev0+g<hash>``
-    2. frozen-build/source-distribution version in ``_build_version.py``
-    3. installed package metadata
-    4. ``0.0.0+unknown`` for non-strict runtime fallback
+    Source runs prefer live Git metadata. Compiled/frozen runs prefer the
+    generated build-version module so GUI startup never shells out to Git unless
+    the packaged build metadata is missing.
     """
-
-    return (
-        _git_version(strict=False)
-        or _build_version()
-        or _metadata_version()
-        or (
-            (_raise_unknown_version())
-            if strict
-            else _UNKNOWN_VERSION
+    if _is_compiled_runtime():
+        version = (
+            _build_version()
+            or _metadata_version()
+            or _git_version(strict=False)
         )
-    )
+    else:
+        version = (
+            _git_version(strict=False)
+            or _build_version()
+            or _metadata_version()
+        )
+
+    if version:
+        return version
+    if strict:
+        return _raise_unknown_version()
+    return _UNKNOWN_VERSION
 
 
 def _raise_unknown_version() -> str:
