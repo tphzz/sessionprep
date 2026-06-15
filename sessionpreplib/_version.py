@@ -165,14 +165,13 @@ def get_version(*, strict: bool = False) -> str:
     """Return the SessionPrep version.
 
     Source runs prefer live Git metadata. Compiled/frozen runs prefer the
-    generated build-version module so GUI startup never shells out to Git unless
-    the packaged build metadata is missing.
+    generated build-version module and never shell out to Git. A packaged app
+    must not trigger platform developer-tool prompts on end-user machines.
     """
     if _is_compiled_runtime():
         version = (
             _build_version()
             or _metadata_version()
-            or _git_version(strict=False)
         )
     else:
         version = (
@@ -190,8 +189,8 @@ def get_version(*, strict: bool = False) -> str:
 
 def _raise_unknown_version() -> str:
     raise VersionResolutionError(
-        "Could not resolve version from Git, generated build metadata, "
-        "or installed package metadata"
+        "Could not resolve version from generated build metadata, installed "
+        "package metadata, or source Git metadata"
     )
 
 

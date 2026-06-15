@@ -48,7 +48,7 @@ def test_compiled_runtime_prefers_build_version_without_git(monkeypatch):
     _no_metadata(monkeypatch)
 
     def fail_git(*, strict):
-        raise AssertionError("compiled runtime should not call Git first")
+        raise AssertionError("compiled runtime should not call Git")
 
     monkeypatch.setattr(_version, "_git_version", fail_git)
 
@@ -61,11 +61,38 @@ def test_compiled_runtime_falls_back_after_build_version(monkeypatch):
     monkeypatch.setattr(_version, "_metadata_version", lambda: "0.3.4")
 
     def fail_git(*, strict):
-        raise AssertionError("metadata should be tried before Git in compiled mode")
+        raise AssertionError("compiled runtime should not call Git")
 
     monkeypatch.setattr(_version, "_git_version", fail_git)
 
     assert _version.get_version(strict=True) == "0.3.4"
+
+
+def test_compiled_runtime_without_metadata_returns_unknown_without_git(monkeypatch):
+    monkeypatch.setattr(_version.sys, "frozen", True, raising=False)
+    _no_build_version(monkeypatch)
+    _no_metadata(monkeypatch)
+
+    def fail_git(*, strict):
+        raise AssertionError("compiled runtime should not call Git")
+
+    monkeypatch.setattr(_version, "_git_version", fail_git)
+
+    assert _version.get_version(strict=False) == "0.0.0+unknown"
+
+
+def test_compiled_runtime_strict_failure_does_not_call_git(monkeypatch):
+    monkeypatch.setattr(_version.sys, "frozen", True, raising=False)
+    _no_build_version(monkeypatch)
+    _no_metadata(monkeypatch)
+
+    def fail_git(*, strict):
+        raise AssertionError("compiled runtime should not call Git")
+
+    monkeypatch.setattr(_version, "_git_version", fail_git)
+
+    with pytest.raises(_version.VersionResolutionError):
+        _version.get_version(strict=True)
 
 
 @pytest.mark.skipif(
