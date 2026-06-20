@@ -12,7 +12,7 @@ from typing import Any
 
 from PySide6.QtCore import Qt, Slot, QSize, QTimer
 from PySide6.QtGui import (
-    QAction, QFont, QIcon, QKeySequence, QShortcut,
+    QAction, QIcon, QKeySequence, QShortcut,
 )
 from PySide6.QtWidgets import (
     QApplication,
@@ -46,6 +46,7 @@ from .theme import COLORS, apply_dark_theme
 from .log import dbg
 from .prefs import PreferencesDialog
 from .detail import render_track_detail_html, PlaybackController, DetailMixin
+from .detail.report_style import configure_report_browser, wrap_report_html
 from .waveform import WaveformPanel, WaveformLoadWorker
 from .widgets import ProgressPanel
 from .window_geometry import (
@@ -887,9 +888,7 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
     def _make_report_browser(self):
         """Create a consistently styled QTextBrowser for reports."""
         browser = _HelpBrowser(self._detector_help)
-        font = QFont("Consolas", 10)
-        font.setStyleHint(QFont.Monospace)
-        browser.setFont(font)
+        configure_report_browser(browser)
         return browser
 
     # ── Slots: phase tabs ─────────────────────────────────────────────────
@@ -906,11 +905,7 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
     @staticmethod
     def _wrap_html(body: str) -> str:
         """Wrap HTML content in a styled <body> tag."""
-        return (
-            f'<body style="background-color:{COLORS["bg"]}; color:{COLORS["text"]};'
-            f' font-family:Consolas,monospace; font-size:10pt; padding:12px;">'
-            f'{body}</body>'
-        )
+        return wrap_report_html(body)
 
     # ── Preferences ───────────────────────────────────────────────────────
 

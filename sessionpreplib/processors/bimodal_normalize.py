@@ -185,7 +185,7 @@ class BimodalNormalizeProcessor(AudioProcessor):
         )
 
         # --- Comparison table ---
-        hdr = ('color:#ffffff; font-weight:bold; font-size:9pt;'
+        hdr = ('color:#ffffff; font-weight:bold; font-size:0.9em;'
                ' padding:3px 16px 3px 0; border-bottom:1px solid #3a3a3a;')
         cell = 'padding:3px 16px 3px 0; white-space:nowrap;'
         dim = "#888888"
@@ -200,16 +200,16 @@ class BimodalNormalizeProcessor(AudioProcessor):
         pk_c, pk_w = row_style(peak_active)
         pk_note = ""
         if is_peak_limited:
-            pk_note = f'<span style="color:{dim}; font-size:9pt;"> (chosen, limiting)</span>'
+            pk_note = f'<span style="color:{dim}; font-size:0.9em;"> (chosen, limiting)</span>'
         elif is_transient:
-            pk_note = f'<span style="color:{dim}; font-size:9pt;"> (chosen)</span>'
+            pk_note = f'<span style="color:{dim}; font-size:0.9em;"> (chosen)</span>'
 
         rms_c, rms_w = row_style(rms_active)
         rms_note = ""
         if is_peak_limited:
-            rms_note = f'<span style="color:{dim}; font-size:9pt;"> (would exceed peak)</span>'
+            rms_note = f'<span style="color:{dim}; font-size:0.9em;"> (would exceed peak)</span>'
         elif rms_active:
-            rms_note = f'<span style="color:{dim}; font-size:9pt;"> (chosen)</span>'
+            rms_note = f'<span style="color:{dim}; font-size:0.9em;"> (chosen)</span>'
 
         table = (
             f'<table cellpadding="0" cellspacing="0" '
@@ -243,7 +243,7 @@ class BimodalNormalizeProcessor(AudioProcessor):
             fader_off = d.get("fader_offset", 0.0)
             html += (
                 f'<div style="margin-left:8px; margin-top:6px;'
-                f' color:#cc8844; font-size:9pt;">'
+                f' color:#cc8844; font-size:0.9em;">'
                 f'Fader rebalanced: {rebalance:+.1f} dB shift'
                 f' &rarr; fader offset {fader_off:+.1f} dB'
                 f'</div>'
@@ -258,7 +258,7 @@ class BimodalNormalizeProcessor(AudioProcessor):
                 density = cr.data.get("density", 0.0)
                 html += (
                     f'<div style="margin-left:8px; margin-top:6px;'
-                    f' color:#888888; font-size:9pt;">'
+                    f' color:#888888; font-size:0.9em;">'
                     f'Analysis: Crest {crest:.1f} dB'
                     f' &middot; Decay {decay:.1f} dB'
                     f' &middot; Density {density:.0%}'

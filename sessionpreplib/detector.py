@@ -124,7 +124,7 @@ class TrackDetector(ABC):
         return (
             f'<tr>'
             f'<td width="90" style="background-color:{sev_color}; color:#000;'
-            f' font-weight:bold; font-size:8pt; text-align:center;'
+            f' font-weight:bold; font-size:0.82em; text-align:center;'
             f' padding:2px 8px;">'
             f'{sev_label}</td>'
             f'<td style="padding-left:6px; white-space:nowrap;">'
@@ -208,7 +208,7 @@ class SessionDetector(ABC):
         return (
             f'<tr>'
             f'<td width="90" style="background-color:{sev_color}; color:#000;'
-            f' font-weight:bold; font-size:8pt; text-align:center;'
+            f' font-weight:bold; font-size:0.82em; text-align:center;'
             f' padding:2px 8px;">'
             f'{sev_label}</td>'
             f'<td style="padding-left:6px; white-space:nowrap;">'

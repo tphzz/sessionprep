@@ -5,6 +5,7 @@ from __future__ import annotations
 from sessionpreplib.chunks import read_chunks, STANDARD_CHUNKS, detect_origin
 from ..theme import COLORS, FILE_COLOR_TRANSIENT, FILE_COLOR_SUSTAINED
 from ..helpers import esc
+from .report_style import REPORT_BADGE_SIZE, REPORT_SECTION_SIZE, REPORT_TITLE_SIZE
 
 
 # ---------------------------------------------------------------------------
@@ -49,7 +50,7 @@ def render_summary_html(
         return html
 
     parts = []
-    parts.append(f'<div style="color:{COLORS["heading"]}; font-size:13pt; font-weight:bold; '
+    parts.append(f'<div style="color:{COLORS["heading"]}; font-size:{REPORT_TITLE_SIZE}; font-weight:bold; '
                  f'margin-bottom:8px;">Session Health: {clean_count}/{total_ok} file(s) CLEAN</div>')
 
     # Overview
@@ -63,23 +64,23 @@ def render_summary_html(
     section_spacing = 'margin-top:14px;'
 
     # Problems
-    parts.append(f'<div style="color:{COLORS["problems"]}; font-size:12pt; font-weight:bold; {section_spacing}">'
+    parts.append(f'<div style="color:{COLORS["problems"]}; font-size:{REPORT_SECTION_SIZE}; font-weight:bold; {section_spacing}">'
                  f'\U0001f534 PROBLEMS ({item_count(problems)})</div>')
     parts.append(render_groups(problems, COLORS["problems"]))
 
     # Attention
-    parts.append(f'<div style="color:{COLORS["attention"]}; font-size:12pt; font-weight:bold; {section_spacing}">'
+    parts.append(f'<div style="color:{COLORS["attention"]}; font-size:{REPORT_SECTION_SIZE}; font-weight:bold; {section_spacing}">'
                  f'\U0001f7e1 ATTENTION ({item_count(attention)})</div>')
     parts.append(render_groups(attention, COLORS["attention"]))
 
     # Information
-    parts.append(f'<div style="color:{COLORS["information"]}; font-size:12pt; font-weight:bold; {section_spacing}">'
+    parts.append(f'<div style="color:{COLORS["information"]}; font-size:{REPORT_SECTION_SIZE}; font-weight:bold; {section_spacing}">'
                  f'\U0001f535 INFORMATION ({item_count(information)})</div>')
     parts.append(render_groups(information, COLORS["information"]))
 
     # Clean
     if show_clean:
-        parts.append(f'<div style="color:{COLORS["clean"]}; font-size:12pt; font-weight:bold; {section_spacing}">'
+        parts.append(f'<div style="color:{COLORS["clean"]}; font-size:{REPORT_SECTION_SIZE}; font-weight:bold; {section_spacing}">'
                      f'\U0001f7e2 CLEAN</div>')
         parts.append(render_groups(clean, COLORS["clean"]))
 
@@ -172,7 +173,7 @@ def render_track_detail_html(track, session=None, *, show_clean: bool = True,
         When True, processors may include additional analytical detail.
     """
     parts = []
-    parts.append(f'<div style="color:{COLORS["heading"]}; font-size:13pt; font-weight:bold;">'
+    parts.append(f'<div style="color:{COLORS["heading"]}; font-size:{REPORT_TITLE_SIZE}; font-weight:bold;">'
                  f'{esc(track.filename)}</div>')
 
     if track.status != "OK":
@@ -288,7 +289,7 @@ def render_track_detail_html(track, session=None, *, show_clean: bool = True,
                     det_rows.append(
                         f'<tr>'
                         f'<td width="90" style="background-color:{sev_color}; color:#000;'
-                        f' font-weight:bold; font-size:8pt; text-align:center;'
+                        f' font-weight:bold; font-size:{REPORT_BADGE_SIZE}; text-align:center;'
                         f' padding:2px 8px;">'
                         f'{sev_label}</td>'
                         f'<td style="padding-left:6px; white-space:nowrap;">'
