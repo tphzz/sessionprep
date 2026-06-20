@@ -31,6 +31,10 @@ from ..theme import (
 )
 from ..widgets import BatchComboBox, BatchToolButton, TableCellDoubleSpinBox
 from ..analysis.worker import BatchReanalyzeWorker
+from .table_layout import (
+    TRACK_TABLE_RIGHT_MIN_WIDTH,
+    apply_track_table_layout,
+)
 
 
 class TrackColumnsMixin:  # pylint: disable=too-few-public-methods
@@ -203,14 +207,6 @@ class TrackColumnsMixin:  # pylint: disable=too-few-public-methods
                 self._apply_row_group_color(row, track.group)
         self._track_table.setSortingEnabled(True)
 
-        # Auto-fit columns 2–7 to content, File column stays Stretch, Ch stays Fixed
-        header = self._track_table.horizontalHeader()
-        for col in (2, 3, 4, 5, 6, 7):
-            header.setSectionResizeMode(col, QHeaderView.ResizeToContents)
-        self._track_table.resizeColumnsToContents()
-        for col in (2, 3, 4, 5, 6, 7):
-            header.setSectionResizeMode(col, QHeaderView.Interactive)
-        self._auto_fit_group_column()
         self._auto_fit_track_table()
 
     def _populate_setup_table(self):
@@ -835,44 +831,21 @@ class TrackColumnsMixin:  # pylint: disable=too-few-public-methods
     # ── Table fitting ────────────────────────────────────────────────────
 
     def _auto_fit_track_table(self):
-        """Shrink the left panel to fit the track table columns, giving
-        more space to the right detail panel.
-
-        Temporarily switches the File column from Stretch to
-        ResizeToContents so we can measure its true content width,
-        then adjusts the splitter and restores Stretch mode.
-        """
-        header = self._track_table.horizontalHeader()
-
-        # Temporarily fit File column to content so we get a true width
-        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        self._track_table.resizeColumnToContents(0)
-        total_w = sum(header.sectionSize(c) for c in range(header.count()))
-        # Restore File column to Stretch
-        header.setSectionResizeMode(0, QHeaderView.Stretch)
-
-        # vertical-header (hidden=0) + scrollbar (~20) + frame borders (~4)
-        vhw = self._track_table.verticalHeader().width() if self._track_table.verticalHeader().isVisible() else 0
-        padding = vhw + 20 + 4
-        needed = total_w + padding
+        """Fit the left pane around the Phase 2 table controls."""
+        layout = apply_track_table_layout(self._track_table)
+        needed = max(layout.table_width, self._track_table.minimumWidth())
 
         splitter_total = self._main_splitter.width()
         if splitter_total > 0:
-            right_w = max(splitter_total - needed, 300)
-            left_w = splitter_total - right_w
+            right_min = TRACK_TABLE_RIGHT_MIN_WIDTH
+            if hasattr(self, "_right_stack"):
+                right_min = max(right_min, self._right_stack.minimumWidth())
+            max_left = max(splitter_total - right_min,
+                           self._track_table.minimumWidth())
+            left_w = min(needed, max_left)
+            right_w = max(splitter_total - left_w, right_min)
             self._main_splitter.setSizes([left_w, right_w])
 
     def _auto_fit_group_column(self):
-        """Resize the Group column (6) to fit the widest current combo text."""
-        max_w = 0
-        for row in range(self._track_table.rowCount()):
-            w = self._track_table.cellWidget(row, 6)
-            if isinstance(w, BatchComboBox):
-                fm = w.fontMetrics()
-                tw = fm.horizontalAdvance(w.currentText())
-                max_w = max(max_w, tw)
-        if max_w > 0:
-            # icon (16) + icon gap (4) + text + dropdown arrow (~24) + margins (16)
-            needed = 16 + 4 + max_w + 24 + 16
-            header = self._track_table.horizontalHeader()
-            header.resizeSection(6, max(needed, 100))
+        """Re-apply table layout after group text changes."""
+        self._auto_fit_track_table()

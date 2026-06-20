@@ -5,7 +5,7 @@ import math
 import numpy as np
 
 from ..models import ParamSpec
-from ..detector import TrackDetector
+from ..detector import TrackDetector, detector_badge_cell_html
 from ..models import DetectorResult, IssueLocation, Severity, TrackContext
 from ..audio import is_silent, windowed_stereo_correlation
 
@@ -455,10 +455,7 @@ class StereoCompatDetector(TrackDetector):
 
         return (
             f'<tr>'
-            f'<td width="90" style="background-color:{sev_color}; color:#000;'
-            f' font-weight:bold; font-size:0.82em; text-align:center;'
-            f' padding:2px 8px;">'
-            f'{sev_label}</td>'
+            f'{detector_badge_cell_html(sev_color, sev_label)}'
             f'<td style="padding-left:6px; white-space:nowrap;">'
             f'<a href="detector:{self.id}" style="color:#dddddd;'
             f' text-decoration:none;"><b>{self.id}</b></a></td>'

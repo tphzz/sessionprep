@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from sessionpreplib.chunks import read_chunks, STANDARD_CHUNKS, detect_origin
+from sessionpreplib.detector import detector_badge_cell_html
 from ..theme import COLORS, FILE_COLOR_TRANSIENT, FILE_COLOR_SUSTAINED
 from ..helpers import esc
 from .report_style import REPORT_BADGE_SIZE, REPORT_SECTION_SIZE, REPORT_TITLE_SIZE
@@ -288,10 +289,7 @@ def render_track_detail_html(track, session=None, *, show_clean: bool = True,
                     }.get(sev, (COLORS["information"], "INFO"))
                     det_rows.append(
                         f'<tr>'
-                        f'<td width="90" style="background-color:{sev_color}; color:#000;'
-                        f' font-weight:bold; font-size:{REPORT_BADGE_SIZE}; text-align:center;'
-                        f' padding:2px 8px;">'
-                        f'{sev_label}</td>'
+                        f'{detector_badge_cell_html(sev_color, sev_label)}'
                         f'<td style="padding-left:6px; white-space:nowrap;">'
                         f'<b>{esc(det_id)}</b></td>'
                         f'<td style="padding-left:6px; color:{COLORS["dim"]};">'

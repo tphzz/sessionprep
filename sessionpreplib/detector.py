@@ -12,6 +12,24 @@ _REPORT_AS_MAP: dict[str, Severity] = {
     "info": Severity.INFO,
 }
 
+DETECTOR_BADGE_WIDTH_PX = 118
+DETECTOR_BADGE_FONT_SIZE = "0.82em"
+
+
+def detector_badge_cell_html(sev_color: str, sev_label: str) -> str:
+    """Return a no-wrap severity badge table cell for report rows."""
+    return (
+        f'<td width="{DETECTOR_BADGE_WIDTH_PX}" '
+        f'style="background-color:{sev_color}; color:#000;'
+        f' width:{DETECTOR_BADGE_WIDTH_PX}px;'
+        f' min-width:{DETECTOR_BADGE_WIDTH_PX}px;'
+        f' white-space:nowrap;'
+        f' font-weight:bold; font-size:{DETECTOR_BADGE_FONT_SIZE};'
+        f' text-align:center; padding:2px 8px;">'
+        f'{sev_label}</td>'
+    )
+
+
 def _report_as_param(det_id: str) -> ParamSpec:
     """Build a detector-specific ``report_as`` ParamSpec."""
     return ParamSpec(
@@ -123,10 +141,7 @@ class TrackDetector(ABC):
         )
         return (
             f'<tr>'
-            f'<td width="90" style="background-color:{sev_color}; color:#000;'
-            f' font-weight:bold; font-size:0.82em; text-align:center;'
-            f' padding:2px 8px;">'
-            f'{sev_label}</td>'
+            f'{detector_badge_cell_html(sev_color, sev_label)}'
             f'<td style="padding-left:6px; white-space:nowrap;">'
             f'<a href="detector:{self.id}" style="color:#dddddd;'
             f' text-decoration:none;"><b>{self.id}</b></a></td>'
@@ -207,10 +222,7 @@ class SessionDetector(ABC):
         )
         return (
             f'<tr>'
-            f'<td width="90" style="background-color:{sev_color}; color:#000;'
-            f' font-weight:bold; font-size:0.82em; text-align:center;'
-            f' padding:2px 8px;">'
-            f'{sev_label}</td>'
+            f'{detector_badge_cell_html(sev_color, sev_label)}'
             f'<td style="padding-left:6px; white-space:nowrap;">'
             f'<a href="detector:{self.id}" style="color:#dddddd;'
             f' text-decoration:none;"><b>{self.id}</b></a></td>'
