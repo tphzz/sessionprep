@@ -63,6 +63,45 @@ class ConfigFieldError:
     message: str
 
 
+@dataclass(frozen=True)
+class ConfigChangeImpact:
+    """Lifecycle impact of changing one structured config preset."""
+
+    phase1_keys: frozenset[str] = frozenset()
+    phase2_keys: frozenset[str] = frozenset()
+    presentation_keys: frozenset[str] = frozenset()
+    daw_keys: frozenset[str] = frozenset()
+
+    @property
+    def changed(self) -> bool:
+        return bool(
+            self.phase1_keys
+            or self.phase2_keys
+            or self.presentation_keys
+            or self.daw_keys
+        )
+
+    @property
+    def requires_phase1(self) -> bool:
+        return bool(self.phase1_keys)
+
+    @property
+    def requires_phase2(self) -> bool:
+        return bool(self.phase2_keys)
+
+    @property
+    def presentation_only(self) -> bool:
+        return self.changed and not (
+            self.phase1_keys or self.phase2_keys or self.daw_keys
+        )
+
+    @property
+    def daw_only(self) -> bool:
+        return self.changed and not (
+            self.phase1_keys or self.phase2_keys or self.presentation_keys
+        )
+
+
 def default_config() -> dict[str, Any]:
     """Returns the built-in default configuration."""
     return {
@@ -553,6 +592,116 @@ def strip_presentation_keys(structured: dict[str, Any]) -> dict[str, Any]:
             for k in keys:
                 section.pop(k, None)
     return stripped
+
+
+def classify_structured_config_change(
+    old: dict[str, Any],
+    new: dict[str, Any],
+) -> ConfigChangeImpact:
+    """Classify how changing one structured config preset affects analysis.
+
+    The result is intentionally conservative. Unknown detector keys inherit
+    the owning detector's lifecycle phase; unknown processor keys require
+    Phase 2; unknown DAW processor keys are DAW-only.
+    """
+    from .detectors import default_detectors
+    from .daw_processors import default_daw_processors
+    from .models import LifecyclePhase
+    from .processors import default_processors
+
+    known: dict[tuple[str, str | None, str], str] = {}
+
+    for spec in ANALYSIS_PARAMS:
+        impact = "presentation" if spec.presentation_only else "phase2"
+        known[("analysis", None, spec.key)] = impact
+
+    for spec in PRESENTATION_PARAMS:
+        known[("presentation", None, spec.key)] = "presentation"
+
+    detector_phase: dict[str, str] = {}
+    for det in default_detectors():
+        phase = getattr(det, "phase", LifecyclePhase.PHASE2)
+        impact = "phase1" if phase == LifecyclePhase.PHASE1 else "phase2"
+        detector_phase[det.id] = impact
+        for spec in det.config_params():
+            key_impact = "presentation" if spec.presentation_only else impact
+            known[("detectors", det.id, spec.key)] = key_impact
+
+    for proc in default_processors():
+        for spec in proc.config_params():
+            impact = "presentation" if spec.presentation_only else "phase2"
+            known[("processors", proc.id, spec.key)] = impact
+
+    for dp in default_daw_processors():
+        for spec in dp.config_params():
+            impact = "presentation" if spec.presentation_only else "daw"
+            known[("daw_processors", dp.id, spec.key)] = impact
+
+    def _section_values(config: dict[str, Any],
+                        section: str,
+                        component: str | None = None) -> dict[str, Any]:
+        root = config.get(section, {})
+        if component is None:
+            return root if isinstance(root, dict) else {}
+        if isinstance(root, dict):
+            value = root.get(component, {})
+            return value if isinstance(value, dict) else {}
+        return {}
+
+    def _impact_for(section: str, component: str | None, key: str) -> str:
+        known_impact = known.get((section, component, key))
+        if known_impact:
+            return known_impact
+        if section == "presentation":
+            return "presentation"
+        if section == "detectors" and component:
+            return detector_phase.get(component, "phase2")
+        if section == "processors":
+            return "phase2"
+        if section == "daw_processors":
+            return "daw"
+        if section == "analysis":
+            return "phase2"
+        return "phase2"
+
+    changed: dict[str, set[str]] = {
+        "phase1": set(),
+        "phase2": set(),
+        "presentation": set(),
+        "daw": set(),
+    }
+
+    # Flat sections
+    for section in ("analysis", "presentation"):
+        old_values = _section_values(old, section)
+        new_values = _section_values(new, section)
+        for key in set(old_values) | set(new_values):
+            if old_values.get(key) != new_values.get(key):
+                impact = _impact_for(section, None, key)
+                changed[impact].add(f"{section}.{key}")
+
+    # Component sections
+    for section in ("detectors", "processors", "daw_processors"):
+        old_root = old.get(section, {})
+        new_root = new.get(section, {})
+        if not isinstance(old_root, dict):
+            old_root = {}
+        if not isinstance(new_root, dict):
+            new_root = {}
+        for component in set(old_root) | set(new_root):
+            old_values = _section_values(old, section, component)
+            new_values = _section_values(new, section, component)
+            for key in set(old_values) | set(new_values):
+                if old_values.get(key) != new_values.get(key):
+                    impact = _impact_for(section, component, key)
+                    changed[impact].add(f"{section}.{component}.{key}")
+
+    return ConfigChangeImpact(
+        phase1_keys=frozenset(changed["phase1"]),
+        phase2_keys=frozenset(changed["phase2"]),
+        presentation_keys=frozenset(changed["presentation"]),
+        daw_keys=frozenset(changed["daw"]),
+    )
 
 
 def flatten_structured_config(structured: dict[str, Any]) -> dict[str, Any]:

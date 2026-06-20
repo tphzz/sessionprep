@@ -24,6 +24,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from sessionpreplib.config import classify_structured_config_change
+
 from ..prefs.param_form import _argb_to_qcolor
 from ..settings import build_defaults, save_config
 from .table_widgets import _SortableItem, _TAB_GROUPS
@@ -692,17 +694,38 @@ class GroupsMixin:  # pylint: disable=too-few-public-methods
         if name not in presets:
             return
 
+        old_preset = self._active_preset()
+        new_preset = presets[name]
+        impact = classify_structured_config_change(old_preset, new_preset)
+
         if self._session is not None:
-            ans = QMessageBox.question(
-                self, "Switch config preset?",
+            intro = (
                 f"Switching to \u201c{name}\u201d will overwrite your "
-                "session config and re-analyze.\n\n"
-                "Group assignments will be preserved.\n\n"
-                "Continue?",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No,
+                "session config.\n\nGroup assignments will be preserved."
             )
-            if ans != QMessageBox.Yes:
+            if impact.requires_phase1:
+                intro += (
+                    "\n\nThe new preset changes Track Layout analysis "
+                    "settings."
+                )
+            elif impact.requires_phase2:
+                intro += (
+                    "\n\nThe new preset changes Phase 2 analysis or gain "
+                    "planning settings."
+                )
+            if impact.requires_phase1 or impact.requires_phase2:
+                confirmed = self._confirm_config_change_reanalysis(
+                    impact, intro=intro)
+            else:
+                ans = QMessageBox.question(
+                    self, "Switch config preset?",
+                    intro + "\n\nContinue?",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No,
+                )
+                confirmed = ans == QMessageBox.Yes
+
+            if not confirmed:
                 # Revert combo to the current preset
                 self._config_preset_combo.blockSignals(True)
                 self._config_preset_combo.setCurrentText(
@@ -721,7 +744,7 @@ class GroupsMixin:  # pylint: disable=too-few-public-methods
 
         if self._session is not None:
             self._session_config = None  # re-init from new preset
-            self._on_analyze()
+            self._apply_config_change_impact(impact)
         else:
             if hasattr(self, "_load_session_widgets"):
                 self._load_session_widgets(self._active_preset())

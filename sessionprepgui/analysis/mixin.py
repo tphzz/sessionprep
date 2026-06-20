@@ -34,7 +34,11 @@ from PySide6.QtWidgets import (
 )
 
 from sessionpreplib.audio import AUDIO_EXTENSIONS, discover_audio_files, discover_track
-from sessionpreplib.config import default_config, flatten_structured_config
+from sessionpreplib.config import (
+    classify_structured_config_change,
+    default_config,
+    flatten_structured_config,
+)
 from sessionpreplib.detectors import default_detectors
 from sessionpreplib.models import SessionContext, TrackContext
 from sessionpreplib.processors import default_processors
@@ -267,6 +271,15 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
             return
         self._session_config = self._read_session_config()
         self._refresh_session_config_dirty_indicators()
+        impact = classify_structured_config_change(
+            self._active_preset(), self._session_config)
+        if impact.requires_phase1:
+            self._status_bar.showMessage(
+                "Config changed: rerun Track Layout to apply Phase 1 "
+                "detector settings.")
+        elif impact.requires_phase2:
+            self._status_bar.showMessage(
+                "Config changed: press Reanalyze to update Phase 2.")
 
     def _refresh_phase2_dirty_indicators(self) -> None:
         if hasattr(self, "_refresh_groups_dirty_indicators"):

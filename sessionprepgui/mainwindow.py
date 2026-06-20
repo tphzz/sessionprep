@@ -33,6 +33,8 @@ from PySide6.QtWidgets import (
 )
 
 from sessionpreplib.config import (
+    ConfigChangeImpact,
+    classify_structured_config_change,
     default_config,
     flatten_structured_config,
 )
@@ -931,6 +933,67 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
 
     # ── Preferences ───────────────────────────────────────────────────────
 
+    def _refresh_config_changed_display(self) -> None:
+        """Refresh visible reports for config changes that do not reanalyze."""
+        if self._session:
+            self._render_summary()
+        cmap = self._config.get("app", {}).get("spectrogram_colormap", "magma")
+        self._waveform.set_colormap(cmap)
+        if self._current_track:
+            html = render_track_detail_html(
+                self._current_track, self._session,
+                show_clean=self._show_clean,
+                verbose=self._verbose)
+            self._file_report.setHtml(self._wrap_html(html))
+
+    def _confirm_config_change_reanalysis(
+        self,
+        impact: ConfigChangeImpact,
+        *,
+        intro: str,
+    ) -> bool:
+        """Ask whether to apply config changes that require reanalysis."""
+        if impact.requires_phase1:
+            ans = QMessageBox.question(
+                self,
+                "Rerun Track Layout?",
+                intro
+                + "\n\nThese changes affect Track Layout checks such as "
+                "dual-mono or one-sided-silence detection. Rerun Track "
+                "Layout now to apply them to the current session?\n\n"
+                "Topology may change, so review Phase 1 before continuing.",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            return ans == QMessageBox.Yes
+
+        if impact.requires_phase2:
+            ans = QMessageBox.question(
+                self,
+                "Reanalyze Phase 2?",
+                intro
+                + "\n\nThese changes affect Phase 2 analysis or gain "
+                "planning. Reanalyze Phase 2 now?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
+            )
+            return ans == QMessageBox.Yes
+
+        return True
+
+    def _apply_config_change_impact(self, impact: ConfigChangeImpact) -> None:
+        """Apply the minimum UI refresh/reanalysis for a config change."""
+        if impact.requires_phase1:
+            self._on_topo_reanalyze()
+            return
+        if impact.requires_phase2:
+            self._on_analyze()
+            return
+        if impact.presentation_keys and self._session:
+            self._refresh_presentation()
+            return
+        self._refresh_config_changed_display()
+
     @Slot()
     def _on_preferences(self):
         old_scale = self._config.get("app", {}).get(
@@ -990,11 +1053,10 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
                 self._pt_utils_window.update_config(self._config)
 
             if self._source_dir:
-                from sessionpreplib.config import strip_presentation_keys
                 new_preset = self._active_preset()
-                old_stripped = strip_presentation_keys(old_preset)
-                new_stripped = strip_presentation_keys(new_preset)
-                if new_stripped != old_stripped:
+                impact = classify_structured_config_change(
+                    old_preset, new_preset)
+                if impact.requires_phase1 or impact.requires_phase2:
                     if self._session_config is not None:
                         # Session has local config — don't auto-re-analyze
                         preset_name = self._active_config_preset_name
@@ -1009,22 +1071,21 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
                             " Config Preset.",
                         )
                     else:
-                        self._on_analyze()
-                elif new_preset != old_preset:
-                    # Only presentation keys changed — lightweight refresh
+                        intro = (
+                            "The active config preset has changed in "
+                            "Preferences."
+                        )
+                        if self._confirm_config_change_reanalysis(
+                                impact, intro=intro):
+                            self._apply_config_change_impact(impact)
+                        else:
+                            self._status_bar.showMessage(
+                                "Preferences saved; current analysis not "
+                                "reanalyzed.")
+                elif impact.presentation_keys:
                     self._refresh_presentation()
                 else:
-                    # GUI-only change — just refresh reports and colormap
-                    self._render_summary()
-                    cmap = self._config.get("app", {}).get(
-                        "spectrogram_colormap", "magma")
-                    self._waveform.set_colormap(cmap)
-                    if self._current_track:
-                        html = render_track_detail_html(
-                            self._current_track, self._session,
-                            show_clean=self._show_clean,
-                            verbose=self._verbose)
-                        self._file_report.setHtml(self._wrap_html(html))
+                    self._refresh_config_changed_display()
 
             # Prompt restart if scale factor changed
             new_scale = self._config.get("app", {}).get(
