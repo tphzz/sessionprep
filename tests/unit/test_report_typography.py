@@ -11,6 +11,7 @@ from PySide6.QtWidgets import QApplication, QTextBrowser
 from sessionprepgui.detail.report import render_summary_html, render_track_detail_html
 from sessionprepgui.detail.report_style import (
     configure_report_browser,
+    report_font_scale,
     wrap_report_html,
 )
 from sessionpreplib.detectors.silence import SilenceDetector
@@ -37,14 +38,53 @@ def _assert_no_fixed_report_typography(html: str) -> None:
     assert not re.search(r"font-size\s*:\s*[^;\"']*pt\b", html)
 
 
+class _FakeScreen:
+    def __init__(self, dpr: float, logical_dpi: float):
+        self._dpr = dpr
+        self._logical_dpi = logical_dpi
+
+    def devicePixelRatio(self) -> float:
+        return self._dpr
+
+    def logicalDotsPerInch(self) -> float:
+        return self._logical_dpi
+
+
+@pytest.mark.parametrize(
+    ("screen", "expected"),
+    [
+        (_FakeScreen(1.0, 96.0), 1.0),
+        (_FakeScreen(1.25, 96.0), 1.08),
+        (_FakeScreen(1.0, 144.0), 1.08),
+        (_FakeScreen(2.0, 96.0), 1.15),
+        (_FakeScreen(1.0, 192.0), 1.15),
+    ],
+)
+def test_report_font_scale_buckets(screen, expected):
+    assert report_font_scale(screen) == expected
+
+
 def test_report_browser_uses_application_font(qapp):
     browser = QTextBrowser()
 
-    configure_report_browser(browser)
+    configure_report_browser(browser, _FakeScreen(1.0, 96.0))
 
     assert browser.font().family() == qapp.font().family()
     assert browser.document().defaultFont().family() == qapp.font().family()
     assert browser.document().defaultFont().pointSize() == qapp.font().pointSize()
+
+
+def test_report_browser_applies_high_dpi_boost(qapp):
+    browser = QTextBrowser()
+    screen = _FakeScreen(2.0, 96.0)
+
+    configure_report_browser(browser, screen)
+
+    expected_size = qapp.font().pointSizeF() * 1.15
+    assert browser.font().family() == qapp.font().family()
+    assert browser.document().defaultFont().pointSizeF() == pytest.approx(
+        expected_size
+    )
 
 
 def test_report_wrapper_does_not_override_platform_font_or_size():

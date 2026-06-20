@@ -154,6 +154,7 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
         self._session_widgets: dict[str, list[tuple[str, QWidget]]] = {}
         self._pt_utils_window = None  # singleton Pro Tools Utils window
         self._log_viewer_window = None  # singleton detached log viewer
+        self._report_screen_connection = None
 
         t0 = time.perf_counter()
         self._detector_help = detector_help_map()
@@ -888,8 +889,27 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
     def _make_report_browser(self):
         """Create a consistently styled QTextBrowser for reports."""
         browser = _HelpBrowser(self._detector_help)
-        configure_report_browser(browser)
+        configure_report_browser(browser, self.screen() or screen_for_startup())
         return browser
+
+    def _refresh_report_browser_fonts(self, screen=None):
+        """Re-apply report font sizing for the current monitor."""
+        target_screen = screen or self.screen() or screen_for_startup()
+        for attr in ("_summary_view", "_file_report"):
+            browser = getattr(self, attr, None)
+            if browser is not None:
+                configure_report_browser(browser, target_screen)
+
+    def _install_report_screen_refresh(self):
+        """Refresh report font scale when the window moves between screens."""
+        handle = self.windowHandle()
+        if handle is None:
+            return
+        if self._report_screen_connection is None:
+            self._report_screen_connection = handle.screenChanged.connect(
+                self._refresh_report_browser_fonts
+            )
+        self._refresh_report_browser_fonts(handle.screen())
 
     # ── Slots: phase tabs ─────────────────────────────────────────────────
 
@@ -1146,6 +1166,7 @@ def main():
 
     t0 = time.perf_counter()
     window.show()
+    window._install_report_screen_refresh()
     dbg(f"window.show: {(time.perf_counter() - t0) * 1000:.1f} ms")
     log.debug(
         "Startup geometry after show: actual=%s frame=%s window_state=%s",
