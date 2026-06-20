@@ -1,4 +1,4 @@
-__pycache__/
+**/__pycache__
 *.pyc
 *.pyo
 
@@ -36,18 +36,17 @@ sessionpreplib/daw_processors/ptsl/DAWProject-Reference.html
 sessionpreplib/_build_version.py
 
 _private/
-_private/*
 
 downloaded-artifacts
 downloaded-artifacts/*
 
 GEMINI.md
+AGENTS.md
+CLAUDE.md
 
 # Temporary build directories
 _dawproject_build/
-_dawproject_build/*
 
 .env
-.env/*
 *.env
 
