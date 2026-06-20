@@ -39,6 +39,7 @@ from sessionpreplib.config import (
 from sessionpreplib.detectors import detector_help_map
 
 from .settings import (
+    DEFAULT_SCALE_FACTOR,
     load_config, save_config,
     resolve_config_preset, build_defaults,
 )
@@ -931,7 +932,8 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
 
     @Slot()
     def _on_preferences(self):
-        old_scale = self._config.get("app", {}).get("scale_factor", 1.0)
+        old_scale = self._config.get("app", {}).get(
+            "scale_factor", DEFAULT_SCALE_FACTOR)
         old_preset = copy.deepcopy(self._active_preset())
 
         dlg = PreferencesDialog(self._config, parent=self)
@@ -1024,7 +1026,8 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
                         self._file_report.setHtml(self._wrap_html(html))
 
             # Prompt restart if scale factor changed
-            new_scale = self._config.get("app", {}).get("scale_factor", 1.0)
+            new_scale = self._config.get("app", {}).get(
+                "scale_factor", DEFAULT_SCALE_FACTOR)
             if new_scale != old_scale:
                 QMessageBox.information(
                     self, "Restart required",
@@ -1144,15 +1147,20 @@ def main():
     # Read directly from JSON to avoid the validate-and-overwrite path
     # in load_config() which could reset the file to defaults.
     import json as _json
-    from .settings import config_path as _cfg_path
+    from .settings import (
+        DEFAULT_SCALE_FACTOR as _default_scale,
+        config_path as _cfg_path,
+        startup_scale_factor_from_raw_config as _startup_scale,
+    )
+    scale = _default_scale
     try:
         with open(_cfg_path(), "r", encoding="utf-8") as _f:
             _raw = _json.load(_f)
-        scale = _raw.get("app", {}).get("scale_factor")
-        if scale is not None and float(scale) != 1.0:
-            os.environ["QT_SCALE_FACTOR"] = str(float(scale))
+        scale = _startup_scale(_raw)
     except Exception:
         pass
+    if scale is not None and float(scale) != 1.0:
+        os.environ["QT_SCALE_FACTOR"] = str(float(scale))
 
     t0 = time.perf_counter()
     app = QApplication(sys.argv)

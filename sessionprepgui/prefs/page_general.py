@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
 )
 
 from sessionpreplib.models import ParamSpec
+from sessionprepgui.settings import DEFAULT_SCALE_FACTOR
 
 from .param_form import (
     _build_param_page,
@@ -37,7 +38,7 @@ _APP_PARAMS = [
         widget_hint="path_picker_folder",
     ),
     ParamSpec(
-        key="scale_factor", type=(int, float), default=1.0,
+        key="scale_factor", type=(int, float), default=DEFAULT_SCALE_FACTOR,
         min=0.5, max=4.0,
         label="HiDPI scale factor",
         description=(

@@ -40,6 +40,8 @@ from .theme import PT_DEFAULT_COLORS
 log = logging.getLogger(__name__)
 
 CONFIG_FILENAME = "sessionprep.config.json"
+DEFAULT_SCALE_FACTOR = 1.15
+SCALE_FACTOR_DEFAULT_VERSION = 2
 
 # ---------------------------------------------------------------------------
 # Presentation defaults  (config-preset-scoped)
@@ -52,7 +54,8 @@ _PRESENTATION_DEFAULTS: dict[str, Any] = {p.key: p.default for p in PRESENTATION
 # ---------------------------------------------------------------------------
 
 _APP_DEFAULTS: dict[str, Any] = {
-    "scale_factor": 1.0,
+    "scale_factor": DEFAULT_SCALE_FACTOR,
+    "_scale_factor_default_version": SCALE_FACTOR_DEFAULT_VERSION,
     "report_verbosity": "normal",
     "phase1_output_folder": "sp_01_tracklayout",
     "phase2_output_folder": "sp_02_prepared",
@@ -307,6 +310,27 @@ def config_path() -> str:
     return os.path.join(get_app_dir(), CONFIG_FILENAME)
 
 
+def normalize_scale_factor(value: Any) -> float:
+    """Return a valid app scale factor, falling back to the default."""
+    try:
+        scale = float(value)
+    except (TypeError, ValueError):
+        return DEFAULT_SCALE_FACTOR
+    return scale
+
+
+def startup_scale_factor_from_raw_config(raw: dict[str, Any]) -> float:
+    """Resolve scale factor from raw JSON before QApplication is created."""
+    if not isinstance(raw, dict):
+        return DEFAULT_SCALE_FACTOR
+    app = raw.get("app")
+    if not isinstance(app, dict):
+        return DEFAULT_SCALE_FACTOR
+    if _needs_scale_default_migration(app):
+        return DEFAULT_SCALE_FACTOR
+    return normalize_scale_factor(app.get("scale_factor"))
+
+
 # ---------------------------------------------------------------------------
 # Load / Save
 # ---------------------------------------------------------------------------
@@ -355,6 +379,8 @@ def load_config() -> dict[str, Any]:
     app_data = data.get("app", {})
     if "output_folder" in app_data and "phase2_output_folder" not in app_data:
         app_data["phase2_output_folder"] = app_data.pop("output_folder")
+    if isinstance(app_data, dict):
+        _migrate_scale_default(app_data)
 
     # -- Merge: defaults ← file overrides --
     merged = _merge_structured(defaults, data)
@@ -451,6 +477,27 @@ def _merge_structured(
         merged["group_presets"] = copy.deepcopy(overrides["group_presets"])
 
     return merged
+
+
+def _needs_scale_default_migration(app_data: dict[str, Any]) -> bool:
+    version = app_data.get("_scale_factor_default_version")
+    if version == SCALE_FACTOR_DEFAULT_VERSION:
+        return False
+    try:
+        scale = float(app_data.get("scale_factor", 1.0))
+    except (TypeError, ValueError):
+        scale = 1.0
+    return scale == 1.0
+
+
+def _migrate_scale_default(app_data: dict[str, Any]) -> None:
+    if _needs_scale_default_migration(app_data):
+        app_data["scale_factor"] = DEFAULT_SCALE_FACTOR
+    else:
+        app_data["scale_factor"] = normalize_scale_factor(
+            app_data.get("scale_factor")
+        )
+    app_data["_scale_factor_default_version"] = SCALE_FACTOR_DEFAULT_VERSION
 
 
 def _merge_config_preset(

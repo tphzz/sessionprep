@@ -1928,7 +1928,8 @@ preferences directory:
 ```json
 {
     "app": {
-        "scale_factor": 1.0,
+        "scale_factor": 1.15,
+        "_scale_factor_default_version": 2,
         "report_verbosity": "normal",
         "output_folder": "",
         "phase1_output_folder": "sp_01_tracklayout",
