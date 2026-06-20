@@ -28,7 +28,7 @@ from ..prefs.param_form import _argb_to_qcolor
 from ..settings import build_defaults, save_config
 from .table_widgets import _SortableItem, _TAB_GROUPS
 from ..theme import COLORS, PT_DEFAULT_COLORS, normalize_color_name
-from ..widgets import BatchComboBox, ColorPickerButton
+from ..widgets import BatchComboBox, ColorPickerButton, TableCellComboBox
 
 
 class GroupsMixin:  # pylint: disable=too-few-public-methods
@@ -216,7 +216,7 @@ class GroupsMixin:  # pylint: disable=too-few-public-methods
         self._groups_tab_table.setItem(row, 3, daw_item)
 
         # Match method dropdown
-        match_combo = QComboBox()
+        match_combo = TableCellComboBox()
         match_combo.addItems(["contains", "regex"])
         mi = match_combo.findText(match_method)
         if mi >= 0:

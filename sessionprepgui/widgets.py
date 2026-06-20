@@ -1,10 +1,10 @@
 """Reusable Qt widgets for batch-edit workflows.
 
-The two classes here — ``BatchEditTableWidget`` and ``BatchComboBox`` — provide
-a generic *multi-select → Alt+Shift+combo → apply to all* pattern that works
-for **any** QTableWidget with cell-widget dropdowns.  This replicates the
-behaviour found in DAWs, where Shift-selecting multiple tracks and
-Alt-clicking a control applies the change to all selected tracks.
+The table-edit classes here provide a generic
+*multi-select → Alt+Shift+combo → apply to all* pattern that works for
+**any** QTableWidget with cell-widget dropdowns.  This replicates the behaviour
+found in DAWs, where Shift-selecting multiple tracks and Alt-clicking a control
+applies the change to all selected tracks.
 
 How it works
 ------------
@@ -41,6 +41,7 @@ from PySide6.QtGui import QBrush, QColor, QPainter
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
+    QDoubleSpinBox,
     QFrame,
     QGridLayout,
     QLabel,
@@ -297,7 +298,23 @@ class BatchEditTableWidget(QTableWidget):
         self.setSelectionMode(old_mode)
 
 
-class BatchComboBox(QComboBox):
+class TableCellComboBox(QComboBox):
+    """Combo box for table cells where wheel means table scroll."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFocusPolicy(Qt.ClickFocus)
+
+    def wheelEvent(self, event):
+        """Let table views scroll instead of changing closed cell combos."""
+        popup = self.view()
+        if popup is not None and popup.isVisible():
+            super().wheelEvent(event)
+            return
+        event.ignore()
+
+
+class BatchComboBox(TableCellComboBox):
     """QComboBox that detects Alt+Shift on click for batch-edit mode.
 
     When the user holds **Alt+Shift** while clicking the combo,
@@ -322,6 +339,17 @@ class BatchComboBox(QComboBox):
         # wrapper recreation when slots live on mixin classes.
         self.setProperty("_batch_mode", self.batch_mode)
         super().mousePressEvent(event)
+
+
+class TableCellDoubleSpinBox(QDoubleSpinBox):
+    """Double spin box for table cells where wheel means table scroll."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFocusPolicy(Qt.ClickFocus)
+
+    def wheelEvent(self, event):
+        event.ignore()
 
 
 class BatchToolButton(QToolButton):

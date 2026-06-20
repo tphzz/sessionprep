@@ -29,7 +29,7 @@ from ..theme import (
     FILE_COLOR_TRANSIENT,
     FILE_COLOR_SUSTAINED,
 )
-from ..widgets import BatchComboBox, BatchToolButton
+from ..widgets import BatchComboBox, BatchToolButton, TableCellDoubleSpinBox
 from ..analysis.worker import BatchReanalyzeWorker
 
 
@@ -160,7 +160,7 @@ class TrackColumnsMixin:  # pylint: disable=too-few-public-methods
                 gain_sort = _SortableItem(f"{gain_db:+.1f}", gain_db)
                 self._track_table.setItem(row, 4, gain_sort)
 
-                spin = QDoubleSpinBox()
+                spin = TableCellDoubleSpinBox()
                 spin.setRange(-60.0, 60.0)
                 spin.setSingleStep(0.1)
                 spin.setDecimals(1)

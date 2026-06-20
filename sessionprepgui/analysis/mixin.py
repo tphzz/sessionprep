@@ -952,8 +952,7 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         self._track_table.removeCellWidget(row, 4)
         self._track_table.removeCellWidget(row, 5)
 
-        from PySide6.QtWidgets import QDoubleSpinBox
-        from ..widgets import BatchComboBox
+        from ..widgets import BatchComboBox, TableCellDoubleSpinBox
         from ..theme import (
             FILE_COLOR_SILENT, FILE_COLOR_TRANSIENT, FILE_COLOR_SUSTAINED,
         )
@@ -1006,7 +1005,7 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
             gain_sort = _SortableItem(f"{gain_db:+.1f}", gain_db)
             self._track_table.setItem(row, 4, gain_sort)
 
-            spin = QDoubleSpinBox()
+            spin = TableCellDoubleSpinBox()
             spin.setRange(-60.0, 60.0)
             spin.setSingleStep(0.1)
             spin.setDecimals(1)
