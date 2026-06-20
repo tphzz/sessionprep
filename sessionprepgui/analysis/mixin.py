@@ -273,6 +273,8 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         self._refresh_session_config_dirty_indicators()
         impact = classify_structured_config_change(
             self._active_preset(), self._session_config)
+        if impact.daw_keys and hasattr(self, "_refresh_daw_processors_from_config"):
+            self._refresh_daw_processors_from_config()
         if impact.requires_phase1:
             self._status_bar.showMessage(
                 "Config changed: rerun Track Layout to apply Phase 1 "
@@ -280,6 +282,9 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         elif impact.requires_phase2:
             self._status_bar.showMessage(
                 "Config changed: press Reanalyze to update Phase 2.")
+        elif impact.daw_keys:
+            self._status_bar.showMessage(
+                "Config changed: Phase 3 DAW settings updated.")
 
     def _refresh_phase2_dirty_indicators(self) -> None:
         if hasattr(self, "_refresh_groups_dirty_indicators"):
