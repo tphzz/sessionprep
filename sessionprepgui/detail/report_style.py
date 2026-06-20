@@ -13,6 +13,7 @@ from ..theme import COLORS
 REPORT_TITLE_SIZE = "1.3em"
 REPORT_SECTION_SIZE = "1.15em"
 REPORT_BADGE_SIZE = "0.82em"
+REPORT_CONTENT_SCALE = 1.15
 
 
 class _ScreenLike(Protocol):
@@ -52,7 +53,7 @@ def configure_report_browser(
     font = QFont(app.font() if app is not None else browser.font())
     if screen is None:
         screen = browser.screen() or QGuiApplication.primaryScreen()
-    scale = report_font_scale(screen)
+    scale = REPORT_CONTENT_SCALE * report_font_scale(screen)
     size = font.pointSizeF()
     if size > 0:
         font.setPointSizeF(size * scale)

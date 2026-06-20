@@ -11,6 +11,7 @@ from PySide6.QtWidgets import QApplication, QTextBrowser
 from sessionprepgui.detail.report import render_summary_html, render_track_detail_html
 from sessionprepgui.detail.report_style import (
     configure_report_browser,
+    REPORT_CONTENT_SCALE,
     report_font_scale,
     wrap_report_html,
 )
@@ -69,9 +70,12 @@ def test_report_browser_uses_application_font(qapp):
 
     configure_report_browser(browser, _FakeScreen(1.0, 96.0))
 
+    expected_size = qapp.font().pointSizeF() * REPORT_CONTENT_SCALE
     assert browser.font().family() == qapp.font().family()
     assert browser.document().defaultFont().family() == qapp.font().family()
-    assert browser.document().defaultFont().pointSize() == qapp.font().pointSize()
+    assert browser.document().defaultFont().pointSizeF() == pytest.approx(
+        expected_size
+    )
 
 
 def test_report_browser_applies_high_dpi_boost(qapp):
@@ -80,7 +84,7 @@ def test_report_browser_applies_high_dpi_boost(qapp):
 
     configure_report_browser(browser, screen)
 
-    expected_size = qapp.font().pointSizeF() * 1.15
+    expected_size = qapp.font().pointSizeF() * REPORT_CONTENT_SCALE * 1.15
     assert browser.font().family() == qapp.font().family()
     assert browser.document().defaultFont().pointSizeF() == pytest.approx(
         expected_size
