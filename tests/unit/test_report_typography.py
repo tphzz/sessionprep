@@ -16,6 +16,7 @@ from sessionprepgui.detail.report_style import (
     wrap_report_html,
 )
 from sessionpreplib.detectors.silence import SilenceDetector
+from sessionpreplib.detectors.stereo_compat import StereoCompatDetector
 from sessionpreplib.models import (
     DetectorResult,
     ProcessorResult,
@@ -37,6 +38,12 @@ def _assert_no_fixed_report_typography(html: str) -> None:
     assert "Consolas" not in html
     assert "monospace" not in html
     assert not re.search(r"font-size\s*:\s*[^;\"']*pt\b", html)
+
+
+def _assert_detector_badge_does_not_wrap(html: str) -> None:
+    assert 'width="118"' in html
+    assert "min-width:118px" in html
+    assert "white-space:nowrap" in html
 
 
 class _FakeScreen:
@@ -145,6 +152,7 @@ def test_track_detail_and_report_fragments_use_relative_typography():
         track,
     )
     _assert_no_fixed_report_typography(det_html)
+    _assert_detector_badge_does_not_wrap(det_html)
     assert "font-size:0.82em" in det_html
 
     processor = BimodalNormalizeProcessor()
@@ -170,3 +178,50 @@ def test_track_detail_and_report_fragments_use_relative_typography():
     )
     _assert_no_fixed_report_typography(proc_html)
     assert "font-size:0.9em" in proc_html
+
+
+def test_stereo_compat_report_badge_does_not_wrap():
+    detector = StereoCompatDetector()
+    detector.configure({})
+    html = detector.render_html(
+        DetectorResult(
+            detector_id="stereo_compat",
+            severity=Severity.ATTENTION,
+            summary="stereo warning",
+            data={
+                "lr_corr": 0.43,
+                "mono_loss_db": 1.5,
+                "windowed_regions": [{"start": 0.0, "end": 1.0}],
+            },
+        )
+    )
+
+    _assert_no_fixed_report_typography(html)
+    _assert_detector_badge_does_not_wrap(html)
+    assert "ATTENTION" in html
+
+
+def test_fallback_detector_report_badge_does_not_wrap():
+    track = TrackContext(
+        filename="Kick.wav",
+        filepath="Kick.wav",
+        audio_data=None,
+        samplerate=48000,
+        channels=1,
+        total_samples=48000,
+        bitdepth="24-bit",
+        subtype="PCM_24",
+        duration_sec=1.0,
+    )
+    track.detector_results["unknown_detector"] = DetectorResult(
+        detector_id="unknown_detector",
+        severity=Severity.ATTENTION,
+        summary="unknown warning",
+        data={},
+    )
+
+    html = render_track_detail_html(track)
+
+    _assert_no_fixed_report_typography(html)
+    _assert_detector_badge_does_not_wrap(html)
+    assert "ATTENTION" in html

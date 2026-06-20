@@ -7,6 +7,7 @@ pytest.importorskip("PySide6")
 from PySide6.QtWidgets import QApplication, QHeaderView, QTableWidgetItem
 
 from sessionprepgui.tracks.table_layout import (
+    TRACK_TABLE_CLASSIFICATION_MIN_WIDTH,
     TRACK_TABLE_FILE_MIN_WIDTH,
     apply_track_table_layout,
     calculate_track_table_layout,
@@ -76,6 +77,7 @@ def test_track_table_layout_fits_headers_widgets_and_rows(qapp):
     layout = calculate_track_table_layout(table)
 
     assert layout.column_widths[0] >= TRACK_TABLE_FILE_MIN_WIDTH
+    assert layout.column_widths[3] >= TRACK_TABLE_CLASSIFICATION_MIN_WIDTH
     for col in range(table.columnCount()):
         header_text = table.horizontalHeaderItem(col).text()
         header_width = (

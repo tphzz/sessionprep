@@ -12,6 +12,7 @@ TRACK_TABLE_CELL_HPAD = 18
 TRACK_TABLE_HEADER_HPAD = 22
 TRACK_TABLE_ROW_VPAD = 6
 TRACK_TABLE_RIGHT_MIN_WIDTH = 400
+TRACK_TABLE_CLASSIFICATION_MIN_WIDTH = 124
 
 
 @dataclass(frozen=True)
@@ -67,6 +68,8 @@ def calculate_track_table_layout(table: QTableWidget) -> TrackTableLayout:
 
     if 0 in widths:
         widths[0] = max(widths[0], TRACK_TABLE_FILE_MIN_WIDTH)
+    if 3 in widths:
+        widths[3] = max(widths[3], TRACK_TABLE_CLASSIFICATION_MIN_WIDTH)
 
     row_height += 2
     content_width = sum(widths.values())

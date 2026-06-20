@@ -6,7 +6,7 @@ from sessionpreplib.chunks import read_chunks, STANDARD_CHUNKS, detect_origin
 from sessionpreplib.detector import detector_badge_cell_html
 from ..theme import COLORS, FILE_COLOR_TRANSIENT, FILE_COLOR_SUSTAINED
 from ..helpers import esc
-from .report_style import REPORT_BADGE_SIZE, REPORT_SECTION_SIZE, REPORT_TITLE_SIZE
+from .report_style import REPORT_SECTION_SIZE, REPORT_TITLE_SIZE
 
 
 # ---------------------------------------------------------------------------
