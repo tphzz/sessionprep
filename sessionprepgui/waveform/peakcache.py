@@ -199,6 +199,20 @@ def load_peaks(path: str, expected_mtime: int | None = None) -> PeakData | None:
 # Query
 # ---------------------------------------------------------------------------
 
+def _select_mip_level(
+    peak_data: PeakData,
+    samples_per_pixel: float,
+) -> MipLevel:
+    """Return the best peak-cache level for the current view density."""
+    best_level = peak_data.levels[0]
+    for lvl in peak_data.levels:
+        if lvl.samples_per_bin <= samples_per_pixel:
+            best_level = lvl
+        else:
+            break
+    return best_level
+
+
 def query_peaks(
     peak_data: PeakData,
     view_start: int,
@@ -224,14 +238,11 @@ def query_peaks(
                  np.zeros(width, dtype=np.float64))
                 for _ in range(peak_data.channels)]
 
-    # Choose the finest mip level where each pixel spans >= 1 bin
-    # (i.e. samples_per_bin <= samples_per_pixel)
+    # Choose the coarsest mip level that is still no wider than a pixel.
+    # If the view is more detailed than the finest cached level, keep using
+    # the finest level rather than falling back to the coarsest.
     samples_per_pixel = view_len / width
-    best_level = peak_data.levels[-1]  # fallback to coarsest
-    for lvl in peak_data.levels:
-        if lvl.samples_per_bin <= samples_per_pixel:
-            best_level = lvl
-            break
+    best_level = _select_mip_level(peak_data, samples_per_pixel)
 
     spb = best_level.samples_per_bin
     n_bins = best_level.data.shape[0]
@@ -278,11 +289,7 @@ def query_peaks_fast(
                 for _ in range(peak_data.channels)]
 
     samples_per_pixel = view_len / width
-    best_level = peak_data.levels[-1]
-    for lvl in peak_data.levels:
-        if lvl.samples_per_bin <= samples_per_pixel:
-            best_level = lvl
-            break
+    best_level = _select_mip_level(peak_data, samples_per_pixel)
 
     spb = best_level.samples_per_bin
     n_bins = best_level.data.shape[0]

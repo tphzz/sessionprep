@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import numpy as np
 
+from sessionprepgui.waveform.renderer import WaveformRenderer, WaveformRenderCtx
 from sessionprepgui.waveform.peakcache import (
     build_peaks,
     load_peaks,
+    MipLevel,
     peaks_path_for,
+    PeakData,
+    query_peaks,
     query_peaks_fast,
     save_peaks,
 )
@@ -57,6 +61,90 @@ def test_query_peaks_fast_returns_channel_min_max_arrays():
         assert mins.shape == (64,)
         assert maxs.shape == (64,)
         assert np.all(mins <= maxs)
+
+
+def _peak_data_with_identifiable_levels() -> PeakData:
+    total_samples = 1_048_576
+    levels = []
+    for spb in (256, 1024, 4096, 16384):
+        n_bins = total_samples // spb
+        marker = float(spb)
+        data = np.full((n_bins, 1, 2), marker, dtype=np.float32)
+        levels.append(MipLevel(samples_per_bin=spb, data=data))
+    return PeakData(
+        channels=1,
+        samplerate=48_000,
+        total_samples=total_samples,
+        source_mtime=123,
+        levels=levels,
+    )
+
+
+def test_query_peaks_uses_finest_level_when_view_is_more_detailed_than_cache():
+    peak_data = _peak_data_with_identifiable_levels()
+
+    result = query_peaks(peak_data, 0, peak_data.total_samples, 8192)
+
+    mins, maxs = result[0]
+    assert np.all(mins == 256.0)
+    assert np.all(maxs == 256.0)
+
+
+def test_query_peaks_fast_uses_finest_level_when_view_is_more_detailed_than_cache():
+    peak_data = _peak_data_with_identifiable_levels()
+
+    result = query_peaks_fast(peak_data, 0, peak_data.total_samples, 8192)
+
+    mins, maxs = result[0]
+    assert np.all(mins == 256.0)
+    assert np.all(maxs == 256.0)
+
+
+def test_query_peaks_fast_selects_expected_cache_resolution_by_view_density():
+    peak_data = _peak_data_with_identifiable_levels()
+    cases = [
+        (4096, 256.0),    # 256 samples/pixel
+        (2048, 256.0),    # 512 samples/pixel
+        (768, 1024.0),    # 1365 samples/pixel
+        (192, 4096.0),    # 5461 samples/pixel
+        (32, 16384.0),    # 32768 samples/pixel
+    ]
+
+    for width, expected_marker in cases:
+        result = query_peaks_fast(peak_data, 0, peak_data.total_samples, width)
+        mins, maxs = result[0]
+        assert np.all(mins == expected_marker)
+        assert np.all(maxs == expected_marker)
+
+
+def test_waveform_renderer_prefers_raw_audio_when_view_is_finer_than_peak_cache():
+    peak_data = _peak_data_with_identifiable_levels()
+    raw = np.linspace(-1.0, 1.0, peak_data.total_samples, dtype=np.float64)
+    renderer = WaveformRenderer()
+    renderer.set_track_data([raw])
+    renderer.set_peak_data(peak_data)
+    ctx = WaveformRenderCtx(
+        x0=0,
+        draw_w=8192,
+        draw_h=100,
+        margin_right=0,
+        view_start=0,
+        view_end=peak_data.total_samples,
+        vscale=1.0,
+        channels=[raw],
+        num_channels=1,
+        show_rms_lr=False,
+        show_rms_avg=False,
+        show_markers=False,
+        wf_antialias=False,
+        wf_line_width=1,
+    )
+
+    renderer._build_peaks(ctx)
+
+    mins, maxs = renderer._peaks_cache[0]
+    assert np.all(mins < 2.0)
+    assert np.all(maxs < 2.0)
 
 
 def test_peaks_path_uses_basename_stem(tmp_path):

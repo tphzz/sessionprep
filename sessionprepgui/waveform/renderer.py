@@ -253,17 +253,21 @@ class WaveformRenderer:
             return
         # Fast path: use pre-computed peak mipmap if available
         if self._peak_data is not None and self._peak_data.levels:
-            cache_key = (width, ctx.view_start, ctx.view_end)
-            if self._cached_view == cache_key and self._peaks_cache:
-                return
             vs, ve = ctx.view_start, ctx.view_end
             if ve - vs <= 0:
                 self._peaks_cache = []
                 return
-            self._peaks_cache = query_peaks_fast(
-                self._peak_data, vs, ve, width)
-            self._cached_view = cache_key
-            return
+            finest_spb = self._peak_data.levels[0].samples_per_bin
+            samples_per_pixel = (ve - vs) / width
+            has_raw_audio = bool(channels and all(len(ch) > 0 for ch in channels))
+            if not (has_raw_audio and samples_per_pixel < finest_spb):
+                cache_key = (width, ctx.view_start, ctx.view_end)
+                if self._cached_view == cache_key and self._peaks_cache:
+                    return
+                self._peaks_cache = query_peaks_fast(
+                    self._peak_data, vs, ve, width)
+                self._cached_view = cache_key
+                return
         # Fallback: raw sample downsampling
         if not channels:
             self._peaks_cache = []
