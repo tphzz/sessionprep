@@ -147,6 +147,7 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
         self._wf_worker: WaveformLoadWorker | None = None
         self._audio_load_worker: AudioLoadWorker | None = None
         self._current_track = None
+        self._selected_detector_overlays: set[str] = set()
         self._session_groups: list[dict] = []
         self._prev_group_assignments: dict[str, str | None] = {}
         self._active_session_preset: str = "Default"

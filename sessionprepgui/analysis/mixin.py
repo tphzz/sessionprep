@@ -365,6 +365,7 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         self._session = None
         self._summary = None
         self._current_track = None
+        self._selected_detector_overlays = set()
         self._topology_dir = None
         self._source_dir = None
         self._topo_source_tracks = []

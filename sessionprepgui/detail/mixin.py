@@ -218,13 +218,28 @@ class DetailMixin:  # pylint: disable=too-few-public-methods
 
     # ── Overlay dropdown ────────────────────────────────────────────────
 
+    def _set_overlay_button_count(self, count: int) -> None:
+        self._overlay_btn.setText(
+            f"Detector Overlays ({count})" if count else "Detector Overlays")
+
+    def _remembered_detector_overlays(self) -> set[str]:
+        if not hasattr(self, "_selected_detector_overlays"):
+            self._selected_detector_overlays = set()
+        return self._selected_detector_overlays
+
+    def _apply_active_detector_overlays(self, available_labels: set[str]) -> None:
+        selected = self._remembered_detector_overlays()
+        active = selected & available_labels
+        self._waveform.set_enabled_overlays(active)
+        self._set_overlay_button_count(len(active))
+
     def _update_overlay_menu(self, issues: list):
         """Rebuild the overlay dropdown menu based on current track issues."""
         self._overlay_menu.clear()
-        self._waveform.set_enabled_overlays(set())
+        self._remembered_detector_overlays()
 
         if not issues:
-            self._overlay_btn.setText("Detector Overlays")
+            self._apply_active_detector_overlays(set())
             return
 
         # Build detector instance map from session
@@ -250,7 +265,7 @@ class DetailMixin:  # pylint: disable=too-few-public-methods
             filtered_issues.append(issue)
 
         if not filtered_issues:
-            self._overlay_btn.setText("Detector Overlays")
+            self._apply_active_detector_overlays(set())
             return
 
         # Build {label: count} from filtered issue list
@@ -259,27 +274,35 @@ class DetailMixin:  # pylint: disable=too-few-public-methods
             label_counts[issue.label] = label_counts.get(issue.label, 0) + 1
 
         # Add a checkable action per detector that has issues
+        selected = self._remembered_detector_overlays()
         for label in sorted(label_counts, key=lambda lb: det_names.get(lb, lb).lower()):
             name = det_names.get(label, label)
             count = label_counts[label]
             action = self._overlay_menu.addAction(f"{name} ({count})")
             action.setCheckable(True)
-            action.setChecked(False)
             action.setData(label)
+            action.setChecked(label in selected)
             action.toggled.connect(self._on_overlay_toggled)
 
-        self._overlay_btn.setText("Detector Overlays")
+        self._apply_active_detector_overlays(set(label_counts))
 
     @Slot()
     def _on_overlay_toggled(self):
         """Collect checked overlay labels and update the waveform."""
+        available = set()
         checked = set()
         for action in self._overlay_menu.actions():
+            if not action.isCheckable():
+                continue
+            label = action.data()
+            available.add(label)
             if action.isChecked():
-                checked.add(action.data())
+                checked.add(label)
+        selected = self._remembered_detector_overlays()
+        selected.difference_update(available)
+        selected.update(checked)
         self._waveform.set_enabled_overlays(checked)
-        n = len(checked)
-        self._overlay_btn.setText(f"Detector Overlays ({n})" if n else "Detector Overlays")
+        self._set_overlay_button_count(len(checked))
 
     @Slot(QAction)
     def _on_spec_fft_changed(self, action):
