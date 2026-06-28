@@ -33,12 +33,15 @@
 ; ---------------------------------------------------------------------------
 
 [Setup]
+; Keep AppId/AppName/AppVerName/UninstallDisplayName stable across releases so
+; Windows treats upgrades as the same installed application. APP_VERSION belongs
+; only in version metadata and artifact filenames.
 AppId={{A9F4C2E1-7B3D-4A6E-8C1F-5D2E0B9A3C78}
 AppName={#AppName}
 AppVersion={#APP_VERSION}
 AppPublisher={#AppPublisher}
 AppPublisherURL={#AppPublisherURL}
-AppVerName={#AppName} {#APP_VERSION}
+AppVerName={#AppName}
 
 DefaultDirName={autopf}\{#AppName}
 DefaultGroupName={#AppName}
@@ -47,6 +50,7 @@ OutputDir=..\..\{#DIST_DIR}
 OutputBaseFilename=sessionprep-{#APP_VERSION}-{#ARCH_SUFFIX}-setup
 
 SetupIconFile={#AppIconSrc}
+UninstallDisplayName={#AppName}
 UninstallDisplayIcon={app}\sessionprep.ico
 
 Compression=lzma

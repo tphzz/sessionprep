@@ -265,7 +265,11 @@ Everything else reads from this computed source:
 | Frozen builds          | Build scripts generate `sessionpreplib/_build_version.py`          |
 
 For installer/package metadata, pass the same computed version to the external
-packager, e.g. Inno Setup `APP_VERSION` or nfpm `VERSION`.
+packager, e.g. Inno Setup `APP_VERSION` or nfpm `VERSION`. Keep installer
+identity stable across releases: Windows Inno Setup `AppName`, `AppVerName`,
+`UninstallDisplayName`, and `AppId` must not include the generated version;
+Linux package `name` stays `sessionprep`; macOS app bundle name stays
+`SessionPrep.app`. Put versions in version metadata and artifact filenames.
 
 ### 2.6 Linux Build Requirements
 
