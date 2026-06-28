@@ -727,6 +727,39 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
                     pass
                 setattr(self, attr, None)
 
+    def _topo_begin_waveform_request(
+        self,
+        kind: str,
+        *,
+        peak_filename: str | None = None,
+        file_count: int = 0,
+        channel_count: int = 0,
+        labels_count: int = 0,
+        description: str = "",
+    ) -> int:
+        """Start a new phase 1 waveform request and return its id."""
+        import logging
+
+        request_id = getattr(self, "_topo_wf_request_id", 0) + 1
+        self._topo_wf_request_id = request_id
+        self._topo_wf_request_kind = kind
+        self._topo_wf_peak_filename = peak_filename
+        self._topo_wf_request_description = description
+        # Keep the legacy attribute in sync for peak-cache completion callbacks.
+        self._topo_wf_filename = peak_filename
+        logging.getLogger(__name__).debug(
+            "Phase 1 waveform request #%d: kind=%s peak=%r files=%d "
+            "channels=%d labels=%d %s",
+            request_id, kind, peak_filename, file_count, channel_count,
+            labels_count, description,
+        )
+        return request_id
+
+    def _topo_is_current_waveform_request(self, request_id: int | None) -> bool:
+        """Return True if *request_id* still matches the active preview."""
+        return (request_id is None
+                or request_id == getattr(self, "_topo_wf_request_id", None))
+
     # ── Input waveform loading ────────────────────────────────────────
 
     def _topo_load_input_from_items(self, file_items, channel_items=None):
@@ -752,16 +785,23 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
 
         self._topo_cancel_workers()
         self._on_topo_stop()
-        self._topo_wf_filename = filename  # track for peak cache lookup
 
         track_map = self._topo_track_map()
         track = track_map.get(filename)
         if not track:
             return
 
+        request_id = self._topo_begin_waveform_request(
+            "input-file",
+            peak_filename=filename,
+            file_count=1,
+            channel_count=track.channels,
+            description=filename,
+        )
+
         cached = self._topo_cached_audio
         if cached and cached[0] == track.filepath:
-            self._topo_show_waveform(cached[1], cached[3])
+            self._topo_show_waveform(cached[1], cached[3], request_id=request_id)
             return
 
         if self._topo_wf_expanded:
@@ -784,17 +824,24 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
         worker = AudioLoadWorker(track, parent=self)
         self._topo_audio_worker = worker
         worker.finished.connect(
-            lambda t, fp=track.filepath: self._on_topo_audio_loaded(t, fp))
+            lambda t, fp=track.filepath, rid=request_id:
+                self._on_topo_audio_loaded(t, fp, rid))
         worker.error.connect(self._on_topo_audio_error)
         worker.start()
 
-    def _on_topo_audio_loaded(self, track, filepath: str):
+    def _on_topo_audio_loaded(self, track, filepath: str,
+                              request_id: int | None = None):
+        if not self._topo_is_current_waveform_request(request_id):
+            import logging
+            logging.getLogger(__name__).debug(
+                "Discarding stale phase 1 audio load for request #%s", request_id)
+            return
         self._topo_audio_worker = None
         if track.audio_data is None:
             return
         self._topo_cached_audio = (
             filepath, track.audio_data, track.audio_data, track.samplerate)
-        self._topo_show_waveform(track.audio_data, track.samplerate)
+        self._topo_show_waveform(track.audio_data, track.samplerate, request_id=request_id)
 
     def _on_topo_audio_error(self, message: str):
         self._topo_audio_worker = None
@@ -837,6 +884,14 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
         if not items:
             return
 
+        request_id = self._topo_begin_waveform_request(
+            "input-multi",
+            file_count=len(items),
+            channel_count=sum(
+                len(item[2]) if item[2] is not None else 0 for item in items),
+            description=", ".join(item[1] for item in items[:4]),
+        )
+
         if self._topo_wf_expanded:
             self._topo_wf_panel.setVisible(True)
         self._topo_wf_panel.waveform.set_loading(True)
@@ -846,7 +901,9 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
         worker = TopoMultiAudioWorker(
             items, "input", self._source_dir or "", parent=self)
         self._topo_multi_worker = worker
-        worker.finished.connect(self._on_topo_multi_done)
+        worker.finished.connect(
+            lambda display, playback, sr, labels, rid=request_id:
+                self._on_topo_multi_done(display, playback, sr, labels, rid))
         worker.error.connect(self._on_topo_multi_error)
         worker.start()
 
@@ -883,6 +940,12 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
         if entry is None:
             return
 
+        request_id = self._topo_begin_waveform_request(
+            "output-file",
+            file_count=1,
+            description=output_filename,
+        )
+
         if self._topo_wf_expanded:
             self._topo_wf_panel.setVisible(True)
         self._topo_wf_panel.waveform.set_loading(True)
@@ -891,15 +954,23 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
         from ..analysis.worker import TopoAudioResolveWorker
         worker = TopoAudioResolveWorker(entry, self._source_dir, parent=self)
         self._topo_resolve_worker = worker
-        worker.finished.connect(self._on_topo_resolve_done)
+        worker.finished.connect(
+            lambda audio, sr, rid=request_id:
+                self._on_topo_resolve_done(audio, sr, rid))
         worker.error.connect(self._on_topo_resolve_error)
         worker.start()
 
-    def _on_topo_resolve_done(self, audio_data, samplerate: int):
+    def _on_topo_resolve_done(self, audio_data, samplerate: int,
+                              request_id: int | None = None):
+        if not self._topo_is_current_waveform_request(request_id):
+            import logging
+            logging.getLogger(__name__).debug(
+                "Discarding stale phase 1 output resolve for request #%s", request_id)
+            return
         self._topo_resolve_worker = None
         self._topo_cached_audio = (
             "__output__", audio_data, audio_data, samplerate)
-        self._topo_show_waveform(audio_data, samplerate)
+        self._topo_show_waveform(audio_data, samplerate, request_id=request_id)
 
     def _on_topo_resolve_error(self, message: str):
         self._topo_resolve_worker = None
@@ -947,6 +1018,14 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
         if not items:
             return
 
+        request_id = self._topo_begin_waveform_request(
+            "output-multi",
+            file_count=len(items),
+            channel_count=sum(
+                len(item[2]) if item[2] is not None else 0 for item in items),
+            description=", ".join(item[1] for item in items[:4]),
+        )
+
         if self._topo_wf_expanded:
             self._topo_wf_panel.setVisible(True)
         self._topo_wf_panel.waveform.set_loading(True)
@@ -956,17 +1035,26 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
         worker = TopoMultiAudioWorker(
             items, "output", self._source_dir, parent=self)
         self._topo_multi_worker = worker
-        worker.finished.connect(self._on_topo_multi_done)
+        worker.finished.connect(
+            lambda display, playback, sr, labels, rid=request_id:
+                self._on_topo_multi_done(display, playback, sr, labels, rid))
         worker.error.connect(self._on_topo_multi_error)
         worker.start()
 
     def _on_topo_multi_done(self, display_audio, playback_audio,
-                            samplerate: int, labels: list[str]):
+                            samplerate: int, labels: list[str],
+                            request_id: int | None = None):
+        if not self._topo_is_current_waveform_request(request_id):
+            import logging
+            logging.getLogger(__name__).debug(
+                "Discarding stale phase 1 multi-load for request #%s", request_id)
+            return
         self._topo_multi_worker = None
         self._topo_cached_audio = (
             "__multi__", display_audio, playback_audio, samplerate)
         self._topo_cached_labels = labels
-        self._topo_show_waveform(display_audio, samplerate, labels=labels)
+        self._topo_show_waveform(
+            display_audio, samplerate, labels=labels, request_id=request_id)
 
     def _on_topo_multi_error(self, message: str):
         self._topo_multi_worker = None
@@ -976,11 +1064,16 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
     # ── Common waveform display ───────────────────────────────────────
 
     def _topo_show_waveform(self, audio_data, samplerate: int,
-                            labels: list[str] | None = None):
+                            labels: list[str] | None = None,
+                            request_id: int | None = None):
         """Run WaveformLoadWorker and display result."""
         import time, logging
         t0 = time.perf_counter()
         log = logging.getLogger(__name__)
+
+        if not self._topo_is_current_waveform_request(request_id):
+            log.debug("Skipping stale phase 1 waveform setup for request #%s", request_id)
+            return
 
         import numpy as np
         if audio_data is None:
@@ -1006,22 +1099,30 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
             spec_window=self._topo_wf_panel.waveform.spec_window,
             parent=self)
         self._topo_wf_worker = worker
-        worker.finished.connect(self._on_topo_wf_loaded)
+        worker.finished.connect(
+            lambda result, rid=request_id: self._on_topo_wf_loaded(result, rid))
         worker.start()
-        log.debug("[Trace] _topo_show_waveform setup: %.2f ms", (time.perf_counter() - t0) * 1000)
+        log.debug(
+            "[Trace] _topo_show_waveform setup: request=%s labels=%d %.2f ms",
+            request_id, len(labels or []), (time.perf_counter() - t0) * 1000,
+        )
 
-    def _on_topo_wf_loaded(self, result: dict):
+    def _on_topo_wf_loaded(self, result: dict, request_id: int | None = None):
         import time, logging
         t0 = time.perf_counter()
         log = logging.getLogger(__name__)
 
+        if not self._topo_is_current_waveform_request(request_id):
+            log.debug("Discarding stale phase 1 waveform result for request #%s", request_id)
+            return
         self._topo_wf_worker = None
         self._topo_wf_panel.waveform.set_precomputed(result)
         # Apply cached peak data for mip-level rendering
         peak_cache = getattr(self, '_peak_cache', {})
-        wf_fn = getattr(self, '_topo_wf_filename', None)
+        wf_fn = getattr(self, '_topo_wf_peak_filename', None)
+        peak_applied = False
         if wf_fn and wf_fn in peak_cache:
-            self._topo_wf_panel.waveform.set_peak_data(peak_cache[wf_fn])
+            peak_applied = self._topo_wf_panel.waveform.set_peak_data(peak_cache[wf_fn])
         elif wf_fn and hasattr(self, '_prioritize_peak'):
             self._prioritize_peak(wf_fn)
         n_ch = len(result["channels"])
@@ -1029,7 +1130,13 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
         self._topo_wf_panel.update_play_mode_channels(n_ch, labels=labels)
         self._topo_wf_panel.play_btn.setEnabled(True)
         self._topo_update_time_label(0)
-        log.debug("[Trace] _on_topo_wf_loaded final UI application: %.2f ms", (time.perf_counter() - t0) * 1000)
+        log.debug(
+            "[Trace] _on_topo_wf_loaded applied request=%s kind=%s channels=%d "
+            "samples=%s sr=%s peak=%r peak_applied=%s in %.2f ms",
+            request_id, getattr(self, "_topo_wf_request_kind", None), n_ch,
+            result.get("total_samples"), result.get("samplerate"), wf_fn,
+            peak_applied, (time.perf_counter() - t0) * 1000,
+        )
 
     @Slot(str)
     def _on_topo_display_mode_changed(self, mode: str):

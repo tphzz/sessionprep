@@ -110,15 +110,43 @@ class WaveformWidget(QWidget):
         self._spec_renderer.reset(samplerate)
         self._invalidate_bg()
 
-    def set_peak_data(self, peak_data):
+    def _peak_data_matches_current_waveform(self, peak_data) -> bool:
+        """Return True when *peak_data* is usable for the current waveform."""
+        if peak_data is None or self._num_channels <= 0 or self._total_samples <= 0:
+            return True
+        actual = (
+            getattr(peak_data, "channels", None),
+            getattr(peak_data, "total_samples", None),
+            getattr(peak_data, "samplerate", None),
+        )
+        expected = (self._num_channels, self._total_samples, self._samplerate)
+        if actual == expected:
+            return True
+
+        import logging
+        logging.getLogger(__name__).warning(
+            "Rejected waveform peak cache metadata mismatch: "
+            "expected channels=%d samples=%d sr=%d, got channels=%r samples=%r sr=%r",
+            self._num_channels, self._total_samples, self._samplerate,
+            actual[0], actual[1], actual[2],
+        )
+        return False
+
+    def set_peak_data(self, peak_data) -> bool:
         """Set pre-computed peak mipmap data for fast rendering.
 
         Can be called before or after set_audio / set_precomputed.
         When set, the renderer uses mip-level lookups instead of
-        downsampling raw samples on each paint.
+        downsampling raw samples on each paint.  Returns ``False`` if
+        metadata shows the peak cache belongs to a different waveform.
         """
+        if not self._peak_data_matches_current_waveform(peak_data):
+            self._wf_renderer.set_peak_data(None)
+            self._invalidate_bg()
+            return False
         self._wf_renderer.set_peak_data(peak_data)
         self._invalidate_bg()
+        return True
 
     def set_loading(self, loading: bool):
         """Show or hide a 'Loading waveform…' placeholder."""
@@ -131,7 +159,7 @@ class WaveformWidget(QWidget):
         self._invalidate_bg()
 
     def set_preview_mode(self, channels_count: int, total_samples: int,
-                         samplerate: int, peak_data: object):
+                         samplerate: int, peak_data: object) -> bool:
         """Instantly prepare widget for rendering using only peak cache metadata."""
         import time, logging
         t0 = time.perf_counter()
@@ -162,10 +190,13 @@ class WaveformWidget(QWidget):
             rms_max_amplitude=0.0,
         )
         self._spec_renderer.reset(samplerate)
-        self._wf_renderer.set_peak_data(peak_data)
+        if not self.set_peak_data(peak_data):
+            self.set_loading(True)
+            return False
         self._loading = False
         self._invalidate_bg()
         log.debug("[Trace] WaveformWidget.set_preview_mode finished in %.2f ms", (time.perf_counter() - t0) * 1000)
+        return True
 
     def set_precomputed(self, result: dict):
         """Apply pre-computed waveform data from a WaveformLoadWorker."""

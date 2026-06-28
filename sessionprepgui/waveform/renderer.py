@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 
 import numpy as np
 
@@ -17,6 +18,8 @@ _CHANNEL_COLORS = [
     "#44aa44", "#44aaaa", "#aa44aa", "#aaaa44",
     "#4488cc", "#cc8844", "#88cc44", "#cc4488",
 ]
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -257,17 +260,29 @@ class WaveformRenderer:
             if ve - vs <= 0:
                 self._peaks_cache = []
                 return
-            finest_spb = self._peak_data.levels[0].samples_per_bin
-            samples_per_pixel = (ve - vs) / width
-            has_raw_audio = bool(channels and all(len(ch) > 0 for ch in channels))
-            if not (has_raw_audio and samples_per_pixel < finest_spb):
-                cache_key = (width, ctx.view_start, ctx.view_end)
-                if self._cached_view == cache_key and self._peaks_cache:
-                    return
-                self._peaks_cache = query_peaks_fast(
-                    self._peak_data, vs, ve, width)
-                self._cached_view = cache_key
-                return
+            if self._peak_data.channels != ctx.num_channels:
+                log.warning(
+                    "Ignoring waveform peak cache with %d channels for %d-channel view",
+                    self._peak_data.channels, ctx.num_channels,
+                )
+            else:
+                finest_spb = self._peak_data.levels[0].samples_per_bin
+                samples_per_pixel = (ve - vs) / width
+                has_raw_audio = bool(channels and all(len(ch) > 0 for ch in channels))
+                if not (has_raw_audio and samples_per_pixel < finest_spb):
+                    cache_key = (width, ctx.view_start, ctx.view_end)
+                    if (self._cached_view == cache_key
+                            and len(self._peaks_cache) == ctx.num_channels):
+                        return
+                    peak_cache = query_peaks_fast(self._peak_data, vs, ve, width)
+                    if len(peak_cache) == ctx.num_channels:
+                        self._peaks_cache = peak_cache
+                        self._cached_view = cache_key
+                        return
+                    log.warning(
+                        "Ignoring waveform peak cache result with %d channels for %d-channel view",
+                        len(peak_cache), ctx.num_channels,
+                    )
         # Fallback: raw sample downsampling
         if not channels:
             self._peaks_cache = []
@@ -342,6 +357,13 @@ class WaveformRenderer:
             painter.setClipRect(ctx.x0, lane_top, ctx.draw_w, lane_bot - lane_top)
 
             color = QColor(_CHANNEL_COLORS[ch % len(_CHANNEL_COLORS)])
+            if ch >= len(self._peaks_cache):
+                log.warning(
+                    "Skipping waveform channel %d because peak cache has only %d channel(s)",
+                    ch, len(self._peaks_cache),
+                )
+                painter.setClipping(False)
+                continue
             mins, maxs = self._peaks_cache[ch]
 
             n_pts = len(mins)

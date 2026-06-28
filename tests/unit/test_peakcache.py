@@ -151,3 +151,35 @@ def test_peaks_path_uses_basename_stem(tmp_path):
     path = peaks_path_for(str(tmp_path), "nested/source file.wav")
 
     assert path == str(tmp_path / "source file.peaks")
+
+
+def test_waveform_renderer_ignores_stale_peak_cache_channel_count(caplog):
+    peak_data = _peak_data_with_identifiable_levels()
+    raw_channels = [
+        np.linspace(-1.0, 1.0, peak_data.total_samples, dtype=np.float64)
+        for _ in range(4)
+    ]
+    renderer = WaveformRenderer()
+    renderer.set_track_data(raw_channels)
+    renderer.set_peak_data(peak_data)
+    ctx = WaveformRenderCtx(
+        x0=0,
+        draw_w=128,
+        draw_h=100,
+        margin_right=0,
+        view_start=0,
+        view_end=peak_data.total_samples,
+        vscale=1.0,
+        channels=raw_channels,
+        num_channels=4,
+        show_rms_lr=False,
+        show_rms_avg=False,
+        show_markers=False,
+        wf_antialias=False,
+        wf_line_width=1,
+    )
+
+    renderer._build_peaks(ctx)
+
+    assert len(renderer._peaks_cache) == 4
+    assert "Ignoring waveform peak cache with 1 channels for 4-channel view" in caplog.text
