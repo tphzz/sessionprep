@@ -9,6 +9,8 @@ normalizing levels, so you can focus on mixing.
 This is a **preflight heuristic** and a **starting-point generator**, not a fully
 automatic mix prep tool. 
 
+## Screenshots
+
 <table>
   <tr>
     <td width="33%">
