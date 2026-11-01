@@ -44,6 +44,7 @@ from ..tracks.table_widgets import (
     _SETUP_RIGHT_PLACEHOLDER, _SETUP_RIGHT_TREE,
     _PHASE_SETUP,
 )
+from ..controls import bind_primary_action, set_action_busy
 from ..theme import COLORS, PT_DEFAULT_COLORS, tune_toolbar_checkbox
 from ..analysis.worker import DawCheckWorker, DawFetchWorker, DawTransferWorker
 
@@ -72,6 +73,7 @@ class DawMixin:  # pylint: disable=too-few-public-methods
         # ── Left: DAW processor selection + status label ────────────────
         self._daw_combo = QComboBox()
         self._daw_combo.setMinimumWidth(140)
+        self._daw_combo.setMaximumWidth(300)
         self._setup_toolbar.addWidget(self._daw_combo)
 
         self._daw_check_label = QLabel("")
@@ -123,7 +125,7 @@ class DawMixin:  # pylint: disable=too-few-public-methods
                 background-color: #2a6db5;
             }
             QToolButton#fetchSplitButton:disabled {
-                color: #666666;
+                color: #aaaaaa;
                 background: transparent;
             }
             QToolButton#fetchSplitButton::menu-button {
@@ -177,6 +179,7 @@ class DawMixin:  # pylint: disable=too-few-public-methods
         self._transfer_action.setEnabled(False)
         self._transfer_action.triggered.connect(self._on_daw_transfer)
         self._setup_toolbar.addAction(self._transfer_action)
+        bind_primary_action(self._setup_toolbar, self._transfer_action)
 
         # self._sync_action = QAction("Sync", self)
         # self._sync_action.setEnabled(False)
@@ -377,6 +380,9 @@ class DawMixin:  # pylint: disable=too-few-public-methods
 
     def _update_daw_lifecycle_buttons(self):
         """Enable/disable Fetch/Transfer/Sync based on active processor state."""
+        set_action_busy(self._transfer_action,
+                        getattr(self, "_daw_transfer_worker", None) is not None,
+                        "Creating\u2026")
         # Check if any async operation is currently running
         is_working = getattr(self, "_daw_check_worker", None) is not None or \
                      getattr(self, "_daw_fetch_worker", None) is not None or \
@@ -706,6 +712,7 @@ class DawMixin:  # pylint: disable=too-few-public-methods
             return
 
         dp_name = self._active_daw_processor.name
+        set_action_busy(self._transfer_action, True, "Creating\u2026")
         self._progress_start(f"Transferring to {dp_name}\u2026")
 
         self._daw_transfer_worker = DawTransferWorker(
@@ -726,6 +733,7 @@ class DawMixin:  # pylint: disable=too-few-public-methods
 
     @Slot(bool, str, object)
     def _on_daw_transfer_result(self, ok: bool, message: str, results):
+        set_action_busy(self._transfer_action, False)
         worker = self._daw_transfer_worker
         self._daw_transfer_worker = None
         if worker:

@@ -100,6 +100,12 @@ sessionprep /path/to/tracks          # analyze (safe, read-only)
 sessionprep /path/to/tracks -x       # analyze + process (writes to processed/)
 ```
 
+In the GUI, **Summary** lists each finding, its affected file and the next step.
+Use **Review file** to inspect it; expand a detector row for its full result or
+open **Help** for its explanation. The local **Waveform preview** header lets
+you hide or reopen audio inspection without losing the current view. The chevron
+points up to open and down to close; keyboard focus remains visible.
+
 **4. Import** processed tracks into your DAW. Use **DAW Transfer** in the GUI to apply fader offsets automatically (Pro Tools via PTSL, DAWproject via file generation).
 
 ---

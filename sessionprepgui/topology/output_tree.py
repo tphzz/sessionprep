@@ -56,7 +56,7 @@ if TYPE_CHECKING:
     from sessionpreplib.models import TrackContext
     from sessionpreplib.topology import TopologyMapping
 
-_DIM = QColor(COLORS["dim"])
+_DIM = QColor(COLORS["metadata"])
 _EMPTY = "\u2014"  # em-dash for unwired slots
 _HIGHLIGHT_BG = QColor(120, 70, 180, 100)  # violet usage highlight
 _DROP_TARGET_BG = QColor(120, 80, 180, 100)  # brighter violet for drop target

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import QApplication
+from .icons import icon_path
 
 
 # ---------------------------------------------------------------------------
@@ -11,6 +12,7 @@ from PySide6.QtWidgets import QApplication
 # ---------------------------------------------------------------------------
 
 COLORS = {
+    "metadata": "#aaaaaa",
     "problems": "#ff4444",
     "attention": "#ffaa00",
     "information": "#4499ff",
@@ -147,14 +149,42 @@ STYLESHEET = """
     QMenuBar::item:selected { background-color: #3a3a3a; }
     QMenu { background-color: #2d2d2d; color: #dddddd; border: 1px solid #555; }
     QMenu::item:selected { background-color: #2a6db5; }
-    QToolBar { background-color: #2d2d2d; border-bottom: 1px solid #555; spacing: 6px; padding: 2px; }
+    QToolBar { background-color: #2d2d2d; border-bottom: 1px solid #555; spacing: 6px; padding: 2px 16px 2px 2px; }
     QToolBar::separator { background-color: #888888; width: 1px; margin: 5px 6px; }
     QToolBar QToolButton { color: #dddddd; padding: 4px 8px; background: transparent; border: none; }
     QToolBar QToolButton:hover { background-color: #3a3a3a; }
-    QToolBar QToolButton:disabled { color: #666666; }
+    QToolBar QToolButton:disabled { color: #aaaaaa; }
     QToolBar QPushButton { color: #dddddd; padding: 4px 8px; background: transparent; border: none; border-radius: 0; }
     QToolBar QPushButton:hover { background-color: #3a3a3a; }
-    QToolBar QPushButton:disabled { color: #666666; background: transparent; }
+    QToolBar QPushButton:disabled { color: #aaaaaa; background: transparent; }
+    QToolBar QToolButton[primaryAction="true"] {
+        color: #4499ff; background: transparent; padding: 0 6px;
+        border: 2px solid transparent;
+    }
+    QToolBar QToolButton[primaryAction="true"]:hover:enabled {
+        color: #ffffff; background: #3a3a3a;
+    }
+    QToolBar QToolButton[primaryAction="true"]:disabled { color: #aaaaaa; }
+    QToolBar QToolButton[primaryAction="true"][primaryBusy="true"]:disabled { color: #4499ff; }
+    QToolBar QToolButton[primaryAction="true"]:focus { border-color: #4499ff; }
+    QComboBox {
+        color: #dddddd; background: #3a3a3a; border: 1px solid #555;
+        border-radius: 2px; padding: 2px 0 2px 8px;
+    }
+    QComboBox:disabled { color: #aaaaaa; background: #2d2d2d; }
+    QComboBox:focus { border-color: #4499ff; }
+    QComboBox::drop-down { subcontrol-origin: padding; subcontrol-position: right center;
+                          width: 16px; border: none; padding: 0 8px; }
+    QComboBox::down-arrow { image: url("@UI_ARROW@"); width: 16px; height: 16px; }
+    QToolButton[compactMenu="true"] {
+        color: #dddddd; background: #3a3a3a; border: 1px solid #555;
+        border-radius: 2px; padding: 2px 32px 2px 8px;
+    }
+    QToolButton[compactMenu="true"]::menu-indicator {
+        image: url("@UI_ARROW@"); width: 16px; height: 16px;
+        subcontrol-position: right center; right: 8px;
+    }
+    QToolButton[compactMenu="true"]:focus { border-color: #4499ff; }
     QSplitter::handle { background-color: #555; width: 2px; }
     QTableWidget { background-color: #252525; border: none; outline: none; gridline-color: #3a3a3a; }
     QTableWidget::item { padding: 2px 6px; }
@@ -200,6 +230,8 @@ STYLESHEET = """
     }
     QProgressBar::chunk { background-color: #2a6db5; border-radius: 3px; }
 """
+
+STYLESHEET = STYLESHEET.replace("@UI_ARROW@", icon_path("chevron-down").as_posix())
 
 
 def tune_toolbar_checkbox(checkbox) -> None:

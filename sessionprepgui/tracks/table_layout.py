@@ -11,6 +11,8 @@ TRACK_TABLE_FILE_MIN_WIDTH = 150
 TRACK_TABLE_CELL_HPAD = 18
 TRACK_TABLE_HEADER_HPAD = 22
 TRACK_TABLE_ROW_VPAD = 6
+# QTableWidget item padding (6 px per side) and the cell boundary surround editors.
+TRACK_TABLE_EDITOR_HPAD = 14
 TRACK_TABLE_RIGHT_MIN_WIDTH = 400
 TRACK_TABLE_CLASSIFICATION_MIN_WIDTH = 124
 
@@ -34,7 +36,9 @@ def track_table_extra_width(table: QTableWidget) -> int:
 
 def calculate_track_table_layout(table: QTableWidget) -> TrackTableLayout:
     """Calculate stable Phase 2 track table column and row sizes."""
+    table.ensurePolished()
     header = table.horizontalHeader()
+    header.ensurePolished()
     header_fm = header.fontMetrics()
     table_fm = table.fontMetrics()
     row_height = max(
@@ -51,10 +55,12 @@ def calculate_track_table_layout(table: QTableWidget) -> TrackTableLayout:
         for row in range(table.rowCount()):
             widget = table.cellWidget(row, col)
             if widget is not None:
+                widget.ensurePolished()
                 hint = widget.sizeHint()
                 min_hint = widget.minimumSizeHint()
-                width = max(width, hint.width(), min_hint.width())
-                row_height = max(row_height, hint.height(), min_hint.height())
+                width = max(width, hint.width() + TRACK_TABLE_EDITOR_HPAD,
+                            min_hint.width() + TRACK_TABLE_EDITOR_HPAD)
+                row_height = max(row_height, hint.height() + 4, min_hint.height() + 4)
                 continue
 
             item = table.item(row, col)

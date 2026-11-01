@@ -46,10 +46,11 @@ from .settings import (
     load_config, save_config,
     resolve_config_preset, build_defaults,
 )
+from .controls import bind_primary_action
 from .theme import COLORS, apply_dark_theme
 from .log import dbg
 from .prefs import PreferencesDialog
-from .detail import render_track_detail_html, PlaybackController, DetailMixin
+from .detail import PlaybackController, DetailMixin
 from .detail.report_style import configure_report_browser, wrap_report_html
 from .waveform import WaveformPanel, WaveformLoadWorker
 from .widgets import ProgressPanel
@@ -65,7 +66,7 @@ from .analysis import (
 )
 from .tracks import (
     TrackColumnsMixin, GroupsMixin,
-    _HelpBrowser, _DraggableTrackTable, _TAB_FILE, _TAB_GROUPS, _TAB_SESSION,
+    _DraggableTrackTable, _TAB_FILE, _TAB_GROUPS, _TAB_SESSION,
     _PAGE_TABS,
     _PHASE_ANALYSIS, _PHASE_SETUP,
 )
@@ -706,6 +707,7 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
         self._prepare_action.setEnabled(False)
         self._prepare_action.triggered.connect(self._on_prepare)
         self._analysis_toolbar.addAction(self._prepare_action)
+        bind_primary_action(self._analysis_toolbar, self._prepare_action)
 
     def _populate_config_preset_combo(self):
         """Fill the config-preset combo from config, preserving the current selection."""
@@ -847,10 +849,11 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
         self._wf_panel.ceil_group.triggered.connect(self._on_spec_ceil_changed)
 
         self._file_splitter.addWidget(self._wf_panel)
+        self._file_splitter.setCollapsible(1, False)
 
         self._file_splitter.setStretchFactor(0, 3)
         self._file_splitter.setStretchFactor(1, 1)
-        self._file_splitter.setSizes([500, 180])
+        self._file_splitter.setSizes([620, 272])
 
         self._detail_tabs.addTab(self._file_splitter, "File")
         self._detail_tabs.setTabEnabled(_TAB_FILE, False)
@@ -893,7 +896,9 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
 
     def _make_report_browser(self):
         """Create a consistently styled QTextBrowser for reports."""
-        browser = _HelpBrowser(self._detector_help)
+        from .detail.browser import ReportBrowser
+        browser = ReportBrowser(self._detector_help)
+        browser.reviewRequested.connect(self._review_summary_file)
         configure_report_browser(browser, self.screen() or screen_for_startup())
         return browser
 
@@ -941,11 +946,7 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
         cmap = self._config.get("app", {}).get("spectrogram_colormap", "magma")
         self._waveform.set_colormap(cmap)
         if self._current_track:
-            html = render_track_detail_html(
-                self._current_track, self._session,
-                show_clean=self._show_clean,
-                verbose=self._verbose)
-            self._file_report.setHtml(self._wrap_html(html))
+            self._refresh_file_report(self._current_track)
 
     def _confirm_config_change_reanalysis(
         self,

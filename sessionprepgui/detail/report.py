@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from urllib.parse import quote
+from ..icons import icon_path
+
 from sessionpreplib.chunks import read_chunks, STANDARD_CHUNKS, detect_origin
-from sessionpreplib.detector import detector_badge_cell_html
 from ..theme import COLORS, FILE_COLOR_TRANSIENT, FILE_COLOR_SUSTAINED
 from ..helpers import esc
 from .report_style import REPORT_SECTION_SIZE, REPORT_TITLE_SIZE
@@ -13,79 +15,192 @@ from .report_style import REPORT_SECTION_SIZE, REPORT_TITLE_SIZE
 # Summary report
 # ---------------------------------------------------------------------------
 
-def render_summary_html(
-    summary: dict,
-    *,
-    show_faders: bool = True,
-    show_clean: bool = True,
-) -> str:
-    """Render a diagnostic summary dict as styled HTML."""
-    problems = summary.get("problems") or []
-    attention = summary.get("attention") or []
-    information = summary.get("information") or []
-    clean = summary.get("clean") or []
-    clean_count = int(summary.get("clean_count", 0))
-    total_ok = int(summary.get("total_ok", 0))
+def _severity_meta(severity):
+    key = "information" if severity == "info" else severity
+    return {
+        "problem": (COLORS["problems"], "Problem"),
+        "attention": (COLORS["attention"], "Attention"),
+        "information": (COLORS["information"], "Information"),
+        "clean": (COLORS["clean"], "Clean"),
+    }.get(key, (COLORS["information"], "Information"))
 
-    def item_count(groups):
-        return sum(len(g.get("items") or []) for g in groups)
 
-    def render_groups(groups, color):
-        html = ""
-        any_printed = False
-        for g in groups:
-            title = g.get("title", "")
-            hint = g.get("hint")
-            items = g.get("items") or []
-            if not items and not g.get("standalone"):
-                continue
-            header = esc(title)
-            if hint:
-                header += f" &rarr; <i>{esc(hint)}</i>"
-            html += f'<div style="margin-left:16px; color:{color};">&bull; {header}</div>\n'
-            for item in items:
-                html += f'<div style="margin-left:32px; color:{COLORS["dim"]};">* {esc(item)}</div>\n'
-            any_printed = True
-        if not any_printed:
-            html += f'<div style="margin-left:16px; color:{COLORS["clean"]};">&bull; None</div>\n'
-        return html
+def _guidance(hint):
+    if not hint:
+        return "\u2014"
+    if hint == "request reprint / check limiting":
+        return "Request a clean reprint or check limiting."
+    return hint[0].upper() + hint[1:]
 
-    parts = []
-    parts.append(f'<div style="color:{COLORS["heading"]}; font-size:{REPORT_TITLE_SIZE}; font-weight:bold; '
-                 f'margin-bottom:8px;">Session Health: {clean_count}/{total_ok} file(s) CLEAN</div>')
 
-    # Overview
+def _location_text(result):
+    ranges = [(i.sample_start, i.sample_end) for i in result.issues]
+    if not ranges:
+        ranges = [r[:2] for r in (result.data.get("ranges") or [])
+                  if isinstance(r, (tuple, list)) and len(r) >= 2]
+    valid = []
+    for start, end in ranges:
+        try:
+            start = int(start)
+            end = start if end is None else int(end)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if 0 <= start <= end:
+            value = f"Samples {start}\u2013{end}" if end != start else f"Sample {start}"
+            if value not in valid:
+                valid.append(value)
+    if not valid:
+        return "\u2014", ""
+    return (valid[0] if len(valid) == 1 else f"{len(valid)} locations",
+            "; ".join(valid))
+
+
+def _image(name):
+    return f'<img src="{esc(icon_path(name).as_uri())}" width="16" height="16">'
+
+
+def _link(scheme, key, label, title=""):
+    target = scheme + ":" + quote(str(key), safe="")
+    return (f'<a href="{esc(target)}" title="{esc(title)}" '
+            f'style="color:{COLORS["information"]}; text-decoration:none;">{label}</a>')
+
+
+def _cell(body, width, index=0, header=False):
+    left = 12 if index == 0 else 6
+    right = 12 if index == 3 else 6
+    padding = 4 if header else 8
+    background = " background-color:#2d2d2d;" if header else ""
+    return (f'<td width="{width}%" valign="top" style="padding:{padding}px {right}px '
+            f'{padding}px {left}px; border-bottom:1px solid #3a3a3a;'
+            f' color:{COLORS["text"]};{background}">'
+            f'<p style="margin-top:0; margin-bottom:0; line-height:120%;">{body}</p></td>')
+
+
+def _table_header(labels, widths):
+    cells = [_cell(esc(label), width, i, True)
+             for i, (label, width) in enumerate(zip(labels, widths))]
+    return ('<table width="100%" cellpadding="0" cellspacing="0" '
+            'style="border-collapse:collapse;">'
+            '<tr>' + "".join(cells) + '</tr>')
+
+
+def render_summary_html(summary, *, show_faders=True, show_clean=True, session=None):
+    """Render compact findings while keeping file and finding counts distinct."""
+    categories = ("problems", "attention", "information", "clean")
+    counts = {key: sum(max(len(g.get("items") or []), int(bool(g.get("standalone"))))
+                       for g in summary.get(key) or []) for key in categories}
+    clean, total = int(summary.get("clean_count", 0)), int(summary.get("total_ok", 0))
+    parts = [f'<p style="font-size:{REPORT_TITLE_SIZE}; font-weight:bold;'
+             f' margin-top:0; margin-bottom:8px;">Session health</p>',
+             f'<p style="margin-top:0; margin-bottom:8px;"><b>{clean} of {total} files clean</b></p>']
     overview = summary.get("overview") or {}
     if overview.get("most_common_sr") is not None:
-        sr = overview["most_common_sr"]
-        bd = overview.get("most_common_bd", "?")
-        parts.append(f'<div style="color:{COLORS["dim"]}; margin-bottom:8px;">'
-                     f'Session format: {sr} Hz / {bd}</div>')
-
-    section_spacing = 'margin-top:14px;'
-
-    # Problems
-    parts.append(f'<div style="color:{COLORS["problems"]}; font-size:{REPORT_SECTION_SIZE}; font-weight:bold; {section_spacing}">'
-                 f'\U0001f534 PROBLEMS ({item_count(problems)})</div>')
-    parts.append(render_groups(problems, COLORS["problems"]))
-
-    # Attention
-    parts.append(f'<div style="color:{COLORS["attention"]}; font-size:{REPORT_SECTION_SIZE}; font-weight:bold; {section_spacing}">'
-                 f'\U0001f7e1 ATTENTION ({item_count(attention)})</div>')
-    parts.append(render_groups(attention, COLORS["attention"]))
-
-    # Information
-    parts.append(f'<div style="color:{COLORS["information"]}; font-size:{REPORT_SECTION_SIZE}; font-weight:bold; {section_spacing}">'
-                 f'\U0001f535 INFORMATION ({item_count(information)})</div>')
-    parts.append(render_groups(information, COLORS["information"]))
-
-    # Clean
-    if show_clean:
-        parts.append(f'<div style="color:{COLORS["clean"]}; font-size:{REPORT_SECTION_SIZE}; font-weight:bold; {section_spacing}">'
-                     f'\U0001f7e2 CLEAN</div>')
-        parts.append(render_groups(clean, COLORS["clean"]))
-
+        parts.append(f'<p style="color:{COLORS["metadata"]}; margin-top:0;">'
+                     f'Session format: {esc(overview["most_common_sr"])} Hz / '
+                     f'{esc(overview.get("most_common_bd", "?"))}</p>')
+    parts.append(f'<p style="color:{COLORS["metadata"]}; margin-top:0; margin-bottom:8px;">'
+                 f'Attention {counts["attention"]} &middot; Information {counts["information"]}</p>')
+    tracks = {t.filename: t for t in session.tracks} if session else {}
+    widths = (22.13, 22.72, 42.62, 12.53)
+    for category in categories:
+        if category == "clean" and not show_clean:
+            continue
+        groups = summary.get(category) or []
+        if not counts[category]:
+            continue
+        severity = {"problems": "problem", "clean": "clean"}.get(category, category)
+        color, label = _severity_meta(severity)
+        count = counts[category]
+        parts.append(f'<p style="font-size:{REPORT_SECTION_SIZE}; color:{color};'
+                     f' font-weight:bold; margin-bottom:6px;">'
+                     f'{label if category != "problems" else "Problems"} &middot; '
+                     f'{count} {"finding" if count == 1 else "findings"}</p>')
+        parts.append(_table_header(("Finding", "Affected file", "Next step", "Action"), widths))
+        for group in groups:
+            items = group.get("items") or []
+            refs = group.get("item_refs") or []
+            if not items and not group.get("standalone"):
+                continue
+            for index in range(max(1, len(items))):
+                ref = refs[index] if index < len(refs) else None
+                filename = ref.get("filename") if ref else None
+                detail = ref.get("detail", "") if ref else (items[index] if items else "\u2014")
+                track = tracks.get(filename)
+                result = track.detector_results.get(group.get("detector_id")) if track else None
+                if result is not None and group.get("detector_id") == "clipping":
+                    runs = result.data.get("runs")
+                    if isinstance(runs, int):
+                        detail = f'{runs} clipped {"range" if runs == 1 else "ranges"}'
+                finding = f'<b>{esc(group.get("title", ""))}</b><br><span style="color:{color};">{label}</span>'
+                file_text = (f'<b>{esc(filename)}</b><br>' if filename else "")
+                file_text += f'<span style="color:{COLORS["metadata"]};">{esc(detail)}</span>'
+                action = _link("report-review", filename, "Review file", f"Review {filename}") if filename else ""
+                values = (finding, file_text, esc(_guidance(group.get("hint"))), action)
+                parts.append('<tr>' + "".join(_cell(value, width, i)
+                             for i, (value, width) in enumerate(zip(values, widths))) + '</tr>')
+        parts.append("</table>")
+    if not any(counts[k] for k in categories if k != "clean" or show_clean):
+        parts.append(f'<p style="color:{COLORS["metadata"]};">No findings to show.</p>')
     return "\n".join(parts)
+
+
+def render_prepared_track_report(data, *, expanded=(), help_open=()):
+    """Render cached report data; interaction never rereads audio or metadata."""
+    parts = [data["header"]]
+    rows = data["rows"]
+    parts.append(f'<p style="font-weight:bold; margin-top:20px; margin-bottom:6px;">Detector findings</p>')
+    if not rows:
+        parts.append(f'<p style="color:{COLORS["metadata"]};">No findings to show.</p>')
+        return "\n".join(parts)
+    widths = (22.13, 22.72, 46.34, 8.81)
+    parts.append(_table_header(("Finding", "Location", "Next step", "Help"), widths))
+    table_open = True
+    for index, row in enumerate(rows):
+        key = row["id"]
+        token = quote(key, safe="")
+        color, label = _severity_meta(row["severity"])
+        arrow = _image("chevron-down" if key in expanded else "chevron-right")
+        title = _link("report-details", key, f'{arrow}&nbsp;&nbsp; <b>{esc(row["title"])}</b>',
+                      "Toggle detector details")
+        finding = (f'<a name="finding-{token}"></a>{title}<br>'
+                   f'<span style="color:{color};">{label}</span>')
+        if row["count"]:
+            finding += f' &middot; <span style="color:{COLORS["metadata"]};">{esc(row["count"])}</span>'
+        values = (finding, esc(row["location"]), esc(row["hint"]),
+                  _link("report-help", key, "Help", "Toggle detector help") if row["help"] else "")
+        parts.append('<tr>' + "".join(_cell(value, width, i)
+                     for i, (value, width) in enumerate(zip(values, widths))) + '</tr>')
+        if key in expanded:
+            parts.append('<tr><td colspan="4" style="padding:4px 12px 8px 52px;">'
+                         '<b>Result</b> ' + esc(row["summary"]) +
+                         ('<br>' + esc(row["locations"]) if row["locations"] else "") +
+                         '<table cellpadding="3" cellspacing="0">' + row["fragment"] +
+                         '</table></td></tr>')
+        if key in help_open:
+            close = _link("report-close-help", key, _image("close"), f"Close {row['title']} help")
+            help_width = 352 if key in expanded else 320
+            # Qt stretches nested tables across a spanning cell. Keep this
+            # bounded help table at document level, in the same scroll flow.
+            parts.append("</table>")
+            table_open = False
+            parts.append(f'<table align="right" width="{help_width}" cellpadding="16" cellspacing="0" '
+                         'style="border:1px solid #555; background-color:#2d2d2d;">'
+                         '<tr><td><a name="help-' + token + '"></a>'
+                         f'<b>{esc(row["title"])}</b></td><td width="16" align="right">{close}</td></tr>'
+                         '<tr><td colspan="2">' + row["help"] + '</td></tr></table>')
+            if index < len(rows) - 1:
+                parts.append('<table width="100%" cellpadding="0" cellspacing="0" '
+                             'style="border-collapse:collapse;">')
+                table_open = True
+    if table_open:
+        parts.append("</table>")
+    return "\n".join(parts)
+
+
+def render_track_detail_html(track, session=None, *, show_clean=True, verbose=False):
+    """Render a static compact view; interactive browsers cache prepared data."""
+    return render_prepared_track_report(
+        prepare_track_report(track, session, show_clean=show_clean, verbose=verbose))
 
 
 # ---------------------------------------------------------------------------
@@ -109,7 +224,7 @@ def render_fader_table_html(session) -> str:
 
         if pr and pr.classification == "Silent":
             rows.append(
-                f'<tr><td style="color:{COLORS["dim"]}">{esc(t.filename)}</td>'
+                f'<tr><td style="color:{COLORS["metadata"]}">{esc(t.filename)}</td>'
                 f'<td>{fmt_str}</td><td>Silent</td><td>0.0 dB</td><td>0.0 dB</td>'
                 f'<td style="color:{COLORS["attention"]}">SILENT</td></tr>'
             )
@@ -157,9 +272,9 @@ def render_fader_table_html(session) -> str:
 # Per-track detail
 # ---------------------------------------------------------------------------
 
-def render_track_detail_html(track, session=None, *, show_clean: bool = True,
-                             verbose: bool = False) -> str:
-    """Render per-track detail as styled HTML.
+def prepare_track_report(track, session=None, *, show_clean: bool = True,
+                             verbose: bool = False) -> dict:
+    """Prepare cached per-track report data.
 
     Parameters
     ----------
@@ -174,6 +289,7 @@ def render_track_detail_html(track, session=None, *, show_clean: bool = True,
         When True, processors may include additional analytical detail.
     """
     parts = []
+    rows = []
     parts.append(f'<div style="color:{COLORS["heading"]}; font-size:{REPORT_TITLE_SIZE}; font-weight:bold;">'
                  f'{esc(track.filename)}</div>')
 
@@ -184,8 +300,8 @@ def render_track_detail_html(track, session=None, *, show_clean: bool = True,
         # File info
         fmt = f"{track.samplerate} Hz / {track.bitdepth} / {track.channels}ch"
         dur = f"{track.duration_sec:.2f}s ({track.total_samples} samples)"
-        parts.append(f'<div style="color:{COLORS["dim"]}; margin-top:6px;">{fmt}</div>')
-        parts.append(f'<div style="color:{COLORS["dim"]};">{dur}</div>')
+        parts.append(f'<div style="color:{COLORS["metadata"]}; margin-top:6px;">{fmt}</div>')
+        parts.append(f'<div style="color:{COLORS["metadata"]};">{dur}</div>')
 
         # Chunk metadata + DAW origin (single line)
         try:
@@ -211,7 +327,7 @@ def render_track_detail_html(track, session=None, *, show_clean: bool = True,
             meta_parts.append(f'Origin: {esc(origin)}')
         if meta_parts:
             parts.append(
-                f'<div style="color:{COLORS["dim"]}; margin-top:4px;">'
+                f'<div style="color:{COLORS["metadata"]}; margin-top:4px;">'
                 f'{" / ".join(meta_parts)}</div>'
             )
 
@@ -247,64 +363,35 @@ def render_track_detail_html(track, session=None, *, show_clean: bool = True,
                     f' &Delta; {delta:+.1f} dB)</div>'
                 )
 
-        # Detector results
-        if track.detector_results:
-            parts.append(f'<div style="margin-top:20px; color:{COLORS["heading"]}; '
-                         f'font-weight:bold;">Detectors</div>')
-            _SEV_ORDER = {"problem": 0, "attention": 1, "information": 2, "info": 2, "clean": 3}
-            def _det_sort_key(item):
-                det_id, result = item
-                det_inst = det_map.get(det_id)
-                if det_inst and hasattr(det_inst, 'effective_severity'):
-                    eff = det_inst.effective_severity(result)
-                    sev = eff.value if eff is not None else "zzz"
-                else:
-                    sev = result.severity.value if hasattr(result.severity, "value") else str(result.severity)
-                name = det_map[det_id].name if det_id in det_map else det_id
-                return (_SEV_ORDER.get(sev, 99), name.lower())
-            det_rows = []
-            for det_id, result in sorted(track.detector_results.items(), key=_det_sort_key):
-                det_inst = det_map.get(det_id)
-                # Determine effective severity (respects report_as override)
-                if det_inst and hasattr(det_inst, 'effective_severity'):
-                    eff = det_inst.effective_severity(result)
-                    if eff is None:
-                        continue
-                    sev = eff.value
-                else:
-                    sev = result.severity.value if hasattr(result.severity, "value") else str(result.severity)
-                if not show_clean and sev == "clean":
+        severity_order = {"problem": 0, "attention": 1, "information": 2, "info": 2, "clean": 3}
+        for det_id, result in track.detector_results.items():
+            detector = det_map.get(det_id)
+            severity = (detector.effective_severity(result)
+                        if detector and hasattr(detector, "effective_severity")
+                        else result.severity)
+            if severity is None:
+                continue
+            severity = getattr(severity, "value", str(severity))
+            if not show_clean and severity == "clean":
+                continue
+            if detector:
+                fragment = detector.render_html(result, track)
+                if not fragment:
                     continue
-                if det_inst:
-                    html_frag = det_inst.render_html(result, track)
-                    if html_frag:
-                        det_rows.append(html_frag)
-                else:
-                    # Fallback: generic row
-                    sev_color, sev_label = {
-                        "problem":     (COLORS["problems"],    "PROBLEM"),
-                        "attention":   (COLORS["attention"],   "ATTENTION"),
-                        "information": (COLORS["information"], "INFO"),
-                        "clean":       (COLORS["clean"],       "OK"),
-                    }.get(sev, (COLORS["information"], "INFO"))
-                    det_rows.append(
-                        f'<tr>'
-                        f'{detector_badge_cell_html(sev_color, sev_label)}'
-                        f'<td style="padding-left:6px; white-space:nowrap;">'
-                        f'<b>{esc(det_id)}</b></td>'
-                        f'<td style="padding-left:6px; color:{COLORS["dim"]};">'
-                        f'{esc(result.summary)}</td>'
-                        f'</tr>'
-                    )
-            if det_rows:
-                parts.append(
-                    '<table cellpadding="3" cellspacing="2" '
-                    'style="margin-left:8px; margin-top:4px;">'
-                )
-                parts.extend(det_rows)
-                parts.append('</table>')
             else:
-                parts.append(f'<div style="margin-left:8px; margin-top:4px; '
-                             f'color:{COLORS["dim"]};">None</div>')
-
-    return "\n".join(parts)
+                fragment = f'<tr><td>{esc(result.summary)}</td></tr>'
+            location, locations = _location_text(result)
+            runs = result.data.get("runs")
+            count = f'{runs} {"range" if runs == 1 else "ranges"}' if isinstance(runs, int) else ""
+            help_html = getattr(detector, "html_help", "") if detector else ""
+            if callable(help_html):
+                help_html = help_html()
+            rows.append({
+                "id": det_id, "title": detector.name if detector else det_id,
+                "severity": severity, "summary": result.summary, "fragment": fragment,
+                "location": location, "locations": locations, "count": count,
+                "hint": _guidance(result.hint),
+                "help": help_html,
+            })
+        rows.sort(key=lambda row: (severity_order.get(row["severity"], 99), row["title"].lower()))
+    return {"header": "\n".join(parts), "rows": rows}

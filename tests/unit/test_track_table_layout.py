@@ -104,3 +104,17 @@ def test_apply_track_table_layout_keeps_file_stretch_and_controls_sized(qapp):
         assert header.sectionSize(col) == layout.column_widths[col]
     assert table.verticalHeader().defaultSectionSize() == layout.row_height
     assert table.verticalHeader().minimumSectionSize() == layout.row_height
+
+
+def test_themed_editor_geometry_keeps_complete_selector_values(qapp):
+    from sessionprepgui.theme import apply_dark_theme
+    table = _track_table()
+    apply_dark_theme(table)
+    table.resize(1300, 400)
+    apply_track_table_layout(table)
+    table.show()
+    qapp.processEvents()
+    for col in (3, 5, 6, 7):
+        widget = table.cellWidget(0, col)
+        assert widget.width() >= widget.sizeHint().width()
+    table.close()

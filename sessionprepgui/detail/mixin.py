@@ -5,13 +5,12 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from PySide6.QtCore import Qt, Slot, QTimer
+from PySide6.QtCore import Qt, Slot, QTimer, QSignalBlocker
 from PySide6.QtGui import QAction
 
 from sessionpreplib.audio import get_window_samples
 
 from ..helpers import fmt_time
-from .report import render_summary_html, render_track_detail_html
 from ..tracks.table_widgets import _TAB_FILE, _TAB_SUMMARY, _PHASE_TOPOLOGY
 from ..theme import COLORS
 from ..analysis.worker import AudioLoadWorker
@@ -43,11 +42,35 @@ class DetailMixin:  # pylint: disable=too-few-public-methods
         """Render the diagnostic summary into the Summary tab."""
         if not self._summary or not self._session:
             return
-        html = render_summary_html(
-            self._summary, show_faders=False,
-            show_clean=self._show_clean,
-        )
-        self._summary_view.setHtml(self._wrap_html(html))
+        self._summary_view.present_summary(
+            self._summary, self._session, show_clean=self._show_clean)
+
+    def _refresh_file_report(self, track=None):
+        track = track if track is not None else self._current_track
+        if track is not None and self._session is not None:
+            self._file_report.present_track(
+                track, self._session, show_clean=self._show_clean,
+                verbose=self._verbose)
+
+    def _review_summary_file(self, filename):
+        """Select the current file by identity, including after table sorting."""
+        if self._session is None or self._summary_view.report_session is not self._session:
+            return
+        track = next((track for track in self._session.tracks
+                      if track.filename == filename), None)
+        if track is None:
+            return
+        for row in range(self._track_table.rowCount()):
+            item = self._track_table.item(row, 0)
+            if item is not None and item.text() == filename:
+                with QSignalBlocker(self._track_table):
+                    self._track_table.clearSelection()
+                    self._track_table.setCurrentCell(row, 0)
+                    self._track_table.selectRow(row)
+                self._track_table.scrollToItem(item)
+                self._show_track_detail(track)
+                self._file_report.setFocus()
+                return
 
     def _show_track_detail(self, track):
         """Populate the File tab with per-track detail + waveform.
@@ -61,10 +84,7 @@ class DetailMixin:  # pylint: disable=too-few-public-methods
         self._current_track = track
 
         # Show HTML report immediately
-        html = render_track_detail_html(track, self._session,
-                                        show_clean=self._show_clean,
-                                        verbose=self._verbose)
-        self._file_report.setHtml(self._wrap_html(html))
+        self._refresh_file_report(track)
 
         # Enable and switch to File tab before heavy work
         self._detail_tabs.setTabEnabled(_TAB_FILE, True)
@@ -106,7 +126,7 @@ class DetailMixin:  # pylint: disable=too-few-public-methods
                 self._prioritize_peak(fn)
 
         if self._detail_tabs.currentIndex() == _TAB_FILE:
-            self._wf_container.setVisible(True)
+            self._wf_container.set_content_available(True)
         self._play_btn.setEnabled(False)
         self._update_time_label(0)
 
@@ -136,7 +156,7 @@ class DetailMixin:  # pylint: disable=too-few-public-methods
             self._waveform.set_audio(None, 44100)
             self._update_overlay_menu([])
             if self._detail_tabs.currentIndex() == _TAB_FILE:
-                self._wf_container.setVisible(False)
+                self._wf_container.set_content_available(False)
             self._play_btn.setEnabled(False)
             self._update_time_label(0)
 
@@ -212,7 +232,7 @@ class DetailMixin:  # pylint: disable=too-few-public-methods
         if self._current_track is not track:
             return
         self._waveform.set_audio(None, 44100)
-        self._wf_container.setVisible(False)
+        self._wf_container.set_content_available(False)
         self._play_btn.setEnabled(False)
         self._status_bar.showMessage(f"Could not load audio: {message}")
 

@@ -37,7 +37,7 @@ from __future__ import annotations
 import time as _time
 
 from PySide6.QtCore import Qt, QItemSelectionModel, QTimer, Signal, QPoint
-from PySide6.QtGui import QBrush, QColor, QPainter
+from PySide6.QtGui import QBrush, QColor, QPainter, QPalette, QTextDocument
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -147,6 +147,8 @@ class _RowTintDelegate(QStyledItemDelegate):
         selected = bool(option.state & QStyle.State_Selected)
 
         if selected:
+            option.palette.setColor(QPalette.Text, QColor('#ffffff'))
+            option.palette.setColor(QPalette.HighlightedText, QColor('#ffffff'))
             option.state &= ~QStyle.State_Selected
             if has_bg:
                 gc = bg.color()
@@ -187,7 +189,57 @@ class BatchEditTableWidget(QTableWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._selected_widget_rows = set()
         self.setItemDelegate(_RowTintDelegate(self))
+        # Sorting remaps persistent selections without selectionChanged.
+        model = self.model()
+        model.layoutChanged.connect(self._sync_widget_selection)
+        model.rowsInserted.connect(self._sync_widget_selection)
+        model.rowsRemoved.connect(self._sync_widget_selection)
+        model.modelReset.connect(self._sync_widget_selection)
+
+    def selectionChanged(self, selected, deselected):
+        super().selectionChanged(selected, deselected)
+        self._sync_widget_selection()
+
+    def _sync_widget_selection(self, *_args):
+        rows = {index.row() for index in self.selectionModel().selectedIndexes()}
+        previous = getattr(self, "_selected_widget_rows", set())
+        self._selected_widget_rows = rows
+        for row in previous.symmetric_difference(rows):
+            if row < self.rowCount():
+                self._refresh_cell_selection(row)
+
+    def setCellWidget(self, row, column, widget):
+        super().setCellWidget(row, column, widget)
+        self._refresh_cell_selection(row)
+
+    def _refresh_cell_selection(self, row):
+        selected = row in getattr(self, "_selected_widget_rows", set())
+        marker = "\n/* selected-row foreground */"
+        for col in range(self.columnCount()):
+            widget = self.cellWidget(row, col)
+            if widget is None:
+                continue
+            widget.setProperty("selectedRow", selected)
+            base = widget.styleSheet().split(marker, 1)[0]
+            rule = ("QComboBox, QAbstractSpinBox, QToolButton, QPushButton, QLabel"
+                    " { color: #ffffff; }")
+            widget.setStyleSheet(base + marker + rule if selected else base)
+            if isinstance(widget, QLabel):
+                original = widget.property("_semantic_html")
+                if selected and original is None and widget.textFormat() == Qt.RichText:
+                    original = widget.text()
+                    widget.setProperty("_semantic_html", original)
+                if original is not None:
+                    if selected:
+                        document = QTextDocument()
+                        document.setHtml(original)
+                        widget.setTextFormat(Qt.PlainText)
+                        widget.setText(document.toPlainText())
+                    else:
+                        widget.setTextFormat(Qt.RichText)
+                        widget.setText(original)
 
     # ── Row colouring ──────────────────────────────────────────────────────
 
@@ -216,7 +268,7 @@ class BatchEditTableWidget(QTableWidget):
                 # Snapshot the widget's original stylesheet on first visit
                 base_ss = w.property("_base_ss")
                 if base_ss is None:
-                    base_ss = w.styleSheet() or ""
+                    base_ss = (w.styleSheet() or "").split("\n/* selected-row foreground */", 1)[0]
                     w.setProperty("_base_ss", base_ss)
 
                 if rgb_str:
@@ -230,6 +282,8 @@ class BatchEditTableWidget(QTableWidget):
                             f"{wtype} {{ background-color: {rgb_str}; }}")
                 else:
                     w.setStyleSheet(base_ss)
+
+        self._refresh_cell_selection(row)
 
     def clear_row_color(self, row: int):
         """Remove any custom background from *row*."""
@@ -305,6 +359,15 @@ class TableCellComboBox(QComboBox):
         super().__init__(parent)
         self.setFocusPolicy(Qt.ClickFocus)
 
+    def sizeHint(self):
+        size = super().sizeHint()
+        size.setWidth(max(size.width(),
+                          self.fontMetrics().horizontalAdvance(self.currentText()) + 42))
+        return size
+
+    def minimumSizeHint(self):
+        return self.sizeHint()
+
     def wheelEvent(self, event):
         """Let table views scroll instead of changing closed cell combos."""
         popup = self.view()
@@ -367,7 +430,17 @@ class BatchToolButton(QToolButton):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setProperty("compactMenu", True)
         self.batch_mode: bool = False
+
+    def sizeHint(self):
+        size = super().sizeHint()
+        size.setWidth(max(size.width(),
+                          self.fontMetrics().horizontalAdvance(self.text()) + 42))
+        return size
+
+    def minimumSizeHint(self):
+        return self.sizeHint()
 
     def mousePressEvent(self, event):
         mods = QApplication.keyboardModifiers()

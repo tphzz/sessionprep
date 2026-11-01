@@ -12,8 +12,10 @@ import re
 from decimal import Decimal
 from typing import Any, Protocol, runtime_checkable
 
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Signal, QSize
 from PySide6.QtGui import QColor, QIcon, QPixmap
+
+from ..icons import icon
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -283,8 +285,7 @@ class PathPicker(QWidget):
     description subtext mirrors the style of ``_build_param_page`` rows,
     making the widget a visual drop-in for any form built with this module.
 
-    This class has **zero dependency on sessionpreplib** — copy
-    ``param_form.py`` to any PySide6 project and use it freely.
+    This class depends on the shared GUI icon helper, not sessionpreplib.
 
     Parameters
     ----------
@@ -364,10 +365,10 @@ class PathPicker(QWidget):
 
         default_repr = repr(spec.default) if spec.default else "empty"
         reset_btn = QPushButton()
-        reset_btn.setIcon(
-            self.style().standardIcon(
-                self.style().StandardPixmap.SP_BrowserReload))
-        reset_btn.setFixedSize(26, 26)
+        reset_btn.setAccessibleName(f"Reset {spec.label or spec.key} to default")
+        reset_btn.setIcon(icon("reset"))
+        reset_btn.setIconSize(QSize(20, 20))
+        reset_btn.setFixedSize(32, 32)
         reset_btn.setToolTip(f"Reset to default ({default_repr})")
         reset_btn.clicked.connect(lambda: self.set_value(spec.default))
 
@@ -462,10 +463,10 @@ def _build_param_page(
         row.addWidget(w, 0)
 
         reset_btn = QPushButton()
-        reset_btn.setIcon(
-            page.style().standardIcon(
-                page.style().StandardPixmap.SP_BrowserReload))
-        reset_btn.setFixedSize(26, 26)
+        reset_btn.setAccessibleName(f"Reset {spec.label or spec.key} to default")
+        reset_btn.setIcon(icon("reset"))
+        reset_btn.setIconSize(QSize(20, 20))
+        reset_btn.setFixedSize(32, 32)
         reset_btn.setToolTip(f"Reset to default ({spec.default})")
         reset_btn.clicked.connect(
             lambda _checked=False, ww=w, dv=spec.default: _set_widget_value(ww, dv))

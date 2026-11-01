@@ -19,7 +19,6 @@ from sessionpreplib.processors import default_processors
 from sessionpreplib.utils import protools_sort_key
 
 from ..helpers import track_analysis_label
-from ..detail.report import render_track_detail_html
 from .table_widgets import _PAGE_TABS, _SortableItem, _make_analysis_cell
 from ..theme import (
     COLORS,
@@ -100,7 +99,7 @@ class TrackColumnsMixin:  # pylint: disable=too-few-public-methods
 
             # Column 1: channel count
             ch_item = _SortableItem(str(track.channels), track.channels)
-            ch_item.setForeground(QColor(COLORS["dim"]))
+            ch_item.setForeground(QColor(COLORS["metadata"]))
             self._track_table.setItem(row, 1, ch_item)
 
             # Column 2: severity counts
@@ -122,14 +121,14 @@ class TrackColumnsMixin:  # pylint: disable=too-few-public-methods
                 cls_item.setForeground(FILE_COLOR_ERROR)
                 self._track_table.setItem(row, 3, cls_item)
                 gain_item = _SortableItem("", 0.0)
-                gain_item.setForeground(QColor(COLORS["dim"]))
+                gain_item.setForeground(QColor(COLORS["metadata"]))
                 self._track_table.setItem(row, 4, gain_item)
             elif pr and pr.classification == "Silent":
                 cls_item = _SortableItem("Silent", "silent")
                 cls_item.setForeground(FILE_COLOR_SILENT)
                 self._track_table.setItem(row, 3, cls_item)
                 gain_item = _SortableItem("0.0 dB", 0.0)
-                gain_item.setForeground(QColor(COLORS["dim"]))
+                gain_item.setForeground(QColor(COLORS["metadata"]))
                 self._track_table.setItem(row, 4, gain_item)
             elif pr:
                 # Determine effective classification
@@ -276,7 +275,7 @@ class TrackColumnsMixin:  # pylint: disable=too-few-public-methods
             channels = track.channels if track else 0
             ch_item = _SortableItem(str(channels), channels)
             ch_item.setFlags(ch_item.flags() & ~Qt.ItemIsEditable)
-            ch_item.setForeground(QColor(COLORS["dim"]))
+            ch_item.setForeground(QColor(COLORS["metadata"]))
             self._setup_table.setItem(row, 3, ch_item)
 
             # Column 4: clip gain
@@ -418,10 +417,7 @@ class TrackColumnsMixin:  # pylint: disable=too-few-public-methods
 
         # Refresh File tab if this track is currently displayed
         if self._current_track and self._current_track.filename == fname:
-            html = render_track_detail_html(track, self._session,
-                                            show_clean=self._show_clean,
-                                            verbose=self._verbose)
-            self._file_report.setHtml(self._wrap_html(html))
+            self._refresh_file_report(track)
 
     # ── RMS Anchor override helpers ──────────────────────────────────────
 
@@ -819,10 +815,7 @@ class TrackColumnsMixin:  # pylint: disable=too-few-public-methods
         """Refresh File tab + waveform overlays if *track* is displayed."""
         if not self._current_track or self._current_track.filename != track.filename:
             return
-        html = render_track_detail_html(track, self._session,
-                                        show_clean=self._show_clean,
-                                        verbose=self._verbose)
-        self._file_report.setHtml(self._wrap_html(html))
+        self._refresh_file_report(track)
         all_issues = []
         for result in track.detector_results.values():
             all_issues.extend(getattr(result, "issues", []))

@@ -453,7 +453,16 @@ third-party tools.
 > The waveform must have keyboard focus (click it first) for keyboard
 > shortcuts to work.
 
-### 6.3 Toolbar Buttons
+### 6.3 Preview Header and View Settings
+
+**Waveform preview** is a local disclosure in both Track Layout and File detail.
+Track Layout starts collapsed. The header stays visible while the preview is
+hidden, and reopening preserves its waveform, cursor, zoom and splitter height.
+The chevron points up to open and down to close. Mouse clicks do not leave a
+selection outline; Tab/Backtab and keyboard activation show a blue focus outline.
+Fit, horizontal zoom and vertical scale use named icon buttons in this header.
+Display settings and playback controls remain available when expanded.
+ Buttons
 
 | Button                       | Effect                                                                                            |
 |------------------------------|---------------------------------------------------------------------------------------------------|
@@ -463,11 +472,11 @@ third-party tools.
 | **Peak / RMS Max**           | Toggle peak ("P") and max-RMS ("R") markers (waveform mode, off by default)                       |
 | **RMS L/R**                  | Toggle per-channel RMS envelope (yellow, waveform mode)                                           |
 | **RMS AVG**                  | Toggle combined RMS envelope (orange, waveform mode)                                              |
-| **Fit**                      | Reset zoom to show entire file                                                                    |
-| **+**                        | Zoom in at cursor                                                                                 |
-| **−**                        | Zoom out at cursor                                                                                |
-| **↑**                        | Scale up (amplitude in waveform, frequency range in spectrogram)                                  |
-| **↓**                        | Scale down (amplitude in waveform, frequency range in spectrogram)                                |
+| **Fit waveform**             | Reset zoom to show entire file                                                                    |
+| **Zoom in at cursor**        | Zoom in at cursor                                                                                 |
+| **Zoom out at cursor**       | Zoom out at cursor                                                                                |
+| **Scale up**                 | Scale up (amplitude in waveform, frequency range in spectrogram)                                  |
+| **Scale down**               | Scale down (amplitude in waveform, frequency range in spectrogram)                                |
 
 ### 6.4 Playback Controls
 
@@ -481,6 +490,17 @@ third-party tools.
 ---
 
 ## 7. GUI Track Table Controls
+
+**Summary** separates file health counts from finding counts and gives each
+finding an affected file, next step and **Review file** action. Review selects
+the corresponding file even after sorting the track table.
+
+In **File**, detector rows show severity, available locations and guidance.
+Click the finding to expand its full detector result. **Help** opens the
+detector explanation in the same report; closing it restores the caller's
+disclosure, focus and scroll position. Long findings wrap and reports use one
+scroll area. The waveform has its own persistent header outside the report.
+These controls change presentation; they do not repair audio or alter analysis.
 
 ### 7.1 Analysis Column
 

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, QSize
 from PySide6.QtGui import QAction, QActionGroup
 from PySide6.QtWidgets import (
     QComboBox,
@@ -11,12 +11,49 @@ from PySide6.QtWidgets import (
     QMenu,
     QPushButton,
     QStyle,
+    QSplitter,
+    QSizePolicy,
     QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
+from ..icons import icon
 from .widget import WaveformWidget
+
+
+class _PreviewDisclosureButton(QToolButton):
+    """Keep keyboard focus visible without making pointer clicks look selected."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("waveformPreviewDisclosure")
+        self.setProperty("keyboardFocus", False)
+
+    def _set_keyboard_focus(self, enabled: bool) -> None:
+        if self.property("keyboardFocus") == enabled:
+            return
+        self.setProperty("keyboardFocus", enabled)
+        self.style().unpolish(self)
+        self.style().polish(self)
+        self.update()
+
+    def focusInEvent(self, event):
+        self._set_keyboard_focus(event.reason() in (
+            Qt.TabFocusReason, Qt.BacktabFocusReason, Qt.ShortcutFocusReason))
+        super().focusInEvent(event)
+
+    def focusOutEvent(self, event):
+        self._set_keyboard_focus(False)
+        super().focusOutEvent(event)
+
+    def mousePressEvent(self, event):
+        self._set_keyboard_focus(False)
+        super().mousePressEvent(event)
+
+    def keyPressEvent(self, event):
+        self._set_keyboard_focus(True)
+        super().keyPressEvent(event)
 
 
 class WaveformPanel(QWidget):
@@ -39,25 +76,125 @@ class WaveformPanel(QWidget):
     def __init__(self, analysis_mode: bool = True, parent=None):
         super().__init__(parent)
         self._analysis_mode = analysis_mode
-
+        self._expanded = True
+        self._content_available = False
+        self._expanded_splitter_sizes = None
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
-
-        # ── WaveformWidget (created first — toolbar references it) ───────
         self.waveform = WaveformWidget()
         self.waveform.position_clicked.connect(self.position_clicked)
+        self.preview_header = self._build_preview_header()
+        layout.addWidget(self.preview_header)
+        self._body = QWidget()
+        body_layout = QVBoxLayout(self._body)
+        body_layout.setContentsMargins(0, 0, 0, 0)
+        body_layout.setSpacing(0)
+        self._view_toolbar = self._build_toolbar()
+        if self._analysis_mode:
+            body_layout.addWidget(self._view_toolbar)
+        else:
+            self._view_toolbar.setFixedHeight(32)
+            self.preview_header.layout().insertWidget(1, self._view_toolbar)
+        body_layout.addWidget(self.waveform, 1)
+        body_layout.addWidget(self._build_transport())
+        layout.addWidget(self._body, 1)
+        self.disclosure_button.toggled.connect(self.set_expanded)
 
-        # ── Toolbar ──────────────────────────────────────────────────────
-        layout.addWidget(self._build_toolbar())
-        layout.addWidget(self.waveform, 1)
+    def _build_preview_header(self) -> QWidget:
+        header = QWidget()
+        header.setObjectName("waveformPreviewHeader")
+        header.setFixedHeight(32)
+        header.setStyleSheet("""
+            #waveformPreviewHeader { background: #2d2d2d; border-bottom: 1px solid #555; }
+            QToolButton { color: #ddd; background: transparent; border: 2px solid transparent;
+                          padding: 0 6px; }
+            QToolButton:hover { background: #3a3a3a; }
+            QToolButton:focus { border-color: #4499ff; }
+            QToolButton#waveformPreviewDisclosure:focus { border-color: transparent; }
+            QToolButton#waveformPreviewDisclosure[keyboardFocus="true"]:focus {
+                border-color: #4499ff;
+            }
+            QToolButton:disabled { color: #aaa; }
+        """)
+        row = QHBoxLayout(header)
+        row.setContentsMargins(0, 0, 8, 0)
+        row.setSpacing(0)
+        self.disclosure_button = _PreviewDisclosureButton()
+        self.disclosure_button.setText("Waveform preview")
+        self.disclosure_button.setAccessibleName("Waveform preview")
+        self.disclosure_button.setToolTip("Show or hide the waveform preview")
+        self.disclosure_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.disclosure_button.setIcon(icon("chevron-down"))
+        self.disclosure_button.setIconSize(QSize(16, 16))
+        self.disclosure_button.setCheckable(True)
+        self.disclosure_button.setChecked(True)
+        self.disclosure_button.setFocusPolicy(Qt.StrongFocus)
+        self.disclosure_button.setFixedHeight(32)
+        row.addWidget(self.disclosure_button)
+        row.addStretch()
+        for name, tooltip, callback in (
+            ("fit", "Fit waveform", self.waveform.zoom_fit),
+            ("zoom-in", "Zoom in at cursor", self.waveform.zoom_in),
+            ("zoom-out", "Zoom out at cursor", self.waveform.zoom_out),
+            ("scale-up", "Scale up (vertical)", self.waveform.scale_up),
+            ("scale-down", "Scale down (vertical)", self.waveform.scale_down),
+        ):
+            button = QToolButton()
+            button.setIcon(icon(name))
+            button.setIconSize(QSize(20, 20))
+            button.setFixedSize(32, 32)
+            button.setToolTip(tooltip)
+            button.setAccessibleName(tooltip)
+            button.setFocusPolicy(Qt.StrongFocus)
+            button.clicked.connect(callback)
+            row.addWidget(button)
+        return header
 
-        # ── Transport bar ────────────────────────────────────────────────
-        layout.addWidget(self._build_transport())
+    def is_expanded(self) -> bool:
+        return self._expanded
 
-    # ------------------------------------------------------------------
-    # Toolbar
-    # ------------------------------------------------------------------
+    def set_content_available(self, available: bool) -> None:
+        """Update data availability without overriding the user's disclosure."""
+        self._content_available = available
+        self.disclosure_button.setAccessibleDescription(
+            "Audio preview available" if available else "No preview audio available")
+        if not available:
+            self.play_btn.setEnabled(False)
+            self.stop_btn.setEnabled(False)
+
+    def set_expanded(self, expanded: bool) -> None:
+        """Change visibility only; retain the waveform, workers and viewport."""
+        expanded = bool(expanded)
+        if self._expanded == expanded:
+            return
+        parent = self.parentWidget()
+        splitter = parent if isinstance(parent, QSplitter) else None
+        index = splitter.indexOf(self) if splitter else -1
+        if splitter and index >= 0:
+            splitter.setCollapsible(index, False)
+        if not expanded and splitter and index >= 0:
+            self._expanded_splitter_sizes = splitter.sizes()
+        self._expanded = expanded
+        self.disclosure_button.setChecked(expanded)
+        self.disclosure_button.setIcon(icon("chevron-down" if expanded else "chevron-up"))
+        self._body.setVisible(expanded)
+        if not self._analysis_mode:
+            self._view_toolbar.setVisible(expanded)
+        self.setMaximumHeight(16777215 if expanded else 32)
+        self.setSizePolicy(QSizePolicy.Preferred,
+                           QSizePolicy.Expanding if expanded else QSizePolicy.Fixed)
+        if expanded and splitter and index >= 0:
+            sizes = self._expanded_splitter_sizes
+            if sizes is None:
+                sizes = splitter.sizes()
+                total = sum(sizes)
+                height = min(280, max(180, total // 3))
+                others = max(1, total - sizes[index])
+                sizes = [max(0, round(size * (total - height) / others))
+                         if i != index else height for i, size in enumerate(sizes)]
+            splitter.setSizes(sizes)
+        self.updateGeometry()
 
     def _build_toolbar(self) -> QWidget:
         toolbar = QHBoxLayout()
@@ -261,31 +398,6 @@ class WaveformPanel(QWidget):
 
         toolbar.addStretch()
 
-        # Zoom / scale buttons
-        style = self.style()
-
-        def _tb(text: str, tooltip: str, icon=None):
-            btn = QToolButton()
-            if icon is not None:
-                btn.setIcon(style.standardIcon(icon))
-            else:
-                btn.setText(text)
-            btn.setToolTip(tooltip)
-            btn.setAutoRaise(True)
-            toolbar.addWidget(btn)
-            return btn
-
-        _tb("Fit", "Zoom to fit entire file", QStyle.SP_BrowserReload
-             ).clicked.connect(self.waveform.zoom_fit)
-        _tb("+", "Zoom in at cursor"
-             ).clicked.connect(self.waveform.zoom_in)
-        _tb("\u2212", "Zoom out at cursor"
-             ).clicked.connect(self.waveform.zoom_out)
-        _tb("", "Scale up (vertical)", QStyle.SP_ArrowUp
-             ).clicked.connect(self.waveform.scale_up)
-        _tb("", "Scale down (vertical)", QStyle.SP_ArrowDown
-             ).clicked.connect(self.waveform.scale_down)
-
         toolbar_widget = QWidget()
         toolbar_widget.setLayout(toolbar)
         toolbar_widget.setFixedHeight(28)
@@ -310,14 +422,20 @@ class WaveformPanel(QWidget):
 
         _BTN_H = 24
 
-        self.play_btn = QPushButton("\u25B6 Play")
+        self.play_btn = QPushButton("Play")
         self.play_btn.setFixedHeight(_BTN_H)
+        self.play_btn.setIcon(icon('play'))
+        self.play_btn.setIconSize(QSize(16, 16))
+        self.play_btn.setAccessibleName('Play')
         self.play_btn.setEnabled(False)
         self.play_btn.clicked.connect(self.play_clicked)
         layout.addWidget(self.play_btn)
 
-        self.stop_btn = QPushButton("\u25A0 Stop")
+        self.stop_btn = QPushButton("Stop")
         self.stop_btn.setFixedHeight(_BTN_H)
+        self.stop_btn.setIcon(icon('stop'))
+        self.stop_btn.setIconSize(QSize(16, 16))
+        self.stop_btn.setAccessibleName('Stop')
         self.stop_btn.setEnabled(False)
         self.stop_btn.clicked.connect(self.stop_clicked)
         layout.addWidget(self.stop_btn)

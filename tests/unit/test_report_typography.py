@@ -201,7 +201,7 @@ def test_stereo_compat_report_badge_does_not_wrap():
     assert "ATTENTION" in html
 
 
-def test_fallback_detector_report_badge_does_not_wrap():
+def test_fallback_detector_report_uses_compact_row():
     track = TrackContext(
         filename="Kick.wav",
         filepath="Kick.wav",
@@ -223,5 +223,6 @@ def test_fallback_detector_report_badge_does_not_wrap():
     html = render_track_detail_html(track)
 
     _assert_no_fixed_report_typography(html)
-    _assert_detector_badge_does_not_wrap(html)
-    assert "ATTENTION" in html
+    assert "unknown_detector" in html
+    assert "Attention" in html
+    assert "report-details:unknown_detector" in html

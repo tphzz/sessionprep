@@ -46,13 +46,23 @@ def build_diagnostic_summary(
     # Detector instance map for is_relevant() checks
     _det_map = {d.id: d for d in getattr(session, "detectors", None) or []}
 
-    def add_group(dst, title, hint, items, standalone=False):
+    item_refs: dict[int, list[dict[str, str]]] = {}
+
+    def add_item(items, filename, detail):
+        # Preserve existing renderer strings while carrying stable identity.
+        items.append(f"{filename}: {detail}")
+        item_refs.setdefault(id(items), []).append(
+            {"filename": str(filename), "detail": str(detail)})
+
+    def add_group(dst, title, hint, items, standalone=False, detector_id=None):
         if not items and not standalone:
             return
         dst.append({
             "title": title,
             "hint": hint,
             "items": items or [],
+            "item_refs": item_refs.get(id(items), []),
+            "detector_id": detector_id,
             "standalone": bool(standalone),
         })
 
@@ -65,7 +75,9 @@ def build_diagnostic_summary(
     file_errors = []
     for t in session.tracks:
         if t.status != "OK":
-            file_errors.append(f"{t.filename}: {t.status}")
+            add_item(
+                file_errors, t.filename,
+                f'{t.status}')
     add_group(problems_groups, "File errors", None, file_errors)
 
     # --- Bucket routing helper (respects report_as overrides) ---
@@ -113,7 +125,9 @@ def build_diagnostic_summary(
             fname = r.data.get("filename", "")
             reasons = r.data.get("mismatch_reasons", [])
             details = ", ".join(reasons) if reasons else "mismatch"
-            format_mismatch_items.append(f"{fname}: format mismatch ({details})")
+            add_item(
+                format_mismatch_items, fname,
+                f'format mismatch ({details})')
             mismatch_names.add(fname)
 
         format_matches = total_ok - len(format_mismatch_items)
@@ -162,11 +176,13 @@ def build_diagnostic_summary(
             actual_samples = r.data.get("actual_samples")
             actual_fmt = r.data.get("actual_duration_fmt", "")
             if actual_samples is not None:
-                length_mismatch_items.append(
-                    f"{fname}: length mismatch ({int(actual_samples)} samples / {actual_fmt})"
-                )
+                add_item(
+                    length_mismatch_items, fname,
+                    f'length mismatch ({int(actual_samples)} samples / {actual_fmt})')
             else:
-                length_mismatch_items.append(f"{fname}: length mismatch")
+                add_item(
+                    length_mismatch_items, fname,
+                    f'length mismatch')
             length_mismatch_names.add(fname)
 
         length_matches = total_ok - len(length_mismatch_items)
@@ -217,9 +233,9 @@ def build_diagnostic_summary(
             clip_r = t.detector_results.get("clipping")
             if clip_r and clip_r.data.get("is_clipped"):
                 runs = int(clip_r.data.get("runs", 0))
-                clipped_items.append(
-                    f"{t.filename}: clipping detected ({runs} clipped ranges)"
-                )
+                add_item(
+                    clipped_items, t.filename,
+                    f'clipping detected ({runs} clipped ranges)')
                 issue_names.add(t.filename)
 
         # DC offset
@@ -228,9 +244,13 @@ def build_diagnostic_summary(
             if dc_r and dc_r.data.get("dc_warn"):
                 dc_db = dc_r.data.get("dc_db", float(-np.inf))
                 if np.isfinite(dc_db):
-                    dc_items.append(f"{t.filename}: DC offset {dc_db + _off:.1f} dBFS")
+                    add_item(
+                        dc_items, t.filename,
+                        f'DC offset {dc_db + _off:.1f} dBFS')
                 else:
-                    dc_items.append(f"{t.filename}: DC offset issue")
+                    add_item(
+                        dc_items, t.filename,
+                        f'DC offset issue')
                 issue_names.add(t.filename)
 
         # Stereo compatibility (correlation + mono folddown, unified detector)
@@ -258,20 +278,25 @@ def build_diagnostic_summary(
                         parts.append(
                             f"mono loss inf dB (> {float(mono_warn_val):g} dB)")
                 if parts:
-                    stereo_compat_items.append(
-                        f"{t.filename}: " + ", ".join(parts))
+                    add_item(
+                        stereo_compat_items, t.filename,
+                        f'' + ', '.join(parts))
 
         # Dual mono
         if not _is_skipped("dual_mono"):
             dm_r = t.detector_results.get("dual_mono")
             if dm_r and dm_r.data.get("dual_mono"):
-                dual_mono_items.append(f"{t.filename}: dual-mono (identical L/R)")
+                add_item(
+                    dual_mono_items, t.filename,
+                    f'dual-mono (identical L/R)')
 
         # Silent
         if not _is_skipped("silence"):
             sil_r = t.detector_results.get("silence")
             if sil_r and sil_r.data.get("is_silent"):
-                silent_items.append(f"{t.filename}: silent")
+                add_item(
+                    silent_items, t.filename,
+                    f'silent')
                 issue_names.add(t.filename)
 
         # One-sided silence
@@ -286,15 +311,13 @@ def build_diagnostic_summary(
                     return f"{float(x) + _off:.1f}" if np.isfinite(x) else "-inf"
 
                 if side:
-                    one_sided_items.append(
-                        f"{t.filename}: one-sided silence ({side}) "
-                        f"(L {fmt_db(l_db)} dBFS, R {fmt_db(r_db)} dBFS)"
-                    )
+                    add_item(
+                        one_sided_items, t.filename,
+                        f'one-sided silence ({side}) (L {fmt_db(l_db)} dBFS, R {fmt_db(r_db)} dBFS)')
                 else:
-                    one_sided_items.append(
-                        f"{t.filename}: one-sided silence "
-                        f"(L {fmt_db(l_db)} dBFS, R {fmt_db(r_db)} dBFS)"
-                    )
+                    add_item(
+                        one_sided_items, t.filename,
+                        f'one-sided silence (L {fmt_db(l_db)} dBFS, R {fmt_db(r_db)} dBFS)')
                 issue_names.add(t.filename)
 
         # Subsonic
@@ -304,12 +327,13 @@ def build_diagnostic_summary(
                 ratio_db = sub_r.data.get("subsonic_ratio_db", float(-np.inf))
                 cutoff_hz = session.config.get("subsonic_hz", 30.0)
                 if np.isfinite(ratio_db):
-                    subsonic_items.append(
-                        f"{t.filename}: subsonic energy {float(ratio_db):.1f} dB "
-                        f"(<= {float(cutoff_hz):g} Hz)"
-                    )
+                    add_item(
+                        subsonic_items, t.filename,
+                        f'subsonic energy {float(ratio_db):.1f} dB (<= {float(cutoff_hz):g} Hz)')
                 else:
-                    subsonic_items.append(f"{t.filename}: subsonic content detected")
+                    add_item(
+                        subsonic_items, t.filename,
+                        f'subsonic content detected')
                 issue_names.add(t.filename)
 
         # Tail exceedance
@@ -326,10 +350,9 @@ def build_diagnostic_summary(
                     if regions > 0:
                         max_exceed = float(summary.get("max_exceed_db", 0.0))
                         tail_min = session.config.get("tail_min_exceed_db", 3.0)
-                        tail_items.append(
-                            f"{t.filename}: {regions} tail region(s) exceed anchor "
-                            f"by >{float(tail_min):g} dB (max +{max_exceed:.1f} dB)"
-                        )
+                        add_item(
+                            tail_items, t.filename,
+                            f'{regions} tail region(s) exceed anchor by >{float(tail_min):g} dB (max +{max_exceed:.1f} dB)')
                         issue_names.add(t.filename)
 
     # Build groups — route to buckets based on report_as overrides
@@ -367,7 +390,7 @@ def build_diagnostic_summary(
 
         bucket = _routed_bucket(det_id, actual_sev)
         if bucket is not None:
-            add_group(bucket, title, hint, items)
+            add_group(bucket, title, hint, items, detector_id=det_id)
 
     # Grouping overlaps
     grouping_items = []

@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
 from sessionpreplib.topology import build_default_topology
 from sessionpreplib.utils import protools_sort_key
 
+from ..controls import bind_primary_action, set_action_busy
 from ..theme import COLORS, tune_toolbar_checkbox
 from ..tracks.table_widgets import _PHASE_TOPOLOGY, _PHASE_ANALYSIS, _PHASE_SETUP
 from ..waveform import WaveformPanel
@@ -137,21 +138,13 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
 
         toolbar.addSeparator()
 
-        self._topo_wf_toggle = QAction("\u25BC Waveform", self)
-        self._topo_wf_toggle.setCheckable(True)
-        self._topo_wf_toggle.setChecked(True)
-        self._topo_wf_toggle.setToolTip("Show / hide the waveform preview")
-        self._topo_wf_toggle.toggled.connect(self._on_topo_wf_toggle)
-        toolbar.addAction(self._topo_wf_toggle)
-
-        toolbar.addSeparator()
-
         self._topo_apply_action = QAction("Apply", self)
         self._topo_apply_action.setToolTip(
             "Write channel-rerouted files to the topology output folder")
         self._topo_apply_action.triggered.connect(self._on_topo_apply)
         self._topo_apply_action.setEnabled(False)
         toolbar.addAction(self._topo_apply_action)
+        bind_primary_action(toolbar, self._topo_apply_action)
 
         layout.addWidget(toolbar)
 
@@ -210,7 +203,9 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
         # Waveform preview panel (starts expanded)
         self._topo_wf_panel = WaveformPanel(analysis_mode=False)
         self._topo_wf_panel.setVisible(True)
-        self._topo_wf_expanded = True
+        self._topo_wf_expanded = False
+        self._topo_wf_toggle = self._topo_wf_panel.disclosure_button
+        self._topo_wf_toggle.toggled.connect(self._on_topo_wf_toggle)
         self._topo_wf_panel.play_clicked.connect(self._on_topo_play)
         self._topo_wf_panel.stop_clicked.connect(self._on_topo_stop)
         self._topo_wf_panel.position_clicked.connect(self._on_topo_wf_seek)
@@ -226,7 +221,9 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
         v_splitter = QSplitter(Qt.Vertical)
         v_splitter.addWidget(h_splitter)
         v_splitter.addWidget(self._topo_wf_panel)
+        v_splitter.setCollapsible(1, False)
         v_splitter.setSizes([700, 300])
+        self._topo_wf_panel.set_expanded(False)
         layout.addWidget(v_splitter, 1)
         self._register_phase_progress_layout(_PHASE_TOPOLOGY, layout)
 
@@ -352,6 +349,7 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
             "peak_cache_folder", "sp_peaks")
         peaks_dir = os.path.join(output_dir, peaks_folder)
 
+        set_action_busy(self._topo_apply_action, True, 'Applying…')
         self._topo_apply_action.setEnabled(False)
         self._topo_reset_action.setEnabled(False)
         self._topo_status_label.setText("Applying topology\u2026")
@@ -382,6 +380,7 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
     def _on_topo_apply_done(self):
         log.info("Apply topology complete")
         self._topo_apply_worker = None
+        set_action_busy(self._topo_apply_action, False)
         self._topo_apply_action.setEnabled(True)
         self._topo_reset_action.setEnabled(True)
 
@@ -412,6 +411,7 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
     def _on_topo_apply_error(self, message: str):
         log.error("Apply topology failed: %s", message)
         self._topo_apply_worker = None
+        set_action_busy(self._topo_apply_action, False)
         self._topo_apply_action.setEnabled(True)
         self._topo_reset_action.setEnabled(True)
         self._progress_fail(message)
@@ -690,11 +690,9 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
             self._topo_load_output_from_items(file_items, channel_items)
 
     def _on_topo_wf_toggle(self, checked: bool):
-        """Show or hide the waveform preview panel."""
+        """Keep the local disclosure state without touching preview requests."""
         self._topo_wf_expanded = checked
-        self._topo_wf_panel.setVisible(checked)
-        self._topo_wf_toggle.setText(
-            "\u25BC Waveform" if checked else "\u25B6 Waveform")
+        self._topo_wf_panel.set_expanded(checked)
 
     def _update_output_highlights(self, file_items, channel_items):
         """Highlight output tree items that reference the selected input."""

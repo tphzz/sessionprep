@@ -418,7 +418,7 @@ sessionprepgui/                  # GUI package (PySide6)
         renderer.py              # WaveformRenderer — peaks, waveform drawing, RMS overlay, dB scale, markers
         spectrogram.py           # SpectrogramRenderer — mel image, frequency scale, freq zoom/pan
         overlay.py               # Stateless overlay drawing functions (issue overlays, time scale)
-        panel.py                 # WaveformPanel — composite widget: toolbar + WaveformWidget + transport bar
+        panel.py                 # WaveformPanel — composite widget: persistent header + view settings + WaveformWidget + transport bar
         widget.py                # WaveformWidget — thin orchestrator coordinating WaveformRenderer
                                  #   and SpectrogramRenderer
 
@@ -1640,6 +1640,34 @@ uv run python sessionprep-gui.py
 Requires PySide6 and sounddevice (installed via the `gui` optional dependency
 group).
 
+### Shared Desktop Controls and Reports
+
+`controls.py` binds the existing phase `QAction` objects to borderless primary
+buttons. Worker ownership controls eligibility; a separate busy property keeps
+running actions disabled and restores their prior label/icon without enabling
+them. Busy feedback uses text-only Applying/Preparing/Creating labels alongside
+the existing progress display; no static loading symbol is assigned. Busy
+transitions notify action bindings even when text and icon are unchanged. `icons.py` loads packaged SVG resources independently of the current
+working directory. Native application fonts remain unchanged.
+
+`detail/browser.py` presents cached `prepare_track_report()` data and owns
+per-session/file/detector disclosure and help state. Interaction only rerenders
+cached HTML; it does not reread metadata, analyze or reload audio. External
+clear/loading/error presentation releases session references. Structured
+summary `item_refs` provide file identities alongside unchanged legacy item
+strings, so Review file does not parse filenames. Keyboard activation and
+logical scroll/focus restoration survive document updates.
+
+`WaveformPanel` keeps one waveform instance and a persistent preview header.
+Collapsing hides its body and remembers splitter sizes without invalidating
+requests, selection or viewport. Existing context changes still govern data
+invalidation. Its disclosure uses an upward opening and downward closing chevron.
+A local input-origin property suppresses only pointer-focus painting; native
+focus, checked state, Tab/Backtab and Space activation remain intact. Keyboard
+activation after a mouse click restores the outline. Other header controls keep
+their existing focus styling. Table editor sizing uses polished font metrics plus the actual
+cell inset, and selection styling follows model layout changes after sorting.
+
 ### 18.2 Package Architecture
 
 | Module                    | Responsibility                                                                                                                                                                                                                                                                                                                                                                                |
@@ -1670,7 +1698,7 @@ group).
 | `waveform/renderer.py`    | `WaveformRenderer` — vectorised NumPy peak/RMS downsampling, waveform drawing, RMS L/R and AVG envelopes, dB scale, peak/RMS markers. Uses mip-level peak queries when `PeakData` is available for near-instant rendering                                                                                                                                                                      |
 | `waveform/spectrogram.py` | `SpectrogramRenderer` — mel spectrogram QImage (256 mel bins via `scipy.signal.stft`), frequency scale, freq zoom/pan, background recompute worker                                                                                                                                                                                                                                            |
 | `waveform/overlay.py`     | Stateless overlay drawing functions — detector issue overlays (with optional frequency bounds), horizontal time scale                                                                                                                                                                                                                                                                         |
-| `waveform/panel.py`       | `WaveformPanel` — composite widget: waveform toolbar + `WaveformWidget` + transport bar. Reused in Phase 1 (topology preview) and Phase 2 (file detail)                                                                                                                                                                                                                                       |
+| `waveform/panel.py`       | `WaveformPanel` — composite widget: persistent preview header + view settings + `WaveformWidget` + transport bar. Reused in Phase 1 (topology preview) and Phase 2 (file detail)                                                                                                                                                                                                                                       |
 | `waveform/widget.py`      | `WaveformWidget` — thin orchestrator coordinating `WaveformRenderer` and `SpectrogramRenderer`; paintEvent, mouse/keyboard event handlers, zoom/pan API, public setters                                                                                                                                                                                                                       |
 | `prefs/param_form.py`     | **Portable** generic widget factory — `ParamSpec` protocol, `PathPickerMode`, `PathPicker`, `_build_widget`, `_build_param_page`, `_set_widget_value`, `_read_widget`, tooltip/subtext builders, `sanitize_output_folder`.  Zero sessionpreplib dependency; copy to any PySide6 project.                                                                                                      |
 | `prefs/preset_panel.py`   | **Portable** `NamedPresetPanel` — reusable CRUD widget for named presets with add/duplicate/rename/delete signals.                                                                                                                                                                                                                                                                            |
@@ -1735,8 +1763,11 @@ leaves. `prefs/` reads `ParamSpec` metadata from detectors and processors.
   are filtered by `_enabled_overlays` — only detectors checked in the Detector
   Overlays dropdown are painted/hoverable.
   Additional features:
-  - **Waveform toolbar** — layout:
-    `[▾ Waveform/Spectrogram] [▾ Display] [▾ Detector Overlays] [Peak / RMS Max] [RMS L/R] [RMS AVG]  ... [Fit] [+] [−] [↑] [↓]`
+  - **Persistent preview header** — local disclosure plus Fit, Zoom In/Out and
+    Scale Up/Down icon buttons. Phase 1 also places its mode/display menus here.
+    Expanded File detail keeps its mode/display/overlay and RMS controls in the
+    view-settings row:
+    `[▾ Waveform/Spectrogram] [▾ Display] [▾ Detector Overlays] [Peak / RMS Max] [RMS L/R] [RMS AVG]`
     The Display Mode dropdown (leftmost) uses a `QActionGroup` for mutual
     exclusivity between waveform and spectrogram. The Display dropdown
     contains spectrogram-specific settings (FFT Size, Window, Color Theme,

@@ -30,7 +30,7 @@ COL_SR = 2
 COL_BIT = 3
 COL_DUR = 4
 
-_DIM = QColor(COLORS["dim"])
+_DIM = QColor(COLORS["metadata"])
 
 
 def _format_duration(seconds: float) -> str:

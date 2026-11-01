@@ -47,7 +47,6 @@ from sessionpreplib.utils import protools_sort_key
 
 from ..helpers import track_analysis_label
 from ..prefs.param_widgets import build_config_pages, load_config_widgets, read_config_widgets
-from ..detail.report import render_track_detail_html
 from ..session.io import save_session as _save_session_file, load_session as _load_session_file
 from ..settings import build_defaults, resolve_config_preset
 from ..tracks.table_widgets import (
@@ -57,6 +56,7 @@ from ..tracks.table_widgets import (
     _PAGE_TABS,
     _PHASE_ANALYSIS, _PHASE_TOPOLOGY, _PHASE_SETUP,
 )
+from ..controls import set_action_busy
 from ..theme import COLORS, FILE_COLOR_OK, FILE_COLOR_ERROR
 from .worker import AnalyzeWorker, PrepareWorker, Phase1AnalyzeWorker
 
@@ -378,6 +378,10 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         self._cancel_worker("_worker")
         self._cancel_worker("_batch_worker")
         self._cancel_worker("_prepare_worker")
+        for attr in ("_prepare_action", "_topo_apply_action", "_transfer_action"):
+            action = getattr(self, attr, None)
+            if action is not None:
+                set_action_busy(action, False)
         self._cancel_worker("_peak_build_worker")
         self._peak_cache = {}
         self._session = None
@@ -419,7 +423,7 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         self._setup_table.setRowCount(0)
         self._summary_view.clear()
         self._file_report.clear()
-        self._wf_container.setVisible(False)
+        self._wf_container.set_content_available(False)
         self._play_btn.setEnabled(False)
         self._stop_btn.setEnabled(False)
         self._detail_tabs.setTabEnabled(_TAB_FILE, False)
@@ -944,7 +948,7 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
             return
         # Ch column
         ch_item = _SortableItem(str(track.channels), track.channels)
-        ch_item.setForeground(QColor(COLORS["dim"]))
+        ch_item.setForeground(QColor(COLORS["metadata"]))
         self._track_table.setItem(row, 1, ch_item)
         # Analysis column
         _plain, html, _color, sort_key = track_analysis_label(track)
@@ -1302,6 +1306,7 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
             self._status_bar.showMessage("No audio processors enabled.")
             return
 
+        set_action_busy(self._prepare_action, True, "Preparing…")
         self._prepare_action.setEnabled(False)
         self._progress_start("Preparing\u2026")
 
@@ -1324,6 +1329,7 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
 
     @Slot()
     def _on_prepare_done(self):
+        set_action_busy(self._prepare_action, False)
         if self._prepare_worker is not None:
             self._prepare_worker.deleteLater()
             self._prepare_worker = None
@@ -1361,6 +1367,7 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
 
     @Slot(str)
     def _on_prepare_error(self, message: str):
+        set_action_busy(self._prepare_action, False)
         log.error("Prepare failed: %s", message)
         if self._prepare_worker is not None:
             self._prepare_worker.deleteLater()
@@ -1371,6 +1378,8 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
 
     def _update_prepare_button(self):
         """Update the Prepare button text and enabled state based on prepare_state."""
+        if getattr(self, "_prepare_worker", None) is not None:
+            return
         if not self._session:
             self._prepare_action.setEnabled(False)
             self._prepare_action.setText("Prepare")
@@ -1463,10 +1472,7 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
 
         # 5. Re-render current track detail
         if self._current_track:
-            html = render_track_detail_html(
-                self._current_track, self._session,
-                show_clean=self._show_clean, verbose=self._verbose)
-            self._file_report.setHtml(self._wrap_html(html))
+            self._refresh_file_report(self._current_track)
 
         # 6. Refresh overlay menu (skipped detectors filtered out)
         if self._current_track:
