@@ -519,6 +519,11 @@ The column is sortable — tracks with problems sort first, then attention, then
 clean.  Within the same worst severity, tracks with more total issues sort
 higher.
 
+Edit **Gain** directly or use its up/down buttons in 0.1 dB steps. The gray
+numeric editor matches the adjacent table selectors; a blue border identifies
+focus. Disabled Gain values (for example, **Skip**) remain muted, including in
+selected rows. The mouse wheel scrolls the table without changing the value.
+
 ### 7.2 Selection
 
 Standard Extended Selection applies to the track table:

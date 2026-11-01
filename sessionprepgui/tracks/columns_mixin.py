@@ -173,9 +173,6 @@ class TrackColumnsMixin:  # pylint: disable=too-few-public-methods
                 spin.blockSignals(False)
                 spin.setProperty("track_filename", track.filename)
                 spin.setEnabled(base_cls != "Skip")
-                spin.setStyleSheet(
-                    f"QDoubleSpinBox {{ color: {COLORS['text']}; }}"
-                )
                 spin.valueChanged.connect(
                     lambda value, s=spin: self._on_gain_changed(value, s))
                 self._track_table.setCellWidget(row, 4, spin)

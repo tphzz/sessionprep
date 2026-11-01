@@ -1668,6 +1668,22 @@ activation after a mouse click restores the outline. Other header controls keep
 their existing focus styling. Table editor sizing uses polished font metrics plus the actual
 cell inset, and selection styling follows model layout changes after sorting.
 
+`TableCellDoubleSpinBox` marks table Gain editors with `tableNumericEditor`.
+The theme scopes their gray surface, focus border and disabled appearance to
+that role. Generic form spin boxes and the global Base palette keep their
+existing treatment. Full table population and incremental planning use the
+same role without local color overrides. Selected marked editors receive the
+white foreground only while enabled, so disabling/re-enabling a selected Gain
+cell retains the correct state. Existing group tint caching/restoration and
+wheel handling remain unchanged.
+
+Styled spin-box frames need explicit stepper glyphs. The role skin uses the
+packaged `ui-spin-up.svg` / `ui-spin-down.svg` artwork in 10px slots, with
+borderless stepper surfaces and existing hover/pressed palette colors. The
+native `QDoubleSpinBox` still owns hit targets, limits, keyboard/mouse stepping,
+locale formatting, suffixes and value signals. No fixed editor or row geometry
+is introduced.
+
 ### 18.2 Package Architecture
 
 | Module                    | Responsibility                                                                                                                                                                                                                                                                                                                                                                                |

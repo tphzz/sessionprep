@@ -114,7 +114,20 @@ def test_themed_editor_geometry_keeps_complete_selector_values(qapp):
     apply_track_table_layout(table)
     table.show()
     qapp.processEvents()
-    for col in (3, 5, 6, 7):
+    for col in (3, 4, 5, 6, 7):
         widget = table.cellWidget(0, col)
         assert widget.width() >= widget.sizeHint().width()
+    from PySide6.QtWidgets import QStyle, QStyleOptionSpinBox
+    spin = table.cellWidget(0, 4)
+    for value in (-60.0, 60.0, 2.9):
+        spin.setValue(value)
+        option = QStyleOptionSpinBox()
+        spin.initStyleOption(option)
+        field = spin.style().subControlRect(QStyle.CC_SpinBox, option, QStyle.SC_SpinBoxEditField, spin)
+        assert field.width() >= spin.fontMetrics().horizontalAdvance(spin.text())
+        for control in (QStyle.SC_SpinBoxUp, QStyle.SC_SpinBoxDown):
+            button = spin.style().subControlRect(QStyle.CC_SpinBox, option, control, spin)
+            assert not button.isEmpty()
+            assert spin.rect().contains(button.center())
+            assert not field.intersects(button)
     table.close()

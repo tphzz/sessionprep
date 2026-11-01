@@ -8,6 +8,7 @@ _NAMES = frozenset((
     "waveform", "fit", "zoom-in", "zoom-out", "scale-up", "scale-down",
     "play", "stop", "reset", "chevron-down", "chevron-right", "chevron-up",
     "plus", "minus", "refresh", "busy", "close",
+    "spin-up", "spin-down",
 ))
 
 

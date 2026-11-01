@@ -173,6 +173,32 @@ STYLESHEET = """
     }
     QComboBox:disabled { color: #aaaaaa; background: #2d2d2d; }
     QComboBox:focus { border-color: #4499ff; }
+    QDoubleSpinBox[tableNumericEditor="true"] {
+        color: #dddddd; background: #3a3a3a; border: 1px solid #555;
+        border-radius: 2px;
+    }
+    QDoubleSpinBox[tableNumericEditor="true"]:focus { border-color: #4499ff; }
+    QDoubleSpinBox[tableNumericEditor="true"]:disabled {
+        color: #aaaaaa; background: #2d2d2d;
+    }
+    QDoubleSpinBox[tableNumericEditor="true"]::up-button,
+    QDoubleSpinBox[tableNumericEditor="true"]::down-button {
+        border: none; background: transparent;
+    }
+    QDoubleSpinBox[tableNumericEditor="true"]::up-button:hover:enabled,
+    QDoubleSpinBox[tableNumericEditor="true"]::down-button:hover:enabled {
+        background: #4a4a4a;
+    }
+    QDoubleSpinBox[tableNumericEditor="true"]::up-button:pressed,
+    QDoubleSpinBox[tableNumericEditor="true"]::down-button:pressed {
+        background: #2a6db5;
+    }
+    QDoubleSpinBox[tableNumericEditor="true"]::up-arrow {
+        image: url("@UI_SPIN_UP@"); width: 10px; height: 10px;
+    }
+    QDoubleSpinBox[tableNumericEditor="true"]::down-arrow {
+        image: url("@UI_SPIN_DOWN@"); width: 10px; height: 10px;
+    }
     QComboBox::drop-down { subcontrol-origin: padding; subcontrol-position: right center;
                           width: 16px; border: none; padding: 0 8px; }
     QComboBox::down-arrow { image: url("@UI_ARROW@"); width: 16px; height: 16px; }
@@ -231,7 +257,10 @@ STYLESHEET = """
     QProgressBar::chunk { background-color: #2a6db5; border-radius: 3px; }
 """
 
-STYLESHEET = STYLESHEET.replace("@UI_ARROW@", icon_path("chevron-down").as_posix())
+STYLESHEET = (STYLESHEET
+              .replace("@UI_ARROW@", icon_path("chevron-down").as_posix())
+              .replace("@UI_SPIN_UP@", icon_path("spin-up").as_posix())
+              .replace("@UI_SPIN_DOWN@", icon_path("spin-down").as_posix()))
 
 
 def tune_toolbar_checkbox(checkbox) -> None:

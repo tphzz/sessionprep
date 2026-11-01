@@ -106,7 +106,7 @@ def test_primary_action_resizes_for_label_and_keeps_focus(qapp):
 @pytest.mark.parametrize("name", [
     "waveform", "fit", "zoom-in", "zoom-out", "scale-up", "scale-down",
     "play", "stop", "reset", "chevron-down", "chevron-right", "chevron-up",
-    "plus", "minus", "refresh", "busy",
+    "plus", "minus", "refresh", "busy", "spin-up", "spin-down",
 ])
 def test_vector_icons_are_available(qapp, name):
     assert not icon(name).isNull()
@@ -276,3 +276,70 @@ def test_selected_status_tracks_identity_through_sort_and_reselection(qapp):
     assert "background-color" in table.cellWidget(2, 1).styleSheet()
     assert table.cellWidget(1, 1).text() == "1A"
     table.close()
+
+
+def test_selected_disabled_gain_preserves_foreground_and_numeric_state(qapp):
+    from PySide6.QtCore import QLocale
+    from PySide6.QtGui import QColor, QPalette
+    from PySide6.QtWidgets import QStyle, QStyleOptionSpinBox, QTableWidgetItem
+    from sessionprepgui.theme import apply_dark_theme
+    from sessionprepgui.widgets import BatchEditTableWidget, TableCellDoubleSpinBox
+
+    table = BatchEditTableWidget()
+    table.setColumnCount(2)
+    table.setRowCount(2)
+    table.setItem(0, 0, QTableWidgetItem("B"))
+    table.setItem(1, 0, QTableWidgetItem("A"))
+    spin = TableCellDoubleSpinBox()
+    spin.setRange(-60.0, 60.0)
+    spin.setDecimals(1)
+    spin.setSingleStep(0.1)
+    spin.setSuffix(" dB")
+    spin.setLocale(QLocale(QLocale.German, QLocale.Germany))
+    spin.setValue(-2.0)
+    table.setCellWidget(0, 1, spin)
+    apply_dark_theme(table)
+    changes = []
+    spin.valueChanged.connect(changes.append)
+    table.show()
+    try:
+        qapp.processEvents()
+        table.clearSelection()
+        initial_text = spin.palette().color(QPalette.Active, QPalette.Text)
+        spin.setEnabled(False)
+        qapp.processEvents()
+        disabled_text = spin.palette().color(QPalette.Disabled, QPalette.Text)
+        table.selectRow(0)
+        qapp.processEvents()
+        assert spin.palette().color(QPalette.Disabled, QPalette.Text) == disabled_text
+        spin.setEnabled(True)
+        qapp.processEvents()
+        selected_text = table.palette().color(
+            QPalette.Active, QPalette.HighlightedText)
+        assert spin.palette().color(QPalette.Active, QPalette.Text) == selected_text
+        spin.setEnabled(False)
+        for tint in (QColor("#334433"), QColor("#443333"), None):
+            table.apply_row_color(0, tint)
+            qapp.processEvents()
+            assert spin.palette().color(QPalette.Disabled, QPalette.Text) == disabled_text
+        table.sortItems(0, Qt.AscendingOrder)
+        qapp.processEvents()
+        assert table.cellWidget(1, 1) is spin
+        assert spin.palette().color(QPalette.Disabled, QPalette.Text) == disabled_text
+        table.clearSelection()
+        spin.setEnabled(True)
+        qapp.processEvents()
+        assert spin.palette().color(QPalette.Active, QPalette.Text) == initial_text
+        assert spin.text() == "-2,0 dB"
+        assert changes == []
+        spin.setFocus(Qt.TabFocusReason)
+        option = QStyleOptionSpinBox()
+        spin.initStyleOption(option)
+        up = spin.style().subControlRect(QStyle.CC_SpinBox, option, QStyle.SC_SpinBoxUp, spin)
+        QTest.mouseClick(spin, Qt.LeftButton, pos=up.center())
+        assert spin.value() == pytest.approx(-1.9)
+        QTest.keyClick(spin, Qt.Key_Up)
+        assert spin.value() == pytest.approx(-1.8)
+        assert len(changes) == 2
+    finally:
+        table.close()

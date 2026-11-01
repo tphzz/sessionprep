@@ -223,7 +223,10 @@ class BatchEditTableWidget(QTableWidget):
                 continue
             widget.setProperty("selectedRow", selected)
             base = widget.styleSheet().split(marker, 1)[0]
-            rule = ("QComboBox, QAbstractSpinBox, QToolButton, QPushButton, QLabel"
+            spin_selector = ("QAbstractSpinBox:enabled"
+                             if widget.property("tableNumericEditor")
+                             else "QAbstractSpinBox")
+            rule = (f"QComboBox, {spin_selector}, QToolButton, QPushButton, QLabel"
                     " { color: #ffffff; }")
             widget.setStyleSheet(base + marker + rule if selected else base)
             if isinstance(widget, QLabel):
@@ -410,6 +413,7 @@ class TableCellDoubleSpinBox(QDoubleSpinBox):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setFocusPolicy(Qt.ClickFocus)
+        self.setProperty("tableNumericEditor", True)
 
     def wheelEvent(self, event):
         event.ignore()
