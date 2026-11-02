@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from numbers import Integral
 from urllib.parse import quote
 from ..icons import icon_path
 
@@ -144,56 +145,114 @@ def render_summary_html(summary, *, show_faders=True, show_clean=True, session=N
     return "\n".join(parts)
 
 
-def render_prepared_track_report(data, *, expanded=(), help_open=()):
-    """Render cached report data; interaction never rereads audio or metadata."""
-    parts = [data["header"]]
+def _finding_line(body, height):
+    # Qt supports table height, but not CSS min-height on report cells.
+    return (f'<table height="{height}" cellpadding="0" cellspacing="0"><tr>'
+            f'<td valign="middle">{body}</td></tr></table>')
+
+
+def _finding_cell(body, width, *, header=False, active=False, index=0, columns=1):
+    size = f' width="{width}"' if width is not None else ""
+    background = COLORS["surface"] if header or active else COLORS["bg"]
+    padding = 4 if header else 8
+    left = 12 if index == 0 else 6
+    right = 12 if index == columns - 1 else 6
+    return (f'<td{size} valign="top" style="padding:{padding}px {right}px {padding}px {left}px;'
+            f' border-bottom:1px solid {COLORS["accent"]};'
+            f' background-color:{background}; color:{COLORS["text"]};">'
+            f'{body}</td>')
+
+
+def visualizable_issues(result, track):
+    """Return existing locations that can safely be shown in this waveform."""
+    if result is None or result.error or track.total_samples <= 0 or track.channels <= 0:
+        return []
+    valid = []
+    for issue in result.issues or []:
+        start, end, channel = issue.sample_start, issue.sample_end, issue.channel
+        if (not isinstance(start, Integral) or isinstance(start, bool)
+                or not 0 <= start < track.total_samples):
+            continue
+        if end is not None and (not isinstance(end, Integral) or isinstance(end, bool)
+                                or not start <= end < track.total_samples):
+            continue
+        if channel is not None and (not isinstance(channel, Integral) or isinstance(channel, bool)
+                                    or not 0 <= channel < track.channels):
+            continue
+        if isinstance(issue.label, str) and issue.label:
+            valid.append(issue)
+    return valid
+
+
+def _finding_actions(row, compact):
+    links = []
+    if row.get("visualize_labels"):
+        links.append((80, _link("report-visualize", row["id"], "<nobr>Visualize</nobr>",
+                                "Show only this detector's locations and fit the whole file")))
+    if row["help"]:
+        links.append((48, _link("report-help", row["id"], "<nobr>Help</nobr>",
+                                f'Help for {row["title"]}')))
+    if compact:
+        cells = [f'<tr><td height="32" width="{width}" align="center" valign="middle">'
+                 f'{link}</td></tr>' for width, link in links]
+        body = '<tr><td height="8"></td></tr>'.join(cells)
+    else:
+        cells = [f'<td height="32" width="{width}" align="center" valign="middle">'
+                 f'{link}</td>' for width, link in links]
+        body = "<tr>" + '<td width="8"></td>'.join(cells) + "</tr>"
+    return '<table cellpadding="0" cellspacing="0">' + body + "</table>" if links else ""
+
+
+def render_prepared_track_report(data, *, expanded=(), compact=False, active_help=None):
+    """Render cached data with severity-leading rows; Help lives in its own pane."""
+    parts = [data["header"],
+             '<div>'
+             '<p style="font-weight:bold; margin-top:20px; margin-bottom:8px;">'
+             '<a name="report-findings"></a>Detector findings</p>']
     rows = data["rows"]
-    parts.append(f'<p style="font-weight:bold; margin-top:20px; margin-bottom:6px;">Detector findings</p>')
     if not rows:
-        parts.append(f'<p style="color:{COLORS["metadata"]};">No findings to show.</p>')
+        parts.append(f'<p style="color:{COLORS["metadata"]};">No findings to show.</p></div>')
         return "\n".join(parts)
-    widths = (22.13, 22.72, 46.34, 8.81)
-    parts.append(_table_header(("Finding", "Location", "Next step", "Help"), widths))
-    table_open = True
-    for index, row in enumerate(rows):
+    widths = ("100", None, "80") if compact else ("100", None, "96", "216", "136")
+    labels = (("Severity", "Finding, location and next step", "Actions") if compact
+              else ("Severity", "Finding", "Location", "Next step", "Actions"))
+    parts.append('<table width="100%" cellpadding="0" cellspacing="0"'
+                 ' style="border-collapse:collapse;"><tr>')
+    parts.extend(_finding_cell("<nobr>Help</nobr>" if label == "Help" else esc(label),
+                               width, header=True, index=i, columns=len(widths))
+                 for i, (label, width) in enumerate(zip(labels, widths)))
+    parts.append("</tr>")
+    for row in rows:
         key = row["id"]
         token = quote(key, safe="")
         color, label = _severity_meta(row["severity"])
         arrow = _image("chevron-down" if key in expanded else "chevron-right")
         title = _link("report-details", key, f'{arrow}&nbsp;&nbsp; <b>{esc(row["title"])}</b>',
                       "Toggle detector details")
-        finding = (f'<a name="finding-{token}"></a>{title}<br>'
-                   f'<span style="color:{color};">{label}</span>')
         if row["count"]:
-            finding += f' &middot; <span style="color:{COLORS["metadata"]};">{esc(row["count"])}</span>'
-        values = (finding, esc(row["location"]), esc(row["hint"]),
-                  _link("report-help", key, "Help", "Toggle detector help") if row["help"] else "")
-        parts.append('<tr>' + "".join(_cell(value, width, i)
-                     for i, (value, width) in enumerate(zip(values, widths))) + '</tr>')
+            title += f' &middot; <span style="color:{COLORS["metadata"]};">{esc(row["count"])}</span>'
+        finding = f'<a name="finding-{token}"></a>' + _finding_line(title, 32 if compact else 40)
+        if compact:
+            finding += (f'<p style="margin:4px 0 0 24px; color:{COLORS["metadata"]};">'
+                        f'{esc(row["location"])}<br>'
+                        f'<span style="color:{COLORS["text"]};">{esc(row["hint"])}</span></p>')
+        severity = _finding_line(f'<span style="color:{color};">{label}</span>',
+                                 32 if compact else 40)
+        actions = _finding_actions(row, compact)
+        values = ((severity, finding, actions) if compact else
+                  (severity, finding, _finding_line(esc(row["location"]), 40),
+                   _finding_line(esc(row["hint"]), 40), actions))
+        parts.append("<tr>" + "".join(
+            _finding_cell(value, width, active=key == active_help and color != COLORS["problems"],
+                          index=i, columns=len(widths))
+            for i, (value, width) in enumerate(zip(values, widths))) + "</tr>")
         if key in expanded:
-            parts.append('<tr><td colspan="4" style="padding:4px 12px 8px 52px;">'
+            parts.append(f'<tr><td colspan="{len(widths)}" style="padding:4px 12px 8px 136px;">'
                          '<b>Result</b> ' + esc(row["summary"]) +
                          ('<br>' + esc(row["locations"]) if row["locations"] else "") +
                          '<table cellpadding="3" cellspacing="0">' + row["fragment"] +
                          '</table></td></tr>')
-        if key in help_open:
-            close = _link("report-close-help", key, _image("close"), f"Close {row['title']} help")
-            help_width = 352 if key in expanded else 320
-            # Qt stretches nested tables across a spanning cell. Keep this
-            # bounded help table at document level, in the same scroll flow.
-            parts.append("</table>")
-            table_open = False
-            parts.append(f'<table align="right" width="{help_width}" cellpadding="16" cellspacing="0" '
-                         'style="border:1px solid #555; background-color:#2d2d2d;">'
-                         '<tr><td><a name="help-' + token + '"></a>'
-                         f'<b>{esc(row["title"])}</b></td><td width="16" align="right">{close}</td></tr>'
-                         '<tr><td colspan="2">' + row["help"] + '</td></tr></table>')
-            if index < len(rows) - 1:
-                parts.append('<table width="100%" cellpadding="0" cellspacing="0" '
-                             'style="border-collapse:collapse;">')
-                table_open = True
-    if table_open:
-        parts.append("</table>")
+    parts.append("</table></div>")
     return "\n".join(parts)
 
 
@@ -392,6 +451,8 @@ def prepare_track_report(track, session=None, *, show_clean: bool = True,
                 "location": location, "locations": locations, "count": count,
                 "hint": _guidance(result.hint),
                 "help": help_html,
+                "visualize_labels": tuple(sorted({issue.label
+                    for issue in visualizable_issues(result, track)})),
             })
         rows.sort(key=lambda row: (severity_order.get(row["severity"], 99), row["title"].lower()))
     return {"header": "\n".join(parts), "rows": rows}

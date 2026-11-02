@@ -41,10 +41,9 @@ def calculate_track_table_layout(table: QTableWidget) -> TrackTableLayout:
     header.ensurePolished()
     header_fm = header.fontMetrics()
     table_fm = table.fontMetrics()
-    row_height = max(
-        table.verticalHeader().minimumSectionSize(),
-        table_fm.height() + TRACK_TABLE_ROW_VPAD,
-    )
+    # The header minimum is our previous output, not an intrinsic content size.
+    # Reusing it here adds row padding again on every auto-fit.
+    row_height = table_fm.height() + TRACK_TABLE_ROW_VPAD
     widths: dict[int, int] = {}
 
     for col in range(table.columnCount()):

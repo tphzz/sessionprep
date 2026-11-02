@@ -1651,22 +1651,55 @@ transitions notify action bindings even when text and icon are unchanged. `icons
 working directory. Native application fonts remain unchanged.
 
 `detail/browser.py` presents cached `prepare_track_report()` data and owns
-per-session/file/detector disclosure and help state. Interaction only rerenders
-cached HTML; it does not reread metadata, analyze or reload audio. External
-clear/loading/error presentation releases session references. Structured
-summary `item_refs` provide file identities alongside unchanged legacy item
-strings, so Review file does not parse filenames. Keyboard activation and
-logical scroll/focus restoration survive document updates.
+per-session/file/detector disclosure. `detail/help_panel.py` wraps the original
+browser in `FileReportPane`, with one contextual right-side Help panel and an
+independently scrolling `QTextBrowser` body. Its header and Close control stay
+fixed. Opening Help focuses its reading browser, with Close reachable through
+Tab/Backtab and an explicit keyboard focus outline. The local 16px Close SVG is
+centered in its 32px target. Opening/switching Help uses prepared detector content; it does not reread
+metadata, analyze or reload audio. Repeat activation preserves Help scroll;
+switching starts the new explanation at the top. Close and scoped Escape restore
+report width, reading anchor and caller focus. File/session replacement,
+clear/loading/error, or removal/suppression of the active finding closes Help
+and releases stale references. Details remain independent.
+
+Finding rows put severity before the disclosure. Their native text role follows
+the application font, while explicit custom HTML pixel/point sizes, faces and
+emphasis remain intact. Narrow reports place location/guidance below the title.
+The Help panel prefers 360 logical pixels with a 16 px gap; it gives space back
+to the report when needed. A measurement of the cached stock header, keyed by
+content and font, protects normalization values at larger scales without
+suppressing legitimate horizontal scrolling in custom result HTML.
+
+Structured summary `item_refs` provide file identities alongside unchanged
+legacy item strings, so Review file does not parse filenames. Qt may move focus
+to a table cell while its tab bar already points at the destination but its page
+stack still contains the outgoing view. `TrackColumnsMixin` ignores navigation
+from that transient current-cell event and restores the previous valid cell under
+`QSignalBlocker`, preserving single and multiple row selections. This prevents
+reentrant tab changes from leaving the File label over Summary content. Stable
+table mouse/keyboard navigation and explicit Review file activation retain their
+normal behavior. Navigation tests assert actual page/visibility and table/report
+identity, including return through the File tab. Semantic reading
+anchors and cached link positions retain report context through resize, font
+changes and document replacement. Focused dock/layout/typography tests cover
+independent scrolling, keyboard operation, stale state and custom formatting.
 
 `WaveformPanel` keeps one waveform instance and a persistent preview header.
-Collapsing hides its body and remembers splitter sizes without invalidating
-requests, selection or viewport. Existing context changes still govern data
+Collapsing hides its body, explicitly allocates only the 32px header at the
+bottom of its splitter, and remembers expanded sizes. Reopening restores those
+sizes proportionally against the current splitter extent. It retains requests,
+selection and viewport. Existing context changes still govern data
 invalidation. Its disclosure uses an upward opening and downward closing chevron.
 A local input-origin property suppresses only pointer-focus painting; native
 focus, checked state, Tab/Backtab and Space activation remain intact. Keyboard
 activation after a mouse click restores the outline. Other header controls keep
 their existing focus styling. Table editor sizing uses polished font metrics plus the actual
 cell inset, and selection styling follows model layout changes after sorting.
+Track table row height comes from current font and editor size hints. The vertical
+header minimum is an output of auto-fit and must not be used as its next input;
+otherwise padding accumulates on every refresh. Repeated fitting is idempotent,
+and remeasurement can shrink previously oversized rows or follow font changes.
 
 `TableCellDoubleSpinBox` marks table Gain editors with `tableNumericEditor`.
 The theme scopes their gray surface, focus border and disabled appearance to
@@ -2202,3 +2235,29 @@ DawProcessor (orchestrated by GUI/CLI, outside Pipeline)
   |-- sync(session)                   -> incremental delta push
   +-- execute_commands(session, cmds)  -> ad-hoc commands from GUI tools
 ```
+
+
+Detector finding Actions are prepared once with the report: Visualize is offered
+only for valid in-bounds `IssueLocation` samples/channels and nonempty labels;
+Help stays independent. `ReportBrowser.visualizeRequested` dispatches cached
+links, including keyboard activation. `DetailMixin` revalidates the current
+session, track identity, report generation, detector relevance and suppression
+before selecting the detector's actual issue labels. Both presentation and
+incremental file refresh use the same validated overlay list. Session detectors
+without `is_relevant` are supported.
+
+Visualize replaces detector-overlay memory and menu/count, expands the shared
+panel and fits the complete timeline without changing RMS/marker flags, Help or
+disclosure. A pending request is scoped to the report generation and only the
+latest is fitted when preview/full data becomes ready. Manual overlay selection
+cancels a pending automatic fit. Worker-identity guards reject stale waveform
+and audio callbacks even for the same track. A terminal missing/read-error
+preview clears loading and rejects Visualize with a status-bar retry instruction;
+a subsequent file reload clears that terminal state. No playback or analysis is
+triggered by report navigation.
+
+Pro Tools Utils applies `0.82 * 2 / 3` of available width at first show only when
+the full monitor geometry has an aspect ratio of at least 2:1. Normal displays
+retain `0.82`; existing minimum sizes, margins, centering, user resizing and
+content-dependent height remain. Focused detector action, Help, shared splitter
+and monitor-geometry tests cover these contracts.

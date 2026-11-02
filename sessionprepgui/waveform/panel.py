@@ -184,6 +184,15 @@ class WaveformPanel(QWidget):
         self.setMaximumHeight(16777215 if expanded else 32)
         self.setSizePolicy(QSizePolicy.Preferred,
                            QSizePolicy.Expanding if expanded else QSizePolicy.Fixed)
+        if not expanded and splitter and index >= 0:
+            sizes = list(self._expanded_splitter_sizes)
+            header_height = self.preview_header.height()
+            remaining = max(0, sum(sizes) - header_height)
+            other_height = max(1, sum(size for i, size in enumerate(sizes) if i != index))
+            splitter.setSizes([
+                header_height if i == index else round(size * remaining / other_height)
+                for i, size in enumerate(sizes)
+            ])
         if expanded and splitter and index >= 0:
             sizes = self._expanded_splitter_sizes
             if sizes is None:
@@ -193,6 +202,10 @@ class WaveformPanel(QWidget):
                 others = max(1, total - sizes[index])
                 sizes = [max(0, round(size * (total - height) / others))
                          if i != index else height for i, size in enumerate(sizes)]
+            available = sum(splitter.sizes())
+            previous = sum(sizes)
+            if available > 0 and previous > 0:
+                sizes = [round(size * available / previous) for size in sizes]
             splitter.setSizes(sizes)
         self.updateGeometry()
 

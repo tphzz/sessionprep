@@ -1473,10 +1473,7 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
 
         # 6. Refresh overlay menu (skipped detectors filtered out)
         if self._current_track:
-            all_issues = []
-            for det_result in self._current_track.detector_results.values():
-                all_issues.extend(getattr(det_result, "issues", []))
-            self._update_overlay_menu(all_issues)
+            self._refresh_waveform_issues()
 
         # 7. Apply any concurrent GUI-only changes
         cmap = self._config.get("app", {}).get("spectrogram_colormap", "magma")

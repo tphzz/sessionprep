@@ -280,10 +280,16 @@ class ProToolsUtilsWindow(QDialog):
             self._initial_geometry_applied = True
             return
 
+        screen = self.screen() or screen_for_startup()
+        full_geometry = screen.geometry() if screen is not None else available
+        width_fraction = PT_UTILS_WIDTH_FRACTION
+        if full_geometry.height() > 0 and full_geometry.width() >= 2 * full_geometry.height():
+            width_fraction *= 2 / 3
+
         base = calculate_startup_geometry(
             available,
             self.minimumSizeHint(),
-            width_fraction=PT_UTILS_WIDTH_FRACTION,
+            width_fraction=width_fraction,
             height_fraction=PT_UTILS_COLOR_HEIGHT_FRACTION,
         )
         width = base.width()

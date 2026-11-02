@@ -47,13 +47,14 @@ def report_font_scale(screen: _ScreenLike | None) -> float:
 def configure_report_browser(
     browser: QTextBrowser,
     screen: QScreen | _ScreenLike | None = None,
+    *, content_scale: float = REPORT_CONTENT_SCALE,
 ) -> None:
     """Make report panes follow the platform application font and DPI."""
     app = QApplication.instance()
     font = QFont(app.font() if app is not None else browser.font())
     if screen is None:
         screen = browser.screen() or QGuiApplication.primaryScreen()
-    scale = REPORT_CONTENT_SCALE * report_font_scale(screen)
+    scale = content_scale * report_font_scale(screen)
     size = font.pointSizeF()
     if size > 0:
         font.setPointSizeF(size * scale)

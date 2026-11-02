@@ -10,6 +10,7 @@ from sessionpreplib.models import DetectorResult, SessionContext, Severity, Trac
 from sessionpreplib.rendering import build_diagnostic_summary
 from sessionprepgui.detail import report
 from sessionprepgui.detail.browser import ReportBrowser
+from sessionprepgui.detail.help_panel import FileReportPane
 
 
 @pytest.fixture(scope="module")
@@ -74,7 +75,7 @@ def test_interaction_reuses_metadata_and_custom_renderer(qapp, monkeypatch):
     assert "Rich result d00" not in browser.toPlainText()
 
 
-def test_fiftieth_row_help_grows_the_single_scrollable_document(qapp):
+def test_help_requests_do_not_insert_content_into_the_report(qapp):
     session, current = session_with_findings(50)
     browser = ReportBrowser({})
     browser.resize(1069, 620)
@@ -82,15 +83,12 @@ def test_fiftieth_row_help_grows_the_single_scrollable_document(qapp):
     browser.present_track(current, session)
     qapp.processEvents()
     before = browser.verticalScrollBar().maximum()
-    assert before > 0
+    requested = []
+    browser.helpRequested.connect(requested.append)
     browser.activate_report_link(QUrl("report-help:d49"))
-    qapp.processEvents()
-    assert browser.verticalScrollBar().maximum() > before
-    browser.verticalScrollBar().setValue(browser.verticalScrollBar().maximum())
-    cursor = browser.document().find("End of help for d49")
-    assert not cursor.isNull()
-    assert browser.cursorRect(cursor).bottom() <= browser.viewport().height()
-    assert browser.findChildren(QAbstractScrollArea) == []
+    assert requested == ["d49"]
+    assert browser.verticalScrollBar().maximum() == before
+    assert "End of help for d49" not in browser.toPlainText()
     browser.close()
 
 
@@ -131,20 +129,24 @@ def test_real_detector_callable_help_is_prepared_once(qapp):
         "clipping", Severity.PROBLEM, "Clipped", {"is_clipped": True, "runs": 1})
     session = SessionContext([current], {}, detectors=[detector])
     browser = ReportBrowser({})
+    pane = FileReportPane(browser)
     browser.present_track(current, session)
     browser.activate_report_link(QUrl("report-help:clipping"))
-    assert "Digital Clipping" in browser.toPlainText()
+    assert "Digital Clipping" in pane.help_title.text()
+    assert "full scale" in pane.help_browser.toPlainText()
+    pane.close()
 
 
 def test_state_is_local_to_session_file_and_help_does_not_expand(qapp):
     session, current = session_with_findings()
     browser = ReportBrowser({})
+    pane = FileReportPane(browser)
     browser.present_track(current, session)
     browser.activate_report_link(QUrl("report-help:d00"))
-    assert "Explanation" in browser.toPlainText()
+    assert "Explanation" in pane.help_browser.toPlainText()
     assert "Rich result" not in browser.toPlainText()
-    browser.activate_report_link(QUrl("report-close-help:d00"))
-    assert "Explanation" not in browser.toPlainText()
+    pane.close_help()
+    assert pane.active_detector_id is None
     browser.activate_report_link(QUrl("report-details:d00"))
     other = track("Other.wav")
     session.tracks.append(other)
@@ -155,6 +157,7 @@ def test_state_is_local_to_session_file_and_help_does_not_expand(qapp):
     new_session = SessionContext([current], {}, detectors=session.detectors)
     browser.present_track(current, new_session)
     assert "Rich result" not in browser.toPlainText()
+    pane.close()
 
 
 def test_literal_percent_escapes_in_filename_are_decoded_once(qapp):
@@ -184,7 +187,7 @@ def test_external_clear_releases_session_and_disclosure_state(qapp):
     assert reference() is None
     assert browser.report_session is None
     assert not browser._states
-    assert not browser._help_origins
+    assert browser.help_row("d00") is None
 
 
 def test_review_selects_identity_after_sort_and_refreshes_selected_widgets(qapp):
@@ -228,40 +231,42 @@ def test_repeated_keyboard_activation_preserves_report_link_focus(qapp):
     from PySide6.QtTest import QTest
     session, current = session_with_findings()
     browser = ReportBrowser({})
-    browser.resize(1069, 620)
-    browser.show()
+    pane = FileReportPane(browser)
+    pane.resize(1069, 620)
+    pane.show()
+    pane.activateWindow()
     browser.present_track(current, session)
+    qapp.processEvents()
     browser.setFocus()
     QTest.keyClick(browser, Qt.Key_Tab)
     QTest.keyClick(browser, Qt.Key_Return)
     assert "Rich result d00" in browser.toPlainText()
     QTest.keyClick(browser, Qt.Key_Return)
     assert "Rich result d00" not in browser.toPlainText()
-    cursor = browser._anchor_cursor(href="report-help:d00")
-    browser.setTextCursor(cursor)
+    browser.setTextCursor(browser._anchor_cursor(href="report-help:d00"))
     QTest.keyClick(browser, Qt.Key_Return)
-    assert "Explanation" in browser.toPlainText()
-    cursor = browser._anchor_cursor(href="report-close-help:d00")
-    browser.setTextCursor(cursor)
+    assert "Explanation" in pane.help_browser.toPlainText()
+    QTest.keyClick(pane.close_button, Qt.Key_Return)
+    assert pane.active_detector_id is None
     QTest.keyClick(browser, Qt.Key_Return)
-    assert "Explanation" not in browser.toPlainText()
-    QTest.keyClick(browser, Qt.Key_Return)
-    assert "Explanation" in browser.toPlainText()
-    browser.close()
+    assert pane.active_detector_id == "d00"
+    pane.close()
 
 
-def test_help_reveal_shows_the_complete_card_and_focuses_close(qapp):
+def test_help_opens_beside_report_and_focuses_reading_area(qapp):
     session, current = session_with_findings(50)
     browser = ReportBrowser({})
-    browser.resize(1069, 620)
-    browser.show()
+    pane = FileReportPane(browser)
+    pane.resize(1069, 620)
+    pane.show()
+    pane.activateWindow()
     browser.present_track(current, session)
     browser.activate_report_link(QUrl("report-help:d49"))
     qapp.processEvents()
-    last = browser.document().find("End of help for d49")
-    assert browser.cursorRect(last).bottom() < browser.viewport().height()
-    cursor = browser.textCursor()
-    from PySide6.QtGui import QTextCursor
-    cursor.movePosition(QTextCursor.NextCharacter, QTextCursor.KeepAnchor)
-    assert cursor.charFormat().anchorHref() == "report-close-help:d49"
-    browser.close()
+    last = pane.help_browser.document().find("End of help for d49")
+    assert not last.isNull()
+    assert pane.help_browser.cursorRect(last).bottom() < pane.help_browser.viewport().height()
+    assert pane.help_browser.hasFocus()
+    assert not pane.close_button.hasFocus()
+    assert "End of help" not in browser.toPlainText()
+    pane.close()

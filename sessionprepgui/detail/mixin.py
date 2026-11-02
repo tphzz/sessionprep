@@ -15,6 +15,7 @@ from ..tracks.table_widgets import _TAB_FILE, _TAB_SUMMARY, _PHASE_TOPOLOGY
 from ..theme import COLORS
 from ..analysis.worker import AudioLoadWorker
 from ..waveform.compute import WaveformLoadWorker
+from .report import visualizable_issues
 
 
 class DetailMixin:  # pylint: disable=too-few-public-methods
@@ -81,6 +82,9 @@ class DetailMixin:  # pylint: disable=too-few-public-methods
         via ``QTimer.singleShot`` so the tab switch paints first.
         """
         self._on_stop()
+        self._pending_detector_visualization = None
+        self._waveform_context_generation = None
+        self._waveform_unavailable_generation = None
         self._current_track = track
 
         # Show HTML report immediately
@@ -116,15 +120,21 @@ class DetailMixin:  # pylint: disable=too-few-public-methods
         # 1. Handle instant preview or loading state
         peak_cache = getattr(self, '_peak_cache', {})
         fn = getattr(track, 'filename', None)
+        self._waveform_unavailable_generation = None
+        self._waveform_context_generation = None
         if fn and fn in peak_cache:
-            self._waveform.set_preview_mode(
+            ready = self._waveform.set_preview_mode(
                 track.channels, track.total_samples, track.samplerate, peak_cache[fn]
             )
+            if ready:
+                self._waveform_context_generation = self._file_report.context_generation
         else:
             self._waveform.set_loading(True)
             if fn and hasattr(self, '_prioritize_peak'):
                 self._prioritize_peak(fn)
 
+        self._refresh_waveform_issues()
+        self._apply_pending_detector_visualization()
         if self._detail_tabs.currentIndex() == _TAB_FILE:
             self._wf_container.set_content_available(True)
         self._play_btn.setEnabled(False)
@@ -139,9 +149,9 @@ class DetailMixin:  # pylint: disable=too-few-public-methods
             worker = AudioLoadWorker(track, parent=self)
             self._audio_load_worker = worker
             worker.finished.connect(
-                lambda t, orig=track: self._on_audio_loaded(t, orig))
+                lambda t, orig=track, w=worker: self._on_audio_loaded(t, orig, w))
             worker.error.connect(
-                lambda msg: self._on_audio_load_error(msg, track))
+                lambda msg, orig=track, w=worker: self._on_audio_load_error(msg, orig, w))
             worker.start()
             return
 
@@ -153,6 +163,10 @@ class DetailMixin:  # pylint: disable=too-few-public-methods
             self._play_btn.setEnabled(True)
             self._start_wf_worker(track)
         else:
+            self._pending_detector_visualization = None
+            self._waveform_context_generation = None
+            self._waveform_unavailable_generation = self._file_report.context_generation
+            self._waveform.set_loading(False)
             self._waveform.set_audio(None, 44100)
             self._update_overlay_menu([])
             if self._detail_tabs.currentIndex() == _TAB_FILE:
@@ -172,7 +186,7 @@ class DetailMixin:  # pylint: disable=too-few-public-methods
             compute_spectrogram=(self._waveform._display_mode == "spectrogram"),
             parent=self)
         self._wf_worker.finished.connect(
-            lambda result, t=track: self._on_waveform_loaded(result, t))
+            lambda result, t=track, w=self._wf_worker: self._on_waveform_loaded(result, t, w))
         self._wf_worker.start()
 
     @Slot(str)
@@ -185,15 +199,21 @@ class DetailMixin:  # pylint: disable=too-few-public-methods
                         self._start_wf_worker(track)
 
     @Slot(object, object)
-    def _on_waveform_loaded(self, result: dict, track):
-        """Receive pre-computed waveform data from the background worker."""
+    def _on_waveform_loaded(self, result: dict, track, worker=None):
+        """Receive waveform data only from the currently owned worker."""
+        if worker is not None and worker is not self._wf_worker:
+            return
         self._wf_worker = None
 
         # Discard if user switched to a different track
         if self._current_track is not track:
             return
 
+        if not self._visualization_context_is_current():
+            return
         self._waveform.set_precomputed(result)
+        self._waveform_unavailable_generation = None
+        self._waveform_context_generation = self._file_report.context_generation
         # Apply cached peak data for mip-level rendering
         peak_cache = getattr(self, '_peak_cache', {})
         fn = getattr(track, 'filename', None)
@@ -210,15 +230,14 @@ class DetailMixin:  # pylint: disable=too-few-public-methods
                 act.setChecked(True)
                 break
 
-        all_issues = []
-        for det_result in track.detector_results.values():
-            all_issues.extend(getattr(det_result, "issues", []))
-        self._waveform.set_issues(all_issues)
-        self._update_overlay_menu(all_issues)
+        self._refresh_waveform_issues()
+        self._apply_pending_detector_visualization()
         self._update_time_label(0)
 
-    def _on_audio_loaded(self, track, orig_track):
+    def _on_audio_loaded(self, track, orig_track, worker=None):
         """Audio data loaded from disk; proceed to waveform rendering."""
+        if worker is not None and worker is not self._audio_load_worker:
+            return
         self._audio_load_worker = None
         # Discard if user switched tracks while we were loading
         if self._current_track is not orig_track:
@@ -226,15 +245,110 @@ class DetailMixin:  # pylint: disable=too-few-public-methods
         # Now kick off the normal waveform worker path
         self._load_waveform(track)
 
-    def _on_audio_load_error(self, message: str, track):
+    def _on_audio_load_error(self, message: str, track, worker=None):
         """Audio file could not be read from disk."""
+        if worker is not None and worker is not self._audio_load_worker:
+            return
         self._audio_load_worker = None
         if self._current_track is not track:
             return
+        self._pending_detector_visualization = None
+        self._waveform_context_generation = None
+        self._waveform_unavailable_generation = self._file_report.context_generation
+        self._waveform.set_loading(False)
         self._waveform.set_audio(None, 44100)
+        self._update_overlay_menu([])
         self._wf_container.set_content_available(False)
         self._play_btn.setEnabled(False)
         self._status_bar.showMessage(f"Could not load audio: {message}")
+
+    def _visualization_context_is_current(self):
+        track = self._current_track
+        return (self._session is not None and track is not None
+                and any(t is track for t in self._session.tracks)
+                and self._file_report.report_session is self._session
+                and self._file_report.track_filename == track.filename)
+
+    def _detector_visualization_issues(self, key):
+        if not self._visualization_context_is_current():
+            return []
+        detector = next((d for d in self._session.detectors if d.id == key), None)
+        result = self._current_track.detector_results.get(key)
+        issues = visualizable_issues(result, self._current_track)
+        if not issues:
+            return []
+        if detector is not None:
+            severity = getattr(detector, "effective_severity", None)
+            relevant = getattr(detector, "is_relevant", None)
+            if callable(severity) and severity(result) is None:
+                return []
+            if callable(relevant) and not relevant(result, self._current_track):
+                return []
+        return issues
+
+    def _refresh_waveform_issues(self):
+        issues = []
+        if self._visualization_context_is_current():
+            for key in self._current_track.detector_results:
+                issues.extend(self._detector_visualization_issues(key))
+        self._waveform.set_issues(issues)
+        self._update_overlay_menu(issues)
+
+    def _on_file_report_context_changed(self):
+        if not self._visualization_context_is_current():
+            self._pending_detector_visualization = None
+            self._waveform_context_generation = None
+            self._waveform_unavailable_generation = None
+            return
+        pending = self._pending_detector_visualization
+        if pending is not None and (
+                pending[0] != self._file_report.context_generation
+                or not self._detector_visualization_issues(pending[1])):
+            self._pending_detector_visualization = None
+        if self._waveform_context_generation == self._file_report.context_generation:
+            self._refresh_waveform_issues()
+
+    @Slot(str)
+    def _visualize_detector(self, key):
+        if not self._visualization_context_is_current():
+            return
+        if not self._file_report.visualization_labels(key):
+            return
+        issues = self._detector_visualization_issues(key)
+        if not issues:
+            return
+        generation = self._file_report.context_generation
+        if getattr(self, "_waveform_unavailable_generation", None) == generation:
+            self._status_bar.showMessage(
+                "Waveform unavailable for this file. Select the file again to retry loading.")
+            return
+        anchor = self._file_report.capture_reading_anchor()
+        self._pending_detector_visualization = (generation, key)
+        selected = self._remembered_detector_overlays()
+        selected.clear()
+        selected.update(issue.label for issue in issues)
+        if self._waveform_context_generation != generation:
+            self._waveform.set_loading(True)
+        self._refresh_waveform_issues()
+        self._wf_panel.set_expanded(True)
+        self._apply_pending_detector_visualization()
+        self._file_report.restore_reading_anchor(anchor)
+        self._file_report.focus_report_link("report-visualize", key)
+
+    def _apply_pending_detector_visualization(self):
+        pending = self._pending_detector_visualization
+        if pending is None:
+            return
+        generation, key = pending
+        if (not self._visualization_context_is_current()
+                or generation != self._file_report.context_generation
+                or not self._file_report.visualization_labels(key)
+                or not self._detector_visualization_issues(key)):
+            self._pending_detector_visualization = None
+            return
+        if self._waveform_context_generation == generation:
+            self._waveform.zoom_fit()
+            self._pending_detector_visualization = None
 
     # ── Overlay dropdown ────────────────────────────────────────────────
 
@@ -280,7 +394,8 @@ class DetailMixin:  # pylint: disable=too-few-public-methods
                 if result:
                     if hasattr(det, 'effective_severity') and det.effective_severity(result) is None:
                         continue
-                    if not det.is_relevant(result, track):
+                    relevant = getattr(det, "is_relevant", None)
+                    if callable(relevant) and not relevant(result, track):
                         continue
             filtered_issues.append(issue)
 
@@ -309,6 +424,7 @@ class DetailMixin:  # pylint: disable=too-few-public-methods
     @Slot()
     def _on_overlay_toggled(self):
         """Collect checked overlay labels and update the waveform."""
+        self._pending_detector_visualization = None
         available = set()
         checked = set()
         for action in self._overlay_menu.actions():

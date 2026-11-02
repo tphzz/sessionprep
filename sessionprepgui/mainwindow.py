@@ -51,7 +51,8 @@ from .theme import COLORS, apply_dark_theme
 from .log import dbg
 from .prefs import PreferencesDialog
 from .detail import PlaybackController, DetailMixin
-from .detail.report_style import configure_report_browser, wrap_report_html
+from .detail.help_panel import FileReportPane
+from .detail.report_style import wrap_report_html
 from .waveform import WaveformPanel, WaveformLoadWorker
 from .widgets import ProgressPanel
 from .window_geometry import (
@@ -152,6 +153,9 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
         self._audio_load_worker: AudioLoadWorker | None = None
         self._current_track = None
         self._selected_detector_overlays: set[str] = set()
+        self._pending_detector_visualization: tuple[int, str] | None = None
+        self._waveform_context_generation: int | None = None
+        self._waveform_unavailable_generation: int | None = None
         self._session_groups: list[dict] = []
         self._prev_group_assignments: dict[str, str | None] = {}
         self._active_session_preset: str = "Default"
@@ -812,7 +816,10 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
         self._file_splitter = QSplitter(Qt.Vertical)
 
         self._file_report = self._make_report_browser()
-        self._file_splitter.addWidget(self._file_report)
+        self._file_report.visualizeRequested.connect(self._visualize_detector)
+        self._file_report.reportChanged.connect(self._on_file_report_context_changed)
+        self._file_report_pane = FileReportPane(self._file_report)
+        self._file_splitter.addWidget(self._file_report_pane)
 
         # Waveform panel (toolbar + waveform + transport)
         self._wf_panel = WaveformPanel(analysis_mode=True)
@@ -899,7 +906,7 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
         from .detail.browser import ReportBrowser
         browser = ReportBrowser(self._detector_help)
         browser.reviewRequested.connect(self._review_summary_file)
-        configure_report_browser(browser, self.screen() or screen_for_startup())
+        browser.refresh_font(self.screen() or screen_for_startup())
         return browser
 
     def _refresh_report_browser_fonts(self, screen=None):
@@ -908,7 +915,10 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
         for attr in ("_summary_view", "_file_report"):
             browser = getattr(self, attr, None)
             if browser is not None:
-                configure_report_browser(browser, target_screen)
+                browser.refresh_font(target_screen)
+        pane = getattr(self, "_file_report_pane", None)
+        if pane is not None:
+            pane.refresh_fonts(target_screen)
 
     def _install_report_screen_refresh(self):
         """Refresh report font scale when the window moves between screens."""

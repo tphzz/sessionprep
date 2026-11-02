@@ -22,6 +22,8 @@ COLORS = {
     "text": "#dddddd",
     "heading": "#ffffff",
     "bg": "#1e1e1e",
+    "surface": "#2d2d2d",
+    "border": "#555555",
     "bg_alt": "#252525",
     "accent": "#3a3a3a",
 }

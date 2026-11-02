@@ -26,6 +26,8 @@ def qapp():
     app = QApplication.instance()
     if app is None:
         app = QApplication([])
+    # Match the application entry point without relying on another test module.
+    app.setStyle("Fusion")
     return app
 
 
@@ -131,3 +133,59 @@ def test_themed_editor_geometry_keeps_complete_selector_values(qapp):
             assert spin.rect().contains(button.center())
             assert not field.intersects(button)
     table.close()
+
+
+@pytest.mark.parametrize("themed", [False, True])
+def test_repeated_auto_fit_preserves_row_height(qapp, themed):
+    table = _track_table()
+    if themed:
+        from sessionprepgui.theme import apply_dark_theme
+        apply_dark_theme(table)
+    table.resize(1300, 400)
+    table.show()
+    qapp.processEvents()
+    try:
+        first = apply_track_table_layout(table)
+        for _ in range(40):
+            current = apply_track_table_layout(table)
+            assert current.row_height == first.row_height
+            assert [table.rowHeight(row) for row in range(table.rowCount())] == [
+                first.row_height] * table.rowCount()
+    finally:
+        table.close()
+
+
+def test_auto_fit_recovers_from_previous_tall_rows(qapp):
+    table = _track_table()
+    expected = calculate_track_table_layout(table)
+    table.verticalHeader().setMinimumSectionSize(120)
+    table.verticalHeader().setDefaultSectionSize(120)
+    try:
+        current = apply_track_table_layout(table)
+        assert current.row_height == expected.row_height
+        assert table.verticalHeader().minimumSectionSize() == expected.row_height
+        assert table.rowHeight(0) == expected.row_height
+    finally:
+        table.close()
+
+
+def test_auto_fit_tracks_font_growth_and_shrink_without_retaining_old_minimum(qapp):
+    table = _track_table()
+    table.show()
+    qapp.processEvents()
+    original_font = table.font()
+    baseline = apply_track_table_layout(table)
+    larger = table.font()
+    larger.setPointSizeF(max(9.0, larger.pointSizeF()) + 10)
+    table.setFont(larger)
+    qapp.processEvents()
+    large = apply_track_table_layout(table)
+    assert large.row_height > baseline.row_height
+    table.setFont(original_font)
+    qapp.processEvents()
+    try:
+        restored = apply_track_table_layout(table)
+        assert restored.row_height == baseline.row_height
+        assert table.rowHeight(0) == baseline.row_height
+    finally:
+        table.close()

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from PySide6.QtCore import Qt, Slot
+from PySide6.QtCore import Qt, Slot, QSignalBlocker
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QComboBox,
@@ -50,6 +50,17 @@ class TrackColumnsMixin:  # pylint: disable=too-few-public-methods
 
     @Slot(int, int, int, int)
     def _on_current_cell_changed(self, row, _col, _prev_row, _prev_col):
+        tabs = getattr(self, "_detail_tabs", None)
+        # Hiding a tab can focus a table editor before Qt updates the page stack.
+        # Do not reopen File from that focus event and reenter the tab switch.
+        if tabs is not None and tabs.currentWidget() is not tabs.widget(tabs.currentIndex()):
+            table = self._track_table
+            if 0 <= _prev_row < table.rowCount() and 0 <= _prev_col < table.columnCount():
+                # Retain the logical selection as well as the cached File report.
+                # BatchEditTableWidget keeps an existing multi-row selection.
+                with QSignalBlocker(table):
+                    table.setCurrentCell(_prev_row, _prev_col)
+            return
         self._select_row(row)
 
     def _select_row(self, row: int):
@@ -813,10 +824,7 @@ class TrackColumnsMixin:  # pylint: disable=too-few-public-methods
         if not self._current_track or self._current_track.filename != track.filename:
             return
         self._refresh_file_report(track)
-        all_issues = []
-        for result in track.detector_results.values():
-            all_issues.extend(getattr(result, "issues", []))
-        self._update_overlay_menu(all_issues)
+        self._refresh_waveform_issues()
 
     # ── Table fitting ────────────────────────────────────────────────────
 

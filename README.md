@@ -101,9 +101,15 @@ sessionprep /path/to/tracks -x       # analyze + process (writes to processed/)
 ```
 
 In the GUI, **Summary** lists each finding, its affected file and the next step.
-Use **Review file** to inspect it; expand a detector row for its full result or
-open **Help** for its explanation. The local **Waveform preview** header lets
-you hide or reopen audio inspection without losing the current view. The chevron
+Use **Review file** to inspect it. Each detector row starts with its severity;
+expand the finding for its full result. Under **Actions**, **Visualize** shows
+only that detector's locations, opens the preview and fits the whole file while
+retaining RMS curves and Peak/RMS markers. **Help** opens its explanation in a
+right-side panel with its own scroll area. Click another Help link to switch
+explanations, or close the panel with **X** or **Esc** while it has focus.
+The local **Waveform preview** header lets
+you hide or reopen audio inspection without losing the current view. When
+collapsed, the header sits at the bottom and releases the space to the report. The chevron
 points up to open and down to close; keyboard focus remains visible.
 Table Gain fields share the neighboring selectors’ gray surface, with clear focus
 and muted disabled values.

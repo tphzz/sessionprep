@@ -127,3 +127,39 @@ def test_keyboard_activation_after_pointer_focus_shows_outline(qapp, preview):
     qapp.processEvents()
     assert not panel.is_expanded() and button.hasFocus()
     assert blue_border_pixels(button) > 0
+
+@pytest.mark.parametrize("analysis_mode", [False, True], ids=["track-layout", "analysis"])
+def test_real_splitter_collapse_parks_header_at_bottom_and_restores_size(qapp, analysis_mode):
+    from PySide6.QtWidgets import QSplitter
+
+    window = QWidget()
+    layout = QVBoxLayout(window)
+    splitter = QSplitter(Qt.Vertical)
+    splitter.addWidget(QWidget())
+    panel = WaveformPanel(analysis_mode=analysis_mode)
+    splitter.addWidget(panel)
+    splitter.setCollapsible(1, False)
+    if analysis_mode:
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 1)
+    layout.addWidget(splitter)
+    window.resize(1000, 700)
+    window.show()
+    splitter.setSizes([620, 272])
+    qapp.processEvents()
+    before = splitter.sizes()
+    try:
+        for height in (800, 700):
+            panel.set_expanded(False)
+            window.resize(1000, height)
+            qapp.processEvents()
+            assert splitter.sizes()[1] == panel.preview_header.height()
+            assert panel.y() + panel.height() == splitter.height()
+            assert panel._body.isHidden()
+            panel.set_expanded(True)
+            qapp.processEvents()
+            after = splitter.sizes()
+            assert abs(after[1] / sum(after) - before[1] / sum(before)) < 0.02
+            before = after
+    finally:
+        window.close()

@@ -457,7 +457,9 @@ third-party tools.
 
 **Waveform preview** is a local disclosure in both Track Layout and File detail.
 Track Layout starts collapsed. The header stays visible while the preview is
-hidden, and reopening preserves its waveform, cursor, zoom and splitter height.
+hidden at the bottom of the pane, releasing the preview's space to the content
+above. Reopening preserves its waveform, cursor and zoom, and restores the
+splitter allocation proportionally after window resizing.
 The chevron points up to open and down to close. Mouse clicks do not leave a
 selection outline; Tab/Backtab and keyboard activation show a blue focus outline.
 Fit, horizontal zoom and vertical scale use named icon buttons in this header.
@@ -495,12 +497,28 @@ Display settings and playback controls remain available when expanded.
 finding an affected file, next step and **Review file** action. Review selects
 the corresponding file even after sorting the track table.
 
-In **File**, detector rows show severity, available locations and guidance.
-Click the finding to expand its full detector result. **Help** opens the
-detector explanation in the same report; closing it restores the caller's
-disclosure, focus and scroll position. Long findings wrap and reports use one
-scroll area. The waveform has its own persistent header outside the report.
-These controls change presentation; they do not repair audio or alter analysis.
+In **File**, detector rows start with severity before the finding chevron,
+followed by available locations and guidance. Click the finding to expand its
+full result independently of the **Actions** beside it. **Visualize** is offered
+when a finding has valid waveform locations. It selects only that detector's
+overlays, expands the preview and fits the whole file; RMS curves, Peak/RMS Max
+markers, the report and any open Help remain unchanged. Manual choices in
+**Detector Overlays** still allow multiple detectors. If audio is still loading,
+only the latest Visualize request for the current file is applied. If audio is
+unavailable, the status bar explains that selecting the file again retries loading.
+
+**Help** opens the complete explanation in a
+right-side panel. Its title and **X** stay visible while the explanation scrolls
+separately from the report. Another Help link switches the explanation and starts
+it at the top; reopening the same explanation keeps its reading position.
+Opening Help focuses its reading area. Tab/Backtab can reach the centered **X**
+with a visible keyboard focus outline.
+Close with **X**, or **Esc** while Help has focus, to restore report width and
+return focus to the caller while retaining the report's reading position.
+Changing file/session or removing the active finding closes Help. Long findings
+reflow at narrower widths. The waveform keeps its own persistent header outside
+the report. These controls change presentation; they do not repair audio or
+alter analysis.
 
 ### 7.1 Analysis Column
 
@@ -586,3 +604,10 @@ Per-track dropdown overriding the auto-detected audio classification.
 Changing the classification re-runs processors only (no detector re-analysis
 needed), since the classification affects only the normalization method and
 gain calculation.
+
+
+## 8. Pro Tools Utils Window
+
+Pro Tools Utils uses a narrower initial width on ultrawide displays (a full-screen
+aspect ratio of at least 2:1). Standard displays retain the existing initial width.
+The window remains centered and resizable; its height continues to fit the active tool.

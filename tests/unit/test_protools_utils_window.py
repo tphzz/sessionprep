@@ -472,3 +472,33 @@ def test_color_tool_grid_can_use_extra_vertical_space():
         assert tool._grid.maximumHeight() >= 1000000
     finally:
         tool.deleteLater()
+
+@pytest.mark.parametrize("full_size,available_size,expected_width", [
+    ((3440, 1440), (3440, 1400), 1881),
+    ((5120, 1440), (5120, 1400), 2799),
+    ((2560, 1080), (2560, 1040), 1399),
+    ((1920, 1080), (1920, 1040), 1574),
+    ((2560, 1440), (2560, 1400), 2099),
+    ((1920, 1080), (1920, 900), 1574),
+])
+def test_utils_ultrawide_startup_width_preserves_normal_displays(
+        qapp, monkeypatch, full_size, available_size, expected_width):
+    class Screen:
+        def geometry(self):
+            return QRect(-3440, 200, *full_size)
+        def availableGeometry(self):
+            return QRect(-3440, 200, *available_size)
+
+    window = ProToolsUtilsWindow({"colors": []})
+    monkeypatch.setattr(window, "screen", lambda: Screen())
+    try:
+        window.prepare_for_show()
+        geometry = window.geometry()
+        assert geometry.width() == expected_width
+        available = Screen().availableGeometry()
+        assert geometry.x() == available.x() + (available.width() - expected_width) // 2
+        window.resize(expected_width - 50, geometry.height())
+        window.prepare_for_show()
+        assert window.width() == expected_width - 50
+    finally:
+        window.close()

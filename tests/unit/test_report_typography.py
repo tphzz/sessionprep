@@ -226,3 +226,56 @@ def test_fallback_detector_report_uses_compact_row():
     assert "unknown_detector" in html
     assert "Attention" in html
     assert "report-details:unknown_detector" in html
+
+
+@pytest.mark.parametrize("screen_scale", [1.0, 2.0])
+def test_finding_ui_role_matches_application_size_and_preserves_report_header(qapp, screen_scale):
+    from sessionprepgui.detail.browser import ReportBrowser
+
+    current = TrackContext("UI role.wav", "missing.wav", None, 48000, 1, 96000,
+                           "24-bit", "PCM_24", 2.0)
+    current.detector_results["example"] = DetectorResult(
+        "example", Severity.ATTENTION, "Review this finding", {})
+    browser = ReportBrowser({})
+    browser.refresh_font(_FakeScreen(screen_scale, 96.0))
+    browser.present_track(current, None)
+    finding = browser.document().find("example")
+    header = browser.document().find("UI role.wav")
+    expected = qapp.font().pointSizeF() * report_font_scale(_FakeScreen(screen_scale, 96.0))
+    assert finding.charFormat().font().pointSizeF() == pytest.approx(expected)
+    assert header.charFormat().font().pointSizeF() == pytest.approx(expected * REPORT_CONTENT_SCALE)
+    assert finding.charFormat().fontWeight() >= 600
+
+
+def test_custom_pixel_and_point_font_sizes_survive_finding_role_and_refresh(qapp):
+    from sessionprepgui.detail.browser import ReportBrowser
+    from sessionpreplib.models import SessionContext
+
+    class Detector:
+        id = "format"
+        name = "Custom formatting"
+        html_help = ""
+        def effective_severity(self, result):
+            return result.severity
+        def render_html(self, result, track):
+            return ("<tr><td><span style='font-size:20px'>PIXEL</span> "
+                    "<span style='font-size:17pt; font-family:Consolas; font-style:italic'>POINT</span>"
+                    "</td></tr>")
+
+    current = TrackContext("Formats.wav", "missing.wav", None, 48000, 1, 96000,
+                           "24-bit", "PCM_24", 2.0)
+    current.detector_results["format"] = DetectorResult(
+        "format", Severity.ATTENTION, "Formatted detail", {})
+    session = SessionContext([current], {}, detectors=[Detector()])
+    browser = ReportBrowser({})
+    browser.present_track(current, session)
+    from PySide6.QtCore import QUrl
+    browser.activate_report_link(QUrl("report-details:format"))
+    for scale in (1.0, 2.0, 1.0):
+        browser.refresh_font(_FakeScreen(scale, 96.0))
+        pixel = browser.document().find("PIXEL").charFormat()
+        point = browser.document().find("POINT").charFormat()
+        assert pixel.font().pixelSize() == 20
+        assert point.fontPointSize() == pytest.approx(17.0)
+        assert point.fontItalic()
+        assert point.font().family() == "Consolas"
