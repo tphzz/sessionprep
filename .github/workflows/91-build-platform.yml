@@ -1,0 +1,143 @@
+name: 91 Helper - Native Linux or Windows
+'on':
+  workflow_call:
+    inputs:
+      platform:
+        required: true
+        type: string
+      runner_labels:
+        required: true
+        type: string
+      resource_group:
+        required: true
+        type: string
+      version:
+        required: true
+        type: string
+      sha:
+        required: true
+        type: string
+      debug:
+        required: true
+        type: boolean
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ${{ fromJSON(inputs.runner_labels) }}
+    concurrency:
+      group: ${{ inputs.resource_group }}
+      cancel-in-progress: false
+      queue: max
+    timeout-minutes: 240
+    env:
+      SOURCE_DIR: src-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.platform }}
+      BUILD_PLATFORM: ${{ inputs.platform }}
+      BUILD_VERSION: ${{ inputs.version }}
+      SOURCE_SHA: ${{ inputs.sha }}
+      DEBUG_BUILD: ${{ inputs.debug }}
+    steps:
+    - name: Checkout exact build commit
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ github.sha }}
+        fetch-depth: 0
+        path: ${{ env.SOURCE_DIR }}
+    - name: Verify native Windows Python and expose Git Bash
+      if: ${{ runner.os == 'Windows' }}
+      shell: powershell
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $python = (Get-Command python.exe -ErrorAction Stop).Source
+        & $python -c "import sys; assert sys.version_info[:2] == (3,13), sys.version"
+        if ($LASTEXITCODE -ne 0) { throw 'Native Python 3.13 is required on this runner' }
+        "CI_PYTHON=$python" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        $git = (Get-Command git.exe -ErrorAction Stop).Source
+        $gitRoot = Split-Path (Split-Path $git -Parent) -Parent
+        $bash = Join-Path $gitRoot 'bin\bash.exe'
+        if (-not (Test-Path -LiteralPath $bash)) { throw 'Git Bash is required on the Windows runner' }
+        Split-Path $bash -Parent | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+    - name: Set up Linux Python
+      id: python
+      if: ${{ runner.os != 'Windows' }}
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      with:
+        python-version: '3.13'
+    - name: Set up uv
+      uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990
+      with:
+        enable-cache: true
+    - name: Locate native MSVC toolchain
+      if: ${{ runner.os == 'Windows' }}
+      id: visual-studio
+      shell: powershell
+      env:
+        BUILD_PLATFORM: ${{ inputs.platform }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $component = if ($env:BUILD_PLATFORM -eq 'win-arm64') { 'Microsoft.VisualStudio.Component.VC.Tools.ARM64' } else { 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64' }
+        $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+        $installation = & $vswhere -version '[18.0,19.0)' -products '*' -requires $component -property installationPath | Select-Object -First 1
+        if ([string]::IsNullOrWhiteSpace($installation)) { throw "Visual Studio 18 native C++ tools missing: $component" }
+        "path=$installation" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+    - name: Activate native MSVC
+      if: ${{ runner.os == 'Windows' }}
+      uses: TheMrMilchmann/setup-msvc-dev@368ef7d1ee4d1171b31d4a7f67f4d954f903f5a9
+      with:
+        arch: ${{ inputs.platform == 'win-arm64' && 'arm64' || 'x64' }}
+        vs-path: ${{ steps.visual-studio.outputs.path }}
+    - name: Restore native compiler caches
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+      with:
+        path: |-
+          ~/.cache/Nuitka
+          ~/.cache/ccache
+          ~/AppData/Local/Nuitka/Nuitka/Cache
+          ~/AppData/Local/ccache
+        key: nuitka-v3-${{ inputs.platform }}-${{ inputs.debug && 'debug' || 'release' }}-${{ hashFiles(format('{0}/uv.lock', env.SOURCE_DIR))
+          }}-${{ github.run_id }}
+        restore-keys: nuitka-v3-${{ inputs.platform }}-${{ inputs.debug && 'debug' || 'release' }}-
+    - name: Build and package native CLI and GUI
+      shell: bash
+      env:
+        PYTHON_INSTALL: ${{ steps.python.outputs.python-path }}
+        UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/sessionprep-env-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.platform }}
+      run: |
+        set -euo pipefail
+        cd "$SOURCE_DIR"
+        python_path="${CI_PYTHON:-$PYTHON_INSTALL}"
+        uv sync --frozen --extra cli --extra gui --python "$python_path"
+        build_args=(--platform "$BUILD_PLATFORM" --version "$BUILD_VERSION" --sha "$SOURCE_SHA")
+        if [[ "$DEBUG_BUILD" == "true" ]]; then build_args+=(--debug); fi
+        uv run --frozen python packaging/github/build.py compile "${build_args[@]}"
+        uv run --frozen python packaging/github/build.py package "${build_args[@]}" --output artifacts
+    - name: Upload platform artifacts
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: sessionprep-${{ inputs.platform }}-${{ inputs.debug && 'debug' || 'release' }}
+        path: ${{ env.SOURCE_DIR }}/artifacts
+        if-no-files-found: error
+    - name: Clean only run-owned workspace
+      if: ${{ always() }}
+      shell: bash
+      run: |
+        "${CI_PYTHON:-python}" - <<'PY'
+        import json, os, pathlib, shutil, stat
+        workspace = pathlib.Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+        temporary = pathlib.Path(os.environ["RUNNER_TEMP"]).resolve()
+        run = os.environ["GITHUB_RUN_ID"] + "-" + os.environ["GITHUB_RUN_ATTEMPT"]
+        def remove_readonly(function, path, error):
+            if not isinstance(error, PermissionError):
+                raise error
+            os.chmod(path, stat.S_IWRITE)
+            function(path)
+        for name in json.loads(os.environ["CLEANUP_NAMES"]):
+            for parent, child in ((workspace, "src-" + run + "-" + name), (temporary, "sessionprep-env-" + run + "-" + name)):
+                target = (parent / child).resolve()
+                if target.parent != parent:
+                    raise RuntimeError("Cleanup target escaped the run workspace")
+                if target.exists():
+                    shutil.rmtree(target, onexc=remove_readonly)
+        PY
+      env:
+        CLEANUP_NAMES: '["${{ inputs.platform }}"]'

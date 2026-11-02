@@ -1,185 +1,186 @@
-name: Build (Nuitka)
-
-on:
+name: 00 Full - All Platforms
+run-name: ${{ github.workflow }} | ${{ github.ref_name }} | ${{ inputs.debug && 'Debug' || 'Release' }}
+'on':
   workflow_dispatch:
-
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-
+    inputs:
+      debug:
+        description: Debug diagnostics (artifacts only)
+        required: false
+        default: false
+        type: boolean
+      notarize_macos:
+        description: Notarize macOS (optional for every ref/configuration)
+        required: false
+        default: false
+        type: boolean
+permissions:
+  contents: read
+concurrency:
+  group: sessionprep-all-${{ github.ref }}
+  cancel-in-progress: false
+  queue: max
 jobs:
-  build:
-    name: ${{ matrix.name }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            name: Linux x64
-            suffix: linux-x64
-          - os: ubuntu-24.04-arm
-            name: Linux arm64
-            suffix: linux-arm64
-          - os: macos-15
-            name: macOS Apple arm64
-            suffix: macos-arm64
-          - os: macos-15-intel
-            name: macOS x64
-            suffix: macos-x64
-          - os: windows-latest
-            name: Windows x64
-            suffix: win-x64
-          - os: windows-11-arm
-            name: Windows arm64
-            suffix: win-arm64
-
+  checks:
+    uses: ./.github/workflows/90-build-checks.yml
+    with:
+      publish_drafts: ${{ !inputs.debug }}
+    secrets:
+      SESSIONPREP_RELEASE_TOKEN: ${{ secrets.SESSIONPREP_RELEASE_TOKEN }}
+  linux-x64:
+    needs:
+    - checks
+    uses: ./.github/workflows/91-build-platform.yml
+    with:
+      platform: linux-x64
+      runner_labels: '["self-hosted", "Linux", "X64", "jammy", "docker"]'
+      resource_group: sessionprep-x64-host
+      version: ${{ needs.checks.outputs.version }}
+      sha: ${{ needs.checks.outputs.sha }}
+      debug: ${{ inputs.debug }}
+  windows-x64:
+    needs:
+    - checks
+    - linux-x64
+    uses: ./.github/workflows/91-build-platform.yml
+    with:
+      platform: win-x64
+      runner_labels: '["self-hosted", "Windows", "X64"]'
+      resource_group: sessionprep-x64-host
+      version: ${{ needs.checks.outputs.version }}
+      sha: ${{ needs.checks.outputs.sha }}
+      debug: ${{ inputs.debug }}
+  linux-arm64:
+    needs:
+    - checks
+    uses: ./.github/workflows/91-build-platform.yml
+    with:
+      platform: linux-arm64
+      runner_labels: '["self-hosted", "Linux", "ARM64", "jammy", "docker"]'
+      resource_group: sessionprep-apple-silicon-host
+      version: ${{ needs.checks.outputs.version }}
+      sha: ${{ needs.checks.outputs.sha }}
+      debug: ${{ inputs.debug }}
+  windows-arm64:
+    needs:
+    - checks
+    - linux-arm64
+    uses: ./.github/workflows/91-build-platform.yml
+    with:
+      platform: win-arm64
+      runner_labels: '["self-hosted", "Windows", "ARM64"]'
+      resource_group: sessionprep-apple-silicon-host
+      version: ${{ needs.checks.outputs.version }}
+      sha: ${{ needs.checks.outputs.sha }}
+      debug: ${{ inputs.debug }}
+  macos:
+    needs:
+    - checks
+    - windows-arm64
+    uses: ./.github/workflows/92-build-macos.yml
+    with:
+      version: ${{ needs.checks.outputs.version }}
+      sha: ${{ needs.checks.outputs.sha }}
+      debug: ${{ inputs.debug }}
+      notarize_macos: ${{ inputs.notarize_macos }}
+      architecture: both
+    secrets:
+      MACOS_DEV_ID_CERT_NAME: ${{ secrets.MACOS_DEV_ID_CERT_NAME }}
+  windows-installer:
+    needs:
+    - checks
+    - windows-x64
+    - windows-arm64
+    uses: ./.github/workflows/93-windows-bundle.yml
+    with:
+      version: ${{ needs.checks.outputs.version }}
+      sha: ${{ needs.checks.outputs.sha }}
+      debug: ${{ inputs.debug }}
+  release:
+    name: Collect verified artifacts and replace owned draft
+    if: ${{ !inputs.debug }}
+    needs:
+    - checks
+    - windows-installer
+    - macos
+    runs-on:
+    - self-hosted
+    - Linux
+    - X64
+    - jammy
+    - docker
+    concurrency:
+      group: sessionprep-x64-host
+      cancel-in-progress: false
+      queue: max
+    permissions:
+      contents: write
+      actions: read
+    env:
+      SOURCE_DIR: src-${{ github.run_id }}-${{ github.run_attempt }}-release
+      BUILD_VERSION: ${{ needs.checks.outputs.version }}
+      SOURCE_SHA: ${{ needs.checks.outputs.sha }}
+      REF_TYPE: ${{ github.ref_type }}
+      REF_NAME: ${{ github.ref_name }}
     steps:
-      - uses: actions/checkout@v5
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v7
-
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version-file: "pyproject.toml"
-
-      - name: Install System Dependencies (Linux)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y gcc patchelf ccache
-
-      - name: Install CCache (macOS)
-        if: runner.os == 'macOS'
-        run: brew install ccache
-
-      - name: Cache Nuitka & CCache
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cache/Nuitka
-            ~/AppData/Local/Nuitka/Nuitka/Cache
-            ~/Library/Caches/Nuitka
-            ~/.cache/ccache
-            ~/Library/Caches/ccache
-            ~/AppData/Local/ccache
-          key: ${{ runner.os }}-${{ matrix.suffix }}-nuitka-${{ hashFiles('**/uv.lock') }}-${{ github.run_id }}
-          restore-keys: |
-            ${{ runner.os }}-${{ matrix.suffix }}-nuitka-${{ hashFiles('**/uv.lock') }}-
-            ${{ runner.os }}-${{ matrix.suffix }}-nuitka-
-
-      - name: Install Dependencies
-        run: uv sync --extra cli --extra gui
-
-      - name: Disable Windows Defender for build directory
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: Add-MpPreference -ExclusionPath $PWD
-
-      - name: Build with Nuitka
-        run: uv run python build_nuitka.py all
-
-      # -----------------------------------------------------------------------
-      # Determine version (used by all packaging steps)
-      # -----------------------------------------------------------------------
-      - name: Determine version
-        id: version
-        shell: bash
-        run: |
-          VER=$(python -c "exec(open('sessionpreplib/_version.py').read()); print(__version__)")
-          echo "ver=$VER" >> "$GITHUB_OUTPUT"
-
-      # -----------------------------------------------------------------------
-      # Linux packaging
-      # -----------------------------------------------------------------------
-      - name: Package Linux Distributions
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          echo 'deb [trusted=yes] https://repo.goreleaser.com/apt/ /' \
-            | sudo tee /etc/apt/sources.list.d/goreleaser.list
-          sudo apt-get update -q && sudo apt-get install -y nfpm
-
-          VERSION="${{ steps.version.outputs.ver }}"
-          SUFFIX="${{ matrix.suffix }}"
-          # Map matrix suffix to nfpm arch (deb/rpm format)
-          case "$SUFFIX" in
-            linux-x64)   NFPM_ARCH=amd64 ;;
-            linux-arm64) NFPM_ARCH=arm64 ;;
-            *)           NFPM_ARCH=amd64 ;;
-          esac
-          export VERSION SUFFIX NFPM_ARCH DIST_DIR=dist_nuitka
-
-          # Merge GUI dist into CLI dist so we have a single unified distribution directory
-          # This prevents nfpm from throwing "content collision" errors
-          cp -a dist_nuitka/sessionprep-gui.dist/. dist_nuitka/sessionprep.dist/
-
-          TMPCONFIG=$(mktemp --suffix=.yaml)
-          envsubst < packaging/linux/nfpm.yaml > "$TMPCONFIG"
-          nfpm package --config "$TMPCONFIG" --packager deb --target dist_nuitka/
-          nfpm package --config "$TMPCONFIG" --packager rpm --target dist_nuitka/
-          rm "$TMPCONFIG"
-
-          STAGING=$(mktemp -d)
-          cp -r dist_nuitka/sessionprep.dist         "$STAGING/sessionprep.dist"
-          cp sessionprepgui/res/sessionprep.png      "$STAGING/sessionprep.png"
-          cp packaging/linux/sessionprep.desktop     "$STAGING/sessionprep.desktop"
-          cp packaging/linux/install-sessionprep.sh  "$STAGING/install-sessionprep.sh"
-          chmod +x "$STAGING/install-sessionprep.sh"
-          tar -czf "dist_nuitka/sessionprep-${VERSION}-${{ matrix.suffix }}.tar.gz" \
-            -C "$STAGING" \
-            sessionprep.dist \
-            sessionprep.png \
-            sessionprep.desktop install-sessionprep.sh
-
-      # -----------------------------------------------------------------------
-      # Windows packaging
-      # -----------------------------------------------------------------------
-      - name: Build InnoSetup Installer
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $ver = "${{ steps.version.outputs.ver }}"
-          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" `
-            "/DAPP_VERSION=$ver" `
-            "/DDIST_DIR=dist_nuitka" `
-            "/DARCH_SUFFIX=${{ matrix.suffix }}" `
-            "packaging\windows\sessionprep.iss"
-
-      # -----------------------------------------------------------------------
-      # macOS packaging
-      # -----------------------------------------------------------------------
-      - name: Package macOS .app bundles as DMG
-        if: runner.os == 'macOS'
-        run: |
-          brew install create-dmg
-          VERSION="${{ steps.version.outputs.ver }}"
-          for app in dist_nuitka/*.app; do
-            [ -d "$app" ] || continue
-            name=$(basename "$app" .app)
-            STAGING=$(mktemp -d)
-            cp -R "$app" "$STAGING/"
-            create-dmg \
-              --volname "$name" \
-              --app-drop-link 600 185 \
-              --sandbox-safe \
-              "dist_nuitka/sessionprep-${VERSION}-${{ matrix.suffix }}.dmg" \
-              "$STAGING"
-            rm -rf "$STAGING"
-          done
-          rm -f dist_nuitka/rw.*.dmg
-
-      # -----------------------------------------------------------------------
-      # Upload
-      # -----------------------------------------------------------------------
-      - name: Upload Artifacts
-        uses: actions/upload-artifact@v6
-        with:
-          name: sessionprep-${{ matrix.suffix }}
-          path: |
-            dist_nuitka/sessionprep-*.*
-            dist_nuitka/sessionprep_*.*
-            !dist_nuitka/sessionprep-*.build
-            !dist_nuitka/sessionprep-*.build/**
-            !dist_nuitka/sessionprep-*.dist
-            !dist_nuitka/sessionprep-*.dist/**
-          if-no-files-found: error
+    - name: Checkout exact build commit
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ github.sha }}
+        fetch-depth: 0
+        path: ${{ env.SOURCE_DIR }}
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      with:
+        python-version: '3.13'
+    - name: Set up uv
+      uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990
+      with:
+        enable-cache: true
+    - name: Download artifacts from this run
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        pattern: sessionprep-*-release
+        path: ${{ env.SOURCE_DIR }}/downloaded-artifacts
+    - name: Validate all release deliverables
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "$SOURCE_DIR"
+        uv sync --frozen --no-default-groups
+        uv run --frozen --no-default-groups python packaging/github/build.py collect --artifact-root downloaded-artifacts --version "$BUILD_VERSION" --sha "$SOURCE_SHA" --output release-assets
+      env:
+        UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/sessionprep-env-${{ github.run_id }}-${{ github.run_attempt }}-release
+    - name: Replace only owned unpublished draft
+      shell: bash
+      env:
+        GH_TOKEN: ${{ secrets.SESSIONPREP_RELEASE_TOKEN || github.token }}
+      run: |
+        set -euo pipefail
+        cd "$SOURCE_DIR"
+        mode=branch
+        title="SessionPrep preview: $REF_NAME"
+        if [[ "$REF_TYPE" == "tag" ]]; then mode=tag; title="SessionPrep $REF_NAME"; fi
+        bash packaging/github/publish-draft-release.sh --artifact-root release-assets --staging-dir staged-release --mode "$mode" --ref-name "$REF_NAME" --target "$SOURCE_SHA" --repo "$GITHUB_REPOSITORY" --release-title "$title" --producer-run-id "$GITHUB_RUN_ID"
+    - name: Clean only run-owned workspace
+      if: ${{ always() }}
+      shell: bash
+      run: |
+        "${CI_PYTHON:-python}" - <<'PY'
+        import json, os, pathlib, shutil, stat
+        workspace = pathlib.Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+        temporary = pathlib.Path(os.environ["RUNNER_TEMP"]).resolve()
+        run = os.environ["GITHUB_RUN_ID"] + "-" + os.environ["GITHUB_RUN_ATTEMPT"]
+        def remove_readonly(function, path, error):
+            if not isinstance(error, PermissionError):
+                raise error
+            os.chmod(path, stat.S_IWRITE)
+            function(path)
+        for name in json.loads(os.environ["CLEANUP_NAMES"]):
+            for parent, child in ((workspace, "src-" + run + "-" + name), (temporary, "sessionprep-env-" + run + "-" + name)):
+                target = (parent / child).resolve()
+                if target.parent != parent:
+                    raise RuntimeError("Cleanup target escaped the run workspace")
+                if target.exists():
+                    shutil.rmtree(target, onexc=remove_readonly)
+        PY
+      env:
+        CLEANUP_NAMES: '["release"]'

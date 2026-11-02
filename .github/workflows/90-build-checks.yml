@@ -1,0 +1,96 @@
+name: 90 Helper - Build checks
+'on':
+  workflow_call:
+    outputs:
+      version:
+        description: version
+        value: ${{ jobs.checks.outputs.version }}
+      sha:
+        description: sha
+        value: ${{ jobs.checks.outputs.sha }}
+    inputs:
+      publish_drafts:
+        required: false
+        default: false
+        type: boolean
+    secrets:
+      SESSIONPREP_RELEASE_TOKEN:
+        required: false
+permissions:
+  contents: read
+jobs:
+  checks:
+    runs-on:
+    - self-hosted
+    - Linux
+    - X64
+    - jammy
+    - docker
+    concurrency:
+      group: sessionprep-x64-host
+      cancel-in-progress: false
+      queue: max
+    env:
+      SOURCE_DIR: src-${{ github.run_id }}-${{ github.run_attempt }}-checks
+      REF_TYPE: ${{ github.ref_type }}
+      REF_NAME: ${{ github.ref_name }}
+      SOURCE_SHA: ${{ github.sha }}
+      QT_QPA_PLATFORM: offscreen
+    outputs:
+      version: ${{ steps.metadata.outputs.version }}
+      sha: ${{ steps.metadata.outputs.sha }}
+    steps:
+    - name: Checkout exact build commit
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ github.sha }}
+        fetch-depth: 0
+        path: ${{ env.SOURCE_DIR }}
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      with:
+        python-version: '3.13'
+    - name: Set up uv
+      uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990
+      with:
+        enable-cache: true
+    - name: Validate version and build tooling
+      id: metadata
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "$SOURCE_DIR"
+        for tool in gh unzip; do command -v "$tool" >/dev/null || { echo "Missing runner prerequisite: $tool" >&2; exit 1; }; done
+        uv sync --frozen --extra cli --extra gui
+        flags=()
+        if [[ "$RELEASE_DRAFTS" == "true" ]]; then flags+=(--release-drafts); fi
+        if [[ "$HAS_RELEASE_TOKEN" == "true" ]]; then flags+=(--release-token-available); fi
+        uv run --frozen python packaging/github/build.py metadata --ref-type "$REF_TYPE" --ref-name "$REF_NAME" --sha "$SOURCE_SHA" --github-output "$GITHUB_OUTPUT" "${flags[@]}"
+        uv run --frozen pytest tests/unit
+      env:
+        UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/sessionprep-env-${{ github.run_id }}-${{ github.run_attempt }}-checks
+        RELEASE_DRAFTS: ${{ inputs.publish_drafts }}
+        HAS_RELEASE_TOKEN: ${{ secrets.SESSIONPREP_RELEASE_TOKEN != '' }}
+    - name: Clean only run-owned workspace
+      if: ${{ always() }}
+      shell: bash
+      run: |
+        "${CI_PYTHON:-python}" - <<'PY'
+        import json, os, pathlib, shutil, stat
+        workspace = pathlib.Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+        temporary = pathlib.Path(os.environ["RUNNER_TEMP"]).resolve()
+        run = os.environ["GITHUB_RUN_ID"] + "-" + os.environ["GITHUB_RUN_ATTEMPT"]
+        def remove_readonly(function, path, error):
+            if not isinstance(error, PermissionError):
+                raise error
+            os.chmod(path, stat.S_IWRITE)
+            function(path)
+        for name in json.loads(os.environ["CLEANUP_NAMES"]):
+            for parent, child in ((workspace, "src-" + run + "-" + name), (temporary, "sessionprep-env-" + run + "-" + name)):
+                target = (parent / child).resolve()
+                if target.parent != parent:
+                    raise RuntimeError("Cleanup target escaped the run workspace")
+                if target.exists():
+                    shutil.rmtree(target, onexc=remove_readonly)
+        PY
+      env:
+        CLEANUP_NAMES: '["checks"]'

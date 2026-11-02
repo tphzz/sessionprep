@@ -1,0 +1,9 @@
+self-hosted-runner:
+  labels: [jammy, docker]
+# GitHub supports queue:max; current actionlint does not parse this new property.
+# tests/unit/test_build_workflows.py checks the queue/cancellation contract.
+# https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency
+paths:
+  .github/workflows/**/*.{yml,yaml}:
+    ignore:
+      - 'unexpected key "queue" for "concurrency" section'

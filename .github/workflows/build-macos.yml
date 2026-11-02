@@ -1,0 +1,44 @@
+name: 12 Build - macOS
+run-name: ${{ github.workflow }} | ${{ github.ref_name }} | ${{ inputs.debug && 'Debug' || 'Release' }}
+'on':
+  workflow_dispatch:
+    inputs:
+      debug:
+        description: Debug diagnostics (artifacts only)
+        required: false
+        default: false
+        type: boolean
+      notarize_macos:
+        description: Notarize macOS (optional for every ref/configuration)
+        required: false
+        default: false
+        type: boolean
+      architecture:
+        description: macOS architecture
+        type: choice
+        default: both
+        options:
+        - both
+        - arm64
+        - x64
+permissions:
+  contents: read
+concurrency:
+  group: sessionprep-macos-${{ github.ref }}
+  cancel-in-progress: false
+  queue: max
+jobs:
+  checks:
+    uses: ./.github/workflows/90-build-checks.yml
+  macos:
+    needs:
+    - checks
+    uses: ./.github/workflows/92-build-macos.yml
+    with:
+      version: ${{ needs.checks.outputs.version }}
+      sha: ${{ needs.checks.outputs.sha }}
+      debug: ${{ inputs.debug }}
+      notarize_macos: ${{ inputs.notarize_macos }}
+      architecture: ${{ inputs.architecture }}
+    secrets:
+      MACOS_DEV_ID_CERT_NAME: ${{ secrets.MACOS_DEV_ID_CERT_NAME }}

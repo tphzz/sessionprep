@@ -1,0 +1,158 @@
+name: 92 Helper - macOS architectures
+'on':
+  workflow_call:
+    inputs:
+      version:
+        required: true
+        type: string
+      sha:
+        required: true
+        type: string
+      debug:
+        required: true
+        type: boolean
+      notarize_macos:
+        required: true
+        type: boolean
+      architecture:
+        required: false
+        type: string
+        default: both
+    secrets:
+      MACOS_DEV_ID_CERT_NAME:
+        required: false
+permissions:
+  contents: read
+jobs:
+  macos:
+    runs-on:
+    - self-hosted
+    - macOS
+    - ARM64
+    concurrency:
+      group: sessionprep-apple-silicon-host
+      cancel-in-progress: false
+      queue: max
+    timeout-minutes: 360
+    env:
+      SOURCE_DIR: src-${{ github.run_id }}-${{ github.run_attempt }}-macos
+      BUILD_VERSION: ${{ inputs.version }}
+      SOURCE_SHA: ${{ inputs.sha }}
+      DEBUG_BUILD: ${{ inputs.debug }}
+      NOTARIZE_MACOS: ${{ inputs.notarize_macos }}
+      DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
+    steps:
+    - name: Checkout exact build commit
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ github.sha }}
+        fetch-depth: 0
+        path: ${{ env.SOURCE_DIR }}
+    - name: Set up ARM64 Python
+      id: arm-python
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      with:
+        python-version: '3.13'
+        architecture: arm64
+    - name: Set up uv
+      uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990
+      with:
+        enable-cache: true
+    - name: Verify Xcode, Rosetta and persistent signing
+      shell: bash
+      env:
+        MACOS_DEV_ID_CERT_NAME: ${{ secrets.MACOS_DEV_ID_CERT_NAME }}
+        SELECTED_ARCH: ${{ inputs.architecture }}
+      run: |
+        set -euo pipefail
+        case "$SELECTED_ARCH" in both|arm64|x64) ;; *) echo 'Invalid macOS architecture selection' >&2; exit 2;; esac
+        xcodebuild -version
+        if [[ "$SELECTED_ARCH" != "arm64" ]]; then /usr/bin/arch -x86_64 /usr/bin/true; fi
+        cd "$SOURCE_DIR"
+        python packaging/macos/ci_signing.py prepare
+    - name: Build and package macOS arm64
+      if: ${{ inputs.architecture != 'x64' }}
+      shell: bash
+      env:
+        SOURCE_DIR: ${{ env.SOURCE_DIR }}
+        UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/sessionprep-env-${{ github.run_id }}-${{ github.run_attempt }}-macos-arm64
+        BUILD_PLATFORM: macos-arm64
+        PYTHON_INSTALL: ${{ steps.arm-python.outputs.python-path }}
+      run: |
+        set -euo pipefail
+        cd "$SOURCE_DIR"
+        python_path="${CI_PYTHON:-$PYTHON_INSTALL}"
+        uv sync --frozen --extra cli --extra gui --python "$python_path"
+        build_args=(--platform "$BUILD_PLATFORM" --version "$BUILD_VERSION" --sha "$SOURCE_SHA")
+        if [[ "$DEBUG_BUILD" == "true" ]]; then build_args+=(--debug); fi
+        uv run --frozen python packaging/github/build.py compile "${build_args[@]}"
+        uv run --frozen python packaging/github/build.py package "${build_args[@]}" --output artifacts
+    - name: Upload platform artifacts
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: sessionprep-macos-arm64-${{ inputs.debug && 'debug' || 'release' }}
+        path: ${{ env.SOURCE_DIR }}/artifacts
+        if-no-files-found: error
+      if: ${{ inputs.architecture != 'x64' }}
+    - name: Checkout exact build commit
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ github.sha }}
+        fetch-depth: 0
+        path: ${{ env.SOURCE_DIR }}-x64
+      if: ${{ inputs.architecture != 'arm64' }}
+    - name: Set up Intel Python under Rosetta
+      id: intel-python
+      if: ${{ inputs.architecture != 'arm64' }}
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      with:
+        python-version: '3.13'
+        architecture: x64
+    - name: Build and package macOS x64
+      if: ${{ inputs.architecture != 'arm64' }}
+      shell: bash
+      env:
+        SOURCE_DIR: ${{ env.SOURCE_DIR }}-x64
+        UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/sessionprep-env-${{ github.run_id }}-${{ github.run_attempt }}-macos-x64
+        BUILD_PLATFORM: macos-x64
+        PYTHON_INSTALL: ${{ steps.intel-python.outputs.python-path }}
+      run: |
+        set -euo pipefail
+        cd "$SOURCE_DIR"
+        python_path="${CI_PYTHON:-$PYTHON_INSTALL}"
+        uv sync --frozen --extra cli --extra gui --python "$python_path"
+        build_args=(--platform "$BUILD_PLATFORM" --version "$BUILD_VERSION" --sha "$SOURCE_SHA")
+        if [[ "$DEBUG_BUILD" == "true" ]]; then build_args+=(--debug); fi
+        uv run --frozen python packaging/github/build.py compile "${build_args[@]}"
+        uv run --frozen python packaging/github/build.py package "${build_args[@]}" --output artifacts
+    - name: Upload platform artifacts
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: sessionprep-macos-x64-${{ inputs.debug && 'debug' || 'release' }}
+        path: ${{ env.SOURCE_DIR }}-x64/artifacts
+        if-no-files-found: error
+      if: ${{ inputs.architecture != 'arm64' }}
+    - name: Clean only run-owned workspace
+      if: ${{ always() }}
+      shell: bash
+      run: |
+        "${CI_PYTHON:-python}" - <<'PY'
+        import json, os, pathlib, shutil, stat
+        workspace = pathlib.Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+        temporary = pathlib.Path(os.environ["RUNNER_TEMP"]).resolve()
+        run = os.environ["GITHUB_RUN_ID"] + "-" + os.environ["GITHUB_RUN_ATTEMPT"]
+        def remove_readonly(function, path, error):
+            if not isinstance(error, PermissionError):
+                raise error
+            os.chmod(path, stat.S_IWRITE)
+            function(path)
+        for name in json.loads(os.environ["CLEANUP_NAMES"]):
+            for parent, child in ((workspace, "src-" + run + "-" + name), (temporary, "sessionprep-env-" + run + "-" + name)):
+                target = (parent / child).resolve()
+                if target.parent != parent:
+                    raise RuntimeError("Cleanup target escaped the run workspace")
+                if target.exists():
+                    shutil.rmtree(target, onexc=remove_readonly)
+        PY
+      env:
+        CLEANUP_NAMES: '["macos", "macos-x64", "macos-arm64"]'
