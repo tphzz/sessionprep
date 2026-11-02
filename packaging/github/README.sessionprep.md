@@ -62,6 +62,11 @@ branches retain their base plus a development suffix. Other branches use the
 nearest reachable valid version tag, commit distance and SHA; synthetic preview
 tags are ignored. Without a version ancestor, the development base is `0.0.0`.
 
+Package setup validates GitHub's built-in ref/SHA variables against the source
+checkout, so the first frozen `uv sync` works with detached HEAD and no generated
+version file. CI branch and tag versions use the same resolver as the explicit
+metadata command. Invalid CI identity fails before stale metadata can be reused.
+
 Artifacts are named `sessionprep-<platform>-release` or `-debug`, where platform is
 `linux-x64`, `linux-arm64`, `win-x64`, `win-arm64`, `macos-arm64`, or `macos-x64`.
 All Platforms adds `sessionprep-win-universal-<configuration>`.

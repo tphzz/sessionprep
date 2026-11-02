@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.metadata
 import importlib.util
+import os
 import re
 import subprocess
 import sys
@@ -167,6 +168,22 @@ def resolve_ref_version(ref_type: str, ref_name: str, commit: str) -> str:
 
 def _git_version(*, strict: bool) -> str | None:
     root = _repo_root()
+    if os.environ.get("GITHUB_ACTIONS") == "true" and (root / ".git").exists():
+        # checkout pins a commit, so branch --show-current is empty in CI.
+        # Validate the checkout before using the event ref during package setup.
+        commit = _git(["rev-parse", "HEAD"], cwd=root)
+        expected = os.environ.get("GITHUB_SHA", "")
+        if (not re.fullmatch(r"[0-9a-fA-F]{40}", expected)
+                or commit is None or commit.lower() != expected.lower()):
+            raise VersionResolutionError("GitHub Actions SHA does not match the source checkout")
+        ref_type = os.environ.get("GITHUB_REF_TYPE", "")
+        ref_name = os.environ.get("GITHUB_REF_NAME", "")
+        if ref_type == "tag":
+            tagged = _git(["rev-parse", "--verify", f"refs/tags/{ref_name}^{{commit}}"], cwd=root)
+            if tagged != commit:
+                raise VersionResolutionError("GitHub Actions tag does not match the source checkout")
+        # Invalid CI identity must not silently reuse stale generated/installed metadata.
+        return resolve_ref_version(ref_type, ref_name, commit)
     invalid_exact_tag_error: VersionResolutionError | None = None
 
     tag = _git(["describe", "--tags", "--exact-match", "HEAD"], cwd=root)

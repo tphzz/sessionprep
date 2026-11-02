@@ -274,13 +274,19 @@ After installation, the CLI is available as `sessionprep`.
 The version number is derived from Git; do not edit a hard-coded version in
 the codebase.
 
-- If `HEAD` is exactly on a tag, the version is the tag name normalized as a
+- In GitHub Actions source checkouts, the resolver uses the built-in
+  `GITHUB_REF_TYPE` and `GITHUB_REF_NAME` after matching the full `GITHUB_SHA`
+  against the checkout. A tag must also resolve locally to that commit.
+  This works during the first isolated package installation in a detached
+  checkout, before the build-metadata command has run. Invalid CI identity
+  fails rather than reusing stale generated or installed metadata.
+- For local source checkouts, a valid exact tag supplies the normalized
   PEP 440 version.
-- Otherwise, the current branch name is treated as the base version and the
-  short commit hash is appended as a dev build, for example
-  `0.3.5.dev0+gb2f7cf6`.
-- Release branches and tags should therefore use version-like names such as
-  `0.3.5`.
+- Version-named branches retain their base and append a development suffix,
+  for example `0.3.5.dev0+gb2f7cf6`. Other branches use the nearest reachable
+  valid version tag, commit distance and hash, or base `0.0.0` without an ancestor.
+- Source archives can use generated metadata. Compiled/frozen apps use generated
+  or installed metadata and never invoke Git, including in a CI environment.
 
 Everything else reads from this computed source:
 

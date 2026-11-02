@@ -9,6 +9,12 @@ from build_conf import BUILD_VERSION_MODULE, TARGETS
 from sessionpreplib import _version
 
 
+@pytest.fixture(autouse=True)
+def _isolate_github_context(monkeypatch):
+    # Individual tests model their own checkout, independently of the CI host.
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+
+
 def _no_build_version(monkeypatch):
     monkeypatch.setattr(_version, "_build_version", lambda: None)
 
@@ -311,3 +317,107 @@ def test_preview_considers_more_than_ten_version_tags(monkeypatch):
         return "2"
     monkeypatch.setattr(_version, "_git", git)
     assert _version.resolve_ref_version("branch", "main", "a" * 40) == "0.3.19.dev2+gaaaaaaa"
+
+
+@pytest.mark.parametrize("exact_tag", [None, "v0.3.4"])
+def test_github_branch_metadata_resolves_detached_checkout(monkeypatch, exact_tag):
+    _no_build_version(monkeypatch)
+    _no_metadata(monkeypatch)
+    sha = "a" * 40
+    for key, value in {"GITHUB_ACTIONS": "true", "GITHUB_REF_TYPE": "branch",
+                       "GITHUB_REF_NAME": "0.3.5", "GITHUB_SHA": sha}.items():
+        monkeypatch.setenv(key, value)
+    responses = {("branch", "--show-current"): "", ("rev-parse", "HEAD"): sha,
+                 ("rev-parse", "--short=7", "HEAD"): sha[:7]}
+    if exact_tag:
+        responses[("describe", "--tags", "--exact-match", "HEAD")] = exact_tag
+    monkeypatch.setattr(_version.subprocess, "run", _git_runner(responses))
+    assert _version.get_version(strict=True) == "0.3.5.dev0+gaaaaaaa"
+
+
+def test_github_tag_metadata_requires_matching_local_tag(monkeypatch):
+    _no_build_version(monkeypatch)
+    _no_metadata(monkeypatch)
+    sha = "a" * 40
+    for key, value in {"GITHUB_ACTIONS": "true", "GITHUB_REF_TYPE": "tag",
+                       "GITHUB_REF_NAME": "v0.3.5", "GITHUB_SHA": sha}.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(_version.subprocess, "run", _git_runner({
+        ("rev-parse", "HEAD"): sha,
+        ("rev-parse", "--verify", "refs/tags/v0.3.5^{commit}"): sha,
+    }))
+    assert _version.get_version(strict=True) == "0.3.5"
+
+
+@pytest.mark.parametrize("field,value", [
+    ("GITHUB_SHA", "b" * 40), ("GITHUB_SHA", "a" * 7),
+    ("GITHUB_SHA", ""), ("GITHUB_REF_TYPE", ""),
+    ("GITHUB_REF_TYPE", "invalid"), ("GITHUB_REF_NAME", ""),
+])
+def test_invalid_github_context_cannot_fall_back_to_stale_metadata(monkeypatch, field, value):
+    for key, item in {"GITHUB_ACTIONS": "true", "GITHUB_REF_TYPE": "branch",
+                      "GITHUB_REF_NAME": "0.3.5", "GITHUB_SHA": "a" * 40}.items():
+        monkeypatch.setenv(key, item)
+    monkeypatch.setenv(field, value)
+    monkeypatch.setattr(_version.subprocess, "run", _git_runner({("rev-parse", "HEAD"): "a" * 40}))
+    monkeypatch.setattr(_version, "_build_version", lambda: "0.3.3")
+    monkeypatch.setattr(_version, "_metadata_version", lambda: "0.3.2")
+    with pytest.raises(_version.VersionResolutionError):
+        _version.get_version(strict=True)
+
+
+@pytest.mark.parametrize("tag_commit", [None, "b" * 40])
+def test_github_tag_rejects_missing_or_moved_tag(monkeypatch, tag_commit):
+    for key, value in {"GITHUB_ACTIONS": "true", "GITHUB_REF_TYPE": "tag",
+                       "GITHUB_REF_NAME": "v0.3.5", "GITHUB_SHA": "a" * 40}.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(_version.subprocess, "run", _git_runner({
+        ("rev-parse", "HEAD"): "a" * 40,
+        ("rev-parse", "--verify", "refs/tags/v0.3.5^{commit}"): tag_commit,
+    }))
+    monkeypatch.setattr(_version, "_metadata_version", lambda: "0.3.2")
+    with pytest.raises(_version.VersionResolutionError):
+        _version.get_version(strict=True)
+
+
+
+def test_source_archive_in_actions_keeps_generated_version_fallback(monkeypatch, tmp_path):
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("GITHUB_SHA", "stale")
+    monkeypatch.setattr(_version, "_repo_root", lambda: tmp_path)
+    monkeypatch.setattr(_version.subprocess, "run", _git_runner({}))
+    monkeypatch.setattr(_version, "_build_version", lambda: "0.3.5")
+    _no_metadata(monkeypatch)
+    assert _version.get_version(strict=True) == "0.3.5"
+
+
+def test_compiled_runtime_ignores_ci_context(monkeypatch):
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("GITHUB_SHA", "stale")
+    monkeypatch.setattr(_version.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(_version, "_build_version", lambda: "0.3.5")
+    monkeypatch.setattr(_version, "_git_version", lambda **kwargs: pytest.fail("Compiled runtime invoked Git"))
+    assert _version.get_version(strict=True) == "0.3.5"
+
+
+def test_github_variables_do_not_override_local_source_version(monkeypatch):
+    monkeypatch.setenv("GITHUB_ACTIONS", "false")
+    monkeypatch.setenv("GITHUB_REF_NAME", "0.1.0")
+    monkeypatch.setenv("GITHUB_SHA", "stale")
+    _no_build_version(monkeypatch)
+    _no_metadata(monkeypatch)
+    monkeypatch.setattr(_version.subprocess, "run", _git_runner({
+        ("branch", "--show-current"): "0.3.5",
+        ("rev-parse", "--short=7", "HEAD"): "b2f7cf6",
+    }))
+    assert _version.get_version(strict=True) == "0.3.5.dev0+gb2f7cf6"
+
+
+def test_github_source_without_readable_git_rejects_stale_metadata(monkeypatch):
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("GITHUB_SHA", "a" * 40)
+    monkeypatch.setattr(_version.subprocess, "run", _git_runner({}))
+    monkeypatch.setattr(_version, "_build_version", lambda: "0.3.3")
+    monkeypatch.setattr(_version, "_metadata_version", lambda: "0.3.2")
+    with pytest.raises(_version.VersionResolutionError, match="SHA"):
+        _version.get_version(strict=True)
