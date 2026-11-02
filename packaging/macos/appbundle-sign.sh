@@ -36,6 +36,14 @@ usage() {
 # ==============================================================================
 APP_PATH=""
 CERT_NAME=""
+# An explicit branch keeps empty optional arguments safe on macOS Bash 3.2.
+sign_code() {
+    if [[ -n "${SIGNING_KEYCHAIN:-}" ]]; then
+        codesign --keychain "$SIGNING_KEYCHAIN" "$@"
+    else
+        codesign "$@"
+    fi
+}
 
 while getopts "a:c:h" opt; do
     case $opt in
@@ -180,7 +188,7 @@ reorganize_resources "$APP_PATH"
 # Step 2: Recursively sign all .dylib and .so files
 log_info "Finding and signing .dylib and .so files in $APP_PATH..."
 while IFS= read -r -d '' file; do
-    codesign --force --verify --timestamp --options runtime --sign "$CERT_NAME" "$file"
+    sign_code --force --verify --timestamp --options runtime --sign "$CERT_NAME" "$file"
 done < <(find "$APP_PATH" -type f \( -name "*.dylib" -o -name "*.so" \) -print0)
 log_success "All embedded libraries were successfully signed."
 
@@ -209,7 +217,7 @@ while IFS= read -r -d '' binary; do
     if [[ "$binary_name" == .* ]]; then continue; fi
 
     log_info "Signing extensionless binary: $binary_name"
-    codesign --force --verify --timestamp --options runtime --entitlements "$ENTITLEMENTS" --sign "$CERT_NAME" "$binary"
+    sign_code --force --verify --timestamp --options runtime --entitlements "$ENTITLEMENTS" --sign "$CERT_NAME" "$binary"
 
 done < <(find "$APP_PATH/Contents/MacOS" -type f ! -name "*.*" -print0)
 
@@ -224,18 +232,18 @@ log_success "All extensionless core binaries have been signed with entitlements.
 APP_EXEC_NAME=$(basename "$APP_PATH" .app)
 if [ -f "$APP_PATH/Contents/MacOS/$APP_EXEC_NAME" ]; then
     log_info "Signing main executable: Contents/MacOS/$APP_EXEC_NAME"
-    codesign --force --verify --timestamp --options runtime --sign "$CERT_NAME" "$APP_PATH/Contents/MacOS/$APP_EXEC_NAME"
+    sign_code --force --verify --timestamp --options runtime --sign "$CERT_NAME" "$APP_PATH/Contents/MacOS/$APP_EXEC_NAME"
 fi
 
 # Fallback: Specifically check for the GUI name from your crash log
 if [ -f "$APP_PATH/Contents/MacOS/sessionprep-gui-macos-arm64" ]; then
     log_info "Signing main executable: Contents/MacOS/sessionprep-gui-macos-arm64"
-    codesign --force --verify --timestamp --options runtime --sign "$CERT_NAME" "$APP_PATH/Contents/MacOS/sessionprep-gui-macos-arm64"
+    sign_code --force --verify --timestamp --options runtime --sign "$CERT_NAME" "$APP_PATH/Contents/MacOS/sessionprep-gui-macos-arm64"
 fi
 
 # Step 3: Sign the main app bundle
 log_info "Signing the main app bundle: $APP_PATH"
-codesign --force --verify --verbose --timestamp --options runtime --sign "$CERT_NAME" "$APP_PATH"
+sign_code --force --verify --verbose --timestamp --options runtime --sign "$CERT_NAME" "$APP_PATH"
 
 # Step 4: Final verification
 log_info "Performing final strict signature verification..."

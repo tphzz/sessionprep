@@ -96,7 +96,7 @@ def fetch_and_bundle_rps(dist_dir, target):
                         shutil.copyfileobj(source, target_file)
                     os.chmod(target_path, 0o755)
 
-def run_nuitka(target_key, clean=False):
+def run_nuitka(target_key, clean=False, *, debug=False, build_version=None):
     _check_dependencies(target_key)
     target = TARGETS[target_key]
     script_path = os.path.join(BASE_DIR, target["script"])
@@ -111,7 +111,7 @@ def run_nuitka(target_key, clean=False):
     print(f"\n[BUILD] Building target: {target_key.upper()}")
     print(f"        Script: {script_path}")
     print(f"        Output: {target['name']}")
-    version = write_build_version_file()
+    version = write_build_version_file(build_version)
     print(f"        Version: {version}")
 
     # Base Nuitka command
@@ -125,13 +125,16 @@ def run_nuitka(target_key, clean=False):
         "--lto=no",
     ]
 
+    if debug:
+        cmd.extend(["--unstripped", f"--report={os.path.join(dist_dir, target_key + '-report.xml')}"])
+
     # Windows and Linux use directory mode (standalone) for faster startup.
     # macOS GUI uses .app bundle (configured below). macOS CLI is not built.
 
     # Platform specific flags
     if not target["console"]:
         if sys.platform == "win32":
-            cmd.append("--windows-disable-console")
+            cmd.append("--windows-console-mode=" + ("attach" if debug else "disable"))
             icon_path = target.get("icon")
             if icon_path and os.path.isfile(icon_path):
                 cmd.append(f"--windows-icon-from-ico={icon_path}")
@@ -202,6 +205,8 @@ def main():
     parser = argparse.ArgumentParser(description="Build SessionPrep with Nuitka")
     parser.add_argument("target", choices=["cli", "gui", "all"], default="all", nargs="?")
     parser.add_argument("--clean", action="store_true", help="Clean cache before building")
+    parser.add_argument("--debug", action="store_true", help="Keep symbols and attach GUI console diagnostics")
+    parser.add_argument("--build-version", help="Validated version resolved for this CI commit")
     args = parser.parse_args()
 
     # Ensure dist folder exists
@@ -218,7 +223,7 @@ def main():
 
     for t in targets_to_build:
         try:
-            run_nuitka(t, clean=args.clean)
+            run_nuitka(t, clean=args.clean, debug=args.debug, build_version=args.build_version)
         except subprocess.CalledProcessError as e:
             print(f"\n[ERROR] Build failed for {t}")
             sys.exit(1)

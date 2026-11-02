@@ -24,8 +24,13 @@
 #define AppName         "SessionPrep"
 #define AppPublisher    "Benjamin Zeiss"
 #define AppPublisherURL "https://github.com/bzeiss/sessionprep"
-#define AppExe          "sessionprep-gui-" + ARCH_SUFFIX + ".exe"
-#define AppCli          "sessionprep-" + ARCH_SUFFIX + ".exe"
+#if ARCH_SUFFIX == "win-universal"
+  #define AppExe "{code:GetGuiExe}"
+  #define AppCli "{code:GetCliExe}"
+#else
+  #define AppExe "sessionprep-gui-" + ARCH_SUFFIX + ".exe"
+  #define AppCli "sessionprep-" + ARCH_SUFFIX + ".exe"
+#endif
 #define AppIconSrc      "..\..\sessionprepgui\res\sessionprep.ico"
 
 ; ---------------------------------------------------------------------------
@@ -63,8 +68,16 @@ ChangesEnvironment=yes
 ; lowest = per-user by default; the dialog lets the user switch to all-users (admin).
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
+#if ARCH_SUFFIX == "win-arm64"
+ArchitecturesAllowed=arm64
+ArchitecturesInstallIn64BitMode=arm64
+#elif ARCH_SUFFIX == "win-universal"
+ArchitecturesAllowed=x64compatible or arm64
+ArchitecturesInstallIn64BitMode=x64compatible or arm64
+#else
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
+#endif
 
 #if SESSIONPREP_SIGNED_BUILD
 SignTool=sessionprepSignTool
@@ -100,11 +113,15 @@ Name: "addtopath"; \
 ; ---------------------------------------------------------------------------
 
 [Files]
-; GUI standalone directory
+#if ARCH_SUFFIX == "win-universal"
+Source: "..\..\{#DIST_DIR}\x64\sessionprep-gui.dist\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs; Check: not IsArm64
+Source: "..\..\{#DIST_DIR}\x64\sessionprep.dist\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs; Check: not IsArm64
+Source: "..\..\{#DIST_DIR}\arm64\sessionprep-gui.dist\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs; Check: IsArm64
+Source: "..\..\{#DIST_DIR}\arm64\sessionprep.dist\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs; Check: IsArm64
+#else
 Source: "..\..\{#DIST_DIR}\sessionprep-gui.dist\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs
-
-; CLI standalone directory
 Source: "..\..\{#DIST_DIR}\sessionprep.dist\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs
+#endif
 
 ; Icon, used by the uninstaller entry and shortcuts.
 Source: "{#AppIconSrc}"; \
@@ -127,6 +144,20 @@ Name: "{group}\{#AppName}"; \
 ; ---------------------------------------------------------------------------
 
 [Code]
+
+#if ARCH_SUFFIX == "win-universal"
+function GetGuiExe(Param: String): String;
+begin
+  if IsArm64 then Result := 'sessionprep-gui-win-arm64.exe'
+  else Result := 'sessionprep-gui-win-x64.exe';
+end;
+
+function GetCliExe(Param: String): String;
+begin
+  if IsArm64 then Result := 'sessionprep-win-arm64.exe'
+  else Result := 'sessionprep-win-x64.exe';
+end;
+#endif
 
 const
   { Registry sub-keys for the two PATH locations. }

@@ -88,7 +88,7 @@ def _git(args: list[str], *, cwd: Path) -> str | None:
     except (OSError, subprocess.CalledProcessError):
         return None
     value = result.stdout.strip()
-    return value or None
+    return value
 
 
 def _build_version() -> str | None:
@@ -121,6 +121,50 @@ def _build_version_from_file() -> str | None:
     return BUILD_VERSION
 
 
+def resolve_ref_version(ref_type: str, ref_name: str, commit: str) -> str:
+    """Resolve an explicit build ref, including a detached CI checkout.
+
+    Version branches retain their declared base. Other branches use their
+    nearest reachable version tag; synthetic preview tags are never bases.
+    """
+    if not re.fullmatch(r"[0-9a-fA-F]{7,40}", commit):
+        raise VersionResolutionError("Build commit must be a Git commit hash")
+    if ref_type == "tag":
+        return _normalize_version(ref_name, source="git tag")
+    if ref_type != "branch" or not ref_name.strip():
+        raise VersionResolutionError("Build ref must be a named branch or version tag")
+    distance = "0"
+    try:
+        base = _normalize_version(ref_name, source="git branch")
+    except VersionResolutionError:
+        root = _repo_root()
+        versions = {}
+        reachable = _git(["tag", "--merged", commit], cwd=root)
+        if reachable is None:
+            raise VersionResolutionError("Could not inspect reachable version tags")
+        for tag in reachable.splitlines():
+            try:
+                versions[tag] = _normalize_version(tag, source="ancestor tag")
+            except VersionResolutionError:
+                continue
+        base = "0.0.0"
+        if versions:
+            args = ["describe", "--tags", "--abbrev=0", f"--candidates={len(versions)}"]
+            for tag in versions:
+                args.extend(["--match", tag])
+            nearest = _git([*args, commit], cwd=root)
+            if nearest not in versions:
+                raise VersionResolutionError("Could not resolve the nearest version tag")
+            base = versions[nearest]
+            distance = _git(["rev-list", "--count", f"{nearest}..{commit}"], cwd=root)
+            if distance is None or not distance.isdigit():
+                raise VersionResolutionError("Could not count commits since the version tag")
+    # Do not stack a second dev/local suffix on an already-development base.
+    base = base.split("+", 1)[0].split(".dev", 1)[0]
+    return _normalize_version(
+        f"{base}.dev{distance}+g{commit[:7].lower()}", source="git branch and commit")
+
+
 def _git_version(*, strict: bool) -> str | None:
     root = _repo_root()
     invalid_exact_tag_error: VersionResolutionError | None = None
@@ -135,11 +179,12 @@ def _git_version(*, strict: bool) -> str | None:
     branch = _git(["branch", "--show-current"], cwd=root)
     commit = _git(["rev-parse", "--short=7", "HEAD"], cwd=root)
     if branch and commit:
-        base = _normalize_version(branch, source="git branch")
-        return _normalize_version(
-            f"{base}.dev0+g{commit}",
-            source="git branch and commit",
-        )
+        try:
+            return resolve_ref_version("branch", branch, commit)
+        except VersionResolutionError:
+            if strict:
+                raise
+            return None
 
     if invalid_exact_tag_error is not None and strict:
         raise invalid_exact_tag_error

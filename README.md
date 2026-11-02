@@ -129,6 +129,12 @@ Download from the releases page:
 | `sessionprep-gui` | GUI application (interactive analysis + waveform + playback) |
 | `sessionprep`     | Command-line tool (scripting, batch workflows, CI)           |
 
+The All Platforms workflow produces one Windows installer that selects native
+x64 or ARM64 files, separate macOS ARM64/Intel DMGs, and Linux packages for both
+architectures. Individual build runs retain their own platform artifacts. Builds
+are manually triggered; release and preview drafts remain unpublished until
+reviewed. See [build and release details](packaging/github/README.sessionprep.md).
+
 ### From source
 
 If you prefer to run the Python scripts directly:

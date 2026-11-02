@@ -45,7 +45,7 @@ virtual environments, and Python version management. All configuration lives in
 
 ### 1.1 Prerequisites
 
-- **Python >= 3.12** (uv can install this for you)
+- **Python 3.13** (uv can install this for you)
 - **uv** — install via:
   ```
   # Windows (PowerShell)
@@ -175,6 +175,34 @@ $env:SP_LOG_LEVEL = "DEBUG"; uv run python sessionprep-gui.py
 
 SessionPrep uses **Nuitka** for creating standalone executables.
 The build metadata is centralized in `build_conf.py`.
+
+### Manual self-hosted CI
+
+Nuitka is the only supported executable builder. The Actions page offers
+`00 Full - All Platforms`, individual Windows/Linux architecture workflows, and
+macOS with an architecture selector. Every build is manually triggered.
+All Platforms alone creates unpublished tag-release or per-branch preview drafts;
+Debug builds and individual platforms attach artifacts only to their run.
+Notarization is an optional checkbox, default off even for tags.
+
+See [the build workflow guide](packaging/github/README.sessionprep.md) for the
+hardware dependency lanes, runner prerequisites, adaptive Windows installer,
+persistent macOS signing, artifact validation and conditional release credentials.
+
+`uv run python build_nuitka.py all --debug` retains native symbols and build
+reports and attaches Windows GUI console diagnostics. It does not enable Nuitka's
+compiler-internal self-check mode. `--build-version` supplies the validated common
+CI version to both targets; normal local builds retain automatic Git resolution.
+The central version helper supports arbitrary branch names using the nearest
+reachable version tag and commit identity, ignoring technical preview tags.
+
+The dev-only PyYAML dependency supports semantic workflow tests. Run the unit
+suite with `uv run pytest tests/unit`. `actionlint` uses `.github/actionlint.yaml`
+for existing custom runner labels; its narrow queue-property exception covers
+GitHub's newer `queue: max`, which is independently checked by workflow tests.
+Native installer fixture tests compile all three Inno variants when Inno Setup
+is available; they never install or execute their payloads. Live runner, signing,
+notarization and installation/upgrade validation require manually initiated runs.
 
 ### 2.1 Centralized Metadata (`build_conf.py`)
 

@@ -180,7 +180,7 @@ def test_invalid_exact_git_tag_falls_back_to_branch(monkeypatch):
     assert _version.get_version(strict=True) == "0.3.5.dev0+gb2f7cf6"
 
 
-def test_invalid_branch_base_fails(monkeypatch):
+def test_arbitrary_branch_without_tags_has_development_version(monkeypatch):
     _no_build_version(monkeypatch)
     _no_metadata(monkeypatch)
     monkeypatch.setattr(
@@ -189,11 +189,11 @@ def test_invalid_branch_base_fails(monkeypatch):
         _git_runner({
             ("branch", "--show-current"): "feature/foo",
             ("rev-parse", "--short=7", "HEAD"): "b2f7cf6",
+            ("tag", "--merged", "b2f7cf6"): "",
         }),
     )
 
-    with pytest.raises(_version.VersionResolutionError):
-        _version.get_version(strict=True)
+    assert _version.get_version(strict=True) == "0.0.0.dev0+gb2f7cf6"
 
 
 def test_version_normalization_without_packaging(monkeypatch):
@@ -258,3 +258,56 @@ def test_installed_metadata_is_runtime_fallback(monkeypatch):
     monkeypatch.setattr(_version, "_metadata_version", lambda: "0.3.4")
 
     assert _version.get_version(strict=False) == "0.3.4"
+
+
+@pytest.mark.parametrize("ref_type", ["tag", "branch"])
+def test_explicit_dispatch_ref_ignores_checkout_branch(monkeypatch, ref_type):
+    monkeypatch.setattr(_version, "_git", lambda args, **kwargs: None)
+    version = _version.resolve_ref_version(ref_type, "v0.3.5", "a" * 40)
+    assert version == ("0.3.5" if ref_type == "tag" else "0.3.5.dev0+gaaaaaaa")
+
+
+def test_preview_uses_nearest_valid_tag_and_ignores_synthetic_tags(monkeypatch):
+    calls = []
+    def git(args, **kwargs):
+        calls.append(args)
+        if args[0] == "tag":
+            return "v0.3.4\nbranch-build-main\nv0.3.3"
+        if args[0] == "describe":
+            assert "branch-build-main" not in args
+            return "v0.3.4"
+        if args[0] == "rev-list":
+            return "12"
+        return None
+    monkeypatch.setattr(_version, "_git", git)
+    assert _version.resolve_ref_version("branch", "feature/audio", "b" * 40) == "0.3.4.dev12+gbbbbbbb"
+    assert any(args[0] == "rev-list" for args in calls)
+
+
+def test_dispatch_rejects_non_version_tag_and_invalid_commit():
+    with pytest.raises(_version.VersionResolutionError):
+        _version.resolve_ref_version("tag", "branch-build-main", "a" * 40)
+    with pytest.raises(_version.VersionResolutionError):
+        _version.resolve_ref_version("branch", "main", "not-a-commit")
+
+
+@pytest.mark.parametrize("reachable,raises", [("", False), (None, True)])
+def test_ref_resolution_distinguishes_no_tags_from_git_failure(monkeypatch, reachable, raises):
+    monkeypatch.setattr(_version, "_git", lambda args, **kwargs: reachable)
+    if raises:
+        with pytest.raises(_version.VersionResolutionError, match="reachable"):
+            _version.resolve_ref_version("branch", "main", "a" * 40)
+    else:
+        assert _version.resolve_ref_version("branch", "main", "a" * 40) == "0.0.0.dev0+gaaaaaaa"
+
+
+def test_preview_considers_more_than_ten_version_tags(monkeypatch):
+    def git(args, **kwargs):
+        if args[0] == "tag":
+            return "\n".join(f"0.3.{n}" for n in range(20))
+        if args[0] == "describe":
+            assert "--candidates=20" in args
+            return "0.3.19"
+        return "2"
+    monkeypatch.setattr(_version, "_git", git)
+    assert _version.resolve_ref_version("branch", "main", "a" * 40) == "0.3.19.dev2+gaaaaaaa"

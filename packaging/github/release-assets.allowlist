@@ -15,5 +15,4 @@ sessionprep_*.deb
 sessionprep-*.rpm
 
 # Windows installers
-sessionprep-*-win-x64-setup.exe
-sessionprep-*-win-arm64-setup.exe
+sessionprep-*-win-universal-setup.exe

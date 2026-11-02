@@ -1,108 +1,109 @@
-# SessionPrep GitHub Release Publishing
+# SessionPrep build workflows
 
-This file documents how the generic release publisher in this directory is used
-by SessionPrep.
+All builds are manually dispatched. Nuitka is the only executable builder.
 
-## Artifact Names
+## Entry points
 
-The Nuitka workflow uploads one GitHub Actions artifact per platform:
+| Actions workflow | Deliverables |
+| --- | --- |
+| 00 Full - All Platforms | Every platform, one adaptive Windows installer, then an unpublished release draft. |
+| 10 Build - Windows x64 | x64 installer and rebuild kit attached to this workflow run. |
+| 11 Build - Windows ARM64 | ARM64 installer and rebuild kit attached to this workflow run. |
+| 12 Build - macOS | Separate ARM64/Intel DMGs; select both (default), ARM64 or x64. |
+| 13 Build - Linux x64 | x64 tarball, DEB and RPM attached to this workflow run. |
+| 14 Build - Linux ARM64 | ARM64 tarball, DEB and RPM attached to this workflow run. |
 
-```text
-sessionprep-linux-x64
-sessionprep-linux-arm64
-sessionprep-macos-arm64
-sessionprep-macos-x64
-sessionprep-win-x64
-sessionprep-win-arm64
-```
+Every entry point offers Debug, default off. Debug retains native symbols and
+build reports, attaches an existing Windows GUI console, and never creates a
+release draft. All Platforms and macOS also offer Notarize, default off. No ref,
+including a tag, implicitly enables notarization. Debug may be notarized when
+explicitly selected, while remaining artifact-only.
 
-The collector job should therefore pass:
+## Hardware scheduling
 
-```bash
---artifact-pattern "sessionprep-*"
-```
-
-## Release Assets
-
-`release-assets.allowlist` is intentionally SessionPrep-specific and currently
-allows these end-user deliverables:
+All Platforms validates once, then runs two independent lanes:
 
 ```text
-sessionprep-*-macos-arm64.dmg
-sessionprep-*-macos-x64.dmg
-sessionprep-*-linux-x64.tar.gz
-sessionprep-*-linux-arm64.tar.gz
-sessionprep_*.deb
-sessionprep-*.rpm
-sessionprep-*-win-x64-setup.exe
-sessionprep-*-win-arm64-setup.exe
+Linux x64   -> Windows x64
+Linux ARM64 -> Windows ARM64 -> macOS ARM64 -> macOS Intel
 ```
 
-Intermediate build directories, loose executables, `.build` folders, and other
-non-release files are intentionally excluded.
+The Windows assembly waits for both Windows architectures. The draft collector
+waits for assembly and both macOS packages; transitive dependencies include Linux.
+Only the collector has release-write permissions.
 
-## Workflow Usage
+Linux runners use self-hosted/Linux/X64 or ARM64/jammy/docker. Windows uses
+self-hosted/Windows/X64 or ARM64. Both macOS builds run sequentially on the
+self-hosted/macOS/ARM64 runner; Intel uses Intel Python through Rosetta.
 
-The SessionPrep workflow calls the generic publisher from the final collector
-job after all platform builds finish:
+The x64 lane and Apple Silicon lane have shared repository-local concurrency
+groups across all entry points. Running builds are not automatically cancelled;
+`queue: max` preserves waiting manual jobs. These groups do not coordinate other
+repositories. Source checkouts, virtual environments and outputs are run-scoped;
+cleanup is restricted to those paths and never removes signing state.
 
-```bash
-if [ "$RELEASE_MODE" = "tag" ]; then
-  RELEASE_TITLE="SessionPrep $REF_NAME"
-else
-  RELEASE_TITLE="SessionPrep branch build: $REF_NAME"
-fi
+## Runner prerequisites
 
-packaging/github/publish-draft-release.sh \
-  --download-run-id "$RUN_ID" \
-  --artifact-root downloaded-artifacts \
-  --artifact-pattern "sessionprep-*" \
-  --mode "$RELEASE_MODE" \
-  --ref-name "$REF_NAME" \
-  --target "$TARGET_SHA" \
-  --repo "$REPOSITORY" \
-  --release-title "$RELEASE_TITLE"
-```
+- Linux: native compiler, ccache, patchelf, nfpm, tar, GitHub CLI and unzip.
+- Windows: native Python 3.13, Git Bash, Visual Studio 18 C++ tools for the native
+  architecture, and Inno Setup 6. CI does not change Defender configuration.
+- macOS: Xcode at `/Applications/Xcode.app`, Rosetta for Intel, and the existing
+  Developer ID signing setup described in [the macOS guide](../macos/README.md).
 
-The workflow has a manual `notarize` input. It defaults to `false`, so branch
-builds produce signed, non-notarized macOS development DMGs by default. If a
-manual branch run is started with `notarize=true`, the macOS jobs use the same
-notarized DMG packaging path as tag builds. Tag builds always notarize.
+Python/uv and dependency setup follow the reusable helpers. Dependencies use the
+frozen lockfile. Missing image prerequisites fail with actionable errors rather
+than modifying system packages during builds.
 
-## Local Dry Run
+## Versions and artifacts
 
-Dry-run against an existing workflow run:
+All helpers check out the exact dispatched commit and receive the same validated
+version/SHA. Valid version tags produce their normalized version. Version-named
+branches retain their base plus a development suffix. Other branches use the
+nearest reachable valid version tag, commit distance and SHA; synthetic preview
+tags are ignored. Without a version ancestor, the development base is `0.0.0`.
 
-```bash
-packaging/github/publish-draft-release.sh \
-  --download-run-id 1234567890 \
-  --artifact-root downloaded-artifacts \
-  --artifact-pattern "sessionprep-*" \
-  --mode branch \
-  --ref-name 0.3.5 \
-  --target "$(git rev-parse HEAD)" \
-  --repo tphzz/sessionprep \
-  --release-title "SessionPrep branch build: 0.3.5" \
-  --dry-run
-```
+Artifacts are named `sessionprep-<platform>-release` or `-debug`, where platform is
+`linux-x64`, `linux-arm64`, `win-x64`, `win-arm64`, `macos-arm64`, or `macos-x64`.
+All Platforms adds `sessionprep-win-universal-<configuration>`.
 
-For a tag build, use:
+Each artifact includes a checksummed manifest binding its file set to platform,
+configuration, version and commit. Windows assembly verifies both payload kits
+and native PE architectures before compiling one installer. It selects ARM64 on
+ARM64 Windows and x64 otherwise, retaining stable product identity, install
+scope, shortcuts and PATH integration. Individual architecture installers remain
+available in their run artifacts, alongside manual Certum rebuild inputs.
 
-```bash
---mode tag
---ref-name 0.3.5
---release-title "SessionPrep 0.3.5"
-```
+The collector verifies all seven artifact manifests before staging the nine
+end-user downloads: two Linux archives, four Linux packages, two macOS DMGs and
+one adaptive Windows installer. Rebuild kits and diagnostics are not release
+assets. Windows CI installers remain unsigned; existing manual signing remains
+available.
 
-## Release Behavior
+## Release ownership and credentials
 
-Branch builds use a release title such as `SessionPrep branch build: 0.3.5`.
-Re-running a branch workflow replaces any matching draft release for that branch
-and uploads assets to the newly created release by release ID. The script also
-cleans up older duplicate draft releases that used the same title before the
-hidden branch release key was introduced. Branch macOS DMGs are non-notarized
-unless the manual workflow run explicitly enables `notarize`.
+Both tag releases and branch previews are **unpublished drafts**. Branch previews
+are also marked prerelease. Only non-Debug All Platforms updates them.
 
-Tag builds use the real Git tag, such as `0.3.5`. Re-running a tag workflow
-replaces the draft release for that tag, but published releases are protected
-and are not modified by the automation. Tag macOS DMGs are always notarized.
+One stable, hashed technical tag identifies each exact branch. Cleanup uses its
+explicit ownership marker, never a shared version or display title. A release
+branch's draft is not removed by another branch or a tag build with the same
+version. Older runs cannot overwrite newer previews. Tag mode checks the remote
+lightweight/annotated tag's commit again before retirement.
+
+Replacement assets are uploaded and verified on a provisional draft before the
+old draft is retired. Every destructive cleanup rechecks draft/tag/body state.
+Published releases are protected. If retirement has begun and promotion fails,
+the complete provisional draft is retained for review/retry. GitHub does not
+provide a single atomic transaction across these operations; changed state or
+API errors stop the operation rather than silently accepting it.
+
+Ordinary same-repository publishing uses `GITHUB_TOKEN` with Contents write.
+No additional secret is required for the normal/default-branch path. GitHub
+requires Workflows write as well if the target differs from the default branch
+under `.github/workflows/`; `GITHUB_TOKEN` cannot receive that permission.
+For that exceptional case, an optional `SESSIONPREP_RELEASE_TOKEN` secret may
+supply a fine-grained token restricted to this repository with Contents write
+and Workflows write. Preflight checks this condition before long builds.
+No token is exposed to platform builds. See [GitHub's release API rule](https://docs.github.com/en/rest/releases/releases#create-a-release).
+
+See [the publisher CLI](README.md) for isolated local staging/dry-run commands.

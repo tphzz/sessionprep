@@ -1,405 +1,186 @@
-name: Build (Nuitka)
-
-on:
+name: 00 Full - All Platforms
+run-name: ${{ github.workflow }} | ${{ github.ref_name }} | ${{ inputs.debug && 'Debug' || 'Release' }}
+'on':
   workflow_dispatch:
     inputs:
-      notarize:
-        description: "Notarize macOS DMGs for this manual run"
+      debug:
+        description: Debug diagnostics (artifacts only)
         required: false
         default: false
         type: boolean
-
+      notarize_macos:
+        description: Notarize macOS (optional for every ref/configuration)
+        required: false
+        default: false
+        type: boolean
+permissions:
+  contents: read
+concurrency:
+  group: sessionprep-all-${{ github.ref }}
+  cancel-in-progress: false
+  queue: max
 jobs:
-  build:
-    name: ${{ matrix.name }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            name: Linux x64
-            suffix: linux-x64
-          - os: ubuntu-24.04-arm
-            name: Linux arm64
-            suffix: linux-arm64
-          - os: macos-15
-            name: macOS Apple arm64
-            suffix: macos-arm64
-          - os: macos-15-intel
-            name: macOS x64
-            suffix: macos-x64
-          - os: windows-latest
-            name: Windows x64
-            suffix: win-x64
-          - os: windows-11-arm
-            name: Windows arm64
-            suffix: win-arm64
-
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v8.1.0
-
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version-file: "pyproject.toml"
-
-      - name: Install System Dependencies (Linux)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y gcc patchelf ccache
-
-      - name: Install CCache (macOS)
-        if: runner.os == 'macOS'
-        run: brew install ccache
-
-      - name: Cache Nuitka & CCache
-        uses: actions/cache@v5
-        continue-on-error: true
-        with:
-          path: |
-            ~/.cache/Nuitka
-            ~/AppData/Local/Nuitka/Nuitka/Cache
-            ~/Library/Caches/Nuitka
-            ~/.cache/ccache
-            ~/Library/Caches/ccache
-            ~/AppData/Local/ccache
-          key: ${{ runner.os }}-${{ matrix.suffix }}-nuitka-v2-${{ hashFiles('**/uv.lock') }}-${{ github.run_id }}
-          restore-keys: |
-            ${{ runner.os }}-${{ matrix.suffix }}-nuitka-v2-${{ hashFiles('**/uv.lock') }}-
-            ${{ runner.os }}-${{ matrix.suffix }}-nuitka-v2-
-
-      - name: Install Dependencies
-        run: uv sync --extra cli --extra gui
-
-      - name: Disable Windows Defender for build directory
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: Add-MpPreference -ExclusionPath $PWD
-
-      - name: Build with Nuitka
-        run: uv run python build_nuitka.py all
-
-      # -----------------------------------------------------------------------
-      # Determine version (used by all packaging steps)
-      # -----------------------------------------------------------------------
-      - name: Determine version
-        id: version
-        shell: bash
-        run: |
-          VER=$(uv run python -c "from build_conf import get_version; print(get_version(strict=True))")
-          echo "ver=$VER" >> "$GITHUB_OUTPUT"
-
-      - name: Determine macOS notarization mode
-        id: notarization
-        shell: bash
-        env:
-          REF_TYPE: ${{ github.ref_type }}
-          NOTARIZE_INPUT: ${{ inputs.notarize }}
-        run: |
-          if [ "$REF_TYPE" = "tag" ] || [ "$NOTARIZE_INPUT" = "true" ]; then
-            echo "should_notarize=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "should_notarize=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      # -----------------------------------------------------------------------
-      # Linux packaging
-      # -----------------------------------------------------------------------
-      - name: Package Linux Distributions
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          echo 'deb [trusted=yes] https://repo.goreleaser.com/apt/ /' \
-            | sudo tee /etc/apt/sources.list.d/goreleaser.list
-          sudo apt-get update -q && sudo apt-get install -y nfpm
-
-          VERSION="${{ steps.version.outputs.ver }}"
-          SUFFIX="${{ matrix.suffix }}"
-          # Map matrix suffix to nfpm arch (deb/rpm format)
-          case "$SUFFIX" in
-            linux-x64)   NFPM_ARCH=amd64 ;;
-            linux-arm64) NFPM_ARCH=arm64 ;;
-            *)           NFPM_ARCH=amd64 ;;
-          esac
-          export VERSION SUFFIX NFPM_ARCH DIST_DIR=dist_nuitka
-
-          # Merge GUI dist into CLI dist so we have a single unified distribution directory
-          # This prevents nfpm from throwing "content collision" errors
-          cp -a dist_nuitka/sessionprep-gui.dist/. dist_nuitka/sessionprep.dist/
-
-          TMPCONFIG=$(mktemp --suffix=.yaml)
-          envsubst < packaging/linux/nfpm.yaml > "$TMPCONFIG"
-          nfpm package --config "$TMPCONFIG" --packager deb --target dist_nuitka/
-          nfpm package --config "$TMPCONFIG" --packager rpm --target dist_nuitka/
-          rm "$TMPCONFIG"
-
-          STAGING=$(mktemp -d)
-          cp -r dist_nuitka/sessionprep.dist         "$STAGING/sessionprep.dist"
-          cp sessionprepgui/res/sessionprep.png      "$STAGING/sessionprep.png"
-          cp packaging/linux/sessionprep.desktop     "$STAGING/sessionprep.desktop"
-          cp packaging/linux/install-sessionprep.sh  "$STAGING/install-sessionprep.sh"
-          chmod +x "$STAGING/install-sessionprep.sh"
-          tar -czf "dist_nuitka/sessionprep-${VERSION}-${{ matrix.suffix }}.tar.gz" \
-            -C "$STAGING" \
-            sessionprep.dist \
-            sessionprep.png \
-            sessionprep.desktop install-sessionprep.sh
-
-      # -----------------------------------------------------------------------
-      # Windows packaging
-      # -----------------------------------------------------------------------
-      - name: Build InnoSetup Installer
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $ver = "${{ steps.version.outputs.ver }}"
-          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" `
-            "/DAPP_VERSION=$ver" `
-            "/DDIST_DIR=dist_nuitka" `
-            "/DARCH_SUFFIX=${{ matrix.suffix }}" `
-            "packaging\windows\sessionprep.iss"
-
-      - name: Package InnoSetup rebuild inputs
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          $ver = "${{ steps.version.outputs.ver }}"
-          $archSuffix = "${{ matrix.suffix }}"
-          $zipPath = "dist_nuitka/sessionprep-$ver-$archSuffix-innosetup-input.zip"
-          $stagingRoot = Join-Path $env:RUNNER_TEMP "sessionprep-innosetup-input-$archSuffix"
-
-          $requiredPaths = @(
-            "dist_nuitka/sessionprep-gui.dist",
-            "dist_nuitka/sessionprep.dist",
-            "packaging/windows/sessionprep.iss",
-            "packaging/windows/sessionprep-signed.iss",
-            "packaging/windows/sessionprep-common.isinc",
-            "sessionprepgui/res/sessionprep.ico"
-          )
-
-          foreach ($path in $requiredPaths) {
-            if (-not (Test-Path -LiteralPath $path)) {
-              throw "Required InnoSetup rebuild input is missing: $path"
-            }
-          }
-
-          if (Test-Path -LiteralPath $stagingRoot) {
-            Remove-Item -LiteralPath $stagingRoot -Recurse -Force
-          }
-          New-Item -ItemType Directory -Path $stagingRoot | Out-Null
-          New-Item -ItemType Directory -Path (Join-Path $stagingRoot "dist_nuitka") | Out-Null
-          New-Item -ItemType Directory -Path (Join-Path $stagingRoot "packaging/windows") -Force | Out-Null
-          New-Item -ItemType Directory -Path (Join-Path $stagingRoot "sessionprepgui/res") -Force | Out-Null
-
-          Copy-Item -LiteralPath "dist_nuitka/sessionprep-gui.dist" -Destination (Join-Path $stagingRoot "dist_nuitka/sessionprep-gui.dist") -Recurse
-          Copy-Item -LiteralPath "dist_nuitka/sessionprep.dist" -Destination (Join-Path $stagingRoot "dist_nuitka/sessionprep.dist") -Recurse
-          Copy-Item -LiteralPath "packaging/windows/sessionprep.iss" -Destination (Join-Path $stagingRoot "packaging/windows/sessionprep.iss")
-          Copy-Item -LiteralPath "packaging/windows/sessionprep-signed.iss" -Destination (Join-Path $stagingRoot "packaging/windows/sessionprep-signed.iss")
-          Copy-Item -LiteralPath "packaging/windows/sessionprep-common.isinc" -Destination (Join-Path $stagingRoot "packaging/windows/sessionprep-common.isinc")
-          Copy-Item -LiteralPath "sessionprepgui/res/sessionprep.ico" -Destination (Join-Path $stagingRoot "sessionprepgui/res/sessionprep.ico")
-
-          $signedRebuildCommandLines = @(
-            '& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" `',
-            '  ''/SsessionprepSignTool=signtool.exe sign /a /fd SHA256 /t http://time.certum.pl/ $f'' `',
-            '  "/DAPP_VERSION=' + $ver + '" `',
-            '  "/DDIST_DIR=dist_nuitka" `',
-            '  "/DARCH_SUFFIX=' + $archSuffix + '" `',
-            '  "packaging\windows\sessionprep-signed.iss"'
-          )
-          $signedRebuildCommand = $signedRebuildCommandLines -join [Environment]::NewLine
-
-          $unsignedRebuildCommandLines = @(
-            '& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" `',
-            '  "/DAPP_VERSION=' + $ver + '" `',
-            '  "/DDIST_DIR=dist_nuitka" `',
-            '  "/DARCH_SUFFIX=' + $archSuffix + '" `',
-            '  "packaging\windows\sessionprep.iss"'
-          )
-          $unsignedRebuildCommand = $unsignedRebuildCommandLines -join [Environment]::NewLine
-
-          $manifest = [ordered]@{
-            version = $ver
-            archSuffix = $archSuffix
-            sourceSha = "${{ github.sha }}"
-            runId = "${{ github.run_id }}"
-            rebuildCommand = $signedRebuildCommand
-            signedRebuildCommand = $signedRebuildCommand
-            unsignedRebuildCommand = $unsignedRebuildCommand
-          }
-          $manifest | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $stagingRoot "innosetup-rebuild.json") -Encoding UTF8
-
-          $readme = @"
-          SessionPrep Inno Setup rebuild kit
-          ==================================
-
-          This archive contains the compiled Nuitka distribution folders and the
-          installer definition needed to rebuild the Windows installer locally.
-
-          Extract the archive and open PowerShell in the extracted root directory.
-
-          Signed Certum rebuild
-          ---------------------
-
-          Requirements:
-
-          - Inno Setup 6
-          - signtool.exe available on PATH
-          - Certum certificate/token available to signtool.exe
-
-          Run:
-
-          $signedRebuildCommand
-
-          Unsigned fallback rebuild
-          -------------------------
-
-          Run:
-
-          $unsignedRebuildCommand
-
-          The signed rebuild signs the setup executable and generated uninstaller.
-          The unsigned fallback produces the same unsigned installer shape as CI.
-          "@
-          $readme.Trim() | Set-Content -LiteralPath (Join-Path $stagingRoot "README-INNOSETUP-REBUILD.txt") -Encoding UTF8
-
-          if (Test-Path -LiteralPath $zipPath) {
-            Remove-Item -LiteralPath $zipPath -Force
-          }
-          Compress-Archive -Path (Join-Path $stagingRoot "*") -DestinationPath $zipPath -CompressionLevel Optimal
-
-          if (-not (Test-Path -LiteralPath $zipPath)) {
-            throw "Expected InnoSetup rebuild input zip was not created: $zipPath"
-          }
-          Write-Host "Created InnoSetup rebuild input zip: $zipPath"
-
-      # -----------------------------------------------------------------------
-      # macOS packaging
-      # -----------------------------------------------------------------------
-      - name: Import macOS Code Signing Certificate
-        if: runner.os == 'macOS'
-        uses: apple-actions/import-codesign-certs@v7.0.0
-        with:
-          p12-file-base64: ${{ secrets.P12_BASE64 }}
-          p12-password: ${{ secrets.P12_PASSWORD }}
-
-      - name: Sign macOS .app bundle
-        if: runner.os == 'macOS'
-        shell: bash
-        env:
-          MACOS_DEV_ID_CERT_NAME: ${{ secrets.MACOS_DEV_ID_CERT_NAME }}
-        run: |
-          if [ -z "$MACOS_DEV_ID_CERT_NAME" ]; then
-            echo "MACOS_DEV_ID_CERT_NAME secret is required for macOS signing." >&2
-            exit 1
-          fi
-
-          APP_PATH="dist_nuitka/SessionPrep.app"
-          if [ ! -d "$APP_PATH" ]; then
-            echo "Expected app bundle not found: $APP_PATH" >&2
-            exit 1
-          fi
-
-          packaging/macos/appbundle-sign.sh \
-            -a "$APP_PATH" \
-            -c "$MACOS_DEV_ID_CERT_NAME"
-
-      - name: Package macOS development DMG
-        if: runner.os == 'macOS' && steps.notarization.outputs.should_notarize != 'true'
-        shell: bash
-        run: |
-          brew install create-dmg
-          VERSION="${{ steps.version.outputs.ver }}"
-          APP_PATH="dist_nuitka/SessionPrep.app"
-          APP_NAME=$(basename "$APP_PATH" .app)
-          DMG_PATH="dist_nuitka/sessionprep-${VERSION}-${{ matrix.suffix }}.dmg"
-
-          STAGING=$(mktemp -d)
-          trap 'rm -rf "$STAGING"' EXIT
-          ditto "$APP_PATH" "$STAGING/$(basename "$APP_PATH")"
-          create-dmg \
-            --volname "$APP_NAME" \
-            --app-drop-link 600 185 \
-            --sandbox-safe \
-            "$DMG_PATH" \
-            "$STAGING"
-          rm -f dist_nuitka/rw.*.dmg
-
-      - name: Notarize and package macOS release DMG
-        if: runner.os == 'macOS' && steps.notarization.outputs.should_notarize == 'true'
-        shell: bash
-        env:
-          MACOS_DEV_ID_CERT_NAME: ${{ secrets.MACOS_DEV_ID_CERT_NAME }}
-          APPLE_NOTARY_USER: ${{ secrets.APPLE_NOTARY_USER }}
-          APPLE_NOTARY_APP_PASSWORD: ${{ secrets.APPLE_NOTARY_APP_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        run: |
-          VERSION="${{ steps.version.outputs.ver }}"
-          APP_PATH="dist_nuitka/SessionPrep.app"
-          FINAL_DMG="dist_nuitka/sessionprep-${VERSION}-${{ matrix.suffix }}.dmg"
-
-          packaging/macos/appbundle-release.sh -a "$APP_PATH"
-          if [ ! -f "SessionPrep.dmg" ]; then
-            echo "Expected notarized DMG not found: SessionPrep.dmg" >&2
-            exit 1
-          fi
-          mv "SessionPrep.dmg" "$FINAL_DMG"
-
-      # -----------------------------------------------------------------------
-      # Upload
-      # -----------------------------------------------------------------------
-      - name: Upload Artifacts
-        uses: actions/upload-artifact@v6
-        with:
-          name: sessionprep-${{ matrix.suffix }}
-          path: |
-            dist_nuitka/sessionprep-*.*
-            dist_nuitka/sessionprep_*.*
-            !dist_nuitka/sessionprep-*.build
-            !dist_nuitka/sessionprep-*.build/**
-            !dist_nuitka/sessionprep-*.dist
-            !dist_nuitka/sessionprep-*.dist/**
-          if-no-files-found: error
-
-  publish-draft-release:
-    name: Publish draft release
-    needs: build
-    runs-on: ubuntu-latest
+  checks:
+    uses: ./.github/workflows/90-build-checks.yml
+    with:
+      publish_drafts: ${{ !inputs.debug }}
+    secrets:
+      SESSIONPREP_RELEASE_TOKEN: ${{ secrets.SESSIONPREP_RELEASE_TOKEN }}
+  linux-x64:
+    needs:
+    - checks
+    uses: ./.github/workflows/91-build-platform.yml
+    with:
+      platform: linux-x64
+      runner_labels: '["self-hosted", "Linux", "X64", "jammy", "docker"]'
+      resource_group: sessionprep-x64-host
+      version: ${{ needs.checks.outputs.version }}
+      sha: ${{ needs.checks.outputs.sha }}
+      debug: ${{ inputs.debug }}
+  windows-x64:
+    needs:
+    - checks
+    - linux-x64
+    uses: ./.github/workflows/91-build-platform.yml
+    with:
+      platform: win-x64
+      runner_labels: '["self-hosted", "Windows", "X64"]'
+      resource_group: sessionprep-x64-host
+      version: ${{ needs.checks.outputs.version }}
+      sha: ${{ needs.checks.outputs.sha }}
+      debug: ${{ inputs.debug }}
+  linux-arm64:
+    needs:
+    - checks
+    uses: ./.github/workflows/91-build-platform.yml
+    with:
+      platform: linux-arm64
+      runner_labels: '["self-hosted", "Linux", "ARM64", "jammy", "docker"]'
+      resource_group: sessionprep-apple-silicon-host
+      version: ${{ needs.checks.outputs.version }}
+      sha: ${{ needs.checks.outputs.sha }}
+      debug: ${{ inputs.debug }}
+  windows-arm64:
+    needs:
+    - checks
+    - linux-arm64
+    uses: ./.github/workflows/91-build-platform.yml
+    with:
+      platform: win-arm64
+      runner_labels: '["self-hosted", "Windows", "ARM64"]'
+      resource_group: sessionprep-apple-silicon-host
+      version: ${{ needs.checks.outputs.version }}
+      sha: ${{ needs.checks.outputs.sha }}
+      debug: ${{ inputs.debug }}
+  macos:
+    needs:
+    - checks
+    - windows-arm64
+    uses: ./.github/workflows/92-build-macos.yml
+    with:
+      version: ${{ needs.checks.outputs.version }}
+      sha: ${{ needs.checks.outputs.sha }}
+      debug: ${{ inputs.debug }}
+      notarize_macos: ${{ inputs.notarize_macos }}
+      architecture: both
+    secrets:
+      MACOS_DEV_ID_CERT_NAME: ${{ secrets.MACOS_DEV_ID_CERT_NAME }}
+  windows-installer:
+    needs:
+    - checks
+    - windows-x64
+    - windows-arm64
+    uses: ./.github/workflows/93-windows-bundle.yml
+    with:
+      version: ${{ needs.checks.outputs.version }}
+      sha: ${{ needs.checks.outputs.sha }}
+      debug: ${{ inputs.debug }}
+  release:
+    name: Collect verified artifacts and replace owned draft
+    if: ${{ !inputs.debug }}
+    needs:
+    - checks
+    - windows-installer
+    - macos
+    runs-on:
+    - self-hosted
+    - Linux
+    - X64
+    - jammy
+    - docker
+    concurrency:
+      group: sessionprep-x64-host
+      cancel-in-progress: false
+      queue: max
     permissions:
       contents: write
       actions: read
-    concurrency:
-      group: draft-release-${{ github.repository }}-${{ github.ref }}
-      cancel-in-progress: false
     env:
-      GH_TOKEN: ${{ github.token }}
-      RELEASE_MODE: ${{ github.ref_type == 'tag' && 'tag' || 'branch' }}
+      SOURCE_DIR: src-${{ github.run_id }}-${{ github.run_attempt }}-release
+      BUILD_VERSION: ${{ needs.checks.outputs.version }}
+      SOURCE_SHA: ${{ needs.checks.outputs.sha }}
+      REF_TYPE: ${{ github.ref_type }}
       REF_NAME: ${{ github.ref_name }}
-      TARGET_SHA: ${{ github.sha }}
-      REPOSITORY: ${{ github.repository }}
-      RUN_ID: ${{ github.run_id }}
     steps:
-      - uses: actions/checkout@v6
-
-      - name: Publish draft release
-        shell: bash
-        run: |
-          if [ "$RELEASE_MODE" = "tag" ]; then
-            RELEASE_TITLE="SessionPrep $REF_NAME"
-          else
-            RELEASE_TITLE="SessionPrep branch build: $REF_NAME"
-          fi
-
-          packaging/github/publish-draft-release.sh \
-            --download-run-id "$RUN_ID" \
-            --artifact-root downloaded-artifacts \
-            --artifact-pattern "sessionprep-*" \
-            --mode "$RELEASE_MODE" \
-            --ref-name "$REF_NAME" \
-            --target "$TARGET_SHA" \
-            --repo "$REPOSITORY" \
-            --release-title "$RELEASE_TITLE"
+    - name: Checkout exact build commit
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ github.sha }}
+        fetch-depth: 0
+        path: ${{ env.SOURCE_DIR }}
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      with:
+        python-version: '3.13'
+    - name: Set up uv
+      uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990
+      with:
+        enable-cache: true
+    - name: Download artifacts from this run
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        pattern: sessionprep-*-release
+        path: ${{ env.SOURCE_DIR }}/downloaded-artifacts
+    - name: Validate all release deliverables
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "$SOURCE_DIR"
+        uv sync --frozen --no-default-groups
+        uv run --frozen --no-default-groups python packaging/github/build.py collect --artifact-root downloaded-artifacts --version "$BUILD_VERSION" --sha "$SOURCE_SHA" --output release-assets
+      env:
+        UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/sessionprep-env-${{ github.run_id }}-${{ github.run_attempt }}-release
+    - name: Replace only owned unpublished draft
+      shell: bash
+      env:
+        GH_TOKEN: ${{ secrets.SESSIONPREP_RELEASE_TOKEN || github.token }}
+      run: |
+        set -euo pipefail
+        cd "$SOURCE_DIR"
+        mode=branch
+        title="SessionPrep preview: $REF_NAME"
+        if [[ "$REF_TYPE" == "tag" ]]; then mode=tag; title="SessionPrep $REF_NAME"; fi
+        bash packaging/github/publish-draft-release.sh --artifact-root release-assets --staging-dir staged-release --mode "$mode" --ref-name "$REF_NAME" --target "$SOURCE_SHA" --repo "$GITHUB_REPOSITORY" --release-title "$title" --producer-run-id "$GITHUB_RUN_ID"
+    - name: Clean only run-owned workspace
+      if: ${{ always() }}
+      shell: bash
+      run: |
+        "${CI_PYTHON:-python}" - <<'PY'
+        import json, os, pathlib, shutil, stat
+        workspace = pathlib.Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+        temporary = pathlib.Path(os.environ["RUNNER_TEMP"]).resolve()
+        run = os.environ["GITHUB_RUN_ID"] + "-" + os.environ["GITHUB_RUN_ATTEMPT"]
+        def remove_readonly(function, path, error):
+            if not isinstance(error, PermissionError):
+                raise error
+            os.chmod(path, stat.S_IWRITE)
+            function(path)
+        for name in json.loads(os.environ["CLEANUP_NAMES"]):
+            for parent, child in ((workspace, "src-" + run + "-" + name), (temporary, "sessionprep-env-" + run + "-" + name)):
+                target = (parent / child).resolve()
+                if target.parent != parent:
+                    raise RuntimeError("Cleanup target escaped the run workspace")
+                if target.exists():
+                    shutil.rmtree(target, onexc=remove_readonly)
+        PY
+      env:
+        CLEANUP_NAMES: '["release"]'

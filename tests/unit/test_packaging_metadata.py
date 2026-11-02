@@ -54,8 +54,8 @@ def test_linux_package_identity_is_stable_and_version_is_separate():
 
 def test_macos_app_identity_is_stable_and_artifact_filename_is_versioned():
     build_conf = _read("build_conf.py")
-    workflow = _read(".github/workflows/build-nuitka.yml")
+    packaging = _read("packaging/macos/ci_signing.py")
 
     assert 'MACOS_APP_NAME = "SessionPrep"' in build_conf
-    assert 'APP_PATH="dist_nuitka/SessionPrep.app"' in workflow
-    assert 'FINAL_DMG="dist_nuitka/sessionprep-${VERSION}-${{ matrix.suffix }}.dmg"' in workflow
+    assert 'ROOT / "dist_nuitka/SessionPrep.app"' in packaging
+    assert 'f"sessionprep-{version}-{platform}.dmg"' in packaging

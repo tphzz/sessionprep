@@ -1,86 +1,48 @@
-# macOS App Deployment Suite: Sign, Notarize & Package
+# macOS signing and packaging
 
-A toolset for preparing, signing, and distributing macOS application bundles. This suite is specifically designed to handle the complexities of cross-platform frameworks (like **PyInstaller**, **Nuitka**, or **PySide6/Qt**) while automating the Apple Notarization and DMG creation process.
+SessionPrep builds separate ARM64 and Intel Nuitka app bundles. The manual macOS
+workflow can build either architecture or both; All Platforms builds both
+sequentially on the Apple Silicon runner, using Rosetta/Intel Python for x64.
 
-## The Deployment Suite
+## Persistent CI signing
 
-The suite consists of two specialized scripts:
+`ci_signing.py prepare` uses the runner's existing
+`~/Library/Keychains/login.keychain-db` and reads its password from
+`~/.config/developer-id-signing/login-keychain-password`. The password file must
+belong to the runner account with mode 600 and contain one nonempty line.
+The workflow unlocks and reuses this keychain; it does not import P12 files,
+create/delete keychains, rewrite the search list or recreate notary credentials.
 
-1.  **appbundle-sign.sh**: The "workhorse" for development. It reorganizes the bundle structure, moves misplaced resources, manages symlinks, and performs recursive signing of all embedded binaries.
-2.  **appbundle-release.sh**: The "finisher" for production. It utilizes the signing script, communicates with the Apple Notary Service, staples the notarization ticket, and packages everything into a user-friendly DMG.
+Exactly one valid Developer ID Application identity is required. Optional secret
+`MACOS_DEV_ID_CERT_NAME` can select its exact name or fingerprint when several
+identities exist. A small signing probe fails early if the existing key/ACL is
+unavailable. The password is masked and never written to artifacts.
 
----
+Both configurations sign the app and DMG. Notarization happens only when the
+Notarize checkbox is checked; its default is off for branches, tags and Debug.
+Checked runs use the already provisioned `developer-id-notary` keychain profile,
+validate Apple's Accepted status, staple/validate tickets, and assess the DMG
+with the disk-image Gatekeeper policy. No Apple ID/app-password or P12 GitHub
+secrets are needed by this CI path. Neither building nor notarizing publishes a
+release; only non-Debug All Platforms creates an unpublished draft.
 
-## Features
+`ci_signing.py package` calls `appbundle-sign.sh` for the established Nuitka/Qt
+bundle layout and preserves the selected interpreter. Optional `SIGNING_KEYCHAIN`
+restricts signing to the existing keychain. The shell signing helper remains
+compatible with stock macOS Bash 3.2 and manual signing without that variable.
 
-* **Structural Repair:** Automatically moves non-executable resources (like `.ico`, `.png`, `.pem`, `.npz`) from `MacOS/` to `Resources/` and maintains functionality via relative symlinks.
-* **Hardened Runtime Support:** Applies necessary entitlements to comply with modern macOS security requirements.
-* **Modern Notarization:** Uses Apple's `notarytool` (Xcode 13+) for faster, reliable automated security scans.
-* **Professional DMG Packaging:** Creates a signed and notarized Disk Image including a shortcut to the `/Applications` folder for a standard drag-and-drop installation experience.
-* **CI/CD Maturity:** Uses scoped environment variables to prevent naming conflicts in complex build pipelines.
-* **Pre-flight Validation:** Performs a dashboard-style check of all credentials and system tools before starting long-running tasks.
+## Manual signing tools
 
----
-
-## Configuration (Environment Variables)
-
-To enable headless/automated operation, the suite looks for the following scoped variables. It is recommended to export these in your `.zshrc` (locally) or set them as **GitHub Repository Secrets**.
-
-### For Signing:
-* **`MACOS_DEV_ID_CERT_NAME`**: The exact name of your certificate (e.g., `Developer ID Application: Your Name (TEAM_ID)`) or its 40-character SHA-1 hash.
-
-### For Notarization & Distribution:
-* **`APPLE_NOTARY_USER`**: Your Apple ID email address.
-* **`APPLE_NOTARY_APP_PASSWORD`**: An **App-Specific Password** generated at [appleid.apple.com](https://appleid.apple.com). Do **not** use your primary iCloud password.
-* **`APPLE_TEAM_ID`**: Your 10-character Team ID found in the Apple Developer Portal.
-
----
-
-## Usage
-
-### 1. Development: Structural Signing
-Use this during active development to verify that the app bundle structure is correct and that the app starts without "Team ID mismatch" or "translocation" errors.
+For a local Nuitka app:
 
 ```bash
-chmod +x packaging/macos/appbundle-sign.sh
-./packaging/macos/appbundle-sign.sh -a "dist/SessionPrep.app"
+bash packaging/macos/appbundle-sign.sh -a dist_nuitka/SessionPrep.app -c "Developer ID Application: Your Name (TEAM_ID)"
 ```
 
-### 2. Production: The Full Release
-Use this when you are ready to distribute your software. This script handles the notarization wait-time and creates the final DMG.
+The older interactive `appbundle-release.sh` remains available for local
+credential-based notarization (`MACOS_DEV_ID_CERT_NAME`, `APPLE_NOTARY_USER`,
+`APPLE_NOTARY_APP_PASSWORD`, `APPLE_TEAM_ID`). It always notarizes when invoked;
+it is not called by CI and does not control the workflow checkbox.
 
-```bash
-chmod +x packaging/macos/appbundle-release.sh
-./packaging/macos/appbundle-release.sh -a "dist/SessionPrep.app"
-```
-
----
-
-## Integration into GitHub Actions
-
-The suite is designed to be the final stage of a CI/CD pipeline.
-
-### Step 1: Secrets Setup
-Add the following to your GitHub Repository Secrets:
-* `APPLE_NOTARY_USER`
-* `APPLE_NOTARY_APP_PASSWORD`
-* `APPLE_TEAM_ID`
-* `MACOS_DEV_ID_CERT_NAME`
-* `P12_BASE64` (Your `.p12` certificate file encoded as base64)
-* `P12_PASSWORD` (The password for your `.p12` file)
-
-### Step 2: Workflow Logic
-1.  **Build:** Create the `.app` bundle (e.g., via PyInstaller).
-2.  **Certificate Import:** Use `apple-actions/import-codesign-certs@v7.0.0` to load your certificate into the runner's keychain.
-3.  **Signing:** Run `appbundle-sign.sh` for all builds to verify structural integrity.
-4.  **Release:** On **Tags** or **Main** branch merges, run `appbundle-release.sh` to generate the notarized DMG.
-
----
-
-## Troubleshooting
-
-> **Pre-flight Check Fails:** > Ensure your variables are exported in your shell. Use `export APPLE_NOTARY_USER="..."` instead of just assigning the value.
-
-> **Notarization Rejected:** > If Apple rejects the submission, check the logs. Common reasons include unsigned third-party libraries or resources still residing in the `Contents/MacOS` folder. The `appbundle-sign.sh` script is designed to prevent these issues.
-
-> **DMG Assessment Failed:** > If the final `spctl` check fails, ensure your certificate is a **Developer ID Application** type. Standard "Apple Development" or "Mac App Store" certificates are not valid for notarized direct distribution.
+See [the workflow guide](../github/README.sessionprep.md) for prerequisites,
+artifact names, versioning and release ownership.

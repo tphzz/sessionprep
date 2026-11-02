@@ -1,0 +1,109 @@
+name: 93 Helper - Adaptive Windows installer
+'on':
+  workflow_call:
+    inputs:
+      version:
+        required: true
+        type: string
+      sha:
+        required: true
+        type: string
+      debug:
+        required: true
+        type: boolean
+permissions:
+  contents: read
+jobs:
+  bundle:
+    runs-on:
+    - self-hosted
+    - Windows
+    - X64
+    concurrency:
+      group: sessionprep-x64-host
+      cancel-in-progress: false
+      queue: max
+    timeout-minutes: 90
+    env:
+      SOURCE_DIR: src-${{ github.run_id }}-${{ github.run_attempt }}-windows-bundle
+      BUILD_VERSION: ${{ inputs.version }}
+      SOURCE_SHA: ${{ inputs.sha }}
+      DEBUG_BUILD: ${{ inputs.debug }}
+    steps:
+    - name: Checkout exact build commit
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ github.sha }}
+        fetch-depth: 0
+        path: ${{ env.SOURCE_DIR }}
+    - name: Verify native Windows Python and expose Git Bash
+      if: ${{ runner.os == 'Windows' }}
+      shell: powershell
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $python = (Get-Command python.exe -ErrorAction Stop).Source
+        & $python -c "import sys; assert sys.version_info[:2] == (3,13), sys.version"
+        if ($LASTEXITCODE -ne 0) { throw 'Native Python 3.13 is required on this runner' }
+        "CI_PYTHON=$python" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        $git = (Get-Command git.exe -ErrorAction Stop).Source
+        $gitRoot = Split-Path (Split-Path $git -Parent) -Parent
+        $bash = Join-Path $gitRoot 'bin\bash.exe'
+        if (-not (Test-Path -LiteralPath $bash)) { throw 'Git Bash is required on the Windows runner' }
+        Split-Path $bash -Parent | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+    - name: Set up uv
+      uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990
+      with:
+        enable-cache: true
+    - name: Download x64 payload
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        name: sessionprep-win-x64-${{ inputs.debug && 'debug' || 'release' }}
+        path: ${{ env.SOURCE_DIR }}/inputs/sessionprep-win-x64-${{ inputs.debug && 'debug' || 'release' }}
+    - name: Download arm64 payload
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        name: sessionprep-win-arm64-${{ inputs.debug && 'debug' || 'release' }}
+        path: ${{ env.SOURCE_DIR }}/inputs/sessionprep-win-arm64-${{ inputs.debug && 'debug' || 'release' }}
+    - name: Assemble adaptive Windows installer
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "$SOURCE_DIR"
+        uv sync --frozen --no-default-groups --python "$CI_PYTHON"
+        configuration=release
+        flags=()
+        if [[ "$DEBUG_BUILD" == "true" ]]; then configuration=debug; flags+=(--debug); fi
+        uv run --frozen --no-default-groups python packaging/windows/build_installer.py bundle --artifact-root inputs --version "$BUILD_VERSION" --sha "$SOURCE_SHA" --configuration "$configuration" --output artifacts
+        uv run --frozen --no-default-groups python packaging/github/build.py manifest --platform win-universal --version "$BUILD_VERSION" --sha "$SOURCE_SHA" --output artifacts "${flags[@]}"
+      env:
+        UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/sessionprep-env-${{ github.run_id }}-${{ github.run_attempt }}-windows-bundle
+    - name: Upload platform artifacts
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: sessionprep-win-universal-${{ inputs.debug && 'debug' || 'release' }}
+        path: ${{ env.SOURCE_DIR }}/artifacts
+        if-no-files-found: error
+    - name: Clean only run-owned workspace
+      if: ${{ always() }}
+      shell: bash
+      run: |
+        "${CI_PYTHON:-python}" - <<'PY'
+        import json, os, pathlib, shutil, stat
+        workspace = pathlib.Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+        temporary = pathlib.Path(os.environ["RUNNER_TEMP"]).resolve()
+        run = os.environ["GITHUB_RUN_ID"] + "-" + os.environ["GITHUB_RUN_ATTEMPT"]
+        def remove_readonly(function, path, error):
+            if not isinstance(error, PermissionError):
+                raise error
+            os.chmod(path, stat.S_IWRITE)
+            function(path)
+        for name in json.loads(os.environ["CLEANUP_NAMES"]):
+            for parent, child in ((workspace, "src-" + run + "-" + name), (temporary, "sessionprep-env-" + run + "-" + name)):
+                target = (parent / child).resolve()
+                if target.parent != parent:
+                    raise RuntimeError("Cleanup target escaped the run workspace")
+                if target.exists():
+                    shutil.rmtree(target, onexc=remove_readonly)
+        PY
+      env:
+        CLEANUP_NAMES: '["windows-bundle"]'

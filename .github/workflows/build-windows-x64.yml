@@ -1,0 +1,30 @@
+name: 10 Build - Windows x64
+run-name: ${{ github.workflow }} | ${{ github.ref_name }} | ${{ inputs.debug && 'Debug' || 'Release' }}
+'on':
+  workflow_dispatch:
+    inputs:
+      debug:
+        description: Debug diagnostics (artifacts only)
+        required: false
+        default: false
+        type: boolean
+permissions:
+  contents: read
+concurrency:
+  group: sessionprep-win-x64-${{ github.ref }}
+  cancel-in-progress: false
+  queue: max
+jobs:
+  checks:
+    uses: ./.github/workflows/90-build-checks.yml
+  build:
+    needs:
+    - checks
+    uses: ./.github/workflows/91-build-platform.yml
+    with:
+      platform: win-x64
+      runner_labels: '["self-hosted", "Windows", "X64"]'
+      resource_group: sessionprep-x64-host
+      version: ${{ needs.checks.outputs.version }}
+      sha: ${{ needs.checks.outputs.sha }}
+      debug: ${{ inputs.debug }}

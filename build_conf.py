@@ -66,7 +66,8 @@ def get_version(*, strict: bool = True) -> str:
 
 def write_build_version_file(version: str | None = None) -> str:
     """Write the frozen-build version module and return the version."""
-    resolved = version or get_version(strict=True)
+    resolved = (_load_version_module()._normalize_version(version, source="build version")
+                if version is not None else get_version(strict=True))
     with open(BUILD_VERSION_FILE, "w", encoding="utf-8", newline="\n") as fh:
         fh.write(f"{_BUILD_VERSION_MARKER}\n")
         fh.write(f'BUILD_VERSION = "{resolved}"\n')
