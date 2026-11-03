@@ -196,6 +196,12 @@ CI version to both targets; normal local builds retain automatic Git resolution.
 The central version helper supports arbitrary branch names using the nearest
 reachable version tag and commit identity, ignoring technical preview tags.
 
+Windows CI enables Nuitka's `--low-memory` mode for both CLI and GUI, in Debug and
+Release builds. It limits C compilation to one job and reduces peak memory use
+at the cost of longer builds. Local builds can opt in with
+`uv run python build_nuitka.py all --low-memory`. See
+[Nuitka's memory guidance](https://nuitka.net/user-documentation/common-issue-solutions.html#memory-issues-and-compiler-bugs).
+
 The dev-only PyYAML dependency supports semantic workflow tests. Run the unit
 suite with `uv run pytest tests/unit`. `actionlint` uses `.github/actionlint.yaml`
 for existing custom runner labels; its narrow queue-property exception covers

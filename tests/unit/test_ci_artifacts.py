@@ -177,3 +177,32 @@ def test_linux_compile_starts_when_all_prerequisites_are_present(monkeypatch):
     monkeypatch.setattr(ci, "run", lambda *args, **kwargs: started.append(True))
     ci.compile_app(argparse.Namespace(platform="linux-x64", version="0.3.5", debug=False))
     assert started == [True]
+
+
+@pytest.mark.parametrize("native_platform, python_platform, low_memory", [
+    ("win-x64", "win32", True),
+    ("win-arm64", "win32", True),
+    ("linux-x64", "linux", False),
+    ("linux-arm64", "linux", False),
+    ("macos-arm64", "darwin", False),
+    ("macos-x64", "darwin", False),
+])
+@pytest.mark.parametrize("debug", [False, True])
+def test_ci_bounds_windows_compiler_memory(monkeypatch, native_platform,
+                                          python_platform, low_memory, debug):
+    import argparse
+    started = []
+    monkeypatch.setattr(ci.sys, "platform", python_platform)
+    monkeypatch.setattr(ci, "get_platform_suffix", lambda: native_platform)
+    monkeypatch.setattr(ci, "check_linux_audio_runtime", lambda: None)
+    monkeypatch.setattr(ci.shutil, "which", lambda name: "/provided/" + name)
+    monkeypatch.setattr(ci, "run", lambda *args, **kwargs: started.append((args, kwargs)))
+
+    ci.compile_app(argparse.Namespace(platform=native_platform, version="0.3.5", debug=debug))
+
+    assert len(started) == 1
+    command, options = started[0]
+    assert ("--low-memory" in command) is low_memory
+    assert ("--debug" in command) is debug
+    assert command[command.index("--build-version") + 1] == "0.3.5"
+    assert options["cwd"] == ROOT

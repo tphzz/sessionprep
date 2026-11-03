@@ -42,3 +42,40 @@ def test_invalid_explicit_version_never_writes_build_metadata(monkeypatch,tmp_pa
     with pytest.raises(Exception,match="not a valid PEP 440"):
         build_conf.write_build_version_file('0.3.5"\ninvalid')
     assert not destination.exists()
+
+
+@pytest.mark.parametrize("target", ["cli", "gui"])
+@pytest.mark.parametrize("low_memory", [False, True])
+def test_low_memory_option_reaches_each_nuitka_target(tmp_path, monkeypatch, target, low_memory):
+    calls = []
+    monkeypatch.setattr(build, "BASE_DIR", str(tmp_path))
+    monkeypatch.setattr(build, "DIST_NUITKA", str(tmp_path / "dist"))
+    monkeypatch.setattr(build.sys, "platform", "win32")
+    monkeypatch.setattr(build, "_check_dependencies", lambda *args: None)
+    monkeypatch.setattr(build, "write_build_version_file", lambda version: version)
+    monkeypatch.setattr(build, "remove_build_version_file", lambda: None)
+    monkeypatch.setattr(build.subprocess, "check_call", lambda args: calls.append(args))
+    monkeypatch.setattr(build, "fetch_and_bundle_rps", lambda *args: None)
+
+    build.run_nuitka(target, low_memory=low_memory, debug=True, build_version="0.3.5")
+
+    assert ("--low-memory" in calls[0]) is low_memory
+    assert "--unstripped" in calls[0]
+    assert "--lto=no" in calls[0]
+
+
+@pytest.mark.parametrize("low_memory", [False, True])
+def test_cli_passes_memory_mode_to_both_targets(tmp_path, monkeypatch, low_memory):
+    calls = []
+    arguments = ["build_nuitka.py", "all"]
+    if low_memory:
+        arguments.append("--low-memory")
+    monkeypatch.setattr(build.sys, "platform", "win32")
+    monkeypatch.setattr(build, "DIST_NUITKA", str(tmp_path / "dist"))
+    monkeypatch.setattr(sys, "argv", arguments)
+    monkeypatch.setattr(build, "run_nuitka", lambda target, **kwargs: calls.append((target, kwargs)))
+
+    build.main()
+
+    assert [target for target, _ in calls] == ["cli", "gui"]
+    assert all(options["low_memory"] is low_memory for _, options in calls)

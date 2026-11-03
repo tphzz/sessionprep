@@ -116,6 +116,9 @@ def compile_app(args):
     if missing:
         raise ValueError(f"Runner prerequisites missing: {', '.join(missing)}; provision them on the runner image")
     command = [sys.executable, str(ROOT / "build_nuitka.py"), "all", "--build-version", args.version]
+    if sys.platform == "win32":
+        # Bound peak MSVC/SciPy compilation memory on shared Windows workers.
+        command.append("--low-memory")
     if args.debug:
         command.append("--debug")
     run(*command, cwd=ROOT)

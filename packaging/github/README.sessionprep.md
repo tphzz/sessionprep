@@ -55,6 +55,20 @@ Python/uv and dependency setup follow the reusable helpers. Dependencies use the
 frozen lockfile. Missing image prerequisites fail with actionable errors rather
 than modifying system packages during builds.
 
+Windows CI uses Nuitka's `--low-memory` mode for both executables and both build
+configurations. This selects one C compiler job and reduces peak memory use when
+compiling SciPy with MSVC on shared workers; compilation can take longer. Local
+builds can use `uv run python build_nuitka.py all --low-memory`. See
+[Nuitka's documented memory controls](https://nuitka.net/user-documentation/common-issue-solutions.html#memory-issues-and-compiler-bugs).
+
+The locked PySide6 6.10.2 ARM64 Linux wheels require glibc 2.39 or newer, so that
+worker needs Ubuntu 24.04 (Noble) or a compatible newer runtime. x64 wheels work
+with the existing Jammy baseline. Runner labels identify scheduling targets;
+verify the actual running image with `cat /etc/os-release` and
+`getconf GNU_LIBC_VERSION` inside the container. Rebuilding a Noble image does not
+change a Compose service still referencing the old Jammy image: update that
+service's `image:` reference and recreate it from the intended image.
+
 Linux GUI test imports and builds require the real PortAudio shared library.
 Installing the Python `sounddevice` package does not supply it on Linux; see
 [its installation guide](https://python-sounddevice.readthedocs.io/en/0.5.5/installation.html).
