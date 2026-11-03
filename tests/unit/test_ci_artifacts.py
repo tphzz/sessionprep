@@ -144,3 +144,36 @@ def test_linux_compilation_stops_before_nuitka_without_audio_runtime(monkeypatch
     monkeypatch.setattr(ci, "run", lambda *a, **kw: pytest.fail("Nuitka must not start"))
     with pytest.raises(ValueError, match="PortAudio"):
         ci.compile_app(argparse.Namespace(platform="linux-x64",version="0.3.5",debug=False))
+
+
+
+@pytest.mark.parametrize("missing", [
+    ("ccache", "nfpm"),
+    ("gcc", "ccache", "patchelf", "nfpm"),
+])
+def test_linux_compile_reports_all_missing_tools_before_starting(monkeypatch, missing):
+    import argparse
+    monkeypatch.setattr(ci.sys, "platform", "linux")
+    monkeypatch.setattr(ci, "get_platform_suffix", lambda: "linux-x64")
+    monkeypatch.setattr(ci, "check_linux_audio_runtime", lambda: None)
+    monkeypatch.setattr(ci.shutil, "which", lambda name: None if name in missing else "/provided/" + name)
+    monkeypatch.setattr(ci, "run", lambda *a, **kw: pytest.fail("Build must not start with missing prerequisites"))
+    with pytest.raises(ValueError) as error:
+        ci.compile_app(argparse.Namespace(platform="linux-x64", version="0.3.5", debug=False))
+    message = str(error.value)
+    for name in missing:
+        assert name in message, message
+    assert "runner image" in message
+
+
+
+def test_linux_compile_starts_when_all_prerequisites_are_present(monkeypatch):
+    import argparse
+    monkeypatch.setattr(ci.sys, "platform", "linux")
+    monkeypatch.setattr(ci, "get_platform_suffix", lambda: "linux-x64")
+    monkeypatch.setattr(ci, "check_linux_audio_runtime", lambda: None)
+    monkeypatch.setattr(ci.shutil, "which", lambda name: "/provided/" + name)
+    started=[]
+    monkeypatch.setattr(ci, "run", lambda *args, **kwargs: started.append(True))
+    ci.compile_app(argparse.Namespace(platform="linux-x64", version="0.3.5", debug=False))
+    assert started == [True]

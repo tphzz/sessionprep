@@ -325,13 +325,20 @@ sudo dnf install gcc patchelf ccache libatomic-static
 
 - **`gcc`**: The C compiler.
 - **`patchelf`**: Required by Nuitka to modify RPATHs in standalone binaries.
-- **`ccache`**: (Optional) Speeds up recompilation significantly.
+- **`ccache`**: Speeds up recompilation. Optional for local Nuitka builds;
+  required by the self-hosted CI helpers to retain compiler caching.
 - **`libatomic`**: Required for linking NumPy extensions statically on some architectures/compilers.
 - **PortAudio runtime**: Required by `sounddevice` when importing the GUI and
   running GUI unit tests. On Ubuntu/Debian install `libportaudio2`; Python package
   installation alone does not supply it on Linux. Provision it in each Linux
   runner image, then rebuild/recreate the containers; no audio device is needed
   for the build-helper library-load preflight.
+
+The Linux CI helper checks `gcc`, `ccache`, `patchelf` and `nfpm` together and
+reports all missing commands before starting Nuitka. Install nFPM separately
+using [its official guide](https://nfpm.goreleaser.com/docs/install/); the Ubuntu
+package list above does not provide it. The [workflow guide](packaging/github/README.sessionprep.md#runner-prerequisites)
+contains the runner-image package list and image-build validation command.
 
 ### 2.7 Project Structure for Packaging
 

@@ -61,13 +61,33 @@ Installing the Python `sounddevice` package does not supply it on Linux; see
 Add `libportaudio2` to the existing apt package list in **both** x64 and ARM64
 runner images, rebuild those images, then recreate the runner containers from
 the updated images. Installing on the Docker host does not provision a container;
-restarting an existing container does not update its image. A Dockerfile layer is:
+restarting an existing container does not update its image. Provision the
+Ubuntu build/runtime package set together, for example in the existing apt layer:
 
 ```dockerfile
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends libportaudio2 \
+    && apt-get install -y --no-install-recommends \
+        build-essential ccache patchelf libatomic1 libportaudio2 \
+        git gh curl ca-certificates tar unzip \
     && rm -rf /var/lib/apt/lists/*
 ```
+
+`ccache` is required by these CI helpers to retain compiler caching on the shared
+workers; local Nuitka builds can run without it. Install `nfpm` separately using
+[its official installation instructions](https://nfpm.goreleaser.com/docs/install/)
+for the image's native architecture. The apt package list above does not install
+nFPM. It is needed to create the DEB/RPM deliverables.
+
+After provisioning all tools, verify the image before starting runner containers:
+
+```dockerfile
+RUN for tool in gcc ccache patchelf nfpm tar gh unzip; do \
+        command -v "$tool" || exit 1; \
+    done
+```
+
+Compilation preflight reports every missing required command in one error and
+starts no compiler until all are present. It does not install missing tools.
 
 The metadata command checks that PortAudio can be located and loaded before
 writing success outputs or collecting GUI tests; compilation repeats the check

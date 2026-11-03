@@ -112,9 +112,9 @@ def compile_app(args):
     required = (["gcc", "ccache", "patchelf", "nfpm"] if sys.platform == "linux"
                 else ["cl.exe"] if sys.platform == "win32"
                 else ["xcrun", "codesign", "ditto", "hdiutil"])
-    for tool in required:
-        if not shutil.which(tool):
-            raise ValueError(f"Runner prerequisite missing: {tool}; provision it on the runner image")
+    missing = [tool for tool in required if not shutil.which(tool)]
+    if missing:
+        raise ValueError(f"Runner prerequisites missing: {', '.join(missing)}; provision them on the runner image")
     command = [sys.executable, str(ROOT / "build_nuitka.py"), "all", "--build-version", args.version]
     if args.debug:
         command.append("--debug")
