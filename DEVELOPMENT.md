@@ -204,6 +204,11 @@ Native installer fixture tests compile all three Inno variants when Inno Setup
 is available; they never install or execute their payloads. Live runner, signing,
 notarization and installation/upgrade validation require manually initiated runs.
 
+Platform-dependent unit tests must select the platform they exercise explicitly.
+The Pro Tools template-cache tests run the same cache assertions for Windows and
+macOS on any test host, plus a Linux case for bypassing native template caches.
+They use fake PTSL engines and do not require Pro Tools to be running.
+
 ### 2.1 Centralized Metadata (`build_conf.py`)
 
 All build metadata—target entry points, asset paths, platform-specific names,
@@ -312,7 +317,7 @@ installed:
 
 ```bash
 # Debian / Ubuntu
-sudo apt install gcc patchelf ccache libatomic1
+sudo apt install gcc patchelf ccache libatomic1 libportaudio2
 
 # Fedora
 sudo dnf install gcc patchelf ccache libatomic-static
@@ -322,6 +327,11 @@ sudo dnf install gcc patchelf ccache libatomic-static
 - **`patchelf`**: Required by Nuitka to modify RPATHs in standalone binaries.
 - **`ccache`**: (Optional) Speeds up recompilation significantly.
 - **`libatomic`**: Required for linking NumPy extensions statically on some architectures/compilers.
+- **PortAudio runtime**: Required by `sounddevice` when importing the GUI and
+  running GUI unit tests. On Ubuntu/Debian install `libportaudio2`; Python package
+  installation alone does not supply it on Linux. Provision it in each Linux
+  runner image, then rebuild/recreate the containers; no audio device is needed
+  for the build-helper library-load preflight.
 
 ### 2.7 Project Structure for Packaging
 

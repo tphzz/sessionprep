@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes.util
 import hashlib
 import json
 import os
@@ -60,6 +61,22 @@ def verify_manifest(directory, platform, version, sha, debug):
     return [directory / name for name in files]
 
 
+def check_linux_audio_runtime():
+    """Check the real shared library without opening audio hardware."""
+    if sys.platform != "linux":
+        return
+    message = ("Linux runner cannot load PortAudio. Install libportaudio2 in the "
+               "Ubuntu/Debian runner image, rebuild it and recreate the runner "
+               "containers for x64 and ARM64.")
+    try:
+        library = ctypes.util.find_library("portaudio")
+        if not library:
+            raise ValueError(message)
+        ctypes.CDLL(library)
+    except OSError as error:
+        raise ValueError(message) from error
+
+
 def metadata(args):
     actual = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
     if actual != args.sha:
@@ -80,6 +97,7 @@ def metadata(args):
             raise ValueError("This ref changes workflows. Configure SESSIONPREP_RELEASE_TOKEN with Contents:write "
                              "and Workflows:write before building release drafts; GITHUB_TOKEN cannot provide that scope.")
     version = resolve_ref_version(args.ref_type, args.ref_name, actual)
+    check_linux_audio_runtime()
     with Path(args.github_output).open("a", encoding="utf-8") as stream:
         stream.write(f"version={version}\nsha={actual}\n")
     print(f"Building {args.ref_type} {args.ref_name} at {actual}: {version}")
@@ -90,6 +108,7 @@ def compile_app(args):
         raise ValueError(f"Native Python architecture mismatch: {get_platform_suffix()} != {args.platform}")
     if sys.version_info[:2] != (3, 13):
         raise ValueError("Builds require native Python 3.13")
+    check_linux_audio_runtime()
     required = (["gcc", "ccache", "patchelf", "nfpm"] if sys.platform == "linux"
                 else ["cl.exe"] if sys.platform == "win32"
                 else ["xcrun", "codesign", "ditto", "hdiutil"])

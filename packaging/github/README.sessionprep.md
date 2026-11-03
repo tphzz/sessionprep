@@ -44,7 +44,8 @@ cleanup is restricted to those paths and never removes signing state.
 
 ## Runner prerequisites
 
-- Linux: native compiler, ccache, patchelf, nfpm, tar, GitHub CLI and unzip.
+- Linux: native compiler, ccache, patchelf, nfpm, tar, GitHub CLI, unzip,
+  and the PortAudio runtime (`libportaudio2` on Ubuntu/Debian).
 - Windows: native Python 3.13, Git Bash, Visual Studio 18 C++ tools for the native
   architecture, and Inno Setup 6. CI does not change Defender configuration.
 - macOS: Xcode at `/Applications/Xcode.app`, Rosetta for Intel, and the existing
@@ -53,6 +54,26 @@ cleanup is restricted to those paths and never removes signing state.
 Python/uv and dependency setup follow the reusable helpers. Dependencies use the
 frozen lockfile. Missing image prerequisites fail with actionable errors rather
 than modifying system packages during builds.
+
+Linux GUI test imports and builds require the real PortAudio shared library.
+Installing the Python `sounddevice` package does not supply it on Linux; see
+[its installation guide](https://python-sounddevice.readthedocs.io/en/0.5.5/installation.html).
+Add `libportaudio2` to the existing apt package list in **both** x64 and ARM64
+runner images, rebuild those images, then recreate the runner containers from
+the updated images. Installing on the Docker host does not provision a container;
+restarting an existing container does not update its image. A Dockerfile layer is:
+
+```dockerfile
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libportaudio2 \
+    && rm -rf /var/lib/apt/lists/*
+```
+
+The metadata command checks that PortAudio can be located and loaded before
+writing success outputs or collecting GUI tests; compilation repeats the check
+on its own worker. No audio device or playback is required by this check. A
+missing/broken library fails with an image-provisioning instruction. It does not
+skip tests, install packages or alter playback behavior.
 
 ## Versions and artifacts
 

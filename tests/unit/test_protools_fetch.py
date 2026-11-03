@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import types
 import json
+import platform
 from types import SimpleNamespace
 from pathlib import Path
 
@@ -60,6 +61,12 @@ def fake_ptsl(monkeypatch):
     module.Engine = engine_factory
     monkeypatch.setitem(sys.modules, "ptsl", module)
     return engines
+
+
+@pytest.fixture(params=("Windows", "Darwin"))
+def supported_template_platform(request, monkeypatch):
+    """Exercise native template-cache paths independently of the test host."""
+    monkeypatch.setattr(platform, "system", lambda: request.param)
 
 
 def _processor(tmp_path, timeout=60.0):
@@ -176,6 +183,7 @@ def test_fetch_failure_does_not_emit_fetch_complete(
     assert "Fetch complete" not in progress
 
 
+@pytest.mark.usefixtures("supported_template_platform")
 def test_fetch_uses_valid_template_cache_without_opening_ptsl(
     fake_ptsl, monkeypatch, tmp_path
 ):
@@ -207,6 +215,7 @@ def test_fetch_uses_valid_template_cache_without_opening_ptsl(
     assert result.daw_state["protools_0"]["folders"][0]["name"] == "Cached"
 
 
+@pytest.mark.usefixtures("supported_template_platform")
 def test_fetch_ignore_cache_opens_ptsl_despite_valid_cache(
     fake_ptsl, monkeypatch, tmp_path
 ):
@@ -239,6 +248,7 @@ def test_fetch_ignore_cache_opens_ptsl_despite_valid_cache(
     assert result.daw_state["protools_0"]["folders"][0]["name"] == "Routing"
 
 
+@pytest.mark.usefixtures("supported_template_platform")
 def test_fetch_ignore_cache_refreshes_template_cache(
     fake_ptsl, monkeypatch, tmp_path
 ):
@@ -271,3 +281,27 @@ def test_fetch_ignore_cache_refreshes_template_cache(
     folders = cache_data["SessionPrep/Template"]["folders"]
     assert folders[0]["name"] == "Routing"
     assert cache_data["SessionPrep/Template"]["mtime"] == template_file.stat().st_mtime
+
+
+def test_linux_fetch_does_not_use_or_rewrite_native_template_cache(
+    fake_ptsl, monkeypatch, tmp_path
+):
+    monkeypatch.setattr(platform, "system", lambda: "Linux")
+    template_file = _template_file(tmp_path, monkeypatch)
+    cache_file = _cache_file(tmp_path, monkeypatch)
+    cached = {
+        "SessionPrep/Template": {
+            "mtime": template_file.stat().st_mtime,
+            "folders": [{"id": "old-folder", "name": "Old"}],
+        }
+    }
+    cached_bytes = json.dumps(cached).encode("utf-8")
+    cache_file.write_bytes(cached_bytes)
+    _allow_fresh_fetch(monkeypatch)
+
+    result = _processor(tmp_path).fetch(_session())
+
+    assert len(fake_ptsl) == 1
+    assert fake_ptsl[0].closed
+    assert result.daw_state["protools_0"]["folders"][0]["name"] == "Routing"
+    assert cache_file.read_bytes() == cached_bytes

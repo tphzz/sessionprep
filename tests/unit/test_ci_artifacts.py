@@ -43,6 +43,7 @@ def test_collector_checks_every_platform_before_creating_destination(tmp_path):
 def test_release_preflight_checks_workflow_changes_before_builds(tmp_path, monkeypatch, has_token):
     import argparse
     import json
+    monkeypatch.setattr(ci, "check_linux_audio_runtime", lambda: None)
     event = tmp_path / "event.json"
     event.write_text(json.dumps({"repository":{"default_branch":"main"}}))
     monkeypatch.setenv("GITHUB_EVENT_PATH", str(event))
@@ -73,3 +74,73 @@ def test_collector_accepts_only_complete_matching_platform_artifacts(tmp_path):
     delivered=list((tmp_path/"release").iterdir())
     assert len(delivered)==9
     assert len([p for p in delivered if p.suffix==".exe"])==1
+
+
+
+def test_linux_audio_runtime_reports_missing_portaudio(monkeypatch):
+    import ctypes
+    import ctypes.util
+    monkeypatch.setattr(ci.sys, "platform", "linux")
+    monkeypatch.setattr(ctypes.util, "find_library", lambda name: None)
+    monkeypatch.setattr(ctypes, "CDLL", lambda name: pytest.fail("Missing library must not be loaded"))
+    with pytest.raises(ValueError, match="libportaudio2"):
+        ci.check_linux_audio_runtime()
+
+
+def test_linux_audio_runtime_reports_unloadable_portaudio(monkeypatch):
+    import ctypes
+    import ctypes.util
+    monkeypatch.setattr(ci.sys, "platform", "linux")
+    monkeypatch.setattr(ctypes.util, "find_library", lambda name: "libportaudio.so.2")
+    def load(name):
+        raise OSError("Dependent shared object missing")
+    monkeypatch.setattr(ctypes, "CDLL", load)
+    with pytest.raises(ValueError, match="runner image") as error:
+        ci.check_linux_audio_runtime()
+    assert isinstance(error.value.__cause__, OSError)
+
+
+def test_linux_audio_runtime_loads_without_opening_a_device(monkeypatch):
+    import ctypes
+    import ctypes.util
+    monkeypatch.setattr(ci.sys, "platform", "linux")
+    monkeypatch.setattr(ctypes.util, "find_library", lambda name: "libportaudio.so.2")
+    loaded=[]
+    monkeypatch.setattr(ctypes, "CDLL", lambda name: loaded.append(name) or object())
+    ci.check_linux_audio_runtime()
+    assert loaded == ["libportaudio.so.2"]
+
+
+@pytest.mark.parametrize("platform", ["win32", "darwin"])
+def test_linux_audio_runtime_leaves_other_platforms_untouched(monkeypatch, platform):
+    import ctypes.util
+    monkeypatch.setattr(ci.sys, "platform", platform)
+    monkeypatch.setattr(ctypes.util, "find_library", lambda name: pytest.fail("Non-Linux runtime must not be probed"))
+    ci.check_linux_audio_runtime()
+
+
+def test_metadata_runtime_failure_leaves_no_success_outputs(tmp_path, monkeypatch):
+    import argparse
+    monkeypatch.setattr(ci.subprocess, "check_output", lambda *a, **kw: "a"*40)
+    def missing():
+        raise ValueError("Missing PortAudio in runner image")
+    monkeypatch.setattr(ci, "check_linux_audio_runtime", missing)
+    output=tmp_path/"outputs"
+    args=argparse.Namespace(ref_type="branch",ref_name="0.3.5",sha="a"*40,
+                            github_output=str(output),release_drafts=False,release_token_available=False)
+    with pytest.raises(ValueError, match="PortAudio"):
+        ci.metadata(args)
+    assert not output.exists()
+
+
+def test_linux_compilation_stops_before_nuitka_without_audio_runtime(monkeypatch):
+    import argparse
+    monkeypatch.setattr(ci.sys, "platform", "linux")
+    monkeypatch.setattr(ci, "get_platform_suffix", lambda: "linux-x64")
+    monkeypatch.setattr(ci.shutil, "which", lambda name: "/provided/" + name)
+    def missing():
+        raise ValueError("Missing PortAudio in runner image")
+    monkeypatch.setattr(ci, "check_linux_audio_runtime", missing)
+    monkeypatch.setattr(ci, "run", lambda *a, **kw: pytest.fail("Nuitka must not start"))
+    with pytest.raises(ValueError, match="PortAudio"):
+        ci.compile_app(argparse.Namespace(platform="linux-x64",version="0.3.5",debug=False))
