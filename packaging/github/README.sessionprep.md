@@ -47,13 +47,33 @@ cleanup is restricted to those paths and never removes signing state.
 - Linux: native compiler, ccache, patchelf, nfpm, tar, GitHub CLI, unzip,
   and the PortAudio runtime (`libportaudio2` on Ubuntu/Debian).
 - Windows: native Python 3.13, Git Bash, Visual Studio 18 C++ tools for the native
-  architecture, and Inno Setup 6. CI does not change Defender configuration.
+  architecture, and Inno Setup 6 or 7. CI does not change Defender configuration.
 - macOS: Xcode at `/Applications/Xcode.app`, Rosetta for Intel, and the existing
   Developer ID signing setup described in [the macOS guide](../macos/README.md).
 
 Python/uv and dependency setup follow the reusable helpers. Dependencies use the
 frozen lockfile. Missing image prerequisites fail with actionable errors rather
 than modifying system packages during builds.
+
+Windows Python selection uses an explicit runner `CI_PYTHON` when set, otherwise
+`python.exe` on the runner account's PATH. Before dependency setup or MSVC
+activation, the helpers validate Python 3.13 and its interpreter platform:
+`win-amd64` for x64 or `win-arm64` for ARM64. An x64 interpreter under emulation
+does not satisfy an ARM64 build. Configure the native interpreter explicitly
+when both versions are installed; the scripts do not install or replace Python.
+
+Installer discovery prefers `ISCC_PATH` (the full `ISCC.exe` path), then the
+legacy `ISCC` override, PATH, and Inno Setup 6/7 machine/per-user locations.
+An invalid explicit override fails rather than selecting a different compiler.
+Configure these variables for the runner account; restart its service after
+changing inherited environment variables. Verify discovery without building:
+
+```powershell
+python packaging/windows/build_installer.py check
+```
+
+Windows native compilation checks installer discovery before running Nuitka.
+The adaptive installer also checks it before staging/extracting payloads.
 
 Windows CI uses Nuitka's `--low-memory` mode for both executables and both build
 configurations. This selects one C compiler job and reduces peak memory use when

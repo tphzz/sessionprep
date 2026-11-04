@@ -200,9 +200,27 @@ def test_ci_bounds_windows_compiler_memory(monkeypatch, native_platform,
 
     ci.compile_app(argparse.Namespace(platform=native_platform, version="0.3.5", debug=debug))
 
-    assert len(started) == 1
-    command, options = started[0]
+    assert len(started) == (2 if python_platform == "win32" else 1)
+    if python_platform == "win32":
+        assert started[0][0][1:] == (ROOT / "packaging/windows/build_installer.py", "check")
+    command, options = started[-1]
     assert ("--low-memory" in command) is low_memory
     assert ("--debug" in command) is debug
     assert command[command.index("--build-version") + 1] == "0.3.5"
     assert options["cwd"] == ROOT
+
+
+
+def test_windows_missing_installer_stops_before_nuitka(monkeypatch):
+    import argparse
+    import subprocess
+    monkeypatch.setattr(ci.sys, "platform", "win32")
+    monkeypatch.setattr(ci, "get_platform_suffix", lambda: "win-x64")
+    monkeypatch.setattr(ci, "check_linux_audio_runtime", lambda: None)
+    monkeypatch.setattr(ci.shutil, "which", lambda name: "/provided/" + name)
+    def fail_preflight(*command, **kwargs):
+        assert command[1:] == (ROOT / "packaging/windows/build_installer.py", "check")
+        raise subprocess.CalledProcessError(1, command)
+    monkeypatch.setattr(ci, "run", fail_preflight)
+    with pytest.raises(subprocess.CalledProcessError):
+        ci.compile_app(argparse.Namespace(platform="win-x64", version="0.3.5", debug=False))

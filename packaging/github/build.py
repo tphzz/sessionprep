@@ -115,6 +115,8 @@ def compile_app(args):
     missing = [tool for tool in required if not shutil.which(tool)]
     if missing:
         raise ValueError(f"Runner prerequisites missing: {', '.join(missing)}; provision them on the runner image")
+    if sys.platform == "win32":
+        run(sys.executable, ROOT / "packaging/windows/build_installer.py", "check", cwd=ROOT)
     command = [sys.executable, str(ROOT / "build_nuitka.py"), "all", "--build-version", args.version]
     if sys.platform == "win32":
         # Bound peak MSVC/SciPy compilation memory on shared Windows workers.

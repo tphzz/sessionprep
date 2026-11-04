@@ -5,6 +5,7 @@ Used by the Nuitka build script to ensure consistent target metadata.
 import os
 import sys
 import platform
+import sysconfig
 import importlib.util
 
 # Core application metadata
@@ -34,10 +35,29 @@ _PLATFORM_SUFFIXES = {
 def get_platform_suffix() -> str:
     """Return platform-arch suffix, e.g. 'win-x64' or 'macos-arm64'."""
     plat = _PLATFORM_SUFFIXES.get(platform.system(), platform.system().lower())
-    arch = platform.machine().lower()
+    if platform.system() == "Windows":
+        # Windows may report the physical ARM64 host for an emulated x64 Python.
+        native = sysconfig.get_platform()
+        arch = {"win-amd64": "x64", "win-arm64": "arm64", "win32": "x86"}.get(
+            native, native.removeprefix("win-"))
+    else:
+        arch = platform.machine().lower()
     # Normalize arch names
     arch = {"x86_64": "x64", "amd64": "x64", "aarch64": "arm64"}.get(arch, arch)
     return f"{plat}-{arch}"
+
+def check_windows_python(target):
+    """Reject emulated/wrong-version Python before selecting the MSVC target."""
+    expected = {"win-x64": "win-amd64", "win-arm64": "win-arm64"}[target]
+    actual = sysconfig.get_platform()
+    version = ".".join(map(str, sys.version_info[:3]))
+    print(f"Selected Python: {sys.executable} ({version}, {actual}); expected {expected}")
+    if sys.version_info[:2] != (3, 13) or actual != expected:
+        raise ValueError(
+            f"{target} requires native Python 3.13 ({expected}); selected "
+            f"{sys.executable} is Python {version} ({actual}). Set CI_PYTHON to the "
+            "matching interpreter executable or correct the runner account's PATH.")
+
 
 def get_executable_name(base_name):
     """Returns the full executable name with platform suffix and extension."""

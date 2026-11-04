@@ -65,7 +65,7 @@ def create_kit(stage, output, version, suffix, dist_dir):
     command = (f'ISCC.exe /DAPP_VERSION={version} /DDIST_DIR={dist_dir} '
                f'/DARCH_SUFFIX={suffix} packaging/windows/sessionprep.iss')
     (stage / "README-INNOSETUP-REBUILD.txt").write_text(
-        "SessionPrep installer rebuild kit\n\nRequires Inno Setup 6. Run from this extracted directory:\n"
+        "SessionPrep installer rebuild kit\n\nRequires Inno Setup 6 or 7 (ISCC.exe). Run from this extracted directory:\n"
         + command + "\n\nFor Certum signing use sessionprep-signed.iss and the existing\n"
         'sessionprepSignTool definition: signtool.exe sign /a /fd SHA256 /t http://time.certum.pl/ $f\n',
         encoding="utf-8")
@@ -76,11 +76,36 @@ def create_kit(stage, output, version, suffix, dist_dir):
                 stream.write(path, path.relative_to(stage).as_posix())
 
 
+def resolve_iscc():
+    """Find the runner account's compiler, honoring explicit configuration first."""
+    for name in ("ISCC_PATH", "ISCC"):
+        explicit = os.environ.get(name, "").strip()
+        if explicit:
+            candidate = Path(explicit)
+            if not candidate.is_file():
+                raise ValueError(f"{name} does not point to an ISCC.exe compiler file: {candidate}")
+            return str(candidate.resolve())
+    found = shutil.which("ISCC.exe")
+    if found:
+        return str(Path(found).resolve())
+    roots = []
+    for name in ("ProgramFiles(x86)", "ProgramFiles", "ProgramW6432"):
+        value = os.environ.get(name)
+        if value and Path(value) not in roots:
+            roots.append(Path(value))
+    if os.environ.get("LOCALAPPDATA"):
+        roots.append(Path(os.environ["LOCALAPPDATA"]) / "Programs")
+    for version in ("6", "7"):
+        for root in roots:
+            candidate = root / ("Inno Setup " + version) / "ISCC.exe"
+            if candidate.is_file():
+                return str(candidate.resolve())
+    raise ValueError("Inno Setup 6 or 7 is missing for this runner account; "
+                     "set ISCC_PATH to the full ISCC.exe path or add it to PATH")
+
+
 def compile_installer(stage, output, version, suffix, dist_dir):
-    compiler = (os.environ.get("ISCC") or shutil.which("ISCC.exe") or
-                str(Path(os.environ.get("ProgramFiles(x86)", "C:/Program Files (x86)")) / "Inno Setup 6/ISCC.exe"))
-    if not Path(compiler).is_file():
-        raise ValueError("Inno Setup 6 is missing; provision ISCC.exe on the runner")
+    compiler = resolve_iscc()
     subprocess.run([compiler, f"/O{output}", f"/DAPP_VERSION={version}", f"/DDIST_DIR={dist_dir}",
                     f"/DARCH_SUFFIX={suffix}", str(stage / "packaging/windows/sessionprep.iss")],
                    cwd=stage, check=True)
@@ -91,14 +116,21 @@ def compile_installer(stage, output, version, suffix, dist_dir):
 
 def main():
     parser = argparse.ArgumentParser(__doc__)
-    parser.add_argument("mode", choices=("single", "bundle"))
-    parser.add_argument("--architecture", choices=("x64", "arm64"))
-    parser.add_argument("--version", required=True)
-    parser.add_argument("--sha", required=True)
-    parser.add_argument("--configuration", required=True, choices=("release", "debug"))
-    parser.add_argument("--artifact-root", type=Path)
-    parser.add_argument("--output", type=Path, required=True)
+    modes = parser.add_subparsers(dest="mode", required=True)
+    modes.add_parser("check", help="Check installer compiler discovery without building")
+    for mode in ("single", "bundle"):
+        child = modes.add_parser(mode)
+        child.add_argument("--architecture", choices=("x64", "arm64"))
+        child.add_argument("--version", required=True)
+        child.add_argument("--sha", required=True)
+        child.add_argument("--configuration", required=True, choices=("release", "debug"))
+        child.add_argument("--artifact-root", type=Path)
+        child.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    compiler = resolve_iscc()
+    if args.mode == "check":
+        print(f"Inno Setup compiler: {compiler}")
+        return
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="sessionprep-inno-") as temporary:

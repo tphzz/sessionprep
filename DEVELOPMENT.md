@@ -202,6 +202,18 @@ at the cost of longer builds. Local builds can opt in with
 `uv run python build_nuitka.py all --low-memory`. See
 [Nuitka's memory guidance](https://nuitka.net/user-documentation/common-issue-solutions.html#memory-issues-and-compiler-bugs).
 
+Windows helpers honor `CI_PYTHON` or select `python.exe` from the runner
+account's PATH, then require Python 3.13 with a matching interpreter platform
+before MSVC activation and dependency setup. Artifact suffixes also follow the
+Windows interpreter architecture, including when x64 Python runs on ARM64.
+
+Installer packaging supports Inno Setup 6 and 7. Prefer `ISCC_PATH` with the
+full compiler path (for example, `C:\Program Files\Inno Setup 7\ISCC.exe`).
+The legacy `ISCC` variable, PATH, and standard machine/per-user locations are
+also supported. An invalid explicit path fails immediately. Run
+`python packaging/windows/build_installer.py check` to verify the compiler
+available to the current account before building.
+
 The dev-only PyYAML dependency supports semantic workflow tests. Run the unit
 suite with `uv run pytest tests/unit`. `actionlint` uses `.github/actionlint.yaml`
 for existing custom runner labels; its narrow queue-property exception covers
