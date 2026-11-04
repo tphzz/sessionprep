@@ -117,8 +117,35 @@ jobs:
         name: sessionprep-${{ inputs.platform }}-${{ inputs.debug && 'debug' || 'release' }}
         path: ${{ env.SOURCE_DIR }}/artifacts
         if-no-files-found: error
+    - name: Clean only run-owned workspace (Windows)
+      if: ${{ always() && runner.os == 'Windows' }}
+      shell: powershell
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $python = if ([string]::IsNullOrWhiteSpace($env:CI_PYTHON)) { (Get-Command python.exe -ErrorAction Stop).Source } else { $env:CI_PYTHON }
+        @'
+        import json, os, pathlib, shutil, stat
+        workspace = pathlib.Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+        temporary = pathlib.Path(os.environ["RUNNER_TEMP"]).resolve()
+        run = os.environ["GITHUB_RUN_ID"] + "-" + os.environ["GITHUB_RUN_ATTEMPT"]
+        def remove_readonly(function, path, error):
+            if not isinstance(error, PermissionError):
+                raise error
+            os.chmod(path, stat.S_IWRITE)
+            function(path)
+        for name in json.loads(os.environ["CLEANUP_NAMES"]):
+            for parent, child in ((workspace, "src-" + run + "-" + name), (temporary, "sessionprep-env-" + run + "-" + name)):
+                target = (parent / child).resolve()
+                if target.parent != parent:
+                    raise RuntimeError("Cleanup target escaped the run workspace")
+                if target.exists():
+                    shutil.rmtree(target, onexc=remove_readonly)
+        '@ | & $python -
+        if ($LASTEXITCODE -ne 0) { throw 'Run-owned cleanup failed' }
+      env:
+        CLEANUP_NAMES: '["${{ inputs.platform }}"]'
     - name: Clean only run-owned workspace
-      if: ${{ always() }}
+      if: ${{ always() && runner.os != 'Windows' }}
       shell: bash
       run: |
         "${CI_PYTHON:-python}" - <<'PY'

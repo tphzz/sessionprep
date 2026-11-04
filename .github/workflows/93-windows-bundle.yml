@@ -83,11 +83,13 @@ jobs:
         name: sessionprep-win-universal-${{ inputs.debug && 'debug' || 'release' }}
         path: ${{ env.SOURCE_DIR }}/artifacts
         if-no-files-found: error
-    - name: Clean only run-owned workspace
+    - name: Clean only run-owned workspace (Windows)
       if: ${{ always() }}
-      shell: bash
+      shell: powershell
       run: |
-        "${CI_PYTHON:-python}" - <<'PY'
+        $ErrorActionPreference = 'Stop'
+        $python = if ([string]::IsNullOrWhiteSpace($env:CI_PYTHON)) { (Get-Command python.exe -ErrorAction Stop).Source } else { $env:CI_PYTHON }
+        @'
         import json, os, pathlib, shutil, stat
         workspace = pathlib.Path(os.environ["GITHUB_WORKSPACE"]).resolve()
         temporary = pathlib.Path(os.environ["RUNNER_TEMP"]).resolve()
@@ -104,6 +106,7 @@ jobs:
                     raise RuntimeError("Cleanup target escaped the run workspace")
                 if target.exists():
                     shutil.rmtree(target, onexc=remove_readonly)
-        PY
+        '@ | & $python -
+        if ($LASTEXITCODE -ne 0) { throw 'Run-owned cleanup failed' }
       env:
         CLEANUP_NAMES: '["windows-bundle"]'
