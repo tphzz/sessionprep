@@ -2,6 +2,7 @@ from pathlib import Path
 
 import json
 import yaml
+import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOWS = ROOT / ".github/workflows"
@@ -124,3 +125,85 @@ def test_windows_python_powershell_guard_rejects_wrong_arch_before_export(tmp_pa
         else:
             assert not destination.exists()
             assert target in result.stdout + result.stderr
+
+
+
+def windows_cleanup_step(name):
+    steps = next(iter(load(name)["jobs"].values()))["steps"]
+    return next(step for step in steps if step.get("name") == "Clean only run-owned workspace (Windows)")
+
+
+@pytest.mark.parametrize("name", ["91-build-platform.yml", "93-windows-bundle.yml"])
+def test_windows_cleanup_has_native_shell_even_before_preflight(name):
+    step = windows_cleanup_step(name)
+    assert step["shell"] == "powershell"
+    assert "always()" in step["if"]
+    if name == "91-build-platform.yml":
+        assert "runner.os == 'Windows'" in step["if"]
+        steps = load(name)["jobs"]["build"]["steps"]
+        other = next(step for step in steps if step.get("name") == "Clean only run-owned workspace")
+        assert other["shell"] == "bash"
+        assert "runner.os != 'Windows'" in other["if"]
+
+
+@pytest.mark.parametrize("name", ["91-build-platform.yml", "93-windows-bundle.yml"])
+def test_windows_cleanup_runs_without_bash_or_exported_ci_python(tmp_path, name):
+    import os
+    import shutil
+    import stat
+    import subprocess
+    import sys
+    powershell = shutil.which("powershell.exe")
+    if sys.platform != "win32" or powershell is None:
+        pytest.skip("Native PowerShell verification requires Windows")
+    workspace = tmp_path / "workspace [literal]"
+    temporary = tmp_path / "temporary [literal]"
+    workspace.mkdir()
+    temporary.mkdir()
+    source = workspace / "src-123-1-win-arm64"
+    environment = temporary / "sessionprep-env-123-1-win-arm64"
+    for target in (source, environment):
+        (target / "nested").mkdir(parents=True)
+        readonly = target / "nested" / "readonly.dat"
+        readonly.write_bytes(b"run-owned")
+        readonly.chmod(stat.S_IREAD)
+    unrelated = workspace / "src-other-run-win-arm64"
+    unrelated.mkdir()
+    (unrelated / "keep.dat").write_bytes(b"keep")
+    variables = dict(os.environ, PATH=str(Path(sys.executable).parent),
+                     GITHUB_WORKSPACE=str(workspace), RUNNER_TEMP=str(temporary),
+                     GITHUB_RUN_ID="123", GITHUB_RUN_ATTEMPT="1",
+                     CLEANUP_NAMES=json.dumps(["win-arm64"]), PYTHONDONTWRITEBYTECODE="1")
+    variables.pop("CI_PYTHON", None)
+    result = subprocess.run([powershell, "-NoProfile", "-NonInteractive", "-Command",
+                             windows_cleanup_step(name)["run"]], env=variables, text=True, capture_output=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not source.exists() and not environment.exists()
+    assert (unrelated / "keep.dat").read_bytes() == b"keep"
+    assert workspace.is_dir() and temporary.is_dir()
+
+
+def test_windows_cleanup_rejects_paths_outside_run_roots(tmp_path):
+    import os
+    import shutil
+    import subprocess
+    import sys
+    powershell = shutil.which("powershell.exe")
+    if sys.platform != "win32" or powershell is None:
+        pytest.skip("Native PowerShell verification requires Windows")
+    workspace, temporary = tmp_path / "workspace", tmp_path / "temporary"
+    workspace.mkdir()
+    temporary.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "keep.dat").write_bytes(b"keep")
+    variables = dict(os.environ, CI_PYTHON=sys.executable,
+                     GITHUB_WORKSPACE=str(workspace), RUNNER_TEMP=str(temporary),
+                     GITHUB_RUN_ID="123", GITHUB_RUN_ATTEMPT="1",
+                     CLEANUP_NAMES=json.dumps(["../../../outside"]), PYTHONDONTWRITEBYTECODE="1")
+    result = subprocess.run([powershell, "-NoProfile", "-NonInteractive", "-Command",
+                             windows_cleanup_step("91-build-platform.yml")["run"]],
+                            env=variables, text=True, capture_output=True)
+    assert result.returncode != 0
+    assert "escaped" in result.stdout + result.stderr
+    assert (outside / "keep.dat").read_bytes() == b"keep"

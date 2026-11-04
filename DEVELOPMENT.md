@@ -206,6 +206,8 @@ Windows helpers honor `CI_PYTHON` or select `python.exe` from the runner
 account's PATH, then require Python 3.13 with a matching interpreter platform
 before MSVC activation and dependency setup. Artifact suffixes also follow the
 Windows interpreter architecture, including when x64 Python runs on ARM64.
+Windows cleanup runs through PowerShell even after native validation fails;
+it can use the existing Python from PATH without requiring Git Bash setup.
 
 Installer packaging supports Inno Setup 6 and 7. Prefer `ISCC_PATH` with the
 full compiler path (for example, `C:\Program Files\Inno Setup 7\ISCC.exe`).

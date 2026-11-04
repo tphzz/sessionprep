@@ -41,6 +41,10 @@ groups across all entry points. Running builds are not automatically cancelled;
 `queue: max` preserves waiting manual jobs. These groups do not coordinate other
 repositories. Source checkouts, virtual environments and outputs are run-scoped;
 cleanup is restricted to those paths and never removes signing state.
+Windows always-run cleanup uses PowerShell to invoke the existing guarded
+Python cleanup directly. It can use Python on PATH when native validation
+fails before exporting CI_PYTHON, without depending on Git Bash setup.
+Cleanup is architecture-independent; the build still requires native Python.
 
 ## Runner prerequisites
 
