@@ -41,9 +41,9 @@ jobs:
       shell: powershell
       run: |
         $ErrorActionPreference = 'Stop'
-        $python = if ([string]::IsNullOrWhiteSpace($env:CI_PYTHON)) { (Get-Command python.exe -ErrorAction Stop).Source } else { $env:CI_PYTHON }
-        & $python -c "import os,sys; sys.path.insert(0,os.environ['SOURCE_DIR']); from build_conf import check_windows_python; check_windows_python('win-x64')"
-        if ($LASTEXITCODE -ne 0) { throw 'Native Python validation failed; see the required architecture above' }
+        $helper = (Resolve-Path -LiteralPath (Join-Path $env:SOURCE_DIR 'packaging/github/windows_python.ps1')).ProviderPath
+        . $helper
+        $python = Find-SessionPrepPython -Target 'win-x64'
         "CI_PYTHON=$python" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
         $git = (Get-Command git.exe -ErrorAction Stop).Source
         $gitRoot = Split-Path (Split-Path $git -Parent) -Parent
