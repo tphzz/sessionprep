@@ -202,10 +202,13 @@ at the cost of longer builds. Local builds can opt in with
 `uv run python build_nuitka.py all --low-memory`. See
 [Nuitka's memory guidance](https://nuitka.net/user-documentation/common-issue-solutions.html#memory-issues-and-compiler-bugs).
 
-Windows helpers honor `CI_PYTHON` or select `python.exe` from the runner
-account's PATH, then require Python 3.13 with a matching interpreter platform
-before MSVC activation and dependency setup. Artifact suffixes also follow the
-Windows interpreter architecture, including when x64 Python runs on ARM64.
+Windows helpers honor an explicit `CI_PYTHON` and reject an invalid override.
+Otherwise they check each `python.exe` on PATH, then standard CPython 3.13
+machine/per-user installer locations (including `Python313-arm64`). Selection
+requires Python 3.13 with the matching interpreter platform before MSVC activation
+and dependency setup. For custom locations, set `CI_PYTHON` to the executable;
+restart the runner service after changing its environment. Artifact suffixes
+also follow the interpreter architecture, including x64 Python on ARM64.
 Windows cleanup runs through PowerShell even after native validation fails;
 it can use the existing Python from PATH without requiring Git Bash setup.
 
@@ -389,6 +392,13 @@ contains the runner-image package list and image-build validation command.
 Core runtime dependencies (`numpy`, `soundfile`, `scipy`) are declared in
 `[project].dependencies`. GUI-only dependencies (`PySide6`, `sounddevice`)
 are declared as optional under `[project.optional-dependencies].gui`.
+
+SoundFile 0.14.0 or newer is required for its Windows ARM64 wheel, which includes
+`_soundfile_data/libsndfile_arm64.dll`. Earlier pure-Python ARM64 installs require
+a separate native libsndfile installation. The frozen lockfile includes native
+SoundFile wheels for all six build targets; use it rather than installing an
+older version globally. Nuitka's built-in `_soundfile_data` rule includes the
+bundled library. See the [SoundFile 0.14.0 release](https://github.com/bastibe/python-soundfile/releases/tag/0.14.0).
 Install with `pip install .[gui]` or `uv sync` (which installs all groups
 by default).
 

@@ -59,12 +59,21 @@ Python/uv and dependency setup follow the reusable helpers. Dependencies use the
 frozen lockfile. Missing image prerequisites fail with actionable errors rather
 than modifying system packages during builds.
 
-Windows Python selection uses an explicit runner `CI_PYTHON` when set, otherwise
-`python.exe` on the runner account's PATH. Before dependency setup or MSVC
-activation, the helpers validate Python 3.13 and its interpreter platform:
-`win-amd64` for x64 or `win-arm64` for ARM64. An x64 interpreter under emulation
-does not satisfy an ARM64 build. Configure the native interpreter explicitly
-when both versions are installed; the scripts do not install or replace Python.
+SoundFile must be at least 0.14.0: its Windows ARM64 wheel bundles the native
+libsndfile DLL. The locked platform wheels and Nuitka's existing `_soundfile_data`
+DLL rule provide this dependency; a separate Windows libsndfile installation is
+not needed with the supported wheel.
+
+Windows Python selection uses an explicit runner `CI_PYTHON` when set and rejects
+an invalid override without falling back. Otherwise the shared PowerShell helper
+checks each `python.exe` on PATH, then standard CPython 3.13 machine/per-user
+installer locations (`Python313` for x64, `Python313-arm64` for ARM64). It skips
+Windows Store execution aliases. Each candidate must pass the existing native
+Python guard before dependency setup, MSVC activation or environment export:
+`win-amd64` for x64 or `win-arm64` for ARM64, running Python 3.13. An x64 interpreter
+under emulation does not satisfy an ARM64 build. Use `CI_PYTHON` for a custom
+installation path; the scripts do not install or replace Python. The standard
+locations follow the [CPython full installer](https://github.com/python/cpython/blob/3.13/Tools/msi/bundle/bundle.wxs).
 
 Installer discovery prefers `ISCC_PATH` (the full `ISCC.exe` path), then the
 legacy `ISCC` override, PATH, and Inno Setup 6/7 machine/per-user locations.
