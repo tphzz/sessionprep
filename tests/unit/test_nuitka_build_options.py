@@ -79,3 +79,32 @@ def test_cli_passes_memory_mode_to_both_targets(tmp_path, monkeypatch, low_memor
 
     assert [target for target, _ in calls] == ["cli", "gui"]
     assert all(options["low_memory"] is low_memory for _, options in calls)
+
+
+@pytest.mark.parametrize("target", ["cli", "gui"])
+@pytest.mark.parametrize("debug", [False, True])
+@pytest.mark.parametrize("native_platform,python_platform", [
+    ("win-arm64", "win32"), ("win-x64", "win32"),
+    ("linux-arm64", "linux"), ("linux-x64", "linux"),
+    ("macos-arm64", "darwin"), ("macos-x64", "darwin"),
+])
+def test_arm64_preserves_lebedev_as_bytecode(tmp_path, monkeypatch, target, debug,
+                                           native_platform, python_platform):
+    calls = []
+    monkeypatch.setattr(build, "BASE_DIR", str(tmp_path))
+    monkeypatch.setattr(build, "DIST_NUITKA", str(tmp_path / "dist"))
+    monkeypatch.setattr(build.sys, "platform", python_platform)
+    monkeypatch.setattr(build, "get_platform_suffix", lambda: native_platform)
+    monkeypatch.setattr(build, "_check_dependencies", lambda *args: None)
+    monkeypatch.setattr(build, "write_build_version_file", lambda version: version)
+    monkeypatch.setattr(build, "remove_build_version_file", lambda: None)
+    monkeypatch.setattr(build.subprocess, "check_call", lambda args: calls.append(args))
+    monkeypatch.setattr(build, "fetch_and_bundle_rps", lambda *args: None)
+
+    build.run_nuitka(target, low_memory=True, debug=debug, build_version="0.3.5")
+
+    command = calls[0]
+    expected = ["--noinclude-custom-mode=scipy.integrate._lebedev:bytecode"] if native_platform == "win-arm64" else []
+    assert [arg for arg in command if arg.startswith("--noinclude-custom-mode=")] == expected
+    assert not any(arg.startswith("--nofollow-import-to=scipy") for arg in command)
+    assert "--low-memory" in command

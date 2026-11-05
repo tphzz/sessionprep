@@ -15,6 +15,8 @@ from build_conf import (
     BASE_DIR,
     DIST_NUITKA,
     MACOS_APP_NAME,
+    NUITKA_BYTECODE_MODULES_BY_PLATFORM,
+    get_platform_suffix,
     remove_build_version_file,
     write_build_version_file,
 )
@@ -154,6 +156,9 @@ def run_nuitka(target_key, clean=False, *, debug=False, build_version=None, low_
 
     for module in target.get("nuitka_include_modules", []):
         cmd.append(f"--include-module={module}")
+
+    for module in NUITKA_BYTECODE_MODULES_BY_PLATFORM.get(get_platform_suffix(), ()):
+        cmd.append(f"--noinclude-custom-mode={module}:bytecode")
 
     # Exclusions (The "Clean Dependencies" Logic)
     for exclude in target.get("nuitka_exclude", []):

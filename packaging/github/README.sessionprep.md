@@ -94,6 +94,12 @@ compiling SciPy with MSVC on shared workers; compilation can take longer. Local
 builds can use `uv run python build_nuitka.py all --low-memory`. See
 [Nuitka's documented memory controls](https://nuitka.net/user-documentation/common-issue-solutions.html#memory-issues-and-compiler-bugs).
 
+Native Windows ARM64 also bundles `scipy.integrate._lebedev` as Python bytecode.
+This preserves the imported module while avoiding its oversized C translation
+unit, which can trigger MSVC C1002 even in serial builds. `build_conf.py` owns
+this narrow policy for both executables and build configurations; SciPy signal
+processing and native libraries remain available.
+
 The locked PySide6 6.10.2 ARM64 Linux wheels require glibc 2.39 or newer, so that
 worker needs Ubuntu 24.04 (Noble) or a compatible newer runtime. x64 wheels work
 with the existing Jammy baseline. Runner labels identify scheduling targets;

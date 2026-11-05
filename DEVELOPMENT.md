@@ -202,6 +202,14 @@ at the cost of longer builds. Local builds can opt in with
 `uv run python build_nuitka.py all --low-memory`. See
 [Nuitka's memory guidance](https://nuitka.net/user-documentation/common-issue-solutions.html#memory-issues-and-compiler-bugs).
 
+Windows ARM64 builds retain `scipy.integrate._lebedev` as embedded Python bytecode
+using Nuitka's `--noinclude-custom-mode=scipy.integrate._lebedev:bytecode` option.
+Native ARM64 MSVC can exhaust its heap compiling this module's large generated
+C file even with one compiler job. The policy lives in `build_conf.py` and applies
+to CLI and GUI, Debug and Release, including local builds. The module remains
+available; SciPy signal processing and its native extensions remain included.
+Other platforms retain their normal compilation policy.
+
 Windows helpers honor an explicit `CI_PYTHON` and reject an invalid override.
 Otherwise they check each `python.exe` on PATH, then standard CPython 3.13
 machine/per-user installer locations (including `Python313-arm64`). Selection

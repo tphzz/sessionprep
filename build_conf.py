@@ -120,6 +120,12 @@ def _resolve_icon() -> str | None:
             return path
     return None
 
+# Native ARM64 MSVC exhausts its heap on this large generated SciPy C unit.
+# Retain the module and its API as bytecode in both executable bundles.
+NUITKA_BYTECODE_MODULES_BY_PLATFORM = {
+    "win-arm64": ("scipy.integrate._lebedev",),
+}
+
 # Target Definitions
 TARGETS = {
     "cli": {
