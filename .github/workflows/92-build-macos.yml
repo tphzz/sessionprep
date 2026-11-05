@@ -48,28 +48,73 @@ jobs:
         ref: ${{ github.sha }}
         fetch-depth: 0
         path: ${{ env.SOURCE_DIR }}
-    - name: Set up ARM64 Python
-      id: arm-python
-      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
-      with:
-        python-version: '3.13'
-        architecture: arm64
     - name: Set up uv
       uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990
       with:
         enable-cache: true
-    - name: Verify Xcode, Rosetta and persistent signing
+    - name: Verify Xcode and Rosetta
       shell: bash
       env:
-        MACOS_DEV_ID_CERT_NAME: ${{ secrets.MACOS_DEV_ID_CERT_NAME }}
         SELECTED_ARCH: ${{ inputs.architecture }}
       run: |
         set -euo pipefail
         case "$SELECTED_ARCH" in both|arm64|x64) ;; *) echo 'Invalid macOS architecture selection' >&2; exit 2;; esac
         xcodebuild -version
         if [[ "$SELECTED_ARCH" != "arm64" ]]; then /usr/bin/arch -x86_64 /usr/bin/true; fi
+    - name: Resolve selected macOS Python interpreters
+      id: macos-python
+      shell: bash
+      env:
+        SELECTED_ARCH: ${{ inputs.architecture }}
+      run: |
+        set -euo pipefail
+        case "$SELECTED_ARCH" in
+          both) architectures=(arm64 x64) ;;
+          arm64|x64) architectures=("$SELECTED_ARCH") ;;
+          *) echo 'Invalid macOS architecture selection' >&2; exit 2 ;;
+        esac
+        bootstrap_python=""
+        for architecture in "${architectures[@]}"; do
+          case "$architecture" in
+            arm64)
+              request=cpython-3.13-macos-aarch64-none
+              override="${CI_PYTHON_MACOS_ARM64:-${CI_PYTHON:-}}" ;;
+            x64)
+              request=cpython-3.13-macos-x86_64-none
+              override="${CI_PYTHON_MACOS_X64:-${CI_PYTHON:-}}" ;;
+          esac
+          if [[ -n "$override" ]]; then
+            python_path="$(uv python find --no-project --no-python-downloads "$override")"
+          else
+            uv python install --no-bin "$request"
+            python_path="$(uv python find --managed-python --no-project "$request")"
+          fi
+          "$python_path" - "$architecture" <<'PY'
+        import platform, sys
+        expected = {"arm64": "arm64", "x64": "x86_64"}[sys.argv[1]]
+        actual = platform.machine()
+        version = ".".join(map(str, sys.version_info[:3]))
+        print(f"Selected Python: {sys.executable} ({version}, {actual}); expected {expected}")
+        if (platform.system() != "Darwin" or platform.python_implementation() != "CPython"
+                or sys.version_info[:2] != (3, 13) or actual != expected):
+            raise SystemExit(f"macos-{sys.argv[1]} requires CPython 3.13 ({expected}); selected {sys.executable} is {version} ({actual})")
+        PY
+          printf '%s-python=%s\n' "$architecture" "$python_path" >> "$GITHUB_OUTPUT"
+          if [[ -z "$bootstrap_python" ]]; then
+            bootstrap_python="$python_path"
+            printf 'bootstrap-python=%s\n' "$bootstrap_python" >> "$GITHUB_OUTPUT"
+            printf 'MACOS_BOOTSTRAP_PYTHON=%s\n' "$bootstrap_python" >> "$GITHUB_ENV"
+          fi
+        done
+    - name: Verify persistent signing
+      shell: bash
+      env:
+        MACOS_DEV_ID_CERT_NAME: ${{ secrets.MACOS_DEV_ID_CERT_NAME }}
+        PYTHON_INSTALL: ${{ steps.macos-python.outputs.bootstrap-python }}
+      run: |
+        set -euo pipefail
         cd "$SOURCE_DIR"
-        python packaging/macos/ci_signing.py prepare
+        "$PYTHON_INSTALL" packaging/macos/ci_signing.py prepare
     - name: Build and package macOS arm64
       if: ${{ inputs.architecture != 'x64' }}
       shell: bash
@@ -77,16 +122,16 @@ jobs:
         SOURCE_DIR: ${{ env.SOURCE_DIR }}
         UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/sessionprep-env-${{ github.run_id }}-${{ github.run_attempt }}-macos-arm64
         BUILD_PLATFORM: macos-arm64
-        PYTHON_INSTALL: ${{ steps.arm-python.outputs.python-path }}
+        PYTHON_INSTALL: ${{ steps.macos-python.outputs.arm64-python }}
       run: |
         set -euo pipefail
         cd "$SOURCE_DIR"
-        python_path="${CI_PYTHON:-$PYTHON_INSTALL}"
+        python_path="$PYTHON_INSTALL"
         uv sync --frozen --extra cli --extra gui --python "$python_path"
         build_args=(--platform "$BUILD_PLATFORM" --version "$BUILD_VERSION" --sha "$SOURCE_SHA")
         if [[ "$DEBUG_BUILD" == "true" ]]; then build_args+=(--debug); fi
-        uv run --frozen python packaging/github/build.py compile "${build_args[@]}"
-        uv run --frozen python packaging/github/build.py package "${build_args[@]}" --output artifacts
+        uv run --frozen --python "$python_path" python packaging/github/build.py compile "${build_args[@]}"
+        uv run --frozen --python "$python_path" python packaging/github/build.py package "${build_args[@]}" --output artifacts
     - name: Upload platform artifacts
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
       with:
@@ -101,13 +146,6 @@ jobs:
         fetch-depth: 0
         path: ${{ env.SOURCE_DIR }}-x64
       if: ${{ inputs.architecture != 'arm64' }}
-    - name: Set up Intel Python under Rosetta
-      id: intel-python
-      if: ${{ inputs.architecture != 'arm64' }}
-      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
-      with:
-        python-version: '3.13'
-        architecture: x64
     - name: Build and package macOS x64
       if: ${{ inputs.architecture != 'arm64' }}
       shell: bash
@@ -115,16 +153,16 @@ jobs:
         SOURCE_DIR: ${{ env.SOURCE_DIR }}-x64
         UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/sessionprep-env-${{ github.run_id }}-${{ github.run_attempt }}-macos-x64
         BUILD_PLATFORM: macos-x64
-        PYTHON_INSTALL: ${{ steps.intel-python.outputs.python-path }}
+        PYTHON_INSTALL: ${{ steps.macos-python.outputs.x64-python }}
       run: |
         set -euo pipefail
         cd "$SOURCE_DIR"
-        python_path="${CI_PYTHON:-$PYTHON_INSTALL}"
+        python_path="$PYTHON_INSTALL"
         uv sync --frozen --extra cli --extra gui --python "$python_path"
         build_args=(--platform "$BUILD_PLATFORM" --version "$BUILD_VERSION" --sha "$SOURCE_SHA")
         if [[ "$DEBUG_BUILD" == "true" ]]; then build_args+=(--debug); fi
-        uv run --frozen python packaging/github/build.py compile "${build_args[@]}"
-        uv run --frozen python packaging/github/build.py package "${build_args[@]}" --output artifacts
+        uv run --frozen --python "$python_path" python packaging/github/build.py compile "${build_args[@]}"
+        uv run --frozen --python "$python_path" python packaging/github/build.py package "${build_args[@]}" --output artifacts
     - name: Upload platform artifacts
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
       with:
@@ -136,8 +174,8 @@ jobs:
       if: ${{ always() }}
       shell: bash
       run: |
-        "${CI_PYTHON:-python}" - <<'PY'
-        import json, os, pathlib, shutil, stat
+        "${MACOS_BOOTSTRAP_PYTHON:-python3}" - <<'PY'
+        import json, os, pathlib, shutil, stat, sys
         workspace = pathlib.Path(os.environ["GITHUB_WORKSPACE"]).resolve()
         temporary = pathlib.Path(os.environ["RUNNER_TEMP"]).resolve()
         run = os.environ["GITHUB_RUN_ID"] + "-" + os.environ["GITHUB_RUN_ATTEMPT"]
@@ -152,7 +190,10 @@ jobs:
                 if target.parent != parent:
                     raise RuntimeError("Cleanup target escaped the run workspace")
                 if target.exists():
-                    shutil.rmtree(target, onexc=remove_readonly)
+                    if sys.version_info >= (3, 12):
+                        shutil.rmtree(target, onexc=remove_readonly)
+                    else:
+                        shutil.rmtree(target, onerror=lambda fn, path, error: remove_readonly(fn, path, error[1]))
         PY
       env:
         CLEANUP_NAMES: '["macos", "macos-x64", "macos-arm64"]'
