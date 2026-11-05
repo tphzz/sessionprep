@@ -55,6 +55,11 @@ Cleanup is architecture-independent; the build still requires native Python.
 - macOS: Xcode at `/Applications/Xcode.app`, Rosetta for Intel, and the existing
   Developer ID signing setup described in [the macOS guide](../macos/README.md).
 
+macOS Python setup uses uv's runner-account managed cache, with explicit ARM64
+and Intel CPython 3.13 requests. It avoids privileged `setup-python` installation.
+Architecture-specific `CI_PYTHON_MACOS_ARM64` / `CI_PYTHON_MACOS_X64` overrides
+are available; see [macOS interpreter setup](../macos/README.md#ci-python-interpreters).
+
 Python/uv and dependency setup follow the reusable helpers. Dependencies use the
 frozen lockfile. Missing image prerequisites fail with actionable errors rather
 than modifying system packages during builds.

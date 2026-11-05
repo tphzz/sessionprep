@@ -210,6 +210,13 @@ to CLI and GUI, Debug and Release, including local builds. The module remains
 available; SciPy signal processing and its native extensions remain included.
 Other platforms retain their normal compilation policy.
 
+macOS helpers use uv-managed CPython 3.13 for each selected architecture,
+validating the executable before signing or dependency setup. ARM64 and Intel
+builds remain sequential and use separate virtual environments. Python setup
+uses the runner account's cache rather than a privileged installer. Preinstalled
+interpreters can be selected per architecture; see
+[macOS Python setup](packaging/macos/README.md#ci-python-interpreters).
+
 Windows helpers honor an explicit `CI_PYTHON` and reject an invalid override.
 Otherwise they check each `python.exe` on PATH, then standard CPython 3.13
 machine/per-user installer locations (including `Python313-arm64`). Selection

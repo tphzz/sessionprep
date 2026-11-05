@@ -4,6 +4,28 @@ SessionPrep builds separate ARM64 and Intel Nuitka app bundles. The manual macOS
 workflow can build either architecture or both; All Platforms builds both
 sequentially on the Apple Silicon runner, using Rosetta/Intel Python for x64.
 
+## CI Python interpreters
+
+The workflow uses uv-managed CPython 3.13 in the runner account's Python cache.
+It requests `cpython-3.13-macos-aarch64-none` for ARM64 and
+`cpython-3.13-macos-x86_64-none` for Intel; only selected architectures are set up.
+Missing managed interpreters are downloaded without an administrator installation
+or changes to the default Python executable. Intel execution requires the
+runner's existing Rosetta installation.
+
+Optional runner environment variables `CI_PYTHON_MACOS_ARM64` and
+`CI_PYTHON_MACOS_X64` select preinstalled interpreter executables. Each takes
+precedence over the legacy `CI_PYTHON` override. A configured override is resolved
+without downloads and must pass the same CPython 3.13, macOS and process-architecture
+checks. An invalid override fails without selecting a different interpreter.
+Both `uv sync` and `uv run` use the verified path for that architecture.
+
+The first verified interpreter also handles signing preparation and run-owned
+cleanup. If setup fails before one is selected, cleanup can use system `python3`,
+including older macOS SDK Python versions. Managed Python installations remain
+cached; cleanup removes only the run's checkouts and virtual environments.
+See [uv's architecture selection documentation](https://docs.astral.sh/uv/concepts/python-versions/#transparent-x86_64-emulation-on-aarch64).
+
 ## Persistent CI signing
 
 `ci_signing.py prepare` uses the runner's existing
