@@ -10,8 +10,14 @@ from PySide6.QtWidgets import QApplication, QTextBrowser
 from ..theme import COLORS
 
 
-REPORT_TITLE_SIZE = "1.3em"
+# Qt rich text ignores em sizes but honours CSS size keywords relative to the
+# document font, so the title role scales with the report font (x-large = 1.5x).
+REPORT_TITLE_SIZE = "x-large"
 REPORT_SECTION_SIZE = "1.15em"
+# Shared File report section role ("Bimodal Normalization", "Detector
+# findings"): report body size, semibold, 20 px above and 8 px to its content.
+# The explicit "medium" keyword keeps the heading out of the finding body role.
+REPORT_SECTION_HEADING = "font-size:medium; font-weight:600; margin-top:20px; margin-bottom:8px;"
 REPORT_BADGE_SIZE = "0.82em"
 REPORT_CONTENT_SCALE = 1.15
 

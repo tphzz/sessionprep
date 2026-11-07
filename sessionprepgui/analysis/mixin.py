@@ -12,7 +12,7 @@ import os
 from typing import Any
 
 from PySide6.QtCore import Qt, Slot, QSize
-from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -57,6 +57,7 @@ from ..tracks.table_widgets import (
     _PAGE_TABS,
     _PHASE_ANALYSIS, _PHASE_TOPOLOGY, _PHASE_SETUP,
 )
+from ..change_marker import MARKER_COLUMN_WIDTH, set_item_marker, set_tab_marker
 from ..controls import set_action_busy
 from ..theme import COLORS, FILE_COLOR_OK, FILE_COLOR_ERROR
 from .worker import AnalyzeWorker, PrepareWorker, Phase1AnalyzeWorker
@@ -116,7 +117,7 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         self._session_tree.header().setStretchLastSection(False)
         self._session_tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
         self._session_tree.header().setSectionResizeMode(1, QHeaderView.Fixed)
-        self._session_tree.setColumnWidth(1, 18)
+        self._session_tree.setColumnWidth(1, MARKER_COLUMN_WIDTH)
         self._session_tree.currentItemChanged.connect(
             self._on_session_tree_selection)
         splitter.addWidget(self._session_tree)
@@ -226,25 +227,17 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
 
     # 哪 Phase-2 preset difference indicators 哪哪哪哪哪哪哪哪哪哪哪哪哪哪
 
-    def _phase2_dirty_icon(self) -> QIcon:
-        icon = getattr(self, "_phase2_dirty_dot_icon", None)
-        if icon is not None:
-            return icon
-        pixmap = QPixmap(12, 12)
-        pixmap.fill(Qt.transparent)
-        painter = QPainter(pixmap)
-        painter.setRenderHint(QPainter.Antialiasing)
-        painter.setBrush(QColor("#e53935"))
-        painter.setPen(Qt.NoPen)
-        painter.drawEllipse(3, 3, 6, 6)
-        painter.end()
-        self._phase2_dirty_dot_icon = QIcon(pixmap)
-        return self._phase2_dirty_dot_icon
+    def _phase2_change_tooltip(self, index: int) -> str:
+        # Name the preset the dirty state is compared against.
+        name = getattr(self, "_active_session_preset" if index == _TAB_GROUPS
+                       else "_active_config_preset_name", None) or ""
+        kind = "group preset" if index == _TAB_GROUPS else "preset"
+        return f"Changed from {kind} \u201c{name}\u201d" if name else f"Changed from {kind}"
 
     def _set_detail_tab_dirty(self, index: int, label: str, dirty: bool) -> None:
         if hasattr(self, "_detail_tabs"):
-            self._detail_tabs.setTabText(
-                index, f"{label} \u25cf" if dirty else label)
+            set_tab_marker(self._detail_tabs, index, dirty,
+                           self._phase2_change_tooltip(index))
 
     def _connect_session_config_dirty_signals(self) -> None:
         for widgets in self._session_widgets.values():
@@ -297,9 +290,9 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         if not hasattr(self, "_session_dirty_items"):
             return
         dirty_keys = self._session_config_dirty_keys()
-        icon = self._phase2_dirty_icon()
+        tooltip = self._phase2_change_tooltip(_TAB_SESSION)
         for key, item in self._session_dirty_items.items():
-            item.setIcon(1, icon if key in dirty_keys else QIcon())
+            set_item_marker(item, 1, key in dirty_keys, tooltip)
         self._set_detail_tab_dirty(_TAB_SESSION, "Config", bool(dirty_keys))
 
     def _session_config_dirty_keys(self) -> set[str]:

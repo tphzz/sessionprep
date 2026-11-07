@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 from numbers import Integral
 from urllib.parse import quote
 from ..icons import icon_path
@@ -9,7 +10,7 @@ from ..icons import icon_path
 from sessionpreplib.chunks import read_chunks, STANDARD_CHUNKS, detect_origin
 from ..theme import COLORS, FILE_COLOR_TRANSIENT, FILE_COLOR_SUSTAINED
 from ..helpers import esc
-from .report_style import REPORT_SECTION_SIZE, REPORT_TITLE_SIZE
+from .report_style import REPORT_SECTION_HEADING, REPORT_SECTION_SIZE, REPORT_TITLE_SIZE
 
 
 # ---------------------------------------------------------------------------
@@ -56,6 +57,14 @@ def _location_text(result):
             "; ".join(valid))
 
 
+def _location_html(location):
+    """Escape a location and keep its sample range on one line."""
+    for prefix in ("Samples ", "Sample "):
+        if location.startswith(prefix):
+            return esc(prefix) + "<nobr>" + esc(location[len(prefix):]) + "</nobr>"
+    return esc(location)
+
+
 def _image(name):
     return f'<img src="{esc(icon_path(name).as_uri())}" width="16" height="16">'
 
@@ -69,7 +78,7 @@ def _link(scheme, key, label, title=""):
 def _cell(body, width, index=0, header=False):
     left = 12 if index == 0 else 6
     right = 12 if index == 3 else 6
-    padding = 4 if header else 8
+    padding = 4
     background = " background-color:#2d2d2d;" if header else ""
     return (f'<td width="{width}%" valign="top" style="padding:{padding}px {right}px '
             f'{padding}px {left}px; border-bottom:1px solid #3a3a3a;'
@@ -80,8 +89,9 @@ def _cell(body, width, index=0, header=False):
 def _table_header(labels, widths):
     cells = [_cell(esc(label), width, i, True)
              for i, (label, width) in enumerate(zip(labels, widths))]
+    # Qt drops a heading's bottom margin before a table; the table carries it.
     return ('<table width="100%" cellpadding="0" cellspacing="0" '
-            'style="border-collapse:collapse;">'
+            'style="margin-top:8px; border-collapse:collapse;">'
             '<tr>' + "".join(cells) + '</tr>')
 
 
@@ -91,7 +101,7 @@ def render_summary_html(summary, *, show_faders=True, show_clean=True, session=N
     counts = {key: sum(max(len(g.get("items") or []), int(bool(g.get("standalone"))))
                        for g in summary.get(key) or []) for key in categories}
     clean, total = int(summary.get("clean_count", 0)), int(summary.get("total_ok", 0))
-    parts = [f'<p style="font-size:{REPORT_TITLE_SIZE}; font-weight:bold;'
+    parts = [f'<p style="font-size:{REPORT_TITLE_SIZE}; font-weight:600;'
              f' margin-top:0; margin-bottom:8px;">Session health</p>',
              f'<p style="margin-top:0; margin-bottom:8px;"><b>{clean} of {total} files clean</b></p>']
     overview = summary.get("overview") or {}
@@ -145,6 +155,15 @@ def render_summary_html(summary, *, show_faders=True, show_clean=True, session=N
     return "\n".join(parts)
 
 
+def _accepts_compact(render_html):
+    """Processor overrides written before ``compact`` existed keep working."""
+    try:
+        parameters = inspect.signature(render_html).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(p.name == "compact" or p.kind is p.VAR_KEYWORD for p in parameters)
+
+
 def _finding_line(body, height):
     # Qt supports table height, but not CSS min-height on report cells.
     return (f'<table height="{height}" cellpadding="0" cellspacing="0"><tr>'
@@ -154,7 +173,7 @@ def _finding_line(body, height):
 def _finding_cell(body, width, *, header=False, active=False, index=0, columns=1):
     size = f' width="{width}"' if width is not None else ""
     background = COLORS["surface"] if header or active else COLORS["bg"]
-    padding = 4 if header else 8
+    padding = 4
     left = 12 if index == 0 else 6
     right = 12 if index == columns - 1 else 6
     return (f'<td{size} valign="top" style="padding:{padding}px {right}px {padding}px {left}px;'
@@ -205,9 +224,10 @@ def _finding_actions(row, compact):
 
 def render_prepared_track_report(data, *, expanded=(), compact=False, active_help=None):
     """Render cached data with severity-leading rows; Help lives in its own pane."""
-    parts = [data["header"],
+    header = data.get("header_compact", data["header"]) if compact else data["header"]
+    parts = [header,
              '<div>'
-             '<p style="font-weight:bold; margin-top:20px; margin-bottom:8px;">'
+             f'<p style="{REPORT_SECTION_HEADING} color:{COLORS["heading"]};">'
              '<a name="report-findings"></a>Detector findings</p>']
     rows = data["rows"]
     if not rows:
@@ -216,8 +236,9 @@ def render_prepared_track_report(data, *, expanded=(), compact=False, active_hel
     widths = ("100", None, "80") if compact else ("100", None, "96", "216", "136")
     labels = (("Severity", "Finding, location and next step", "Actions") if compact
               else ("Severity", "Finding", "Location", "Next step", "Actions"))
+    # Qt drops the heading's bottom margin before a table; the table carries it.
     parts.append('<table width="100%" cellpadding="0" cellspacing="0"'
-                 ' style="border-collapse:collapse;"><tr>')
+                 ' style="margin-top:8px; border-collapse:collapse;"><tr>')
     parts.extend(_finding_cell("<nobr>Help</nobr>" if label == "Help" else esc(label),
                                width, header=True, index=i, columns=len(widths))
                  for i, (label, width) in enumerate(zip(labels, widths)))
@@ -231,23 +252,23 @@ def render_prepared_track_report(data, *, expanded=(), compact=False, active_hel
                       "Toggle detector details")
         if row["count"]:
             title += f' &middot; <span style="color:{COLORS["metadata"]};">{esc(row["count"])}</span>'
-        finding = f'<a name="finding-{token}"></a>' + _finding_line(title, 32 if compact else 40)
+        finding = f'<a name="finding-{token}"></a>' + _finding_line(title, 32)
         if compact:
             finding += (f'<p style="margin:4px 0 0 24px; color:{COLORS["metadata"]};">'
-                        f'{esc(row["location"])}<br>'
+                        f'{_location_html(row["location"])}<br>'
                         f'<span style="color:{COLORS["text"]};">{esc(row["hint"])}</span></p>')
-        severity = _finding_line(f'<span style="color:{color};">{label}</span>',
-                                 32 if compact else 40)
+        severity = _finding_line(f'<span style="color:{color};">{label}</span>', 32)
         actions = _finding_actions(row, compact)
         values = ((severity, finding, actions) if compact else
-                  (severity, finding, _finding_line(esc(row["location"]), 40),
-                   _finding_line(esc(row["hint"]), 40), actions))
+                  (severity, finding, _finding_line(_location_html(row["location"]), 32),
+                   _finding_line(esc(row["hint"]), 32), actions))
         parts.append("<tr>" + "".join(
             _finding_cell(value, width, active=key == active_help and color != COLORS["problems"],
                           index=i, columns=len(widths))
             for i, (value, width) in enumerate(zip(values, widths))) + "</tr>")
         if key in expanded:
-            parts.append(f'<tr><td colspan="{len(widths)}" style="padding:4px 12px 8px 136px;">'
+            indent = 144 if compact else 136
+            parts.append(f'<tr><td colspan="{len(widths)}" style="padding:4px 12px 4px {indent}px;">'
                          '<b>Result</b> ' + esc(row["summary"]) +
                          ('<br>' + esc(row["locations"]) if row["locations"] else "") +
                          '<table cellpadding="3" cellspacing="0">' + row["fragment"] +
@@ -349,7 +370,7 @@ def prepare_track_report(track, session=None, *, show_clean: bool = True,
     """
     parts = []
     rows = []
-    parts.append(f'<div style="color:{COLORS["heading"]}; font-size:{REPORT_TITLE_SIZE}; font-weight:bold;">'
+    parts.append(f'<div style="color:{COLORS["heading"]}; font-size:{REPORT_TITLE_SIZE}; font-weight:600;">'
                  f'{esc(track.filename)}</div>')
 
     if track.status != "OK":
@@ -401,21 +422,26 @@ def prepare_track_report(track, session=None, *, show_clean: bool = True,
                 html_fragment = proc_inst.render_html(pr, track, verbose=verbose)
                 if not html_fragment:
                     continue  # processor chose to suppress output (e.g. no-op)
+                compact_fragment = (proc_inst.render_html(pr, track, verbose=verbose, compact=True)
+                                    if _accepts_compact(proc_inst.render_html) else None) or html_fragment
             else:
                 # Fallback: basic display
-                html_fragment = (
-                    f'<div style="margin-left:8px;">'
+                html_fragment = compact_fragment = (
+                    f'<div>'
                     f'{esc(pr.classification or "")} &middot; {esc(pr.method)} '
                     f'&middot; {pr.gain_db:+.1f} dB</div>'
                 )
-            parts.append(f'<div style="margin-top:12px; color:{COLORS["heading"]}; '
-                         f'font-weight:bold;">{esc(proc_map[proc_id].name if proc_id in proc_map else proc_id)}</div>')
-            parts.append(html_fragment)
+            # The anchor starts the finding body role for processor bodies
+            # (see ReportBrowser); the heading keeps its own section role.
+            parts.append(f'<p style="{REPORT_SECTION_HEADING} color:{COLORS["heading"]};">'
+                         '<a name="report-processors"></a>'
+                         f'{esc(proc_map[proc_id].name if proc_id in proc_map else proc_id)}</p>')
+            parts.append((html_fragment, compact_fragment))
             if track.group:
                 original = pr.data.get("original_gain_db", pr.gain_db)
                 delta = pr.gain_db - original
                 parts.append(
-                    f'<div style="margin-left:8px; margin-top:4px;">'
+                    f'<div style="color:{COLORS["metadata"]}; margin-top:8px;">'
                     f'Group: <b>{esc(track.group)}</b>'
                     f' &nbsp;&middot;&nbsp; Group level: <b>{pr.gain_db:+.1f} dB</b>'
                     f' (individual: {original:+.1f} dB,'
@@ -455,4 +481,6 @@ def prepare_track_report(track, session=None, *, show_clean: bool = True,
                     for issue in visualizable_issues(result, track)})),
             })
         rows.sort(key=lambda row: (severity_order.get(row["severity"], 99), row["title"].lower()))
-    return {"header": "\n".join(parts), "rows": rows}
+    wide = [p if isinstance(p, str) else p[0] for p in parts]
+    compact = [p if isinstance(p, str) else p[1] for p in parts]
+    return {"header": "\n".join(wide), "header_compact": "\n".join(compact), "rows": rows}

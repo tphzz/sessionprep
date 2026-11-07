@@ -86,7 +86,7 @@ class AudioProcessor(ABC):
         """
 
     def render_html(self, result: ProcessorResult, track: TrackContext | None = None,
-                    *, verbose: bool = False) -> str:
+                    *, verbose: bool = False, compact: bool = False) -> str:
         """Return an HTML fragment for this processor's result.
 
         Override in subclasses for richer output (e.g. comparison tables).
@@ -100,10 +100,12 @@ class AudioProcessor(ABC):
             so that the processor can decide its own rendering relevance.
         verbose : bool
             When True, include additional analytical detail.
+        compact : bool
+            When True, render a narrow-width variant (no wide fixed columns).
         """
         cls_text = result.classification or "Unknown"
         return (
-            f'<div style="margin-left:8px;">'
+            f'<div>'
             f'Classification: <b>{cls_text}</b>'
             f' &nbsp;&middot;&nbsp; {result.method}'
             f' &nbsp;&middot;&nbsp; {result.gain_db:+.1f} dB'

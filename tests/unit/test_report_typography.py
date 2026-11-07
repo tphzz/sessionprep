@@ -120,7 +120,8 @@ def test_summary_report_uses_relative_typography():
     html = render_summary_html(summary)
 
     _assert_no_fixed_report_typography(html)
-    assert "font-size:1.3em" in html
+    # Title role uses a CSS keyword Qt honours; category headings keep their size.
+    assert "font-size:x-large" in html
     assert "font-size:1.15em" in html
 
 
@@ -177,7 +178,9 @@ def test_track_detail_and_report_fragments_use_relative_typography():
         verbose=True,
     )
     _assert_no_fixed_report_typography(proc_html)
-    assert "font-size:0.9em" in proc_html
+    # Chosen state is named in text; normalization uses no status colours.
+    assert "Chosen" in proc_html
+    assert "#44cc44" not in proc_html and "#cc8844" not in proc_html
 
 
 def test_stereo_compat_report_badge_does_not_wrap():
@@ -243,7 +246,10 @@ def test_finding_ui_role_matches_application_size_and_preserves_report_header(qa
     header = browser.document().find("UI role.wav")
     expected = qapp.font().pointSizeF() * report_font_scale(_FakeScreen(screen_scale, 96.0))
     assert finding.charFormat().font().pointSizeF() == pytest.approx(expected)
-    assert header.charFormat().font().pointSizeF() == pytest.approx(expected * REPORT_CONTENT_SCALE)
+    # The file name uses the x-large title role (1.5x the report body).
+    assert header.charFormat().font().pointSizeF() == pytest.approx(expected * REPORT_CONTENT_SCALE * 1.5)
+    section = browser.document().find("Detector findings")
+    assert section.charFormat().font().pointSizeF() == pytest.approx(expected * REPORT_CONTENT_SCALE)
     assert finding.charFormat().fontWeight() >= 600
 
 

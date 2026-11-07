@@ -51,6 +51,7 @@ from .theme import COLORS, apply_dark_theme
 from .log import dbg
 from .prefs import PreferencesDialog
 from .detail import PlaybackController, DetailMixin
+from .change_marker import install_tab_marker, use_marker_tab_bar
 from .detail.help_panel import FileReportPane
 from .detail.report_style import wrap_report_html
 from .waveform import WaveformPanel, WaveformLoadWorker
@@ -805,6 +806,7 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
 
         # ── Tabs (Summary / File) ─────────────────────────────────────────
         self._detail_tabs = QTabWidget()
+        use_marker_tab_bar(self._detail_tabs)
         self._detail_tabs.setDocumentMode(True)
         self._detail_tabs.currentChanged.connect(self._on_detail_tab_changed)
 
@@ -867,11 +869,13 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
 
         # Groups tab — session-local group editor
         self._detail_tabs.addTab(self._build_groups_tab(), "Groups")
+        install_tab_marker(self._detail_tabs, _TAB_GROUPS)
         self._detail_tabs.setTabEnabled(_TAB_GROUPS, False)
 
         # Config tab — per-session config overrides
         self._detail_tabs.addTab(
             self._build_session_settings_tab(), "Config")
+        install_tab_marker(self._detail_tabs, _TAB_SESSION)
         self._detail_tabs.setTabEnabled(_TAB_SESSION, False)
 
         # Container for detail tabs

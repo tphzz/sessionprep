@@ -6,7 +6,7 @@ from math import ceil
 from urllib.parse import quote, unquote
 
 from PySide6.QtCore import QPoint, Qt, QUrl, Signal
-from PySide6.QtGui import QTextCharFormat, QTextCursor, QTextDocument
+from PySide6.QtGui import QTextCharFormat, QTextCursor, QTextDocument, QTextFormat
 
 from ..tracks.table_widgets import DETAIL_TAB_INSET, _HelpBrowser
 from .report import prepare_track_report, render_prepared_track_report, render_summary_html
@@ -122,7 +122,7 @@ class ReportBrowser(_HelpBrowser):
         expanded = self._states.setdefault(self._track_key, set())
         expanded.intersection_update(r["id"] for r in self._prepared["rows"])
         self.reportChanged.emit()
-        self._compact = self.viewport().width() < 850
+        self._compact = self._wants_compact()
         self._render_track()
         if anchor is not None:
             self.restore_reading_anchor(anchor)
@@ -165,7 +165,9 @@ class ReportBrowser(_HelpBrowser):
                 fragment = iterator.fragment()
                 if fragment.isValid():
                     char = fragment.charFormat()
-                    if char.fontPointSize() <= 0 and char.font().pixelSize() < 0:
+                    # Keyword-sized text (title/section roles) keeps its size.
+                    if (char.fontPointSize() <= 0 and char.font().pixelSize() < 0
+                            and not char.hasProperty(QTextFormat.FontSizeAdjustment)):
                         inherited_fonts.append((fragment.position(), fragment.length()))
                     if char.anchorHref():
                         self._anchor_positions.setdefault(char.anchorHref(), fragment.position())
@@ -173,7 +175,10 @@ class ReportBrowser(_HelpBrowser):
                         self._named_positions.setdefault(name, fragment.position())
                 iterator += 1
             block = block.next()
-        start = self._named_positions.get("report-findings")
+        # Processor bodies (normalization) and findings use the finding body role.
+        starts = [self._named_positions[name] for name in ("report-processors", "report-findings")
+                  if name in self._named_positions]
+        start = min(starts) if starts else None
         self._finding_font_ranges = [r for r in inherited_fonts if start is not None and r[0] >= start]
         self._apply_finding_font()
 
@@ -245,18 +250,34 @@ class ReportBrowser(_HelpBrowser):
         """Measure cached metadata only; custom detector details may still scroll."""
         if self._mode != "file" or self._prepared is None:
             return 0
-        key = (self._prepared["header"], self.font().key())
-        if self._minimum_header_cache is None or self._minimum_header_cache[0] != key:
+        # The compact header is the narrowest layout the report renders.
+        return self._header_width(self._prepared.get("header_compact", self._prepared["header"]))
+
+    def _header_width(self, header):
+        """Widget width the cached header needs without horizontal scrolling."""
+        key = (header, self.font().key())
+        cache = self._minimum_header_cache if isinstance(self._minimum_header_cache, dict) else {}
+        if key not in cache:
+            if len(cache) >= 8:  # current wide/compact headers at a few fonts
+                cache.clear()
             document = QTextDocument()
             document.setDefaultFont(self.font())
             document.setDefaultTextOption(self.document().defaultTextOption())
-            document.setHtml(wrap_report_html(self._prepared["header"]))
+            document.setHtml(wrap_report_html(header))
             _apply_report_inset(document)
             document.setTextWidth(1)
             minimum = ceil(document.documentLayout().documentSize().width())
-            minimum += 2 * self.frameWidth() + self.verticalScrollBar().sizeHint().width()
-            self._minimum_header_cache = (key, minimum)
-        return self._minimum_header_cache[1]
+            cache[key] = minimum + 2 * self.frameWidth() + self.verticalScrollBar().sizeHint().width()
+        self._minimum_header_cache = cache
+        return cache[key]
+
+    def _wants_compact(self):
+        """Compact below 850 px, or when the wide header would need to scroll."""
+        if self.viewport().width() < 850:
+            return True
+        if self._mode != "file" or self._prepared is None:
+            return False
+        return self.width() < self._header_width(self._prepared["header"])
 
     def refresh_font(self, screen=None):
         anchor = self.capture_reading_anchor()
@@ -283,7 +304,7 @@ class ReportBrowser(_HelpBrowser):
     def resizeEvent(self, event):
         anchor = self.capture_reading_anchor()
         super().resizeEvent(event)
-        compact = self.viewport().width() < 850
+        compact = self._wants_compact()
         if compact != self._compact:
             self._compact = compact
             self._render_track()

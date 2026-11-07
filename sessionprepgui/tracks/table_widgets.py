@@ -80,7 +80,7 @@ class _HelpBrowser(QTextBrowser):
         self.setMouseTracking(True)
 
     def mouseMoveEvent(self, event):
-        anchor = self.anchorAt(event.pos())
+        anchor = self.anchorAt(event.position().toPoint())
         if anchor.startswith("detector:"):
             det_id = anchor[len("detector:"):]
             html = self._help_map.get(det_id)

@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
 
 from sessionprepgui.prefs.dialog import PreferencesDialog
 from sessionprepgui.settings import build_defaults
+from sessionprepgui.change_marker import is_button_marked, is_tab_marked
 
 
 @pytest.fixture(scope="module")
@@ -83,8 +84,11 @@ def test_preferences_dirty_indicators_are_clean_on_open(qapp):
     dlg = _dialog(qapp)
     try:
         assert dlg._save_btn.text() == "Save Preferences"
+        assert not is_button_marked(dlg._save_btn)
         assert dlg._tabs.tabText(dlg._global_tab_index) == "Global"
+        assert not is_tab_marked(dlg._tabs, dlg._global_tab_index)
         assert dlg._tabs.tabText(dlg._preset_tab_index) == "Config Presets"
+        assert not is_tab_marked(dlg._tabs, dlg._preset_tab_index)
         assert dlg._global_items["general"].icon(1).isNull()
         assert dlg._global_items["colors"].icon(1).isNull()
         assert dlg._global_items["groups"].icon(1).isNull()
@@ -103,15 +107,20 @@ def test_preferences_general_dirty_dot_tracks_changed_and_restored_value(qapp):
         combo.setCurrentIndex(1 if original == 0 else 0)
 
         assert not dlg._global_items["general"].icon(1).isNull()
-        assert dlg._tabs.tabText(dlg._global_tab_index) == "Global \u25cf"
+        assert dlg._tabs.tabText(dlg._global_tab_index) == "Global"
+        assert is_tab_marked(dlg._tabs, dlg._global_tab_index)
         assert dlg._tabs.tabText(dlg._preset_tab_index) == "Config Presets"
-        assert dlg._save_btn.text() == "Save Preferences \u25cf"
+        assert not is_tab_marked(dlg._tabs, dlg._preset_tab_index)
+        assert dlg._save_btn.text() == "Save Preferences"
+        assert is_button_marked(dlg._save_btn)
 
         combo.setCurrentIndex(original)
 
         assert dlg._global_items["general"].icon(1).isNull()
         assert dlg._tabs.tabText(dlg._global_tab_index) == "Global"
+        assert not is_tab_marked(dlg._tabs, dlg._global_tab_index)
         assert dlg._save_btn.text() == "Save Preferences"
+        assert not is_button_marked(dlg._save_btn)
     finally:
         dlg.close()
 
@@ -123,7 +132,8 @@ def test_preferences_colors_dirty_dot_tracks_palette_edit(qapp):
         item.setText(item.text() + " Edited")
 
         assert not dlg._global_items["colors"].icon(1).isNull()
-        assert dlg._save_btn.text() == "Save Preferences \u25cf"
+        assert dlg._save_btn.text() == "Save Preferences"
+        assert is_button_marked(dlg._save_btn)
     finally:
         dlg.close()
 
@@ -136,7 +146,8 @@ def test_preferences_groups_dirty_dot_tracks_group_edit(qapp):
         item.setText(item.text() + " Edited")
 
         assert not dlg._global_items["groups"].icon(1).isNull()
-        assert dlg._save_btn.text() == "Save Preferences \u25cf"
+        assert dlg._save_btn.text() == "Save Preferences"
+        assert is_button_marked(dlg._save_btn)
     finally:
         dlg.close()
 
@@ -148,14 +159,19 @@ def test_preferences_config_analysis_dirty_dot_tracks_changed_and_restored_value
 
         assert not dlg._preset_items["analysis"].icon(1).isNull()
         assert dlg._tabs.tabText(dlg._global_tab_index) == "Global"
-        assert dlg._tabs.tabText(dlg._preset_tab_index) == "Config Presets \u25cf"
-        assert dlg._save_btn.text() == "Save Preferences \u25cf"
+        assert not is_tab_marked(dlg._tabs, dlg._global_tab_index)
+        assert dlg._tabs.tabText(dlg._preset_tab_index) == "Config Presets"
+        assert is_tab_marked(dlg._tabs, dlg._preset_tab_index)
+        assert dlg._save_btn.text() == "Save Preferences"
+        assert is_button_marked(dlg._save_btn)
 
         restore()
 
         assert dlg._preset_items["analysis"].icon(1).isNull()
         assert dlg._tabs.tabText(dlg._preset_tab_index) == "Config Presets"
+        assert not is_tab_marked(dlg._tabs, dlg._preset_tab_index)
         assert dlg._save_btn.text() == "Save Preferences"
+        assert not is_button_marked(dlg._save_btn)
     finally:
         dlg.close()
 
@@ -168,8 +184,10 @@ def test_preferences_config_detector_dirty_dot_marks_child_and_parent(qapp):
 
         assert not dlg._preset_items[section].icon(1).isNull()
         assert not dlg._preset_items["_presentation"].icon(1).isNull()
-        assert dlg._tabs.tabText(dlg._preset_tab_index) == "Config Presets \u25cf"
-        assert dlg._save_btn.text() == "Save Preferences \u25cf"
+        assert dlg._tabs.tabText(dlg._preset_tab_index) == "Config Presets"
+        assert is_tab_marked(dlg._tabs, dlg._preset_tab_index)
+        assert dlg._save_btn.text() == "Save Preferences"
+        assert is_button_marked(dlg._save_btn)
     finally:
         dlg.close()
 
@@ -183,8 +201,10 @@ def test_preferences_config_protools_templates_mark_child_and_parent(qapp):
 
         assert not dlg._preset_items["daw_processors.protools"].icon(1).isNull()
         assert not dlg._preset_items["_daw_processors"].icon(1).isNull()
-        assert dlg._tabs.tabText(dlg._preset_tab_index) == "Config Presets \u25cf"
-        assert dlg._save_btn.text() == "Save Preferences \u25cf"
+        assert dlg._tabs.tabText(dlg._preset_tab_index) == "Config Presets"
+        assert is_tab_marked(dlg._tabs, dlg._preset_tab_index)
+        assert dlg._save_btn.text() == "Save Preferences"
+        assert is_button_marked(dlg._save_btn)
     finally:
         dlg.close()
 
@@ -195,7 +215,10 @@ def test_preferences_config_preset_list_changes_mark_config_tab(qapp):
         dlg._on_cfg_added("Dirty Test")
 
         assert dlg._tabs.tabText(dlg._global_tab_index) == "Global"
-        assert dlg._tabs.tabText(dlg._preset_tab_index) == "Config Presets \u25cf"
-        assert dlg._save_btn.text() == "Save Preferences \u25cf"
+        assert not is_tab_marked(dlg._tabs, dlg._global_tab_index)
+        assert dlg._tabs.tabText(dlg._preset_tab_index) == "Config Presets"
+        assert is_tab_marked(dlg._tabs, dlg._preset_tab_index)
+        assert dlg._save_btn.text() == "Save Preferences"
+        assert is_button_marked(dlg._save_btn)
     finally:
         dlg.close()

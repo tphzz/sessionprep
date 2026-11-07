@@ -1769,9 +1769,22 @@ Config) keep their content `DETAIL_TAB_INSET` (16 logical px,
 root-frame margins on every document, the Groups/Config pages as layout margins,
 and the Help panel keeps it from the File pane's top, right and bottom edges.
 The waveform preview stays full width. A measurement of the cached stock
-header, keyed by content and font, protects normalization values at larger
-scales without suppressing legitimate horizontal scrolling in custom result
-HTML.
+header (its compact variant), keyed by content and font, protects normalization
+values at larger scales without suppressing legitimate horizontal scrolling in
+custom result HTML.
+
+Report rows use 4 px vertical cell padding; single-line File cells are 32 px
+high. The report title uses the `x-large` CSS keyword and processor sections
+and "Detector findings" share `REPORT_SECTION_HEADING` (`medium`, semibold);
+Qt ignores `em` sizes, and keyword-sized text is excluded from the finding body
+font, which starts at the first processor body (`report-processors`).
+`Processor.render_html()` accepts `compact=True`; `prepare_track_report()`
+caches both header variants and the compact File layout uses `header_compact`.
+
+Modified pages, tabs and Save Preferences use `sessionprepgui/change_marker.py`:
+a vector dot painted at the device-pixel ratio (white on selected/pressed
+backgrounds), `MarkerTabBar` reserving the slot after a tab label so nothing
+reflows, a 24 px tree marker column and tooltip/accessible descriptions.
 
 Structured summary `item_refs` provide file identities alongside unchanged
 legacy item strings, so Review file does not parse filenames. Qt may move focus

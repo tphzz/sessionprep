@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
 from sessionprepgui.settings import build_defaults
 from sessionprepgui.mainwindow import SessionPrepWindow
 from sessionprepgui.tracks.table_widgets import _TAB_GROUPS, _TAB_SESSION
+from sessionprepgui.change_marker import is_tab_marked
 
 
 @pytest.fixture(scope="module")
@@ -99,7 +100,9 @@ def test_phase2_dirty_indicators_are_clean_on_preset_values(qapp):
     window = _window(qapp)
     try:
         assert window._detail_tabs.tabText(_TAB_GROUPS) == "Groups"
+        assert not is_tab_marked(window._detail_tabs, _TAB_GROUPS)
         assert window._detail_tabs.tabText(_TAB_SESSION) == "Config"
+        assert not is_tab_marked(window._detail_tabs, _TAB_SESSION)
         for item in window._session_dirty_items.values():
             assert item.icon(1).isNull()
     finally:
@@ -178,6 +181,7 @@ def test_phase2_groups_tab_stays_clean_before_first_analysis_groups_load(qapp):
         window._refresh_phase2_dirty_indicators()
 
         assert window._detail_tabs.tabText(_TAB_GROUPS) == "Groups"
+        assert not is_tab_marked(window._detail_tabs, _TAB_GROUPS)
     finally:
         window.close()
 
@@ -188,12 +192,16 @@ def test_phase2_groups_dirty_highlights_cell_and_tab(qapp):
         item = window._groups_tab_table.item(0, 0)
         item.setText(item.text() + " Edited")
 
-        assert window._detail_tabs.tabText(_TAB_GROUPS) == "Groups \u25cf"
+        assert window._detail_tabs.tabText(_TAB_GROUPS) == "Groups"
+        assert is_tab_marked(window._detail_tabs, _TAB_GROUPS)
         assert item.background().color() == window._GROUP_DIRTY_BG
+        assert window._detail_tabs.tabToolTip(_TAB_GROUPS) == (
+            f"Changed from group preset “{window._active_session_preset}”")
 
         window._on_groups_tab_reset()
 
         assert window._detail_tabs.tabText(_TAB_GROUPS) == "Groups"
+        assert not is_tab_marked(window._detail_tabs, _TAB_GROUPS)
         assert (
             window._groups_tab_table.item(0, 0).background().style()
             == Qt.NoBrush
@@ -216,7 +224,8 @@ def test_phase2_groups_dirty_color_uses_centered_button_indicator(qapp):
         widget.setCurrentColor(alternate)
         widget.colorChanged.emit(alternate)
 
-        assert window._detail_tabs.tabText(_TAB_GROUPS) == "Groups \u25cf"
+        assert window._detail_tabs.tabText(_TAB_GROUPS) == "Groups"
+        assert is_tab_marked(window._detail_tabs, _TAB_GROUPS)
         assert widget.property("sessionDirty") is True
         assert widget._dirty_indicator is True
         assert "\u25cf" not in widget.text()
@@ -230,7 +239,8 @@ def test_phase2_groups_added_row_marks_full_row(qapp):
         window._on_groups_tab_add()
         row = window._groups_tab_table.rowCount() - 1
 
-        assert window._detail_tabs.tabText(_TAB_GROUPS) == "Groups \u25cf"
+        assert window._detail_tabs.tabText(_TAB_GROUPS) == "Groups"
+        assert is_tab_marked(window._detail_tabs, _TAB_GROUPS)
         assert window._groups_dirty_cells()[row] == set(range(6))
     finally:
         window.close()
@@ -242,7 +252,8 @@ def test_phase2_groups_removed_row_marks_tab(qapp):
         window._groups_tab_table.selectRow(0)
         window._on_groups_tab_remove()
 
-        assert window._detail_tabs.tabText(_TAB_GROUPS) == "Groups \u25cf"
+        assert window._detail_tabs.tabText(_TAB_GROUPS) == "Groups"
+        assert is_tab_marked(window._detail_tabs, _TAB_GROUPS)
         assert window._groups_dirty_cells() == {}
     finally:
         window.close()
@@ -254,13 +265,24 @@ def test_phase2_config_analysis_dirty_marks_tree_and_tab(qapp):
         restore = _set_different_value(
             _first_config_widget(window, "analysis"))
 
-        assert window._detail_tabs.tabText(_TAB_SESSION) == "Config \u25cf"
+        assert window._detail_tabs.tabText(_TAB_SESSION) == "Config"
+        assert is_tab_marked(window._detail_tabs, _TAB_SESSION)
         assert not window._session_dirty_items["analysis"].icon(1).isNull()
+        expected = f"Changed from preset “{window._active_config_preset_name}”"
+        assert window._detail_tabs.tabToolTip(_TAB_SESSION) == expected
+        assert window._session_dirty_items["analysis"].toolTip(1) == expected
+        bar = window._detail_tabs.tabBar()
+        if hasattr(bar, "accessibleTabName"):
+            assert bar.accessibleTabName(_TAB_SESSION) == f"Config, {expected}"
 
         restore()
 
         assert window._detail_tabs.tabText(_TAB_SESSION) == "Config"
+        assert not is_tab_marked(window._detail_tabs, _TAB_SESSION)
         assert window._session_dirty_items["analysis"].icon(1).isNull()
+        assert window._detail_tabs.tabToolTip(_TAB_SESSION) == ""
+        if hasattr(bar, "accessibleTabName"):
+            assert bar.accessibleTabName(_TAB_SESSION) == "Config"
     finally:
         window.close()
 
@@ -271,7 +293,8 @@ def test_phase2_config_child_dirty_marks_parent(qapp):
         section = _first_config_section(window, "detectors.")
         _set_different_value(_first_config_widget(window, section))
 
-        assert window._detail_tabs.tabText(_TAB_SESSION) == "Config \u25cf"
+        assert window._detail_tabs.tabText(_TAB_SESSION) == "Config"
+        assert is_tab_marked(window._detail_tabs, _TAB_SESSION)
         assert not window._session_dirty_items[section].icon(1).isNull()
         assert not window._session_dirty_items["_presentation"].icon(1).isNull()
     finally:
@@ -283,11 +306,13 @@ def test_phase2_config_revert_clears_tree_and_tab(qapp):
     try:
         _set_different_value(_first_config_widget(window, "analysis"))
 
-        assert window._detail_tabs.tabText(_TAB_SESSION) == "Config \u25cf"
+        assert window._detail_tabs.tabText(_TAB_SESSION) == "Config"
+        assert is_tab_marked(window._detail_tabs, _TAB_SESSION)
 
         window._on_session_config_reset()
 
         assert window._detail_tabs.tabText(_TAB_SESSION) == "Config"
+        assert not is_tab_marked(window._detail_tabs, _TAB_SESSION)
         assert window._session_dirty_items["analysis"].icon(1).isNull()
     finally:
         window.close()

@@ -125,40 +125,52 @@ class BimodalNormalizeProcessor(AudioProcessor):
             },
         )
 
-    def render_html(self, result: ProcessorResult, track=None, *, verbose: bool = False) -> str:
-        """Render the normalization analysis as summary line + comparison table."""
+    def render_html(self, result: ProcessorResult, track=None, *, verbose: bool = False,
+                    compact: bool = False) -> str:
+        """Render the normalization summary line and comparison table.
+
+        The table follows the report's finding-table style. The chosen or
+        limiting measure is named in text (not by colour alone). ``compact``
+        renders percentage columns with the note under the measure name.
+        """
         d = result.data
         cls_text = result.classification or "Unknown"
+        surface, separator = "#2d2d2d", "#3a3a3a"
+        text, metadata, muted = "#dddddd", "#aaaaaa", "#888888"
 
         # Classification color
         if "Transient" in cls_text:
             type_color = "#cc77ff"
         elif "Sustained" in cls_text:
             type_color = "#44cccc"
-        elif cls_text == "Skip":
-            type_color = "#888888"
         else:
-            type_color = "#888888"
+            type_color = muted
 
         # Skip / Silent / Unknown: single-line, no breakdown
         if cls_text in ("Skip", "Silent", "Unknown"):
             return (
-                f'<div style="margin-left:8px;">'
-                f'Classification: <span style="color:{type_color}; font-weight:bold;">'
-                f'{cls_text}</span> &mdash; no normalization</div>'
+                f'<div><span style="color:{type_color}; font-weight:bold;">{cls_text}</span>'
+                f' &nbsp;&middot;&nbsp; <span style="color:{metadata};">No normalization</span>'
+                f'</div>'
             )
 
         off = self._db_offset
 
+        def fmt_inf(val):
+            return "+&infin;" if val > 0 else "&minus;&infin;"
+
+        def minus(text):
+            return "&minus;" + text[1:] if text.startswith("-") else text
+
         def fmt_abs(val):
             if not math.isfinite(val):
-                return "&minus;&infin;"
-            return f"{val + off:.1f}"
+                return fmt_inf(val)
+            return minus(f"{val + off:.1f}")
 
         def fmt_rel(val):
             if not math.isfinite(val):
-                return "&minus;&infin;"
-            return f"{val:+.1f}"
+                return fmt_inf(val)
+            return minus(f"{val:+.1f}")
 
         det_peak = d.get("detected_peak_db", float("-inf"))
         det_rms = d.get("detected_rms_db", float("-inf"))
@@ -175,77 +187,85 @@ class BimodalNormalizeProcessor(AudioProcessor):
         peak_active = is_transient or is_peak_limited
         rms_active = not is_transient and not is_peak_limited
 
-        # --- Summary line ---
-        summary = (
-            f'<div style="margin-left:8px; margin-top:4px;">'
-            f'<span style="color:{type_color}; font-weight:bold;">{cls_text}</span>'
-            f' &nbsp;&middot;&nbsp; {result.method}'
-            f' &nbsp;&middot;&nbsp; <b>{result.gain_db:+.1f} dB</b>'
-            f'</div>'
-        )
-
-        # --- Comparison table ---
-        hdr = ('color:#ffffff; font-weight:bold; font-size:0.9em;'
-               ' padding:3px 16px 3px 0; border-bottom:1px solid #3a3a3a;')
-        cell = 'padding:3px 16px 3px 0; white-space:nowrap;'
-        dim = "#888888"
-        active_color = "#44cc44"
-        inactive_color = "#dddddd"
-
-        def row_style(active):
-            c = active_color if active else inactive_color
-            w = "font-weight:bold;" if active else ""
-            return c, w
-
-        pk_c, pk_w = row_style(peak_active)
-        pk_note = ""
         if is_peak_limited:
-            pk_note = f'<span style="color:{dim}; font-size:0.9em;"> (chosen, limiting)</span>'
+            method = f"Peak (limited) &rarr; {minus(f'{tgt_peak:.1f}')} dBFS"
         elif is_transient:
-            pk_note = f'<span style="color:{dim}; font-size:0.9em;"> (chosen)</span>'
+            method = f"Peak &rarr; {minus(f'{tgt_peak:.1f}')} dBFS"
+        else:
+            method = f"RMS &rarr; {minus(f'{tgt_rms:.1f}')} dBFS"
 
-        rms_c, rms_w = row_style(rms_active)
-        rms_note = ""
-        if is_peak_limited:
-            rms_note = f'<span style="color:{dim}; font-size:0.9em;"> (would exceed peak)</span>'
-        elif rms_active:
-            rms_note = f'<span style="color:{dim}; font-size:0.9em;"> (chosen)</span>'
-
-        table = (
-            f'<table cellpadding="0" cellspacing="0" '
-            f'style="margin-left:8px; margin-top:12px;">'
-            f'<tr>'
-            f'<td style="{hdr}"></td>'
-            f'<td style="{hdr}">Detected</td>'
-            f'<td style="{hdr}">Target</td>'
-            f'<td style="{hdr}">Gain</td>'
-            f'</tr>'
-            f'<tr>'
-            f'<td style="{cell} color:{dim};">Peak</td>'
-            f'<td style="{cell} color:{pk_c}; {pk_w}">{fmt_abs(det_peak)} dBFS</td>'
-            f'<td style="{cell} color:{pk_c}; {pk_w}">{tgt_peak:.1f} dBFS</td>'
-            f'<td style="{cell} color:{pk_c}; {pk_w}">{fmt_rel(gain_for_peak)} dB{pk_note}</td>'
-            f'</tr>'
-            f'<tr>'
-            f'<td style="{cell} color:{dim};">{rms_metric}</td>'
-            f'<td style="{cell} color:{rms_c}; {rms_w}">{fmt_abs(det_rms)} dBFS</td>'
-            f'<td style="{cell} color:{rms_c}; {rms_w}">{tgt_rms:.1f} dBFS</td>'
-            f'<td style="{cell} color:{rms_c}; {rms_w}">{fmt_rel(gain_for_rms)} dB{rms_note}</td>'
-            f'</tr>'
-            f'</table>'
+        # --- Summary line ---
+        html = (
+            f'<div><span style="color:{type_color}; font-weight:bold;">{cls_text}</span>'
+            f' &nbsp;&middot;&nbsp; {method}'
+            f' &nbsp;&middot;&nbsp; <b>{minus(f"{result.gain_db:+.1f}")} dB</b></div>'
         )
 
-        html = summary + table
+        def note(chosen, label):
+            if not label:
+                return ""
+            style = (f"color:{type_color}; font-weight:600;" if chosen
+                     else f"color:{metadata};")
+            return f'<span style="{style}">{label}</span>'
+
+        pk_note = note(True, "Chosen &middot; limiting" if is_peak_limited
+                       else "Chosen" if is_transient else "")
+        rms_note = (note(False, "Would exceed peak") if is_peak_limited
+                    else note(True, "Chosen") if rms_active else "")
+
+        # --- Comparison table (finding-table style) ---
+        head = (f'padding:4px 12px; background-color:{surface}; color:{text};'
+                f' border-bottom:1px solid {separator};')
+        cell = f'padding:4px 12px; border-bottom:1px solid {separator};'
+
+        def value_cells(values, active, width_attrs):
+            weight = " font-weight:bold;" if active else ""
+            return "".join(
+                f'<td{width} style="{cell} white-space:nowrap; color:{text};{weight}">{value}</td>'
+                for value, width in zip(values, width_attrs))
+
+        peak_values = (f"{fmt_abs(det_peak)} dBFS", f"{minus(f'{tgt_peak:.1f}')} dBFS",
+                       f"{fmt_rel(gain_for_peak)} dB")
+        rms_values = (f"{fmt_abs(det_rms)} dBFS", f"{minus(f'{tgt_rms:.1f}')} dBFS",
+                      f"{fmt_rel(gain_for_rms)} dB")
+        if compact:
+            widths = (' width="30%"', ' width="24%"', ' width="24%"', ' width="22%"')
+            header = "".join(f'<td{w} style="{head}">{label}</td>' for label, w in
+                             zip(("Measure", "Detected", "Target", "Gain"), widths))
+
+            def row(metric, values, active, row_note):
+                measure = metric + (f"<br>{row_note}" if row_note else "")
+                return (f'<tr><td{widths[0]} style="{cell} color:{metadata};">{measure}</td>'
+                        + value_cells(values, active, widths[1:]) + '</tr>')
+            table_attrs = 'width="100%" '
+        else:
+            widths = (' width="112"', ' width="104"', ' width="104"', ' width="88"', ' width="150"')
+            header = "".join(f'<td{w} style="{head}">{label}</td>' for label, w in
+                             zip(("Measure", "Detected", "Target", "Gain", "&nbsp;"), widths))
+
+            def row(metric, values, active, row_note):
+                return (f'<tr><td{widths[0]} style="{cell} color:{metadata};">{metric}</td>'
+                        + value_cells(values, active, widths[1:4])
+                        + f'<td{widths[4]} style="{cell} white-space:nowrap;">{row_note or "&nbsp;"}</td></tr>')
+            table_attrs = ""
+
+        html += (
+            f'<table {table_attrs}cellpadding="0" cellspacing="0"'
+            f' style="margin-top:8px; border-collapse:collapse;">'
+            f'<tr>{header}</tr>'
+            + row("Peak", peak_values, peak_active, pk_note)
+            + row(rms_metric, rms_values, rms_active, rms_note)
+            + '</table>'
+        )
 
         # Fader rebalance note
         rebalance = d.get("fader_rebalance_shift", 0.0)
         if rebalance != 0.0:
             fader_off = d.get("fader_offset", 0.0)
             html += (
-                f'<div style="margin-left:8px; margin-top:6px;'
-                f' color:#cc8844; font-size:0.9em;">'
-                f'Fader rebalanced: {rebalance:+.1f} dB shift'
-                f' &rarr; fader offset {fader_off:+.1f} dB'
+                f'<div style="margin-top:8px; color:{metadata};">'
+                f'Fader rebalanced: {minus(f"{rebalance:+.1f}")} dB shift'
+                f' &rarr; fader offset {minus(f"{fader_off:+.1f}")} dB'
                 f'</div>'
             )
 
@@ -257,8 +277,7 @@ class BimodalNormalizeProcessor(AudioProcessor):
                 decay = cr.data.get("decay_db", 0.0)
                 density = cr.data.get("density", 0.0)
                 html += (
-                    f'<div style="margin-left:8px; margin-top:6px;'
-                    f' color:#888888; font-size:0.9em;">'
+                    f'<div style="margin-top:8px; color:{metadata};">'
                     f'Analysis: Crest {crest:.1f} dB'
                     f' &middot; Decay {decay:.1f} dB'
                     f' &middot; Density {density:.0%}'

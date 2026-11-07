@@ -11,7 +11,7 @@ import re
 from typing import Any
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPixmap
+from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -38,6 +38,11 @@ from .page_colors import ColorsPage
 from .page_general import GeneralPage
 from .page_groups import GroupsPage
 from .preset_panel import NamedPresetPanel
+from ..change_marker import (
+    MARKER_COLUMN_WIDTH, install_button_marker, install_tab_marker,
+    set_button_marker, set_item_marker, set_tab_marker, use_marker_tab_bar)
+
+_UNSAVED = "Unsaved changes"
 
 
 class PreferencesDialog(QDialog):
@@ -49,7 +54,6 @@ class PreferencesDialog(QDialog):
         self.resize(1150, 700)
         self._config = copy.deepcopy(config)
         self._saved = False
-        self._dirty_icon = self._make_dirty_icon()
         self._original_global_state: dict[str, Any] = {}
         self._original_config_state: dict[str, Any] = {}
         self._global_items: dict[str, QTreeWidgetItem] = {}
@@ -108,6 +112,7 @@ class PreferencesDialog(QDialog):
         root.setContentsMargins(8, 8, 8, 8)
 
         self._tabs = QTabWidget()
+        use_marker_tab_bar(self._tabs)
         self._tabs.setDocumentMode(True)
         root.addWidget(self._tabs, 1)
 
@@ -115,10 +120,13 @@ class PreferencesDialog(QDialog):
             self._build_global_tab(), "Global")
         self._preset_tab_index = self._tabs.addTab(
             self._build_preset_tab(), "Config Presets")
+        install_tab_marker(self._tabs, self._global_tab_index)
+        install_tab_marker(self._tabs, self._preset_tab_index)
 
         btn_box = QDialogButtonBox(QDialogButtonBox.Cancel | QDialogButtonBox.Save)
         self._save_btn = btn_box.button(QDialogButtonBox.Save)
         self._save_btn.setText("Save Preferences")
+        install_button_marker(self._save_btn)
         self._save_btn.setDefault(True)
         btn_box.accepted.connect(self._on_save)
         btn_box.rejected.connect(self.reject)
@@ -138,7 +146,7 @@ class PreferencesDialog(QDialog):
         self._global_tree.header().setStretchLastSection(False)
         self._global_tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
         self._global_tree.header().setSectionResizeMode(1, QHeaderView.Fixed)
-        self._global_tree.setColumnWidth(1, 18)
+        self._global_tree.setColumnWidth(1, MARKER_COLUMN_WIDTH)
         splitter.addWidget(self._global_tree)
 
         self._global_stack = QStackedWidget()
@@ -196,7 +204,7 @@ class PreferencesDialog(QDialog):
         self._preset_tree.header().setStretchLastSection(False)
         self._preset_tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
         self._preset_tree.header().setSectionResizeMode(1, QHeaderView.Fixed)
-        self._preset_tree.setColumnWidth(1, 18)
+        self._preset_tree.setColumnWidth(1, MARKER_COLUMN_WIDTH)
         splitter.addWidget(self._preset_tree)
 
         self._preset_stack = QStackedWidget()
@@ -252,18 +260,6 @@ class PreferencesDialog(QDialog):
             stack.setCurrentIndex(idx)
 
     # ДД Dirty indicators ДДДДДДДДДДДДДДДДДДДДДДДДДДДДДДДДДДДДДДДДДДДДД
-
-    @staticmethod
-    def _make_dirty_icon() -> QIcon:
-        pixmap = QPixmap(12, 12)
-        pixmap.fill(Qt.transparent)
-        painter = QPainter(pixmap)
-        painter.setRenderHint(QPainter.Antialiasing)
-        painter.setBrush(QColor("#e53935"))
-        painter.setPen(Qt.NoPen)
-        painter.drawEllipse(3, 3, 6, 6)
-        painter.end()
-        return QIcon(pixmap)
 
     def _connect_dirty_signals(self) -> None:
         self._general_page.preferencesChanged.connect(
@@ -322,10 +318,10 @@ class PreferencesDialog(QDialog):
     def _set_tree_icon(self, item: QTreeWidgetItem | None,
                        dirty: bool) -> None:
         if item is not None:
-            item.setIcon(1, self._dirty_icon if dirty else QIcon())
+            set_item_marker(item, 1, dirty, _UNSAVED)
 
     def _set_tab_dirty(self, index: int, label: str, dirty: bool) -> None:
-        self._tabs.setTabText(index, f"{label} \u25cf" if dirty else label)
+        set_tab_marker(self._tabs, index, dirty, _UNSAVED)
 
     def _update_dirty_indicators(self) -> None:
         if self._loading_cfg_widgets:
@@ -346,10 +342,7 @@ class PreferencesDialog(QDialog):
         self._set_tab_dirty(
             self._preset_tab_index, "Config Presets", config_dirty)
 
-        self._save_btn.setText(
-            "Save Preferences \u25cf"
-            if global_dirty or config_dirty
-            else "Save Preferences")
+        set_button_marker(self._save_btn, global_dirty or config_dirty, _UNSAVED)
 
     def _update_config_tree_dirty_indicators(self) -> None:
         dirty_keys = self._config_tree_dirty_keys()
