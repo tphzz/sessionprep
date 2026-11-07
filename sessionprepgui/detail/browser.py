@@ -8,9 +8,20 @@ from urllib.parse import quote, unquote
 from PySide6.QtCore import QPoint, Qt, QUrl, Signal
 from PySide6.QtGui import QTextCharFormat, QTextCursor, QTextDocument
 
-from ..tracks.table_widgets import _HelpBrowser
+from ..tracks.table_widgets import DETAIL_TAB_INSET, _HelpBrowser
 from .report import prepare_track_report, render_prepared_track_report, render_summary_html
 from .report_style import REPORT_CONTENT_SCALE, configure_report_browser, wrap_report_html
+
+
+def _apply_report_inset(document):
+    """Inset report text by the shared detail-tab inset on every side."""
+    root = document.rootFrame()
+    fmt = root.frameFormat()
+    fmt.setLeftMargin(DETAIL_TAB_INSET)
+    fmt.setRightMargin(DETAIL_TAB_INSET)
+    fmt.setTopMargin(DETAIL_TAB_INSET)
+    fmt.setBottomMargin(DETAIL_TAB_INSET)
+    root.setFrameFormat(fmt)
 
 
 @dataclass(frozen=True)
@@ -87,12 +98,14 @@ class ReportBrowser(_HelpBrowser):
         self._finding_font_ranges.clear()
         self._minimum_header_cache = None
         super().clear()
+        _apply_report_inset(self.document())
         self.reportChanged.emit()
 
     def setHtml(self, html):
         """External loading/error messages invalidate interactive content."""
         self.clear()
         super().setHtml(html)
+        _apply_report_inset(self.document())
 
     def present_track(self, track, session, *, show_clean=True, verbose=False):
         same = (session is self.report_session and self._mode == "file"
@@ -140,13 +153,7 @@ class ReportBrowser(_HelpBrowser):
 
     def _set_document(self, html):
         super().setHtml(wrap_report_html(html))
-        root = self.document().rootFrame()
-        fmt = root.frameFormat()
-        fmt.setLeftMargin(24)
-        fmt.setRightMargin(24)
-        fmt.setTopMargin(16 if self._mode == "summary" else 4)
-        fmt.setBottomMargin(16)
-        root.setFrameFormat(fmt)
+        _apply_report_inset(self.document())
         self.document().documentLayout().documentSize()
         self._anchor_positions.clear()
         self._named_positions.clear()
@@ -244,11 +251,7 @@ class ReportBrowser(_HelpBrowser):
             document.setDefaultFont(self.font())
             document.setDefaultTextOption(self.document().defaultTextOption())
             document.setHtml(wrap_report_html(self._prepared["header"]))
-            root = document.rootFrame()
-            fmt = root.frameFormat()
-            fmt.setLeftMargin(24)
-            fmt.setRightMargin(24)
-            root.setFrameFormat(fmt)
+            _apply_report_inset(document)
             document.setTextWidth(1)
             minimum = ceil(document.documentLayout().documentSize().width())
             minimum += 2 * self.frameWidth() + self.verticalScrollBar().sizeHint().width()

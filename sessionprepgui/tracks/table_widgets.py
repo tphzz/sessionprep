@@ -24,6 +24,10 @@ _TAB_FILE = 1
 _TAB_GROUPS = 2
 _TAB_SESSION = 3
 
+# Logical-pixel inset between Phase 2 detail-tab content (Summary, File,
+# Groups, Config) and the edges of the tab content area.
+DETAIL_TAB_INSET = 16
+
 _PAGE_TABS = 0
 
 _PHASE_TOPOLOGY = 0

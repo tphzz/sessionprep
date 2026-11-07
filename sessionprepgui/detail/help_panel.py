@@ -9,7 +9,11 @@ from PySide6.QtWidgets import (
 
 from ..icons import icon
 from ..theme import COLORS
+from ..tracks.table_widgets import DETAIL_TAB_INSET
 from .report_style import configure_report_browser
+
+# Report-to-dock gap; the report's own text inset sits inside the report.
+_HELP_GAP = 16
 
 
 class _HelpCloseButton(QToolButton):
@@ -32,7 +36,7 @@ class FileReportPane(QWidget):
         self._content_signature = None
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(16)
+        layout.setSpacing(_HELP_GAP)
         layout.addWidget(report, 1)
 
         self._help_panel = QFrame()
@@ -95,8 +99,15 @@ class FileReportPane(QWidget):
         self.help_browser.setWordWrapMode(QTextOption.WrapAtWordBoundaryOrAnywhere)
         self.help_browser.document().setDocumentMargin(16)
         panel_layout.addWidget(self.help_browser, 1)
-        layout.addWidget(self._help_panel)
-        self._help_panel.hide()
+        # The dock keeps the detail-tab inset from the pane's top, right and
+        # bottom edges; the report keeps the full height beside it.
+        self._help_dock = QWidget()
+        dock_layout = QVBoxLayout(self._help_dock)
+        dock_layout.setContentsMargins(0, DETAIL_TAB_INSET, DETAIL_TAB_INSET, DETAIL_TAB_INSET)
+        dock_layout.setSpacing(0)
+        dock_layout.addWidget(self._help_panel)
+        layout.addWidget(self._help_dock)
+        self._help_dock.hide()
         self._escape = QShortcut(QKeySequence(Qt.Key_Escape), self._help_panel)
         self._escape.setContext(Qt.WidgetWithChildrenShortcut)
         self._escape.activated.connect(self.close_help)
@@ -126,7 +137,8 @@ class FileReportPane(QWidget):
         # space when the user makes the File region narrower.
         preferred = min(360, max(140, round(self.width() * 0.4)))
         if self._active_detector_id is not None:
-            available = self.width() - 16 - self.report.minimum_header_width()
+            available = (self.width() - _HELP_GAP - DETAIL_TAB_INSET
+                         - self.report.minimum_header_width())
             preferred = min(preferred, max(140, available))
         self._help_panel.setFixedWidth(preferred)
 
@@ -159,7 +171,7 @@ class FileReportPane(QWidget):
             self._content_signature = None
         self._set_content(row)
         self._fit_help_width()
-        self._help_panel.show()
+        self._help_dock.show()
         self.layout().activate()
         self.report.set_active_help(key)
         self.report.restore_reading_anchor(anchor)
@@ -187,7 +199,7 @@ class FileReportPane(QWidget):
         self._active_detector_id = None
         self._help_generation = None
         self._content_signature = None
-        self._help_panel.hide()
+        self._help_dock.hide()
         self.help_browser.clear()
         self.help_title.clear()
         self.layout().activate()

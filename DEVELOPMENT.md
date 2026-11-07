@@ -1763,9 +1763,15 @@ Finding rows put severity before the disclosure. Their native text role follows
 the application font, while explicit custom HTML pixel/point sizes, faces and
 emphasis remain intact. Narrow reports place location/guidance below the title.
 The Help panel prefers 360 logical pixels with a 16 px gap; it gives space back
-to the report when needed. A measurement of the cached stock header, keyed by
-content and font, protects normalization values at larger scales without
-suppressing legitimate horizontal scrolling in custom result HTML.
+to the report when needed. All Phase 2 detail tabs (Summary, File, Groups,
+Config) keep their content `DETAIL_TAB_INSET` (16 logical px,
+`sessionprepgui/tracks/table_widgets.py`) from every edge: reports apply it as
+root-frame margins on every document, the Groups/Config pages as layout margins,
+and the Help panel keeps it from the File pane's top, right and bottom edges.
+The waveform preview stays full width. A measurement of the cached stock
+header, keyed by content and font, protects normalization values at larger
+scales without suppressing legitimate horizontal scrolling in custom result
+HTML.
 
 Structured summary `item_refs` provide file identities alongside unchanged
 legacy item strings, so Review file does not parse filenames. Qt may move focus
