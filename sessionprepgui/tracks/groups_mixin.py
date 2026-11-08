@@ -28,7 +28,7 @@ from sessionpreplib.config import classify_structured_config_change
 
 from ..prefs.param_form import _argb_to_qcolor
 from ..settings import build_defaults, save_config
-from .table_widgets import _SortableItem, _TAB_GROUPS
+from .table_widgets import DETAIL_TAB_INSET, _SortableItem, _TAB_GROUPS
 from ..theme import COLORS, PT_DEFAULT_COLORS, normalize_color_name
 from ..widgets import BatchComboBox, ColorPickerButton, TableCellComboBox
 
@@ -48,7 +48,8 @@ class GroupsMixin:  # pylint: disable=too-few-public-methods
         page = QWidget()
         page.setAutoFillBackground(True)
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(0, 0, 0, 0)  # flush with the tab area
+        layout.setContentsMargins(
+            DETAIL_TAB_INSET, DETAIL_TAB_INSET, DETAIL_TAB_INSET, DETAIL_TAB_INSET)
         layout.setSpacing(6)
 
         desc = QLabel(

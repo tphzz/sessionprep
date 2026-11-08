@@ -35,6 +35,8 @@ from sessionpreplib.logging_setup import (
     set_runtime_log_level,
 )
 
+from .theme import WINDOW_MARGIN
+
 
 _LOG_LINE_RE = re.compile(
     r"^(?P<time>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}) "
@@ -124,7 +126,7 @@ class LogViewerWindow(QDialog):
 
     def _init_ui(self) -> None:
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setContentsMargins(*(WINDOW_MARGIN,) * 4)
         layout.setSpacing(8)
 
         top = QHBoxLayout()

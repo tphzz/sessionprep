@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
 
 from sessionpreplib.daw_processors import ptsl_helpers as ptslh
 
+from ...theme import WINDOW_MARGIN
 from ...widgets import ColorGridPanel
 from .connection_common import PTSL_MUTATION_TIMEOUT_MS, PTSL_READ_TIMEOUT_MS
 
@@ -31,7 +32,7 @@ class ColorTool(QWidget):
 
     def _init_ui(self):
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setContentsMargins(*(WINDOW_MARGIN,) * 4)
         layout.setSpacing(6)
 
         self._desc = QLabel(
@@ -48,11 +49,14 @@ class ColorTool(QWidget):
             parent=self,
         )
         self._grid.colorClicked.connect(self._on_color_clicked)
+        # The page already pads 4 px; the grid adds no margin of its own.
+        self._grid.layout().setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self._grid, 1)
 
         status_row = QHBoxLayout()
         self._status = QLabel("")
         self._status.setStyleSheet("color: #888; font-size: 8pt;")
+        self._status.hide()  # shown only while it has a message
         status_row.addWidget(self._status)
         status_row.addStretch()
         layout.addLayout(status_row)
@@ -80,14 +84,14 @@ class ColorTool(QWidget):
             if use_minimum_grid_height
             else self._grid.aspect_limited_height_for_width(inner_width)
         )
-        status_height = self._status.sizeHint().height()
+        # A transient status message borrows space from the grid; it never
+        # changes the window size.
         return (
             margins.top()
             + margins.bottom()
             + desc_height
             + grid_height
-            + status_height
-            + spacing * 3
+            + spacing * 2
             + COLOR_PICKER_EXTRA_PREFERRED_HEIGHT
         )
 
@@ -112,6 +116,7 @@ class ColorTool(QWidget):
     def _set_status(self, text: str, color: str):
         self._status.setText(text)
         self._status.setStyleSheet(f"color: {color}; font-size: 8pt;")
+        self._status.setVisible(bool(text))
 
     def _fetch_pt_palette(self):
         if self._client is None:

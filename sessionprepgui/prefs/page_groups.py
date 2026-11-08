@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
 )
 
 from .config_pages import GroupsTableWidget
+from .param_form import SETTINGS_PAGE_MARGIN
 from .preset_panel import NamedPresetPanel
 
 
@@ -81,7 +82,7 @@ class GroupsPage(QWidget):
 
     def _init_ui(self) -> None:
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setContentsMargins(*(SETTINGS_PAGE_MARGIN,) * 4)
         layout.setSpacing(8)
 
         desc = QLabel(

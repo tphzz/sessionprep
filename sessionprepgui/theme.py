@@ -29,6 +29,10 @@ COLORS = {
     "alt_row": "#2c2c2c",  # alternating (zebra) table/tree rows; subtle on bg_alt
 }
 
+# Logical-pixel content margin of tool windows and dialogs (Log Viewer,
+# Pro Tools Utils, Preferences) and of tool pages inside their tabs.
+WINDOW_MARGIN = 4
+
 # File list item colors by status
 FILE_COLOR_OK = QColor("#cccccc")
 FILE_COLOR_ERROR = QColor("#ff4444")

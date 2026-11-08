@@ -1768,13 +1768,23 @@ stacks actions; and narrow (viewport below 460 px, left again only at 476 px so
 a scroll bar appearing after the switch cannot flip it back, or the compact
 header would scroll), which stacks each finding in one column with inline
 actions. The Help panel prefers 360 logical pixels (minimum 140) with an 8 px
-gap and sits flush with the File pane's top, right and bottom edges; it gives
-space back to the report when needed, and below a 240 px body its simple
-two-column Help tables stack (`stack_two_column_rows`). Only the Summary and
-File report browsers keep `DETAIL_TAB_INSET` (16 logical px,
-`sessionprepgui/tracks/table_widgets.py`) as root-frame margins on every
-document; Groups and Config page content is flush with the tab area. The
-waveform preview stays full width. A measurement of the cached stock header
+gap and keeps `DETAIL_TAB_INSET` from the File pane's top, right and bottom
+edges; it gives space back to the report when needed, and below a 240 px body
+its simple two-column Help tables stack (`stack_two_column_rows`).
+`DETAIL_TAB_INSET` (4 logical px, `sessionprepgui/tracks/table_widgets.py`) is
+the shared padding of detail-tab content: the Summary/File report text
+(root-frame margins on every document), the Groups and Config page content and
+the Help dock edges. The track table and the detail tab bar stay flush. The
+generated settings pages (Phase 2 Config and Preferences) use
+`SETTINGS_PAGE_MARGIN` (4 px, `prefs/param_form.py`). Navigation-tree | page
+splitters call `controls.fit_navigation_pane()` so a width-capped tree never
+leaves an unpainted strip beside the handle. Tool windows and dialogs (Log
+Viewer, Pro Tools Utils, Preferences) use `theme.WINDOW_MARGIN` (4 logical px)
+as their content margin, and the Pro Tools tool pages pad their content by the
+same 4 px inside the tab area (the Color Picker's `ColorGridPanel` adds no
+margin of its own there). Their status lines are shown only while they hold a
+message and never change the preferred window height. The waveform preview stays full
+width. A measurement of the cached stock header
 (its narrow variant, the narrowest layout), keyed by content and font, protects
 normalization values at larger scales without suppressing legitimate
 horizontal scrolling in custom result HTML.
@@ -1813,6 +1823,13 @@ changes and document replacement. Focused dock/layout/typography tests cover
 independent scrolling, keyboard operation, stale state and custom formatting.
 
 `WaveformPanel` keeps one waveform instance and a persistent preview header.
+In both phases the view controls sit in that header row after the disclosure
+(`_ViewControlRow`): the panel marks which controls are wanted (display mode,
+analysis mode) through `set_wanted()`, and the row shows the leading wanted
+controls that fit and moves the rest into a "»" (More view controls) menu,
+where dropdowns appear as submenus and toggles as checkable items that click the
+real button. Do not call `setVisible()` on the view controls directly. Tab order
+follows the row: disclosure, view controls, », zoom/scale buttons.
 Collapsing hides its body, explicitly allocates only the 32px header at the
 bottom of its splitter, and remembers expanded sizes. Reopening restores those
 sizes proportionally against the current splitter extent. It retains requests,

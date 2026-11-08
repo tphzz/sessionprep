@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
 
 from ...prefs.preset_panel import NamedPresetPanel
 from ...settings import save_config
+from ...theme import WINDOW_MARGIN
 from .connection_common import PTSL_MUTATION_TIMEOUT_MS, PTSL_READ_TIMEOUT_MS
 
 
@@ -220,7 +221,7 @@ class TrackHeightTool(QWidget):
 
     def _init_ui(self):
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setContentsMargins(*(WINDOW_MARGIN,) * 4)
         layout.setSpacing(6)
 
         self._desc = QLabel(
@@ -329,6 +330,7 @@ class TrackHeightTool(QWidget):
 
         self._status = QLabel("")
         self._status.setStyleSheet("color: #888; font-size: 8pt;")
+        self._status.hide()  # shown only while it has a message
         layout.addWidget(self._status)
         self._bottom_stretch = QSpacerItem(
             0, 0, QSizePolicy.Minimum, QSizePolicy.Fixed
@@ -373,7 +375,8 @@ class TrackHeightTool(QWidget):
             )
             parts.append(header_height + rows_height + self._table.frameWidth() * 2 + 4)
 
-        parts.append(self._status.sizeHint().height())
+        # A transient status message borrows space from the table; it never
+        # changes the window size.
         visible_part_count = len([height for height in parts if height > 0])
         return (
             margins.top()
@@ -385,6 +388,7 @@ class TrackHeightTool(QWidget):
     def _set_status(self, text: str, color: str):
         self._status.setText(text)
         self._status.setStyleSheet(f"color: {color}; font-size: 8pt;")
+        self._status.setVisible(bool(text))
 
     def _set_error_status(self, text: str):
         self._set_status(text, "#f44336")

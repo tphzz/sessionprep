@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
 
 from sessionpreplib.daw_processors.ptsl_connection import ProToolsConnectionSettings
 
-from ...theme import apply_dark_theme
+from ...theme import WINDOW_MARGIN, apply_dark_theme
 from ...window_geometry import (
     STARTUP_SCREEN_MARGIN,
     calculate_startup_geometry,
@@ -176,7 +176,7 @@ class ProToolsUtilsWindow(QDialog):
 
     def _init_ui(self):
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setContentsMargins(*(WINDOW_MARGIN,) * 4)
 
         # Connection header
         header = QHBoxLayout()

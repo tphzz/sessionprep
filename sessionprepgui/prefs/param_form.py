@@ -427,6 +427,11 @@ class PathPicker(QWidget):
 # Page builder
 # ---------------------------------------------------------------------------
 
+# Inner margin of generated settings pages (Preferences and Phase 2 Config),
+# matching the 4 px detail-tab padding.
+SETTINGS_PAGE_MARGIN = 4
+
+
 def _build_param_page(
     params: list[Any],
     values: dict[str, Any],
@@ -437,7 +442,8 @@ def _build_param_page(
     """
     page = QWidget()
     outer = QVBoxLayout(page)
-    outer.setContentsMargins(12, 12, 12, 12)
+    outer.setContentsMargins(
+        SETTINGS_PAGE_MARGIN, SETTINGS_PAGE_MARGIN, SETTINGS_PAGE_MARGIN, SETTINGS_PAGE_MARGIN)
     outer.setSpacing(12)
     widgets: list[tuple[str, QWidget]] = []
     for spec in params:

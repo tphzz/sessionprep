@@ -38,6 +38,8 @@ from .page_colors import ColorsPage
 from .page_general import GeneralPage
 from .page_groups import GroupsPage
 from .preset_panel import NamedPresetPanel
+from ..controls import fit_navigation_pane
+from ..theme import WINDOW_MARGIN
 from ..change_marker import (
     MARKER_COLUMN_WIDTH, install_button_marker, install_tab_marker,
     set_button_marker, set_item_marker, set_tab_marker, use_marker_tab_bar)
@@ -109,7 +111,7 @@ class PreferencesDialog(QDialog):
 
     def _init_ui(self) -> None:
         root = QVBoxLayout(self)
-        root.setContentsMargins(8, 8, 8, 8)
+        root.setContentsMargins(*(WINDOW_MARGIN,) * 4)
 
         self._tabs = QTabWidget()
         use_marker_tab_bar(self._tabs)
@@ -153,6 +155,7 @@ class PreferencesDialog(QDialog):
         splitter.addWidget(self._global_stack)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
+        fit_navigation_pane(splitter)
         layout.addWidget(splitter, 1)
 
         self._global_page_index: dict[int, int] = {}
@@ -211,6 +214,7 @@ class PreferencesDialog(QDialog):
         splitter.addWidget(self._preset_stack)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
+        fit_navigation_pane(splitter)
         layout.addWidget(splitter, 1)
 
         self._preset_page_index: dict[int, int] = {}

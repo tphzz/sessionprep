@@ -259,7 +259,7 @@ def test_help_tables_stack_only_in_a_narrow_body(qapp, pane, monkeypatch):
     qapp.processEvents()
     # 400 px pane: Help min(360, max(140, 160)) = 160; the body is under 240.
     assert pane._help_panel.width() == 160 and _help_rows(pane) == 4
-    assert pane.report.width() == 400 - 8 - 160
+    assert pane.report.width() == 400 - 8 - 160 - 4  # gap, Help, dock inset
     assert pane.report._layout == "narrow"
     pane.resize(1069, 620)
     qapp.processEvents()

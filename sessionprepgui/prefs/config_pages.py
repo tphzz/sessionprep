@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
 from ..widgets import ColorPickerButton
 
 from .param_form import (
+    SETTINGS_PAGE_MARGIN,
     _build_param_page,
     _color_swatch_icon,
     _read_widget,
@@ -652,7 +653,7 @@ def build_config_pages(
     proc_parent.setFont(0, QFont("", -1, QFont.Bold))
     placeholder = QWidget()
     pl = QVBoxLayout(placeholder)
-    pl.setContentsMargins(12, 12, 12, 12)
+    pl.setContentsMargins(*(SETTINGS_PAGE_MARGIN,) * 4)
     pl.addWidget(QLabel("Select a processor from the tree to configure."))
     pl.addStretch()
     register_page(proc_parent, placeholder, "_processors")
@@ -677,7 +678,7 @@ def build_config_pages(
     daw_parent.setFont(0, QFont("", -1, QFont.Bold))
     placeholder2 = QWidget()
     pl2 = QVBoxLayout(placeholder2)
-    pl2.setContentsMargins(12, 12, 12, 12)
+    pl2.setContentsMargins(*(SETTINGS_PAGE_MARGIN,) * 4)
     pl2.addWidget(QLabel("Select a DAW processor from the tree to configure."))
     pl2.addStretch()
     register_page(daw_parent, placeholder2, "_daw_processors")

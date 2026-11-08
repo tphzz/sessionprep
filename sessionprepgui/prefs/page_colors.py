@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .param_form import _argb_to_qcolor
+from .param_form import SETTINGS_PAGE_MARGIN, _argb_to_qcolor
 from ..widgets import ColorGridPanel
 
 
@@ -75,7 +75,7 @@ class ColorsPage(QWidget):
 
     def _init_ui(self) -> None:
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setContentsMargins(*(SETTINGS_PAGE_MARGIN,) * 4)
         layout.setSpacing(8)
 
         desc = QLabel(

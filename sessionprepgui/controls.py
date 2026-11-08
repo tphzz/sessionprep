@@ -1,7 +1,7 @@
 """Shared desktop action behavior, independent of phase eligibility."""
 from PySide6.QtCore import QEvent, QObject, QSize, Qt
 from PySide6.QtGui import QAction, QIcon
-from PySide6.QtWidgets import QToolBar, QToolButton
+from PySide6.QtWidgets import QSplitter, QToolBar, QToolButton
 
 
 class _PrimaryActionBinding(QObject):
@@ -75,3 +75,19 @@ def set_action_busy(action: QAction, busy: bool, text: str = "") -> None:
     if busy != was_busy:
         # Dynamic properties alone do not notify bindings when text/icon are unchanged.
         action.changed.emit()
+
+
+def fit_navigation_pane(splitter: QSplitter) -> None:
+    """Start a navigation-tree | page splitter with the tree at its maximum width.
+
+    Without explicit sizes QSplitter may hand the width-capped tree more space
+    than its maximum; the surplus is never painted (a dark strip beside the
+    handle) until the user drags the handle. Call after adding both panes.
+    """
+    pane = splitter.widget(0)
+    if pane is None or splitter.count() < 2:
+        return
+    if pane.maximumWidth() >= 16777215:  # QWIDGETSIZE_MAX: no cap, no gap to fix
+        return
+    width = max(pane.minimumWidth(), pane.maximumWidth())
+    splitter.setSizes([width] + [1 << 20] * (splitter.count() - 1))
