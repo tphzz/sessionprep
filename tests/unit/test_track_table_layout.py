@@ -94,13 +94,15 @@ def test_track_table_layout_fits_headers_widgets_and_rows(qapp):
     assert layout.table_width == layout.content_width + track_table_extra_width(table)
 
 
-def test_apply_track_table_layout_keeps_file_stretch_and_controls_sized(qapp):
+def test_apply_track_table_layout_fits_file_column_and_sizes_controls(qapp):
     table = _track_table()
 
     layout = apply_track_table_layout(table)
     header = table.horizontalHeader()
 
-    assert header.sectionResizeMode(0) == QHeaderView.Stretch
+    # File is auto-fitted (fit_file_column), never narrower than its minimum.
+    assert header.sectionResizeMode(0) == QHeaderView.Fixed
+    assert header.sectionSize(0) >= TRACK_TABLE_FILE_MIN_WIDTH
     for col in range(1, table.columnCount()):
         assert header.sectionResizeMode(col) == QHeaderView.Interactive
         assert header.sectionSize(col) == layout.column_widths[col]

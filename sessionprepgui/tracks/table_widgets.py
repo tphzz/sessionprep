@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 
-from PySide6.QtCore import Qt, Signal, QUrl, QMimeData, QPoint
+from PySide6.QtCore import QEvent, Qt, Signal, QUrl, QMimeData, QPoint
 from PySide6.QtGui import QColor, QDrag, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QLabel,
@@ -100,11 +100,43 @@ class _HelpBrowser(QTextBrowser):
 class _DraggableTrackTable(BatchEditTableWidget):
     """BatchEditTableWidget with file-drag support for external applications."""
 
+    # The File column takes the free width but never less than this; when the
+    # pane is narrower than all columns the table scrolls horizontally.
+    FILE_COLUMN_MIN_WIDTH = 160  # = table_layout.TRACK_TABLE_FILE_MIN_WIDTH
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setDragEnabled(True)
         self.setDefaultDropAction(Qt.CopyAction)
+        self.setTextElideMode(Qt.ElideMiddle)   # long names keep their extension
         self._source_dir: str | None = None
+        self._fitting_file_column = False
+
+    def fit_file_column(self, *_args) -> None:
+        """Give column 0 the remaining width, at least FILE_COLUMN_MIN_WIDTH."""
+        if self._fitting_file_column or self.columnCount() == 0:
+            return
+        header = self.horizontalHeader()
+        others = sum(header.sectionSize(c) for c in range(1, self.columnCount())
+                     if not header.isSectionHidden(c))
+        width = max(self.FILE_COLUMN_MIN_WIDTH, self.viewport().width() - others)
+        if header.sectionSize(0) != width:
+            self._fitting_file_column = True
+            try:
+                header.resizeSection(0, width)
+            finally:
+                self._fitting_file_column = False
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.fit_file_column()
+
+    def viewportEvent(self, event):
+        # A vertical scroll bar appearing narrows the viewport, not the table.
+        result = super().viewportEvent(event)
+        if event.type() == QEvent.Resize:
+            self.fit_file_column()
+        return result
 
     def set_source_dir(self, path: str | None):
         self._source_dir = path

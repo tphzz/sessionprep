@@ -84,6 +84,17 @@ def _color_swatch_icon(argb: str, size: int = 16) -> QIcon:
 # Widget factory
 # ---------------------------------------------------------------------------
 
+# String settings fields are at least this wide, so default values such as
+# folder names are fully visible; longer values scroll inside the field.
+LINE_EDIT_MIN_WIDTH = 200
+LINE_EDIT_MAX_MIN_WIDTH = 360   # beyond this a value scrolls inside its field
+
+
+def _fit_line_edit(w: QLineEdit) -> None:
+    text_width = w.fontMetrics().horizontalAdvance(w.text() or w.placeholderText())
+    w.setMinimumWidth(min(max(LINE_EDIT_MIN_WIDTH, text_width + 24), LINE_EDIT_MAX_MIN_WIDTH))
+
+
 def _build_widget(spec: Any, value: Any) -> QWidget:
     """Create an appropriate input widget for a ParamSpec and set its value.
 
@@ -174,11 +185,13 @@ def _build_widget(spec: Any, value: Any) -> QWidget:
         else:
             w.setText(str(value) if value else "")
         w.setPlaceholderText("comma-separated values")
+        _fit_line_edit(w)
         w._param_spec = spec
         return w
 
     w = QLineEdit()
     w.setText(str(value) if value is not None else "")
+    _fit_line_edit(w)
     w._param_spec = spec
     return w
 

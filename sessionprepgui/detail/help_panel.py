@@ -23,6 +23,37 @@ _HELP_STACK_BELOW = 240
 _CELL = r"<td\b[^>]*>(?:(?!<td\b|</?tr\b|<table\b|</td>).)*</td>"
 _TWO_CELL_ROW = re.compile(rf"<tr>\s*({_CELL})\s*({_CELL})\s*</tr>", re.S | re.I)
 _LEFT_PADDING = re.compile(r"padding-left\s*:\s*[^;'\"]*;?", re.I)
+_SEPARATOR = re.compile(r"border-bottom\s*:\s*[^;'\"]*;?", re.I)
+_BREAKS_BEFORE_TABLE = re.compile(r"(?:<br\s*/?>\s*)+(?=<table\b)", re.I)
+_BREAKS_AFTER_TABLE = re.compile(r"(?<=</table>)(?:\s*<br\s*/?>)+", re.I)
+_TABLE_TAG = re.compile(r"<table\b[^>]*>", re.I)
+_CELL_TAG = re.compile(r"<(t[dh])\b([^>]*)>", re.I)
+_STYLE_ATTR = re.compile(r"""\sstyle\s*=\s*(['"])(.*?)\1""", re.I | re.S)
+
+
+def normalize_help_tables(html: str) -> str:
+    """Give detector Help tables the approved Help-body rhythm.
+
+    No blank line before or after a table, 8 px above and below it, body-size
+    text and a 1 px separator under every row. Detector HTML stays untouched.
+    """
+    html = _BREAKS_BEFORE_TABLE.sub("", html)
+    html = _BREAKS_AFTER_TABLE.sub("", html)
+    html = _TABLE_TAG.sub(
+        '<table width="100%" cellspacing="0" cellpadding="0"'
+        ' style="margin-top:8px; margin-bottom:8px; border-collapse:collapse;">', html)
+
+    def cell(match):
+        tag, attrs = match.group(1), match.group(2)
+        style = _STYLE_ATTR.search(attrs)
+        # An existing separator is replaced rather than duplicated.
+        existing = _SEPARATOR.sub("", style.group(2)).strip().rstrip(";") if style else ""
+        existing = f"{existing}; " if existing else ""
+        attrs = _STYLE_ATTR.sub("", attrs)
+        separator = f"border-bottom:1px solid {COLORS['accent']}; padding-top:4px; padding-bottom:4px;"
+        quote = "'" if '"' in existing else '"'   # keep quoted values intact
+        return f"<{tag}{attrs} style={quote}{existing}{separator}{quote}>"
+    return _CELL_TAG.sub(cell, html)
 
 
 def stack_two_column_rows(html: str) -> str:
@@ -32,10 +63,13 @@ def stack_two_column_rows(html: str) -> str:
     stacked meaning loses its side padding so it aligns with the term.
     """
     def stacked(match):
-        meaning = match.group(2)
+        term, meaning = match.group(1), match.group(2)
         opening = meaning[:meaning.index(">") + 1]
         meaning = _LEFT_PADDING.sub("", opening) + meaning[len(opening):]
-        return f"<tr>{match.group(1)}</tr><tr>{meaning}</tr>"
+        # One separator per stacked pair: under the meaning, not the term.
+        term_open = term[:term.index(">") + 1]
+        term = _SEPARATOR.sub("", term_open) + term[len(term_open):]
+        return f"<tr>{term}</tr><tr>{meaning}</tr>"
     return _TWO_CELL_ROW.sub(stacked, html)
 
 
@@ -195,7 +229,7 @@ class FileReportPane(QWidget):
             self._render_help(keep_scroll=False)
 
     def _render_help(self, *, keep_scroll):
-        help_html = self._content_signature[1]
+        help_html = normalize_help_tables(self._content_signature[1])
         if self._help_stacked:
             help_html = stack_two_column_rows(help_html)
         self.help_browser.setHtml(

@@ -360,10 +360,12 @@ class WaveformPanel(QWidget):
             "QToolButton:checked { background-color: #2a6db5;"
             " color: #ffffff; }")
 
+        # The chevron sits about 4 px after the label with 8 px right padding
+        # (approved header design); the padding reserves its slot.
         dropdown_style = (
-            "QToolButton { padding-right: 30px; }"
+            "QToolButton { padding-right: 21px; }"
             "QToolButton::menu-indicator { subcontrol-position: right center;"
-            " subcontrol-origin: padding; right: 5px; }")
+            " subcontrol-origin: padding; right: 8px; }")
 
         # Display mode dropdown
         self.display_mode_btn = QToolButton()
@@ -557,9 +559,16 @@ class WaveformPanel(QWidget):
     # Transport bar
     # ------------------------------------------------------------------
 
+    _COMBO_MIN_WIDTH = 120
+    _ICON_ONLY_WIDTH = 32
+    _COMPACT_HYSTERESIS = 8
+
     def _build_transport(self) -> QWidget:
         transport = QWidget()
         transport.setObjectName("wfTransport")
+        transport.installEventFilter(self)
+        self._transport = transport
+        self._transport_compact = False
         transport.setFixedHeight(32)
         transport.setStyleSheet(
             "#wfTransport { background-color: #2d2d2d;"
@@ -575,6 +584,7 @@ class WaveformPanel(QWidget):
         self.play_btn.setIcon(icon('play'))
         self.play_btn.setIconSize(QSize(16, 16))
         self.play_btn.setAccessibleName('Play')
+        self.play_btn.setToolTip('Play')
         self.play_btn.setEnabled(False)
         self.play_btn.clicked.connect(self.play_clicked)
         layout.addWidget(self.play_btn)
@@ -584,6 +594,7 @@ class WaveformPanel(QWidget):
         self.stop_btn.setIcon(icon('stop'))
         self.stop_btn.setIconSize(QSize(16, 16))
         self.stop_btn.setAccessibleName('Stop')
+        self.stop_btn.setToolTip('Stop')
         self.stop_btn.setEnabled(False)
         self.stop_btn.clicked.connect(self.stop_clicked)
         layout.addWidget(self.stop_btn)
@@ -592,7 +603,7 @@ class WaveformPanel(QWidget):
         self._play_mode_combo = QComboBox()
         self._play_mode_combo.setFixedHeight(_BTN_H)
         self._play_mode_combo.setToolTip("Select playback channel routing")
-        self._play_mode_combo.setMinimumWidth(160)
+        self._play_mode_combo.setMinimumWidth(self._COMBO_MIN_WIDTH)
         self._play_mode_combo.addItem("As-is", ("as_is", None))
         self._play_mode_combo.addItem("Mono", ("mono", None))
         self._play_mode_combo.currentIndexChanged.connect(
@@ -607,6 +618,45 @@ class WaveformPanel(QWidget):
         layout.addStretch()
 
         return transport
+
+    def _transport_full_width(self) -> int:
+        """Width the transport needs with labelled Play/Stop buttons."""
+        layout = self._transport.layout()
+        margins = layout.contentsMargins()
+        buttons = sum(self._labelled_width(b) for b in (self.play_btn, self.stop_btn))
+        widgets = sum(1 for i in range(layout.count()) if layout.itemAt(i).widget())
+        return (margins.left() + margins.right() + layout.spacing() * max(0, widgets - 1) + buttons
+                + self._COMBO_MIN_WIDTH + self.time_label.sizeHint().width())
+
+    def _labelled_width(self, button: QPushButton) -> int:
+        if not self._transport_compact:
+            button._labelled_width = button.sizeHint().width()
+        return getattr(button, "_labelled_width", button.sizeHint().width())
+
+    def _update_transport_compact(self) -> None:
+        """Play/Stop become icon-only when the transport would not fit."""
+        full = self._transport_full_width()
+        width = self._transport.width()
+        if self._transport_compact:
+            compact = width < full + self._COMPACT_HYSTERESIS
+        else:
+            compact = width < full
+        if compact == self._transport_compact:
+            return
+        self._transport_compact = compact
+        for button, label in ((self.play_btn, "Play"), (self.stop_btn, "Stop")):
+            if compact:
+                button.setText("")
+                button.setFixedWidth(self._ICON_ONLY_WIDTH)
+            else:
+                button.setMinimumWidth(0)
+                button.setMaximumWidth(16777215)
+                button.setText(label)
+
+    def eventFilter(self, watched, event):
+        if watched is getattr(self, "_transport", None) and event.type() == QEvent.Resize:
+            self._update_transport_compact()
+        return super().eventFilter(watched, event)
 
     # ------------------------------------------------------------------
     # Play-mode helpers

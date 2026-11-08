@@ -346,6 +346,17 @@ class WaveformWidget(QWidget):
         h = max(1, self.height())
         sz = self.size()
 
+        if self._loading or not self._channels or self._total_samples == 0:
+            # Placeholders are cheap: paint them at the current size instead of
+            # stretching (or rebuilding) a cached image while resizing.
+            painter = QPainter(self)
+            painter.fillRect(self.rect(), QColor(COLORS["bg"]))
+            painter.setPen(QPen(QColor(COLORS["dim"])))
+            painter.drawText(self.rect(), Qt.AlignCenter,
+                             "Loading waveform…" if self._loading else "No waveform")
+            painter.end()
+            return
+
         if not self._is_resizing and (self._bg_pixmap is None or getattr(self._bg_pixmap, "_logical_size", None) != sz):
             self._update_bg_pixmap(w, h)
 

@@ -777,7 +777,9 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
 
         header = self._track_table.horizontalHeader()
         header.setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        header.setSectionResizeMode(0, QHeaderView.Stretch)
+        # File fills the free width (≥ 160 px, see fit_file_column); other
+        # columns keep their widths and the table scrolls when it is too narrow.
+        header.setSectionResizeMode(0, QHeaderView.Fixed)
         header.setSectionResizeMode(1, QHeaderView.Fixed)
         header.setSectionResizeMode(2, QHeaderView.Interactive)
         header.setSectionResizeMode(3, QHeaderView.Interactive)
@@ -792,6 +794,9 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
         header.resizeSection(5, 100)
         header.resizeSection(6, 140)
         header.resizeSection(7, 130)
+        header.sectionResized.connect(
+            lambda index, *_: index and self._track_table.fit_file_column())
+        self._track_table.fit_file_column()
 
         self._track_table.cellClicked.connect(self._on_row_clicked)
         self._track_table.currentCellChanged.connect(self._on_current_cell_changed)

@@ -352,7 +352,8 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
         set_action_busy(self._topo_apply_action, True, 'Applying…')
         self._topo_apply_action.setEnabled(False)
         self._topo_reset_action.setEnabled(False)
-        self._topo_status_label.setText("Applying topology\u2026")
+        # Progress is shown by the progress strip at the bottom; the toolbar
+        # keeps its input/output summary.
         self._progress_start("Applying topology\u2026")
 
         # Put Phase 1 topology on session for the worker to read

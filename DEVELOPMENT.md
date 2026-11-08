@@ -1770,7 +1770,14 @@ header would scroll), which stacks each finding in one column with inline
 actions. The Help panel prefers 360 logical pixels (minimum 140) with an 8 px
 gap and keeps `DETAIL_TAB_INSET` from the File pane's top, right and bottom
 edges; it gives space back to the report when needed, and below a 240 px body
-its simple two-column Help tables stack (`stack_two_column_rows`).
+its simple two-column Help tables stack (`stack_two_column_rows`). Detector Help
+HTML is normalised centrally by `normalize_help_tables` (no blank line around
+tables, 8 px above/below, body-size text, a 1 px separator under each row; one
+separator per stacked pair). The Phase 2 track table's File column is
+Fixed and auto-filled by `_DraggableTrackTable.fit_file_column` to
+max(160 px, free width); long names elide in the middle and the table scrolls
+horizontally when the pane is too narrow. String settings fields are at least
+`param_form.LINE_EDIT_MIN_WIDTH` (200 px) or their value's width.
 `DETAIL_TAB_INSET` (4 logical px, `sessionprepgui/tracks/table_widgets.py`) is
 the shared padding of detail-tab content: the Summary/File report text
 (root-frame margins on every document), the Groups and Config page content and
@@ -1829,7 +1836,12 @@ analysis mode) through `set_wanted()`, and the row shows the leading wanted
 controls that fit and moves the rest into a "»" (More view controls) menu,
 where dropdowns appear as submenus and toggles as checkable items that click the
 real button. Do not call `setVisible()` on the view controls directly. Tab order
-follows the row: disclosure, view controls, », zoom/scale buttons.
+follows the row: disclosure, view controls, », zoom/scale buttons. The transport
+keeps the playback-mode combo at least 120 px wide; when Play, Stop, the combo and
+the time readout do not fit, Play and Stop become 32 px icon-only buttons
+(tooltips and accessible names kept) and return to labels only with 8 px of
+spare room. The waveform placeholders are painted at the current size rather
+than from the cached background.
 Collapsing hides its body, explicitly allocates only the 32px header at the
 bottom of its splitter, and remembers expanded sizes. Reopening restores those
 sizes proportionally against the current splitter extent. It retains requests,

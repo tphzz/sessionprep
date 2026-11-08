@@ -7,7 +7,9 @@ from dataclasses import dataclass
 from PySide6.QtWidgets import QHeaderView, QStyle, QTableWidget
 
 
-TRACK_TABLE_FILE_MIN_WIDTH = 150
+# File keeps at least this width; when the pane is narrower than all columns
+# the table scrolls horizontally (approved 2026-11-08).
+TRACK_TABLE_FILE_MIN_WIDTH = 160
 TRACK_TABLE_CELL_HPAD = 18
 TRACK_TABLE_HEADER_HPAD = 22
 TRACK_TABLE_ROW_VPAD = 6
@@ -99,8 +101,12 @@ def apply_track_table_layout(table: QTableWidget) -> TrackTableLayout:
 
     if table.columnCount() > 0:
         header.setMinimumSectionSize(24)
-        header.setSectionResizeMode(0, QHeaderView.Stretch)
+        # File takes the free width but never less than its minimum (Stretch
+        # would squeeze it); see _DraggableTrackTable.fit_file_column.
+        header.setSectionResizeMode(0, QHeaderView.Fixed)   # auto-fitted, not dragged
         header.resizeSection(0, layout.column_widths.get(0, TRACK_TABLE_FILE_MIN_WIDTH))
+        if hasattr(table, "fit_file_column"):
+            table.fit_file_column()
 
     vertical = table.verticalHeader()
     vertical.setMinimumSectionSize(layout.row_height)
