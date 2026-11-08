@@ -96,7 +96,7 @@ def metadata(args):
         changed = subprocess.check_output(["git", "diff", "--name-only", "refs/remotes/origin/" + default_branch,
                                            actual, "--", ".github/workflows/"], text=True)
         if changed.strip():
-            raise ValueError("This ref changes workflows. Configure SESSIONPREP_RELEASE_TOKEN with Contents:write "
+            raise ValueError("This ref changes workflows. Configure GH_TOKEN with Contents:write "
                              "and Workflows:write before building release drafts; GITHUB_TOKEN cannot provide that scope.")
     version = resolve_ref_version(args.ref_type, args.ref_name, actual)
     check_linux_audio_runtime()

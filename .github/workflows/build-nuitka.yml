@@ -25,7 +25,7 @@ jobs:
     with:
       publish_drafts: ${{ !inputs.debug }}
     secrets:
-      SESSIONPREP_RELEASE_TOKEN: ${{ secrets.SESSIONPREP_RELEASE_TOKEN }}
+      GH_TOKEN: ${{ secrets.GH_TOKEN }}
   linux-x64:
     needs:
     - checks
@@ -154,7 +154,7 @@ jobs:
     - name: Replace only owned unpublished draft
       shell: bash
       env:
-        GH_TOKEN: ${{ secrets.SESSIONPREP_RELEASE_TOKEN || github.token }}
+        GH_TOKEN: ${{ secrets.GH_TOKEN || github.token }}
       run: |
         set -euo pipefail
         cd "$SOURCE_DIR"

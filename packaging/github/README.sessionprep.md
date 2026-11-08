@@ -227,7 +227,7 @@ Ordinary same-repository publishing uses `GITHUB_TOKEN` with Contents write.
 No additional secret is required for the normal/default-branch path. GitHub
 requires Workflows write as well if the target differs from the default branch
 under `.github/workflows/`; `GITHUB_TOKEN` cannot receive that permission.
-For that exceptional case, an optional `SESSIONPREP_RELEASE_TOKEN` secret may
+For that exceptional case, an optional `GH_TOKEN` secret may
 supply a fine-grained token restricted to this repository with Contents write
 and Workflows write. Preflight checks this condition before long builds.
 No token is exposed to platform builds. See [GitHub's release API rule](https://docs.github.com/en/rest/releases/releases#create-a-release).
