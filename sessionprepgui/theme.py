@@ -26,6 +26,7 @@ COLORS = {
     "border": "#555555",
     "bg_alt": "#252525",
     "accent": "#3a3a3a",
+    "alt_row": "#2c2c2c",  # alternating (zebra) table/tree rows; subtle on bg_alt
 }
 
 # File list item colors by status
@@ -286,7 +287,7 @@ def apply_dark_theme(window) -> None:
     palette.setColor(QPalette.Window, bg)
     palette.setColor(QPalette.WindowText, text)
     palette.setColor(QPalette.Base, bg_alt)
-    palette.setColor(QPalette.AlternateBase, accent)
+    palette.setColor(QPalette.AlternateBase, QColor(COLORS["alt_row"]))
     palette.setColor(QPalette.ToolTipBase, bg_alt)
     palette.setColor(QPalette.ToolTipText, text)
     palette.setColor(QPalette.Text, text)

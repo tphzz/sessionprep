@@ -24,8 +24,8 @@ _TAB_FILE = 1
 _TAB_GROUPS = 2
 _TAB_SESSION = 3
 
-# Logical-pixel inset between Phase 2 detail-tab content (Summary, File,
-# Groups, Config) and the edges of the tab content area.
+# Logical-pixel text inset of the Phase 2 report browsers (Summary, File).
+# Groups and Config page content, and the File Help dock, sit flush.
 DETAIL_TAB_INSET = 16
 
 _PAGE_TABS = 0

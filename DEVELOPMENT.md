@@ -1761,30 +1761,42 @@ and releases stale references. Details remain independent.
 
 Finding rows put severity before the disclosure. Their native text role follows
 the application font, while explicit custom HTML pixel/point sizes, faces and
-emphasis remain intact. Narrow reports place location/guidance below the title.
-The Help panel prefers 360 logical pixels with a 16 px gap; it gives space back
-to the report when needed. All Phase 2 detail tabs (Summary, File, Groups,
-Config) keep their content `DETAIL_TAB_INSET` (16 logical px,
-`sessionprepgui/tracks/table_widgets.py`) from every edge: reports apply it as
-root-frame margins on every document, the Groups/Config pages as layout margins,
-and the Help panel keeps it from the File pane's top, right and bottom edges.
-The waveform preview stays full width. A measurement of the cached stock
-header (its compact variant), keyed by content and font, protects normalization
-values at larger scales without suppressing legitimate horizontal scrolling in
-custom result HTML.
+emphasis remain intact. The File report has three layouts chosen by
+`ReportBrowser._wanted_layout()`: wide; compact (viewport below 850 px, or the
+wide header would scroll), which places location/guidance below the title and
+stacks actions; and narrow (viewport below 460 px, left again only at 476 px so
+a scroll bar appearing after the switch cannot flip it back, or the compact
+header would scroll), which stacks each finding in one column with inline
+actions. The Help panel prefers 360 logical pixels (minimum 140) with an 8 px
+gap and sits flush with the File pane's top, right and bottom edges; it gives
+space back to the report when needed, and below a 240 px body its simple
+two-column Help tables stack (`stack_two_column_rows`). Only the Summary and
+File report browsers keep `DETAIL_TAB_INSET` (16 logical px,
+`sessionprepgui/tracks/table_widgets.py`) as root-frame margins on every
+document; Groups and Config page content is flush with the tab area. The
+waveform preview stays full width. A measurement of the cached stock header
+(its narrow variant, the narrowest layout), keyed by content and font, protects
+normalization values at larger scales without suppressing legitimate
+horizontal scrolling in custom result HTML.
 
 Report rows use 4 px vertical cell padding; single-line File cells are 32 px
 high. The report title uses the `x-large` CSS keyword and processor sections
 and "Detector findings" share `REPORT_SECTION_HEADING` (`medium`, semibold);
 Qt ignores `em` sizes, and keyword-sized text is excluded from the finding body
 font, which starts at the first processor body (`report-processors`).
-`Processor.render_html()` accepts `compact=True`; `prepare_track_report()`
-caches both header variants and the compact File layout uses `header_compact`.
+`Processor.render_html()` accepts `compact=True` and `narrow=True`;
+`prepare_track_report()` caches `header`, `header_compact` and `header_narrow`.
+Overrides written without a keyword keep working: a missing `narrow` falls back
+to the compact fragment, a missing `compact` to the wide one.
 
 Modified pages, tabs and Save Preferences use `sessionprepgui/change_marker.py`:
 a vector dot painted at the device-pixel ratio (white on selected/pressed
-backgrounds), `MarkerTabBar` reserving the slot after a tab label so nothing
-reflows, a 24 px tree marker column and tooltip/accessible descriptions.
+backgrounds), `MarkerTabBar` widening a marked tab by a 4 px gap plus the 7 px
+dot after its label (unmarked tabs keep their normal width; markability is tab
+data, so it moves with the tab), Save Preferences widening the same way while
+keeping its own stylesheet, a 24 px tree marker column and tooltip/accessible
+descriptions. Zebra rows use the `alt_row` palette role (`#2c2c2c`,
+`QPalette.AlternateBase`), a subtle step from the `#252525` base.
 
 Structured summary `item_refs` provide file identities alongside unchanged
 legacy item strings, so Review file does not parse filenames. Qt may move focus

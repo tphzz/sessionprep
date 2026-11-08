@@ -50,7 +50,6 @@ from ..prefs.param_widgets import build_config_pages, load_config_widgets, read_
 from ..session.io import save_session as _save_session_file, load_session as _load_session_file
 from ..settings import build_defaults, resolve_config_preset
 from ..tracks.table_widgets import (
-    DETAIL_TAB_INSET,
     _SETUP_RIGHT_TREE,
     _SortableItem, _make_analysis_cell,
     _TAB_FILE, _TAB_GROUPS, _TAB_SESSION, _TAB_SUMMARY,
@@ -76,8 +75,7 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         page = QWidget()
         page.setAutoFillBackground(True)
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(
-            DETAIL_TAB_INSET, DETAIL_TAB_INSET, DETAIL_TAB_INSET, DETAIL_TAB_INSET)
+        layout.setContentsMargins(0, 0, 0, 0)  # flush with the tab area
 
         desc = QLabel(
             "Session-local config adjustments. Changes here apply only to "

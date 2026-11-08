@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import logging
 from numbers import Integral
 from urllib.parse import quote
 from ..icons import icon_path
@@ -55,6 +56,12 @@ def _location_text(result):
         return "\u2014", ""
     return (valid[0] if len(valid) == 1 else f"{len(valid)} locations",
             "; ".join(valid))
+
+
+def _signed(value):
+    """Signed one-decimal value using a true minus sign (normalization section)."""
+    text = f"{value:+.1f}"
+    return "&minus;" + text[1:] if text.startswith("-") else text
 
 
 def _location_html(location):
@@ -155,13 +162,31 @@ def render_summary_html(summary, *, show_faders=True, show_clean=True, session=N
     return "\n".join(parts)
 
 
-def _accepts_compact(render_html):
-    """Processor overrides written before ``compact`` existed keep working."""
+_log = logging.getLogger(__name__)
+
+
+def _layout_variant(render_html, args, verbose, fallback, **layout):
+    """Render an optional narrower layout, keeping ``fallback`` when unavailable.
+
+    Only keywords the override declares (or ``**kwargs``) are passed, and a
+    failing variant never takes the File report down with it.
+    """
+    if not all(_accepts(render_html, name) for name in layout):
+        return fallback
+    try:
+        return render_html(*args, verbose=verbose, **layout) or fallback
+    except Exception:  # noqa: BLE001 - third-party renderers must not break the report
+        _log.exception("Processor layout variant %s failed; using the wider one", layout)
+        return fallback
+
+
+def _accepts(render_html, name):
+    """Processor overrides written before a layout keyword existed keep working."""
     try:
         parameters = inspect.signature(render_html).parameters.values()
     except (TypeError, ValueError):
         return False
-    return any(p.name == "compact" or p.kind is p.VAR_KEYWORD for p in parameters)
+    return any(p.name == name or p.kind is p.VAR_KEYWORD for p in parameters)
 
 
 def _finding_line(body, height):
@@ -222,9 +247,62 @@ def _finding_actions(row, compact):
     return '<table cellpadding="0" cellspacing="0">' + body + "</table>" if links else ""
 
 
-def render_prepared_track_report(data, *, expanded=(), compact=False, active_help=None):
-    """Render cached data with severity-leading rows; Help lives in its own pane."""
-    header = data.get("header_compact", data["header"]) if compact else data["header"]
+def _render_narrow_findings(rows, expanded, active_help):
+    """One stacked column: severity, title band, location and next step, actions."""
+    parts = ['<table width="100%" cellpadding="0" cellspacing="0"'
+             ' style="margin-top:8px; border-collapse:collapse;">']
+    for row in rows:
+        key = row["id"]
+        token = quote(key, safe="")
+        color, label = _severity_meta(row["severity"])
+        arrow = _image("chevron-down" if key in expanded else "chevron-right")
+        title = _link("report-details", key, f'{arrow}&nbsp;&nbsp; <b>{esc(row["title"])}</b>',
+                      "Toggle detector details")
+        # The count leads the metadata lines, so the title band holds the title
+        # only; an absent location is left out rather than shown as a dash.
+        details = [f'<nobr>{esc(row["count"])}</nobr>'] if row["count"] else []
+        if row["location"] and row["location"] != "—":
+            details.append(_location_html(row["location"]))
+        if row["hint"]:
+            details.append(f'<span style="color:{COLORS["text"]};">{esc(row["hint"])}</span>')
+        # One inner table with explicit rows: Qt adds stray empty blocks around
+        # paragraphs/divs that hold tables, and ignores table/cell heights this
+        # deep, so 6 px padding centres a line in the 32 px title/action bands.
+        lines = [f'<tr><td><a name="finding-{token}"></a>'
+                 f'<span style="color:{color};">{label}</span></td></tr>',
+                 f'<tr><td style="padding:6px 0;">{title}</td></tr>']
+        if details:
+            lines.append(f'<tr><td style="padding-left:24px; color:{COLORS["metadata"]};">'
+                         + "<br>".join(details) + '</td></tr>')
+        actions = _finding_actions(row, False)
+        if actions:
+            lines.append(f'<tr><td style="padding:6px 0;">{actions}</td></tr>')
+        body = ('<table width="100%" cellpadding="0" cellspacing="0">'
+                + "".join(lines) + '</table>')
+        active = key == active_help and color != COLORS["problems"]
+        parts.append("<tr>" + _finding_cell(body, None, active=active) + "</tr>")
+        if key in expanded:
+            parts.append('<tr><td style="padding:4px 12px 4px 36px;">'
+                         '<b>Result</b> ' + esc(row["summary"]) +
+                         ('<br>' + esc(row["locations"]) if row["locations"] else "") +
+                         '<table cellpadding="3" cellspacing="0">' + row["fragment"] +
+                         '</table></td></tr>')
+    parts.append("</table>")
+    return parts
+
+
+def render_prepared_track_report(data, *, expanded=(), compact=False, narrow=False,
+                                 active_help=None):
+    """Render cached data with severity-leading rows; Help lives in its own pane.
+
+    ``narrow`` (below the compact layout) stacks each finding in one column.
+    """
+    if narrow:
+        header = data.get("header_narrow", data.get("header_compact", data["header"]))
+    elif compact:
+        header = data.get("header_compact", data["header"])
+    else:
+        header = data["header"]
     parts = [header,
              '<div>'
              f'<p style="{REPORT_SECTION_HEADING} color:{COLORS["heading"]};">'
@@ -232,6 +310,10 @@ def render_prepared_track_report(data, *, expanded=(), compact=False, active_hel
     rows = data["rows"]
     if not rows:
         parts.append(f'<p style="color:{COLORS["metadata"]};">No findings to show.</p></div>')
+        return "\n".join(parts)
+    if narrow:
+        parts.extend(_render_narrow_findings(rows, expanded, active_help))
+        parts.append("</div>")
         return "\n".join(parts)
     widths = ("100", None, "80") if compact else ("100", None, "96", "216", "136")
     labels = (("Severity", "Finding, location and next step", "Actions") if compact
@@ -267,8 +349,7 @@ def render_prepared_track_report(data, *, expanded=(), compact=False, active_hel
                           index=i, columns=len(widths))
             for i, (value, width) in enumerate(zip(values, widths))) + "</tr>")
         if key in expanded:
-            indent = 144 if compact else 136
-            parts.append(f'<tr><td colspan="{len(widths)}" style="padding:4px 12px 4px {indent}px;">'
+            parts.append(f'<tr><td colspan="{len(widths)}" style="padding:4px 12px 4px 136px;">'
                          '<b>Result</b> ' + esc(row["summary"]) +
                          ('<br>' + esc(row["locations"]) if row["locations"] else "") +
                          '<table cellpadding="3" cellspacing="0">' + row["fragment"] +
@@ -422,11 +503,16 @@ def prepare_track_report(track, session=None, *, show_clean: bool = True,
                 html_fragment = proc_inst.render_html(pr, track, verbose=verbose)
                 if not html_fragment:
                     continue  # processor chose to suppress output (e.g. no-op)
-                compact_fragment = (proc_inst.render_html(pr, track, verbose=verbose, compact=True)
-                                    if _accepts_compact(proc_inst.render_html) else None) or html_fragment
+                render = proc_inst.render_html
+                compact_fragment = _layout_variant(render, (pr, track), verbose, html_fragment,
+                                                   compact=True)
+                # compact=True too: a **kwargs override that only knows compact
+                # then still returns its compact rather than its wide fragment.
+                narrow_fragment = _layout_variant(render, (pr, track), verbose, compact_fragment,
+                                                  compact=True, narrow=True)
             else:
                 # Fallback: basic display
-                html_fragment = compact_fragment = (
+                html_fragment = compact_fragment = narrow_fragment = (
                     f'<div>'
                     f'{esc(pr.classification or "")} &middot; {esc(pr.method)} '
                     f'&middot; {pr.gain_db:+.1f} dB</div>'
@@ -436,16 +522,16 @@ def prepare_track_report(track, session=None, *, show_clean: bool = True,
             parts.append(f'<p style="{REPORT_SECTION_HEADING} color:{COLORS["heading"]};">'
                          '<a name="report-processors"></a>'
                          f'{esc(proc_map[proc_id].name if proc_id in proc_map else proc_id)}</p>')
-            parts.append((html_fragment, compact_fragment))
+            parts.append((html_fragment, compact_fragment, narrow_fragment))
             if track.group:
                 original = pr.data.get("original_gain_db", pr.gain_db)
                 delta = pr.gain_db - original
                 parts.append(
                     f'<div style="color:{COLORS["metadata"]}; margin-top:8px;">'
                     f'Group: <b>{esc(track.group)}</b>'
-                    f' &nbsp;&middot;&nbsp; Group level: <b>{pr.gain_db:+.1f} dB</b>'
-                    f' (individual: {original:+.1f} dB,'
-                    f' &Delta; {delta:+.1f} dB)</div>'
+                    f' &nbsp;&middot;&nbsp; Group level: <b>{_signed(pr.gain_db)} dB</b>'
+                    f' (individual: {_signed(original)} dB,'
+                    f' &Delta; {_signed(delta)} dB)</div>'
                 )
 
         severity_order = {"problem": 0, "attention": 1, "information": 2, "info": 2, "clean": 3}
@@ -483,4 +569,6 @@ def prepare_track_report(track, session=None, *, show_clean: bool = True,
         rows.sort(key=lambda row: (severity_order.get(row["severity"], 99), row["title"].lower()))
     wide = [p if isinstance(p, str) else p[0] for p in parts]
     compact = [p if isinstance(p, str) else p[1] for p in parts]
-    return {"header": "\n".join(wide), "header_compact": "\n".join(compact), "rows": rows}
+    narrow = [p if isinstance(p, str) else p[2] for p in parts]
+    return {"header": "\n".join(wide), "header_compact": "\n".join(compact),
+            "header_narrow": "\n".join(narrow), "rows": rows}

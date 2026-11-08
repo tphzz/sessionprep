@@ -1,4 +1,4 @@
-"""Phase 2 detail tabs share one content inset on every edge."""
+"""Phase 2 report text keeps a 16 px inset; Groups, Config and the Help dock sit flush."""
 from urllib.parse import quote
 
 import pytest
@@ -19,6 +19,7 @@ from sessionpreplib.processors import default_processors
 from sessionpreplib.rendering import build_diagnostic_summary
 
 INSET = 16
+GAP = 8  # report-to-Help-dock gap
 
 
 def test_detail_tab_inset_is_sixteen_logical_pixels():
@@ -159,23 +160,23 @@ def test_report_header_minimum_width_follows_the_shared_inset(qapp, window, monk
 
 
 @pytest.mark.parametrize("tab", [_TAB_GROUPS, _TAB_SESSION])
-def test_groups_and_config_pages_inset_every_edge(qapp, window, tab):
+def test_groups_and_config_pages_sit_flush(qapp, window, tab):
     owner, _tracks = window
     page = _show_tab(qapp, owner, tab)
     margins = page.layout().contentsMargins()
-    assert (margins.left(), margins.top(), margins.right(), margins.bottom()) == (INSET,) * 4
+    assert (margins.left(), margins.top(), margins.right(), margins.bottom()) == (0, 0, 0, 0)
 
     description = next(w for w in page.findChildren(QLabel)
                        if w.text().startswith("Session-local") and w.parentWidget() is page)
-    assert description.mapTo(page, QPoint(0, 0)) == QPoint(INSET, INSET)
+    assert description.mapTo(page, QPoint(0, 0)) == QPoint(0, 0)
     revert = next(b for b in page.findChildren(QPushButton)
                   if b.text() == "Revert to Preset")
     right = revert.mapTo(page, QPoint(revert.width(), 0)).x()
-    assert right == page.width() - INSET
+    assert right == page.width()
     bottom = max(w.mapTo(page, QPoint(0, w.height())).y()
                  for w in page.findChildren(QWidget, options=Qt.FindDirectChildrenOnly)
                  if w.isVisible())
-    assert bottom == page.height() - INSET
+    assert bottom == page.height()
 
 
 def test_waveform_preview_stays_full_width_in_file_tab(qapp, window):
@@ -234,14 +235,14 @@ def _panel_rect(pane):
     return top_left.x(), top_left.y(), top_left.x() + panel.width(), top_left.y() + panel.height()
 
 
-def test_help_dock_keeps_the_inset_from_top_right_and_bottom(qapp, pane):
+def test_help_dock_sits_flush_with_top_right_and_bottom(qapp, pane):
     _open_help(qapp, pane)
     assert pane.help_browser.isVisible()
     left, top, right, bottom = _panel_rect(pane)
-    assert (top, pane.width() - right, pane.height() - bottom) == (INSET, INSET, INSET)
+    assert (top, pane.width() - right, pane.height() - bottom) == (0, 0, 0)
     assert pane._help_panel.width() == 360
     report_right = pane.report.mapTo(pane, QPoint(pane.report.width(), 0)).x()
-    assert left - report_right == 16
+    assert left - report_right == GAP
     # The report keeps the full height and its own text inset.
     assert pane.report.mapTo(pane, QPoint(0, 0)) == QPoint(0, 0)
     assert pane.report.height() == pane.height()
@@ -257,25 +258,25 @@ def test_closing_help_returns_the_dock_inset_to_the_report(qapp, pane):
     assert pane.report.width() == width == pane.width()
 
 
-def test_help_width_gives_back_gap_inset_and_header_minimum(qapp, pane, monkeypatch):
+def test_help_width_gives_back_gap_and_header_minimum(qapp, pane, monkeypatch):
     monkeypatch.setattr(pane.report, "minimum_header_width", lambda: 500)
     _open_help(qapp, pane)
     pane.resize(800, 620)
     _settle(qapp, pane)
-    # preferred min(360, 0.4 * 800) = 320; available = 800 - 16 gap - 16 inset - 500.
-    assert pane._help_panel.width() == 800 - 16 - INSET - 500
+    # preferred min(360, 0.4 * 800) = 320; available = 800 - 8 gap - 500.
+    assert pane._help_panel.width() == 800 - GAP - 500
 
 
-def test_constrained_help_dock_keeps_its_inset_and_minimum(qapp, pane, monkeypatch):
+def test_constrained_help_dock_stays_flush_at_its_minimum(qapp, pane, monkeypatch):
     monkeypatch.setattr(pane.report, "minimum_header_width", lambda: 5000)
     _open_help(qapp, pane)
     _settle(qapp, pane)
     left, top, right, bottom = _panel_rect(pane)
     assert pane._help_panel.width() == 140
-    assert pane._help_dock.width() == 140 + INSET
-    assert (top, pane.width() - right, pane.height() - bottom) == (INSET, INSET, INSET)
+    assert pane._help_dock.width() == 140
+    assert (top, pane.width() - right, pane.height() - bottom) == (0, 0, 0)
     report_right = pane.report.mapTo(pane, QPoint(pane.report.width(), 0)).x()
-    assert left - report_right == 16
+    assert left - report_right == GAP
 
 
 def test_scrolling_report_keeps_text_inset_inside_the_viewport(qapp, monkeypatch):
@@ -317,3 +318,23 @@ def test_cleared_report_keeps_the_inset(qapp):
     browser = ReportBrowser({})
     browser.clear()
     assert _root_margins(browser) == (INSET,) * 4
+
+
+def test_narrow_help_header_wraps_instead_of_clipping(qapp, pane, monkeypatch):
+    from PySide6.QtWidgets import QLabel
+
+    monkeypatch.setattr(pane.report, "minimum_header_width", lambda: 5000)
+    context = pane._help_panel.findChild(QLabel, "detectorHelpContext")
+    # Pin a small pixel font: the offscreen platform draws every glyph as a
+    # 12 px box, so real-font word widths cannot be assumed here.
+    font = context.font()
+    font.setPixelSize(7)
+    context.setFont(font)
+    _open_help(qapp, pane)
+    _settle(qapp, pane)
+    assert pane._help_panel.width() == 140
+    assert context.wordWrap() and pane.help_title.wordWrap()
+    # Every word of the kicker fits inside the label's width (no clipping).
+    widest = max(context.fontMetrics().horizontalAdvance(w) for w in context.text().split())
+    assert widest <= context.width()
+    assert context.heightForWidth(context.width()) <= context.height()

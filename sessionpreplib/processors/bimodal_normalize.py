@@ -126,12 +126,13 @@ class BimodalNormalizeProcessor(AudioProcessor):
         )
 
     def render_html(self, result: ProcessorResult, track=None, *, verbose: bool = False,
-                    compact: bool = False) -> str:
+                    compact: bool = False, narrow: bool = False) -> str:
         """Render the normalization summary line and comparison table.
 
         The table follows the report's finding-table style. The chosen or
         limiting measure is named in text (not by colour alone). ``compact``
-        renders percentage columns with the note under the measure name.
+        renders percentage columns with the note under the measure name;
+        ``narrow`` stacks one entry per measure under a legend band.
         """
         d = result.data
         cls_text = result.classification or "Unknown"
@@ -228,7 +229,19 @@ class BimodalNormalizeProcessor(AudioProcessor):
                        f"{fmt_rel(gain_for_peak)} dB")
         rms_values = (f"{fmt_abs(det_rms)} dBFS", f"{minus(f'{tgt_rms:.1f}')} dBFS",
                       f"{fmt_rel(gain_for_rms)} dB")
-        if compact:
+        if narrow:
+            header = (f'<td style="{head}">Measure<br>'
+                      f'Detected &rarr; Target &middot; Gain</td>')
+
+            def row(metric, values, active, row_note):
+                weight = " font-weight:bold;" if active else ""
+                det, tgt, gain = (f"<nobr>{value}</nobr>" for value in values)
+                return (f'<tr><td style="{cell}"><span style="color:{metadata};">{metric}</span>'
+                        + (f"<br>{row_note}" if row_note else "")
+                        + f'<br><span style="color:{text};{weight}">'
+                        f'{det} &rarr; {tgt} &middot; {gain}</span></td></tr>')
+            table_attrs = 'width="100%" '
+        elif compact:
             widths = (' width="30%"', ' width="24%"', ' width="24%"', ' width="22%"')
             header = "".join(f'<td{w} style="{head}">{label}</td>' for label, w in
                              zip(("Measure", "Detected", "Target", "Gain"), widths))

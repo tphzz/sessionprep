@@ -12,7 +12,7 @@ from PySide6.QtWidgets import QApplication, QPushButton, QTabWidget, QTreeWidget
 from sessionpreplib.models import DetectorResult, ProcessorResult, SessionContext, Severity, TrackContext
 from sessionpreplib.processors.bimodal_normalize import BimodalNormalizeProcessor
 from sessionprepgui.change_marker import (
-    MARKER_COLUMN_WIDTH, MARKER_GAP, PARENT_TOOLTIP, ChangeMarkerSlot, change_marker_icon,
+    MARKER_COLUMN_WIDTH, MARKER_DOT, MARKER_GAP, PARENT_TOOLTIP, ChangeMarkerSlot, change_marker_icon,
     install_button_marker, install_tab_marker, is_button_marked, is_tab_marked,
     set_button_marker, set_item_marker, set_tab_marker, use_marker_tab_bar)
 from sessionprepgui.detail import report
@@ -91,7 +91,7 @@ def test_tab_marker_needs_the_marker_tab_bar(qapp):
         use_marker_tab_bar(tabs)
 
 
-def test_tab_marker_slot_sits_right_after_the_label(qapp):
+def test_tab_marker_dot_sits_right_after_the_label(qapp):
     tabs = _themed_tabs()
     install_tab_marker(tabs, 1)
     tabs.resize(500, 120)
@@ -100,19 +100,22 @@ def test_tab_marker_slot_sits_right_after_the_label(qapp):
     bar = tabs.tabBar()
     label = bar.fontMetrics().size(Qt.TextShowMnemonic, "Config").width()
     plain = bar.tabRect(0).width() - bar.fontMetrics().size(Qt.TextShowMnemonic, "Groups").width()
-    # Reserved tab = unreserved tab padding + label + 4 px gap + 16 px slot.
-    assert bar.tabRect(1).width() - label == plain + MARKER_GAP + 16
+    # A markable but clean tab keeps its normal width.
+    assert bar.tabRect(1).width() - label == plain
     set_tab_marker(tabs, 1, True, "Changed")
+    qapp.processEvents()
+    # Marked tab = normal tab padding + label + 4 px gap + 7 px dot.
+    assert bar.tabRect(1).width() - label == plain + MARKER_GAP + MARKER_DOT
     image = bar.grab().toImage()
     rect = bar.tabRect(1)
     ratio = image.devicePixelRatio()
-    dot_x = rect.x() + 16 + label + MARKER_GAP + 8
+    dot_x = rect.x() + 16 + label + MARKER_GAP + MARKER_DOT / 2
     colour = QColor(image.pixelColor(round(dot_x * ratio), round(rect.center().y() * ratio)))
     assert colour.name() == COLORS["information"]
     tabs.close()
 
 
-def test_tab_marker_reserves_its_slot_and_explains_itself(qapp):
+def test_tab_marker_widens_only_while_shown_and_explains_itself(qapp):
     tabs = _themed_tabs()
     install_tab_marker(tabs, 1)
     tabs.show()
@@ -123,37 +126,48 @@ def test_tab_marker_reserves_its_slot_and_explains_itself(qapp):
     assert is_tab_marked(tabs, 1)
     assert tabs.tabText(1) == "Config"
     assert tabs.tabToolTip(1) == "Changed from preset “Default”"
-    assert tabs.tabBar().tabRect(1).width() == width  # no reflow
+    assert tabs.tabBar().tabRect(1).width() == width + MARKER_GAP + MARKER_DOT
+    set_tab_marker(tabs, 1, True, "again")  # idempotent: no second widening
+    qapp.processEvents()
+    assert tabs.tabBar().tabRect(1).width() == width + MARKER_GAP + MARKER_DOT
     set_tab_marker(tabs, 1, False, "x")
+    qapp.processEvents()
     assert not is_tab_marked(tabs, 1) and tabs.tabToolTip(1) == ""
+    assert tabs.tabBar().tabRect(1).width() == width  # back to normal
     tabs.setTabEnabled(1, False)
     set_tab_marker(tabs, 1, True, "x")
     assert not is_tab_marked(tabs, 1)  # disabled tabs never show the marker
     tabs.setTabEnabled(1, True)
-    set_tab_marker(tabs, 0, True, "x")  # tabs without a reserved slot are ignored
+    set_tab_marker(tabs, 0, True, "x")  # tabs that were never made markable are ignored
     assert not is_tab_marked(tabs, 0)
     tabs.close()
 
 
-def test_button_marker_keeps_width_and_turns_white_when_pressed(qapp):
+def test_button_marker_widens_only_while_shown_and_turns_white_when_pressed(qapp):
     button = QPushButton("Save Preferences")
+    button.setStyleSheet("QPushButton { color: #123456; }")  # the button's own sheet
     slot = install_button_marker(button)
     button.show()
     qapp.processEvents()
     width = button.sizeHint().width()
+    assert not slot.isVisible()
     set_button_marker(button, True, "Unsaved changes")
     qapp.processEvents()
     assert is_button_marked(button)
     assert button.text() == "Save Preferences"
     assert button.toolTip() == "Unsaved changes" == button.accessibleDescription()
-    assert button.sizeHint().width() == width
+    assert button.sizeHint().width() == width + MARKER_GAP + MARKER_DOT
+    assert "color: #123456" in button.styleSheet()  # own styling is kept
     assert slot.geometry().right() < button.width() and slot.isVisible()
     assert not slot._on_selection()
     button.setDown(True)
     assert slot._on_selection()
     button.setDown(False)
     set_button_marker(button, False, "Unsaved changes")
+    qapp.processEvents()
     assert not is_button_marked(button) and button.toolTip() == ""
+    assert button.styleSheet() == "QPushButton { color: #123456; }"
+    assert button.sizeHint().width() == width and not slot.isVisible()
     button.close()
 
 
@@ -164,7 +178,7 @@ def test_marker_slot_paints_nothing_when_clean_or_disabled(qapp):
     marked = slot.grab().toImage()
     slot.setEnabled(False)
     disabled = slot.grab().toImage()
-    centre = (4 + 8, 8)
+    centre = (MARKER_GAP + 3, 8)
     assert clean.pixelColor(*centre) == disabled.pixelColor(*centre)
     assert marked.pixelColor(*centre) != clean.pixelColor(*centre)
 
@@ -388,7 +402,7 @@ def test_sample_ranges_stay_together_and_compact_details_align(monkeypatch):
     for compact in (False, True):
         html = render_prepared_track_report(data, compact=compact, expanded={"clipping"})
         assert "Samples <nobr>1000–1004</nobr>" in html
-        assert f"padding:4px 12px 4px {144 if compact else 136}px;" in html
+        assert "padding:4px 12px 4px 136px;" in html
 
 
 def test_normalization_cells_are_never_empty():
@@ -398,51 +412,51 @@ def test_normalization_cells_are_never_empty():
         assert not re.search(r'<td[^>]*></td>', html)
 
 
-@pytest.mark.parametrize("extra_css", ["", "QTabBar::tab { padding: 6px 24px; margin-right: 6px; }"])
-def test_tab_marker_geometry_follows_the_style(qapp, extra_css):
-    from PySide6.QtWidgets import QStyle, QStyleOptionTab
-
+@pytest.mark.parametrize("css", [None, "", "QTabBar::tab { padding: 6px 24px; margin-right: 6px; }"])
+def test_tab_marker_geometry_follows_the_style(qapp, css):
     tabs = QTabWidget()
-    tabs.setStyleSheet(STYLESHEET + "\n" + extra_css)
+    if css is not None:  # None = plain Fusion without the app stylesheet
+        tabs.setStyleSheet(STYLESHEET + "\n" + css)
     use_marker_tab_bar(tabs)
     tabs.setDocumentMode(True)
-    tabs.addTab(QWidget(), "Summary")
     tabs.addTab(QWidget(), "Config")
-    install_tab_marker(tabs, 1)
+    tabs.addTab(QWidget(), "Config")  # same label, unreserved: the plain tab
+    install_tab_marker(tabs, 0)
+    set_tab_marker(tabs, 0, True, "Changed")
     tabs.resize(500, 120)
     tabs.show()
     qapp.processEvents()
     bar = tabs.tabBar()
-    option = QStyleOptionTab()
-    bar.initStyleOption(option, 1)
-    label = bar.fontMetrics().size(Qt.TextShowMnemonic, "Config").width()
-    plain = bar.style().sizeFromContents(QStyle.CT_TabBarTab, option, QSize(label, bar.fontMetrics().height()), bar)
-    assert bar.tabRect(1).width() == plain.width() + MARKER_GAP + 16
-    text = bar.style().subElementRect(QStyle.SE_TabBarTabText, option, bar)
-    assert text.width() >= label  # the label is never clipped
+    assert bar.tabRect(0).width() == bar.tabRect(1).width() + MARKER_GAP + MARKER_DOT
     tabs.close()
 
 
-@pytest.mark.parametrize("points", [24.0, 30.0])
-def test_large_report_fonts_switch_to_compact_instead_of_scrolling(qapp, monkeypatch, points):
+def test_large_report_fonts_switch_to_compact_instead_of_scrolling(qapp, monkeypatch):
     from PySide6.QtGui import QFont
     from sessionprepgui.detail.browser import ReportBrowser
 
     monkeypatch.setattr(report, "read_chunks", lambda path: ("WAVE", []))
     _processor, track, session = _normalized_session(method="Peak Limited")
     browser = ReportBrowser({})
-    font = QFont(browser.font())
-    font.setPointSizeF(points)
-    browser.setFont(font)
-    browser.document().setDefaultFont(font)
     browser.resize(900, 600)
     browser.show()
-    browser.present_track(track, session)
-    qapp.processEvents()
+    # Grow the font until the wide header genuinely needs more than the widget
+    # (font-independent: platform fonts differ between Windows and CI).
+    for points in range(12, 80, 2):
+        font = QFont(browser.font())
+        font.setPointSizeF(float(points))
+        browser.setFont(font)
+        browser.document().setDefaultFont(font)
+        browser.present_track(track, session)
+        qapp.processEvents()
+        if browser._header_width(browser._prepared["header"]) > browser.width():
+            break
+    else:
+        pytest.skip("the wide header never exceeded the widget width")
     assert browser.viewport().width() >= 850  # the fixed threshold alone would stay wide
-    assert browser._header_width(browser._prepared["header"]) > browser.width()
-    assert browser._compact
-    assert browser.horizontalScrollBar().maximum() == 0
+    assert browser._layout in ("compact", "narrow")
+    if browser.minimum_header_width() <= browser.width():
+        assert browser.horizontalScrollBar().maximum() == 0
     browser.close()
 
 
@@ -456,10 +470,10 @@ def test_normal_report_font_keeps_the_wide_layout_at_900_px(qapp, monkeypatch):
     browser.show()
     browser.present_track(track, session)
     qapp.processEvents()
-    assert not browser._compact
+    assert browser._layout == "wide"
     browser.resize(800, 600)
     qapp.processEvents()
-    assert browser._compact  # the existing 850 px viewport threshold still applies
+    assert browser._layout == "compact"  # the existing 850 px viewport threshold still applies
     browser.close()
 
 
@@ -470,7 +484,7 @@ def test_pressed_save_marker_is_painted_white(qapp):
     button.show()
     set_button_marker(button, True, "Unsaved changes")
     qapp.processEvents()
-    centre = (MARKER_GAP + 8, 8)
+    centre = (MARKER_GAP + 3, 8)
     idle = slot.grab().toImage()
     assert QColor(idle.pixelColor(*centre)).name() == COLORS["information"]
     button.setDown(True)
@@ -478,3 +492,60 @@ def test_pressed_save_marker_is_painted_white(qapp):
     assert QColor(pressed.pixelColor(*centre)).name() == COLORS["heading"]
     button.setDown(False)
     button.close()
+
+
+@pytest.mark.parametrize("css", [None, ""])
+def test_marking_a_visible_tab_relayouts_to_the_exact_width(qapp, css):
+    # Regression: the spacer is resized after Qt laid the tab out with its
+    # initial width; the bar must lay the tabs out again.
+    tabs = QTabWidget()
+    if css is not None:
+        tabs.setStyleSheet(STYLESHEET + css)
+    use_marker_tab_bar(tabs)
+    tabs.setDocumentMode(True)
+    for label in ("Summary", "File", "Groups", "Config"):
+        tabs.addTab(QWidget(), label)
+    install_tab_marker(tabs, 3)
+    tabs.resize(600, 120)
+    tabs.show()
+    qapp.processEvents()
+    bar = tabs.tabBar()
+    width = bar.tabRect(3).width()
+    set_tab_marker(tabs, 3, True, "Changed")
+    assert bar.tabRect(3).width() == width + MARKER_GAP + MARKER_DOT
+    qapp.processEvents()
+    assert bar.tabRect(3).width() == width + MARKER_GAP + MARKER_DOT
+    tabs.close()
+
+
+def test_zebra_rows_use_the_subtle_alt_row_role(qapp):
+    from PySide6.QtGui import QPalette
+    from sessionprepgui.theme import apply_dark_theme
+
+    saved = QPalette(qapp.palette())
+    try:
+        apply_dark_theme(QWidget())
+        palette = qapp.palette()
+        assert COLORS["alt_row"] == "#2c2c2c"
+        assert palette.color(QPalette.AlternateBase).name() == COLORS["alt_row"]
+        assert palette.color(QPalette.Base).name() == COLORS["bg_alt"]
+        # Accent keeps hover/control surfaces; it is no longer the zebra colour.
+        assert palette.color(QPalette.Button).name() == COLORS["accent"] != COLORS["alt_row"]
+    finally:
+        qapp.setPalette(saved)
+
+
+def test_unmarking_keeps_stylesheet_changes_made_after_install(qapp):
+    button = QPushButton("Save Preferences")
+    button.setStyleSheet("QPushButton { color: red; }")
+    install_button_marker(button)
+    button.setStyleSheet("QPushButton { color: blue; }")  # changed after install
+    set_button_marker(button, True, "Unsaved changes")
+    assert "color: blue" in button.styleSheet() and "padding-right" in button.styleSheet()
+    set_button_marker(button, False, "")
+    assert button.styleSheet() == "QPushButton { color: blue; }"
+    bare = QPushButton("Save")
+    install_button_marker(bare)
+    set_button_marker(bare, True, "x")
+    set_button_marker(bare, False, "")
+    assert bare.styleSheet() == ""

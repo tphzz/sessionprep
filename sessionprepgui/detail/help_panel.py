@@ -1,7 +1,9 @@
 """The File report's on-demand, independently scrolling detector Help pane."""
 from __future__ import annotations
 
-from PySide6.QtCore import QPoint, QSize, Qt
+import re
+
+from PySide6.QtCore import QEvent, QPoint, QSize, Qt, QTimer
 from PySide6.QtGui import QFont, QKeySequence, QShortcut, QTextOption
 from PySide6.QtWidgets import (
     QFrame, QHBoxLayout, QLabel, QTextBrowser, QToolButton, QVBoxLayout, QWidget,
@@ -9,11 +11,31 @@ from PySide6.QtWidgets import (
 
 from ..icons import icon
 from ..theme import COLORS
-from ..tracks.table_widgets import DETAIL_TAB_INSET
 from .report_style import configure_report_browser
 
 # Report-to-dock gap; the report's own text inset sits inside the report.
-_HELP_GAP = 16
+_HELP_GAP = 8
+# Below this Help body width, two-column Help tables stack (term, then meaning).
+_HELP_STACK_BELOW = 240
+
+# One table cell that holds no nested cell, row or table.
+_CELL = r"<td\b[^>]*>(?:(?!<td\b|</?tr\b|<table\b|</td>).)*</td>"
+_TWO_CELL_ROW = re.compile(rf"<tr>\s*({_CELL})\s*({_CELL})\s*</tr>", re.S | re.I)
+_LEFT_PADDING = re.compile(r"padding-left\s*:\s*[^;'\"]*;?", re.I)
+
+
+def stack_two_column_rows(html: str) -> str:
+    """Put the second cell of each simple two-cell table row on its own row.
+
+    Rows with nested tables or another cell count are left unchanged; the
+    stacked meaning loses its side padding so it aligns with the term.
+    """
+    def stacked(match):
+        meaning = match.group(2)
+        opening = meaning[:meaning.index(">") + 1]
+        meaning = _LEFT_PADDING.sub("", opening) + meaning[len(opening):]
+        return f"<tr>{match.group(1)}</tr><tr>{meaning}</tr>"
+    return _TWO_CELL_ROW.sub(stacked, html)
 
 
 class _HelpCloseButton(QToolButton):
@@ -34,6 +56,8 @@ class FileReportPane(QWidget):
         self._active_detector_id = None
         self._help_generation = None
         self._content_signature = None
+        self._help_stacked = False
+        self._help_anchor = None  # (block text, occurrence, top) across a width change
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(_HELP_GAP)
@@ -68,6 +92,8 @@ class FileReportPane(QWidget):
         titles = QVBoxLayout()
         titles.setSpacing(4)
         context = QLabel("Detector help")
+        context.setObjectName("detectorHelpContext")
+        context.setWordWrap(True)  # wraps beside Close in a narrow dock (approved design)
         context.setStyleSheet(f"color:{COLORS['metadata']};")
         self.help_title = QLabel()
         self.help_title.setTextFormat(Qt.PlainText)
@@ -99,11 +125,12 @@ class FileReportPane(QWidget):
         self.help_browser.setWordWrapMode(QTextOption.WrapAtWordBoundaryOrAnywhere)
         self.help_browser.document().setDocumentMargin(16)
         panel_layout.addWidget(self.help_browser, 1)
-        # The dock keeps the detail-tab inset from the pane's top, right and
-        # bottom edges; the report keeps the full height beside it.
+        self.help_browser.installEventFilter(self)
+        # The dock sits flush with the pane's top, right and bottom edges;
+        # the report keeps the full height beside it.
         self._help_dock = QWidget()
         dock_layout = QVBoxLayout(self._help_dock)
-        dock_layout.setContentsMargins(0, DETAIL_TAB_INSET, DETAIL_TAB_INSET, DETAIL_TAB_INSET)
+        dock_layout.setContentsMargins(0, 0, 0, 0)
         dock_layout.setSpacing(0)
         dock_layout.addWidget(self._help_panel)
         layout.addWidget(self._help_dock)
@@ -137,10 +164,20 @@ class FileReportPane(QWidget):
         # space when the user makes the File region narrower.
         preferred = min(360, max(140, round(self.width() * 0.4)))
         if self._active_detector_id is not None:
-            available = (self.width() - _HELP_GAP - DETAIL_TAB_INSET
-                         - self.report.minimum_header_width())
+            available = self.width() - _HELP_GAP - self.report.minimum_header_width()
             preferred = min(preferred, max(140, available))
+        # The panel's 1 px border on each side surrounds the Help body.
+        stacked = preferred - 2 < _HELP_STACK_BELOW
+        restack = stacked != self._help_stacked and self._content_signature is not None
+        if restack:
+            # The body only reaches its new width later; keep the passage the
+            # reader was on and re-apply it once the body has been resized.
+            self._help_anchor = self._capture_help_anchor()
         self._help_panel.setFixedWidth(preferred)
+        if stacked != self._help_stacked:
+            self._help_stacked = stacked
+            if restack:
+                self._render_help(keep_scroll=True)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -151,12 +188,73 @@ class FileReportPane(QWidget):
         if signature != self._content_signature:
             self.help_title.setText(row["title"])
             self.help_browser.setAccessibleName(f'Help for {row["title"]}')
-            self.help_browser.setHtml(
-                f'<body style="background-color:{COLORS["surface"]};'
-                f' color:{COLORS["text"]};">{row["help"]}</body>')
-            self.help_browser.document().setDocumentMargin(16)
-            self.help_browser.verticalScrollBar().setValue(0)
             self._content_signature = signature
+            self._help_anchor = None
+            self._render_help(keep_scroll=False)
+
+    def _render_help(self, *, keep_scroll):
+        help_html = self._content_signature[1]
+        if self._help_stacked:
+            help_html = stack_two_column_rows(help_html)
+        self.help_browser.setHtml(
+            f'<body style="background-color:{COLORS["surface"]};'
+            f' color:{COLORS["text"]};">{help_html}</body>')
+        self.help_browser.document().setDocumentMargin(16)
+        self.help_browser.document().documentLayout().documentSize()
+        if keep_scroll:
+            self._apply_help_anchor(self._help_anchor)
+        else:
+            self.help_browser.verticalScrollBar().setValue(0)
+
+    def _capture_help_anchor(self):
+        """The first visible text block and its offset from the body top."""
+        browser = self.help_browser
+        block = browser.cursorForPosition(QPoint(0, 0)).block()
+        while block.isValid() and not block.text().strip():
+            block = block.next()
+        if not block.isValid():
+            return None
+        text = block.text()
+        occurrence, previous = 0, block.previous()
+        while previous.isValid():
+            occurrence += previous.text() == text
+            previous = previous.previous()
+        cursor = browser.textCursor()
+        cursor.setPosition(block.position())
+        return text, occurrence, browser.cursorRect(cursor).top()
+
+    def _apply_help_anchor(self, anchor):
+        if anchor is None:
+            return
+        browser = self.help_browser
+        text, occurrence, top = anchor
+        document = browser.document()
+        document.documentLayout().documentSize()
+        block = document.begin()
+        while block.isValid():
+            if block.text() == text:
+                if not occurrence:
+                    break
+                occurrence -= 1
+            block = block.next()
+        if not block.isValid():
+            return  # the passage is gone; keep the current position
+        cursor = browser.textCursor()
+        cursor.setPosition(block.position())
+        bar = browser.verticalScrollBar()
+        bar.setValue(bar.value() + browser.cursorRect(cursor).top() - top)
+
+    def _apply_pending_help_anchor(self):
+        anchor, self._help_anchor = self._help_anchor, None
+        if self._content_signature is not None:
+            self._apply_help_anchor(anchor)
+
+    def eventFilter(self, watched, event):
+        if (watched is self.help_browser and event.type() == QEvent.Resize
+                and self._help_anchor is not None):
+            # Re-apply after the browser has laid the document out at its new width.
+            QTimer.singleShot(0, self._apply_pending_help_anchor)
+        return super().eventFilter(watched, event)
 
     def _show_help(self, key):
         row = self.report.help_row(key)
@@ -199,6 +297,7 @@ class FileReportPane(QWidget):
         self._active_detector_id = None
         self._help_generation = None
         self._content_signature = None
+        self._help_anchor = None
         self._help_dock.hide()
         self.help_browser.clear()
         self.help_title.clear()

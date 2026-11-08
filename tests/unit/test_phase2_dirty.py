@@ -316,3 +316,14 @@ def test_phase2_config_revert_clears_tree_and_tab(qapp):
         assert window._session_dirty_items["analysis"].icon(1).isNull()
     finally:
         window.close()
+
+
+def test_phase2_change_tooltips_name_their_own_comparison_preset(qapp):
+    window = _window(qapp)
+    try:
+        window._active_session_preset = "Band groups"
+        window._active_config_preset_name = "Mix config"
+        assert window._phase2_change_tooltip(_TAB_GROUPS) == "Changed from group preset “Band groups”"
+        assert window._phase2_change_tooltip(_TAB_SESSION) == "Changed from preset “Mix config”"
+    finally:
+        window.close()

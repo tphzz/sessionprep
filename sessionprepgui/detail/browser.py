@@ -12,6 +12,54 @@ from ..tracks.table_widgets import DETAIL_TAB_INSET, _HelpBrowser
 from .report import prepare_track_report, render_prepared_track_report, render_summary_html
 from .report_style import REPORT_CONTENT_SCALE, configure_report_browser, wrap_report_html
 
+# File report layouts by viewport width: wide, compact below 850 px, narrow
+# (stacked findings) below 460 px. Narrow is left again only at 476 px, so a
+# scroll bar appearing or disappearing after the switch cannot flip it back.
+COMPACT_BELOW = 850
+NARROW_BELOW = 460
+NARROW_EXIT_AT = 476
+
+
+def _scan_document(document):
+    """Return (finding-role ranges, anchor hrefs, anchor names) of a report document."""
+    inherited, hrefs, names = [], {}, {}
+    block = document.begin()
+    while block.isValid():
+        iterator = block.begin()
+        while not iterator.atEnd():
+            fragment = iterator.fragment()
+            if fragment.isValid():
+                char = fragment.charFormat()
+                # Keyword-sized text (title/section roles) keeps its size.
+                if (char.fontPointSize() <= 0 and char.font().pixelSize() < 0
+                        and not char.hasProperty(QTextFormat.FontSizeAdjustment)):
+                    inherited.append((fragment.position(), fragment.length()))
+                if char.anchorHref():
+                    hrefs.setdefault(char.anchorHref(), fragment.position())
+                for name in char.anchorNames():
+                    names.setdefault(name, fragment.position())
+            iterator += 1
+        block = block.next()
+    # Processor bodies (normalization) and findings use the finding body role.
+    starts = [names[name] for name in ("report-processors", "report-findings") if name in names]
+    start = min(starts) if starts else None
+    ranges = [r for r in inherited if start is not None and r[0] >= start]
+    return ranges, hrefs, names
+
+
+def _apply_point_size(document, ranges, size):
+    if size <= 0 or not ranges:
+        return
+    fmt = QTextCharFormat()
+    fmt.setFontPointSize(size)
+    cursor = QTextCursor(document)
+    cursor.beginEditBlock()
+    for position, length in ranges:
+        cursor.setPosition(position)
+        cursor.setPosition(position + length, QTextCursor.KeepAnchor)
+        cursor.mergeCharFormat(fmt)
+    cursor.endEditBlock()
+
 
 def _apply_report_inset(document):
     """Inset report text by the shared detail-tab inset on every side."""
@@ -54,7 +102,7 @@ class ReportBrowser(_HelpBrowser):
         self._finding_font_ranges = []
         self._minimum_header_cache = None
         self._generation = 0
-        self._compact = False
+        self._layout = "wide"  # "wide", "compact" or "narrow"
         self._active_help = None
         self.anchorClicked.connect(self.activate_report_link)
         self.setAccessibleName("Analysis report")
@@ -122,7 +170,7 @@ class ReportBrowser(_HelpBrowser):
         expanded = self._states.setdefault(self._track_key, set())
         expanded.intersection_update(r["id"] for r in self._prepared["rows"])
         self.reportChanged.emit()
-        self._compact = self._wants_compact()
+        self._layout = self._wanted_layout()
         self._render_track()
         if anchor is not None:
             self.restore_reading_anchor(anchor)
@@ -155,54 +203,24 @@ class ReportBrowser(_HelpBrowser):
         super().setHtml(wrap_report_html(html))
         _apply_report_inset(self.document())
         self.document().documentLayout().documentSize()
-        self._anchor_positions.clear()
-        self._named_positions.clear()
-        inherited_fonts = []
-        block = self.document().begin()
-        while block.isValid():
-            iterator = block.begin()
-            while not iterator.atEnd():
-                fragment = iterator.fragment()
-                if fragment.isValid():
-                    char = fragment.charFormat()
-                    # Keyword-sized text (title/section roles) keeps its size.
-                    if (char.fontPointSize() <= 0 and char.font().pixelSize() < 0
-                            and not char.hasProperty(QTextFormat.FontSizeAdjustment)):
-                        inherited_fonts.append((fragment.position(), fragment.length()))
-                    if char.anchorHref():
-                        self._anchor_positions.setdefault(char.anchorHref(), fragment.position())
-                    for name in char.anchorNames():
-                        self._named_positions.setdefault(name, fragment.position())
-                iterator += 1
-            block = block.next()
-        # Processor bodies (normalization) and findings use the finding body role.
-        starts = [self._named_positions[name] for name in ("report-processors", "report-findings")
-                  if name in self._named_positions]
-        start = min(starts) if starts else None
-        self._finding_font_ranges = [r for r in inherited_fonts if start is not None and r[0] >= start]
+        ranges, hrefs, names = _scan_document(self.document())
+        self._anchor_positions = hrefs
+        self._named_positions = names
+        self._finding_font_ranges = ranges
         self._apply_finding_font()
 
     def _apply_finding_font(self):
         # Qt's HTML subset ignores em sizes. Use the native UI role without
         # changing faces, emphasis, or explicit custom-renderer font sizes.
-        size = self.font().pointSizeF() / REPORT_CONTENT_SCALE
-        if size <= 0 or not self._finding_font_ranges:
-            return
-        fmt = QTextCharFormat()
-        fmt.setFontPointSize(size)
-        cursor = QTextCursor(self.document())
-        cursor.beginEditBlock()
-        for position, length in self._finding_font_ranges:
-            cursor.setPosition(position)
-            cursor.setPosition(position + length, QTextCursor.KeepAnchor)
-            cursor.mergeCharFormat(fmt)
-        cursor.endEditBlock()
+        _apply_point_size(self.document(), self._finding_font_ranges,
+                          self.font().pointSizeF() / REPORT_CONTENT_SCALE)
 
     def _render_track(self):
         if self._mode == "file" and self._prepared is not None:
             self._set_document(render_prepared_track_report(
                 self._prepared, expanded=self._states[self._track_key],
-                compact=self._compact, active_help=self._active_help))
+                compact=self._layout == "compact", narrow=self._layout == "narrow",
+                active_help=self._active_help))
 
     def _anchor_cursor(self, *, name=None, href=None):
         position = (self._named_positions.get(name) if name is not None
@@ -250,39 +268,56 @@ class ReportBrowser(_HelpBrowser):
         """Measure cached metadata only; custom detector details may still scroll."""
         if self._mode != "file" or self._prepared is None:
             return 0
-        # The compact header is the narrowest layout the report renders.
-        return self._header_width(self._prepared.get("header_compact", self._prepared["header"]))
+        # The narrow header is the narrowest layout the report renders.
+        prepared = self._prepared
+        return self._header_width(
+            prepared.get("header_narrow", prepared.get("header_compact", prepared["header"])))
 
     def _header_width(self, header):
         """Widget width the cached header needs without horizontal scrolling."""
         key = (header, self.font().key())
         cache = self._minimum_header_cache if isinstance(self._minimum_header_cache, dict) else {}
         if key not in cache:
-            if len(cache) >= 8:  # current wide/compact headers at a few fonts
+            if len(cache) >= 12:  # wide/compact/narrow headers at a few fonts
                 cache.clear()
             document = QTextDocument()
             document.setDefaultFont(self.font())
             document.setDefaultTextOption(self.document().defaultTextOption())
             document.setHtml(wrap_report_html(header))
             _apply_report_inset(document)
+            # Measure with the same finding body role the live document uses.
+            _apply_point_size(document, _scan_document(document)[0],
+                              self.font().pointSizeF() / REPORT_CONTENT_SCALE)
             document.setTextWidth(1)
             minimum = ceil(document.documentLayout().documentSize().width())
             cache[key] = minimum + 2 * self.frameWidth() + self.verticalScrollBar().sizeHint().width()
         self._minimum_header_cache = cache
         return cache[key]
 
-    def _wants_compact(self):
-        """Compact below 850 px, or when the wide header would need to scroll."""
-        if self.viewport().width() < 850:
-            return True
-        if self._mode != "file" or self._prepared is None:
-            return False
-        return self.width() < self._header_width(self._prepared["header"])
+    def _wanted_layout(self):
+        """Pick the widest layout whose header fits without horizontal scrolling."""
+        viewport = self.viewport().width()
+        file_report = self._mode == "file" and self._prepared is not None
+        narrow_below = NARROW_EXIT_AT if self._layout == "narrow" else NARROW_BELOW
+        if viewport < narrow_below or (file_report and self.width() < self._header_width(
+                self._prepared.get("header_compact", self._prepared["header"]))):
+            return "narrow"
+        if viewport < COMPACT_BELOW or (
+                file_report and self.width() < self._header_width(self._prepared["header"])):
+            return "compact"
+        return "wide"
+
+    def _update_layout(self):
+        layout = self._wanted_layout()
+        if layout != self._layout:
+            self._layout = layout
+            self._render_track()
 
     def refresh_font(self, screen=None):
         anchor = self.capture_reading_anchor()
         configure_report_browser(self, screen)
         self._apply_finding_font()
+        self._update_layout()
         self.document().documentLayout().documentSize()
         self.restore_reading_anchor(anchor)
 
@@ -304,10 +339,7 @@ class ReportBrowser(_HelpBrowser):
     def resizeEvent(self, event):
         anchor = self.capture_reading_anchor()
         super().resizeEvent(event)
-        compact = self._wants_compact()
-        if compact != self._compact:
-            self._compact = compact
-            self._render_track()
+        self._update_layout()
         self.restore_reading_anchor(anchor)
 
     def keyPressEvent(self, event):
