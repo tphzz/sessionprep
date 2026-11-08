@@ -14,7 +14,7 @@ name: 90 Helper - Build checks
         default: false
         type: boolean
     secrets:
-      SESSIONPREP_RELEASE_TOKEN:
+      GH_TOKEN:
         required: false
 permissions:
   contents: read
@@ -52,7 +52,9 @@ jobs:
     - name: Set up uv
       uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990
       with:
-        enable-cache: true
+        # Self-hosted runners keep uv's local cache. The remote cache only held
+        # a pruned copy, and saving it pruned downloaded wheels locally.
+        enable-cache: false
     - name: Validate version and build tooling
       id: metadata
       shell: bash
@@ -69,7 +71,7 @@ jobs:
       env:
         UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/sessionprep-env-${{ github.run_id }}-${{ github.run_attempt }}-checks
         RELEASE_DRAFTS: ${{ inputs.publish_drafts }}
-        HAS_RELEASE_TOKEN: ${{ secrets.SESSIONPREP_RELEASE_TOKEN != '' }}
+        HAS_RELEASE_TOKEN: ${{ secrets.GH_TOKEN != '' }}
     - name: Clean only run-owned workspace
       if: ${{ always() }}
       shell: bash

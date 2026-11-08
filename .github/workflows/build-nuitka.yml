@@ -25,7 +25,7 @@ jobs:
     with:
       publish_drafts: ${{ !inputs.debug }}
     secrets:
-      SESSIONPREP_RELEASE_TOKEN: ${{ secrets.SESSIONPREP_RELEASE_TOKEN }}
+      GH_TOKEN: ${{ secrets.GH_TOKEN }}
   linux-x64:
     needs:
     - checks
@@ -134,7 +134,9 @@ jobs:
     - name: Set up uv
       uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990
       with:
-        enable-cache: true
+        # Self-hosted runners keep uv's local cache. The remote cache only held
+        # a pruned copy, and saving it pruned downloaded wheels locally.
+        enable-cache: false
     - name: Download artifacts from this run
       uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
       with:
@@ -152,7 +154,7 @@ jobs:
     - name: Replace only owned unpublished draft
       shell: bash
       env:
-        GH_TOKEN: ${{ secrets.SESSIONPREP_RELEASE_TOKEN || github.token }}
+        GH_TOKEN: ${{ secrets.GH_TOKEN || github.token }}
       run: |
         set -euo pipefail
         cd "$SOURCE_DIR"
