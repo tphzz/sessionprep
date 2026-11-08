@@ -137,20 +137,14 @@ def windows_cleanup_step(name):
     return next(step for step in steps if step.get("name") == "Clean only run-owned workspace (Windows)")
 
 
-@pytest.mark.parametrize("name", ["91-build-platform.yml", "93-windows-bundle.yml"])
+@pytest.mark.parametrize("name", ["93-windows-bundle.yml"])
 def test_windows_cleanup_has_native_shell_even_before_preflight(name):
     step = windows_cleanup_step(name)
     assert step["shell"] == "powershell"
     assert "always()" in step["if"]
-    if name == "91-build-platform.yml":
-        assert "runner.os == 'Windows'" in step["if"]
-        steps = load(name)["jobs"]["build"]["steps"]
-        other = next(step for step in steps if step.get("name") == "Clean only run-owned workspace")
-        assert other["shell"] == "bash"
-        assert "runner.os != 'Windows'" in other["if"]
 
 
-@pytest.mark.parametrize("name", ["91-build-platform.yml", "93-windows-bundle.yml"])
+@pytest.mark.parametrize("name", ["93-windows-bundle.yml"])
 def test_windows_cleanup_runs_without_bash_or_exported_ci_python(tmp_path, name):
     import os
     import shutil
@@ -206,8 +200,44 @@ def test_windows_cleanup_rejects_paths_outside_run_roots(tmp_path):
                      GITHUB_RUN_ID="123", GITHUB_RUN_ATTEMPT="1",
                      CLEANUP_NAMES=json.dumps(["../../../outside"]), PYTHONDONTWRITEBYTECODE="1")
     result = subprocess.run([powershell, "-NoProfile", "-NonInteractive", "-Command",
-                             windows_cleanup_step("91-build-platform.yml")["run"]],
+                             windows_cleanup_step("93-windows-bundle.yml")["run"]],
                             env=variables, text=True, capture_output=True)
     assert result.returncode != 0
     assert "escaped" in result.stdout + result.stderr
     assert (outside / "keep.dat").read_bytes() == b"keep"
+
+
+# ── Build caching ───────────────────────────────────────────────────────────
+
+def native_build_steps(name):
+    job = next(iter(load(name)["jobs"].values()))
+    return job, [step for step in job["steps"] if "build.py compile" in step.get("run", "")]
+
+
+@pytest.mark.parametrize("name", ["91-build-platform.yml", "92-build-macos.yml"])
+def test_native_builds_reuse_stable_folders_so_compiler_caches_hit(name):
+    """Compiler caches key on absolute paths; run-scoped folders made every compile a miss."""
+    job, builds = native_build_steps(name)
+    assert builds
+    folders = [job["env"]["SOURCE_DIR"]] + [step["env"].get("SOURCE_DIR", "") for step in builds]
+    environments = [step["env"]["UV_PROJECT_ENVIRONMENT"] for step in builds]
+    for value in folders + environments:
+        assert "run_id" not in value and "run_attempt" not in value and "runner.temp" not in value
+    assert all(value.startswith("${{ github.workspace }}/env-") for value in environments)
+    assert len(set(environments)) == len(environments)          # one environment per architecture
+    for step in job["steps"]:
+        if step.get("uses", "").startswith("actions/checkout@"):
+            assert step["with"].get("clean", True) is True        # stale outputs are removed
+        assert not step.get("name", "").startswith("Clean only run-owned")
+
+
+def test_self_hosted_builds_keep_caches_local():
+    for path in WORKFLOWS.glob("*.yml"):
+        for job in load(path.name)["jobs"].values():
+            for step in job.get("steps", []):
+                uses = step.get("uses", "")
+                assert not uses.startswith("actions/cache@"), path.name
+                if uses.startswith("astral-sh/setup-uv@"):
+                    # Saving the remote uv cache prunes downloaded wheels locally.
+                    assert step["with"]["enable-cache"] is False, path.name
+

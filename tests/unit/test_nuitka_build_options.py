@@ -81,6 +81,35 @@ def test_cli_passes_memory_mode_to_both_targets(tmp_path, monkeypatch, low_memor
     assert all(options["low_memory"] is low_memory for _, options in calls)
 
 
+@pytest.mark.parametrize("jobs", [None, 4])
+def test_explicit_jobs_override_the_low_memory_single_job(tmp_path, monkeypatch, jobs):
+    calls = []
+    monkeypatch.setattr(build, "BASE_DIR", str(tmp_path))
+    monkeypatch.setattr(build, "DIST_NUITKA", str(tmp_path / "dist"))
+    monkeypatch.setattr(build, "_check_dependencies", lambda *args: None)
+    monkeypatch.setattr(build, "write_build_version_file", lambda version: version)
+    monkeypatch.setattr(build, "remove_build_version_file", lambda: None)
+    monkeypatch.setattr(build.subprocess, "check_call", lambda args: calls.append(args))
+    monkeypatch.setattr(build, "fetch_and_bundle_rps", lambda *args: None)
+
+    build.run_nuitka("cli", low_memory=True, jobs=jobs, build_version="0.3.5")
+
+    assert "--low-memory" in calls[0]
+    assert [arg for arg in calls[0] if arg.startswith("--jobs")] == ([] if jobs is None else ["--jobs=4"])
+
+
+def test_cli_passes_jobs_to_both_targets(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(build.sys, "platform", "win32")
+    monkeypatch.setattr(build, "DIST_NUITKA", str(tmp_path / "dist"))
+    monkeypatch.setattr(sys, "argv", ["build_nuitka.py", "all", "--low-memory", "--jobs", "4"])
+    monkeypatch.setattr(build, "run_nuitka", lambda target, **kwargs: calls.append((target, kwargs)))
+
+    build.main()
+
+    assert [(target, options["jobs"]) for target, options in calls] == [("cli", 4), ("gui", 4)]
+
+
 @pytest.mark.parametrize("target", ["cli", "gui"])
 @pytest.mark.parametrize("debug", [False, True])
 @pytest.mark.parametrize("native_platform,python_platform", [

@@ -198,8 +198,12 @@ reachable version tag and commit identity, ignoring technical preview tags.
 
 Windows CI enables Nuitka's `--low-memory` mode for both CLI and GUI, in Debug and
 Release builds. It limits C compilation to one job and reduces peak memory use
-at the cost of longer builds. Local builds can opt in with
-`uv run python build_nuitka.py all --low-memory`. See
+at the cost of longer builds; Windows x64 overrides the job count with `--jobs 4`
+(`WINDOWS_PARALLEL_JOBS` in `packaging/github/build.py`) because warm-cache builds
+are dominated by clcache lookups. Native CI builds use stable per-platform build
+and environment folders so ccache/clcache hit across runs; see
+`packaging/github/README.sessionprep.md`. Local builds can opt in with
+`uv run python build_nuitka.py all --low-memory [--jobs N]`. See
 [Nuitka's memory guidance](https://nuitka.net/user-documentation/common-issue-solutions.html#memory-issues-and-compiler-bugs).
 
 Windows ARM64 builds retain `scipy.integrate._lebedev` as embedded Python bytecode

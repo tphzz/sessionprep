@@ -19,6 +19,8 @@ from sessionpreplib._version import resolve_ref_version
 
 PLATFORMS = ("linux-x64", "linux-arm64", "win-x64", "win-arm64", "macos-arm64", "macos-x64")
 MANIFEST = "build-manifest.json"
+# ARM64 keeps one job: its SciPy translation units hit MSVC memory limits.
+WINDOWS_PARALLEL_JOBS = {"win-x64": 4}
 
 
 def run(*args, **kwargs):
@@ -121,6 +123,10 @@ def compile_app(args):
     if sys.platform == "win32":
         # Bound peak MSVC/SciPy compilation memory on shared Windows workers.
         command.append("--low-memory")
+        if args.platform in WINDOWS_PARALLEL_JOBS:
+            # Low memory alone means one compiler job; with warm clcache most
+            # files are cache lookups, so x64 checks them in parallel.
+            command.extend(["--jobs", str(WINDOWS_PARALLEL_JOBS[args.platform])])
     if args.debug:
         command.append("--debug")
     run(*command, cwd=ROOT)

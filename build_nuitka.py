@@ -3,7 +3,7 @@ Nuitka build script for SessionPrep.
 Builds standalone executables for CLI and GUI with optimized settings.
 
 Usage:
-    uv run python build_nuitka.py [cli|gui|all] [--clean] [--low-memory]
+    uv run python build_nuitka.py [cli|gui|all] [--clean] [--low-memory] [--jobs N]
 """
 import sys
 import os
@@ -98,7 +98,8 @@ def fetch_and_bundle_rps(dist_dir, target):
                         shutil.copyfileobj(source, target_file)
                     os.chmod(target_path, 0o755)
 
-def run_nuitka(target_key, clean=False, *, debug=False, build_version=None, low_memory=False):
+def run_nuitka(target_key, clean=False, *, debug=False, build_version=None, low_memory=False,
+               jobs=None):
     _check_dependencies(target_key)
     target = TARGETS[target_key]
     script_path = os.path.join(BASE_DIR, target["script"])
@@ -129,6 +130,9 @@ def run_nuitka(target_key, clean=False, *, debug=False, build_version=None, low_
 
     if low_memory:
         cmd.append("--low-memory")
+    if jobs is not None:
+        # An explicit job count overrides the single job implied by --low-memory.
+        cmd.append(f"--jobs={jobs}")
 
     if debug:
         cmd.extend(["--unstripped", f"--report={os.path.join(dist_dir, target_key + '-report.xml')}"])
@@ -217,6 +221,7 @@ def main():
     parser.add_argument("--build-version", help="Validated version resolved for this CI commit")
     parser.add_argument("--low-memory", action="store_true",
                         help="Reduce compiler memory use (one compiler job; slower builds)")
+    parser.add_argument("--jobs", type=int, help="Parallel C compiler jobs (overrides --low-memory's single job)")
     args = parser.parse_args()
 
     # Ensure dist folder exists
@@ -234,7 +239,7 @@ def main():
     for t in targets_to_build:
         try:
             run_nuitka(t, clean=args.clean, debug=args.debug, build_version=args.build_version,
-                       low_memory=args.low_memory)
+                       low_memory=args.low_memory, jobs=args.jobs)
         except subprocess.CalledProcessError as e:
             print(f"\n[ERROR] Build failed for {t}")
             sys.exit(1)

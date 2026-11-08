@@ -155,28 +155,3 @@ esac
             assert "MACOS_BOOTSTRAP_PYTHON=" + interpreters["arm64"] in environment_file.read_text()
         if scenario != "intel-install-fails":
             assert not any(line.startswith("uv:python install") for line in log)
-
-
-@pytest.mark.parametrize("version,callback", [((3, 9, 6), "onerror"), ((3, 13, 17), "onexc")])
-def test_macos_cleanup_keeps_fallback_python_compatibility(tmp_path, monkeypatch, version, callback):
-    script = next(step["run"] for step in steps() if step.get("name") == "Clean only run-owned workspace")
-    assert '${MACOS_BOOTSTRAP_PYTHON:-python3}' in script
-    code = re.search(r"<<'PY'\n(.*?)\nPY", script, re.DOTALL)[1]
-    workspace, temporary = tmp_path / "workspace", tmp_path / "temporary"
-    workspace.mkdir()
-    temporary.mkdir()
-    source = workspace / "src-123-1-macos"
-    source.mkdir()
-    monkeypatch.setenv("GITHUB_WORKSPACE", str(workspace))
-    monkeypatch.setenv("RUNNER_TEMP", str(temporary))
-    monkeypatch.setenv("GITHUB_RUN_ID", "123")
-    monkeypatch.setenv("GITHUB_RUN_ATTEMPT", "1")
-    monkeypatch.setenv("CLEANUP_NAMES", '["macos"]')
-    monkeypatch.setattr(sys, "version_info", version)
-    calls = []
-    def remove(path, **kwargs):
-        calls.append((path, kwargs))
-        assert set(kwargs) == {callback}
-    monkeypatch.setattr(shutil, "rmtree", remove)
-    exec(compile(code, "macos-cleanup", "exec"), {})
-    assert [path for path, _ in calls] == [source.resolve()]

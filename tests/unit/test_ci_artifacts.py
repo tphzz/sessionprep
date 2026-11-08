@@ -179,17 +179,17 @@ def test_linux_compile_starts_when_all_prerequisites_are_present(monkeypatch):
     assert started == [True]
 
 
-@pytest.mark.parametrize("native_platform, python_platform, low_memory", [
-    ("win-x64", "win32", True),
-    ("win-arm64", "win32", True),
-    ("linux-x64", "linux", False),
-    ("linux-arm64", "linux", False),
-    ("macos-arm64", "darwin", False),
-    ("macos-x64", "darwin", False),
+@pytest.mark.parametrize("native_platform, python_platform, low_memory, jobs", [
+    ("win-x64", "win32", True, "4"),
+    ("win-arm64", "win32", True, None),
+    ("linux-x64", "linux", False, None),
+    ("linux-arm64", "linux", False, None),
+    ("macos-arm64", "darwin", False, None),
+    ("macos-x64", "darwin", False, None),
 ])
 @pytest.mark.parametrize("debug", [False, True])
 def test_ci_bounds_windows_compiler_memory(monkeypatch, native_platform,
-                                          python_platform, low_memory, debug):
+                                          python_platform, low_memory, jobs, debug):
     import argparse
     started = []
     monkeypatch.setattr(ci.sys, "platform", python_platform)
@@ -205,6 +205,8 @@ def test_ci_bounds_windows_compiler_memory(monkeypatch, native_platform,
         assert started[0][0][1:] == (ROOT / "packaging/windows/build_installer.py", "check")
     command, options = started[-1]
     assert ("--low-memory" in command) is low_memory
+    # x64 checks its warm clcache in parallel; ARM64 keeps one SciPy-safe job.
+    assert (command[command.index("--jobs") + 1] if "--jobs" in command else None) == jobs
     assert ("--debug" in command) is debug
     assert command[command.index("--build-version") + 1] == "0.3.5"
     assert options["cwd"] == ROOT

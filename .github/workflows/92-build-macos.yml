@@ -35,7 +35,8 @@ jobs:
       queue: max
     timeout-minutes: 360
     env:
-      SOURCE_DIR: src-${{ github.run_id }}-${{ github.run_attempt }}-macos
+      # Stable folders keep ccache hits across runs; checkout resets them.
+      SOURCE_DIR: build-macos
       BUILD_VERSION: ${{ inputs.version }}
       SOURCE_SHA: ${{ inputs.sha }}
       DEBUG_BUILD: ${{ inputs.debug }}
@@ -51,7 +52,9 @@ jobs:
     - name: Set up uv
       uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990
       with:
-        enable-cache: true
+        # Self-hosted runners keep uv's local cache. The remote cache only held
+        # a pruned copy, and saving it pruned downloaded wheels locally.
+        enable-cache: false
     - name: Verify Xcode and Rosetta
       shell: bash
       env:
@@ -120,7 +123,7 @@ jobs:
       shell: bash
       env:
         SOURCE_DIR: ${{ env.SOURCE_DIR }}
-        UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/sessionprep-env-${{ github.run_id }}-${{ github.run_attempt }}-macos-arm64
+        UV_PROJECT_ENVIRONMENT: ${{ github.workspace }}/env-macos-arm64
         BUILD_PLATFORM: macos-arm64
         PYTHON_INSTALL: ${{ steps.macos-python.outputs.arm64-python }}
       run: |
@@ -151,7 +154,7 @@ jobs:
       shell: bash
       env:
         SOURCE_DIR: ${{ env.SOURCE_DIR }}-x64
-        UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/sessionprep-env-${{ github.run_id }}-${{ github.run_attempt }}-macos-x64
+        UV_PROJECT_ENVIRONMENT: ${{ github.workspace }}/env-macos-x64
         BUILD_PLATFORM: macos-x64
         PYTHON_INSTALL: ${{ steps.macos-python.outputs.x64-python }}
       run: |
@@ -170,30 +173,3 @@ jobs:
         path: ${{ env.SOURCE_DIR }}-x64/artifacts
         if-no-files-found: error
       if: ${{ inputs.architecture != 'arm64' }}
-    - name: Clean only run-owned workspace
-      if: ${{ always() }}
-      shell: bash
-      run: |
-        "${MACOS_BOOTSTRAP_PYTHON:-python3}" - <<'PY'
-        import json, os, pathlib, shutil, stat, sys
-        workspace = pathlib.Path(os.environ["GITHUB_WORKSPACE"]).resolve()
-        temporary = pathlib.Path(os.environ["RUNNER_TEMP"]).resolve()
-        run = os.environ["GITHUB_RUN_ID"] + "-" + os.environ["GITHUB_RUN_ATTEMPT"]
-        def remove_readonly(function, path, error):
-            if not isinstance(error, PermissionError):
-                raise error
-            os.chmod(path, stat.S_IWRITE)
-            function(path)
-        for name in json.loads(os.environ["CLEANUP_NAMES"]):
-            for parent, child in ((workspace, "src-" + run + "-" + name), (temporary, "sessionprep-env-" + run + "-" + name)):
-                target = (parent / child).resolve()
-                if target.parent != parent:
-                    raise RuntimeError("Cleanup target escaped the run workspace")
-                if target.exists():
-                    if sys.version_info >= (3, 12):
-                        shutil.rmtree(target, onexc=remove_readonly)
-                    else:
-                        shutil.rmtree(target, onerror=lambda fn, path, error: remove_readonly(fn, path, error[1]))
-        PY
-      env:
-        CLEANUP_NAMES: '["macos", "macos-x64", "macos-arm64"]'

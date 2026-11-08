@@ -39,9 +39,28 @@ self-hosted/macOS/ARM64 runner; Intel uses Intel Python through Rosetta.
 The x64 lane and Apple Silicon lane have shared repository-local concurrency
 groups across all entry points. Running builds are not automatically cancelled;
 `queue: max` preserves waiting manual jobs. These groups do not coordinate other
-repositories. Source checkouts, virtual environments and outputs are run-scoped;
-cleanup is restricted to those paths and never removes signing state.
-Windows always-run cleanup uses PowerShell to invoke the existing guarded
+repositories. Native builds (Linux, Windows, macOS) use stable per-platform
+folders in the runner workspace: `build-<platform>` for the checkout and
+`env-<platform>` for the virtual environment. Compiler caches (ccache, clcache)
+key on absolute include and source paths, so run-scoped folders made every
+compile a cache miss. Checkout resets the folder (`git clean -ffdx`) at the
+start of each run; the virtual environment is re-synced from the frozen lockfile.
+The lane concurrency groups and one-job-per-runner scheduling keep these folders
+exclusive. Compiler and uv caches stay on the runner (Nuitka's cache directory and
+uv's default cache); nothing is uploaded to the GitHub Actions cache, and
+`setup-uv` caching is off because saving its remote copy prunes the local wheels.
+Linux runner containers must keep the runner user's `~/.cache` across runs, for
+example on a volume; recreating a container without it causes one cold build.
+Because uv no longer prunes on save, its cache and managed Pythons only grow;
+run `uv cache prune` on a runner occasionally if disk space matters. If a locked
+file (an orphaned build process or an antivirus handle) makes checkout fail to
+reset `build-<platform>`, every later run on that runner fails the same way: stop
+the process and delete `build-<platform>` (and `env-<platform>` if `uv sync` was
+interrupted) by hand. Folders named `src-<run>-<platform>` left by older killed
+runs are no longer cleaned automatically and can be deleted once.
+Checks, Windows assembly and release collection keep run-scoped checkouts and
+environments; their cleanup is restricted to those paths and never removes
+signing state. Windows always-run cleanup (Windows assembly only) uses PowerShell to invoke the existing guarded
 Python cleanup directly. It can use Python on PATH when native validation
 fails before exporting CI_PYTHON, without depending on Git Bash setup.
 Cleanup is architecture-independent; the build still requires native Python.
@@ -94,9 +113,12 @@ Windows native compilation checks installer discovery before running Nuitka.
 The adaptive installer also checks it before staging/extracting payloads.
 
 Windows CI uses Nuitka's `--low-memory` mode for both executables and both build
-configurations. This selects one C compiler job and reduces peak memory use when
-compiling SciPy with MSVC on shared workers; compilation can take longer. Local
-builds can use `uv run python build_nuitka.py all --low-memory`. See
+configurations. On its own this selects one C compiler job and reduces peak
+memory use when compiling SciPy with MSVC on shared workers. Windows x64 adds
+`--jobs 4`: with a warm clcache almost every file is a cache lookup, and serial
+lookups took about 30 minutes. Windows ARM64 keeps one job because of its SciPy
+compiler-memory limits. Local builds can use
+`uv run python build_nuitka.py all --low-memory [--jobs N]`. See
 [Nuitka's documented memory controls](https://nuitka.net/user-documentation/common-issue-solutions.html#memory-issues-and-compiler-bugs).
 
 Native Windows ARM64 also bundles `scipy.integrate._lebedev` as Python bytecode.
