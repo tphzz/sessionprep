@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
+from dataclasses import replace
 import logging
 import threading
 
@@ -74,7 +76,8 @@ class DawFetchWorker(QThread):
                 kwargs["progress_cb"] = self._on_progress
             if accepts_kwargs or "ignore_cache" in params:
                 kwargs["ignore_cache"] = self._ignore_cache
-            session = self._processor.fetch(self._session, **kwargs)
+            snapshot = replace(self._session, daw_state=deepcopy(self._session.daw_state))
+            session = self._processor.fetch(snapshot, **kwargs)
             self.result.emit(True, "Fetch complete", session)
         except Exception as e:
             self.result.emit(False, str(e), None)

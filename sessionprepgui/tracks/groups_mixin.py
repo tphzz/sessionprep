@@ -24,7 +24,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from sessionpreplib.config import classify_structured_config_change
+from sessionpreplib.config import classify_structured_config_change, resolve_session_config
 
 from ..prefs.param_form import _argb_to_qcolor
 from ..settings import build_defaults, save_config
@@ -695,14 +695,14 @@ class GroupsMixin:  # pylint: disable=too-few-public-methods
         if name not in presets:
             return
 
-        old_preset = self._active_preset()
-        new_preset = presets[name]
-        impact = classify_structured_config_change(old_preset, new_preset)
+        old_config = self._effective_session_config()
+        new_config = resolve_session_config(presets[name], self._session_overrides)
+        impact = classify_structured_config_change(old_config, new_config)
 
         if self._session is not None:
             intro = (
-                f"Switching to \u201c{name}\u201d will overwrite your "
-                "session config.\n\nGroup assignments will be preserved."
+                f"Switching to \u201c{name}\u201d updates inherited settings.\n\n"
+                "Session overrides and group assignments will be preserved."
             )
             if impact.requires_phase1:
                 intro += (
@@ -735,22 +735,11 @@ class GroupsMixin:  # pylint: disable=too-few-public-methods
                 return
 
         self._active_config_preset_name = name
-        self._config.setdefault("app", {})["active_config_preset"] = name
-        save_config(self._config)
-
-        # Refresh DAW processors from the new preset (e.g. new mix templates)
-        self._configure_daw_processors()
-        self._populate_daw_combo()
-        self._update_daw_lifecycle_buttons()
-
-        if self._session is not None:
-            self._session_config = None  # re-init from new preset
-            self._apply_config_change_impact(impact)
-        else:
-            if hasattr(self, "_load_session_widgets"):
-                self._load_session_widgets(self._active_preset())
-            if hasattr(self, "_refresh_phase2_dirty_indicators"):
-                self._refresh_phase2_dirty_indicators()
+        if self._session is None:
+            self._config.setdefault("app", {})["active_config_preset"] = name
+            save_config(self._config)
+        self._load_session_widgets(new_config)
+        self._apply_config_change_impact(impact)
 
     # ── Group column (col 6) ────────────────────────────────────────────
 

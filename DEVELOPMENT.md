@@ -1737,8 +1737,9 @@ The GUI is a PySide6 application split across the `sessionprepgui/` package.
 uv run python sessionprep-gui.py
 ```
 
-Requires PySide6 and sounddevice (installed via the `gui` optional dependency
-group).
+When PySide6 or sounddevice is missing, the source launcher invokes uv again
+once with the `gui` extra in the selected environment. You can also install
+that extra explicitly with `uv sync --extra gui`.
 
 ### Shared Desktop Controls and Reports
 
@@ -2228,9 +2229,9 @@ preferences directory:
   by group presets
 - **`config_presets`** — named config presets, each containing five
   sub-sections: `analysis`, `detectors`, `processors`, `daw_processors`,
-  `presentation`. The active preset is identified by `app.active_config_preset`.
-  Managed via the Preferences dialog (Config Presets tab) and the toolbar
-  "Config:" combo.
+  `presentation`. `app.active_config_preset` selects the initial preset
+  for new projects. Each open project has its own selection under Phase 2
+  Config.
 - **`group_presets`** — named group presets (lists of track group dicts
   with name, color, gain-linked, daw-target). Managed via the Preferences
   dialog (Global → Groups) and the toolbar "Group:" combo.
@@ -2241,12 +2242,19 @@ and will be saved in session project files in the future.
 
 **Config presets vs. session config:**
 
-Config presets define the global defaults for analysis parameters, detector
-thresholds, processor targets, and DAW processor settings. When analysis
-starts, the active config preset is snapshot into the session's Config tab
-(`_session_config`). The user can then tweak per-session overrides without
-affecting the global preset. `_flat_config()` reads from the session config
-widgets when available, falling back to the global preset otherwise.
+Config presets define the defaults for analysis parameters, detector
+thresholds, processor targets, and DAW processor settings. A session stores
+the selected preset name and explicit overrides keyed by field, such as
+`daw_processors.protools.protools_temp_dir`. `resolve_session_config()`
+overlays those values on the current preset. The GUI renders the effective
+fields, and `_flat_config()` flattens that model for workers. An edit that
+equals the preset still records an override.
+
+Session files store `session_config_overrides` as optional metadata alongside
+the resolved `session_config` snapshot. Interactive reopen resolves inherited
+fields again. When reading a legacy snapshot, saved values that differ from
+the selected preset become overrides. Queued transfers use the resolved
+snapshot captured at enqueue time.
 
 **Lifecycle:**
 
@@ -2261,9 +2269,10 @@ widgets when available, falling back to the global preset otherwise.
    with defaults. `flatten_structured_config()` converts a preset into a
    flat key-value dict for the pipeline and `AnalyzeWorker`.
 5. The **Preferences dialog** provides a two-tab UI for editing all settings.
-   On save, changes are written to the config file. If analysis-relevant
-   parameters changed and a session is loaded, re-analysis is triggered
-   automatically; presentation-only changes trigger a lightweight refresh.
+   Saving refreshes the active project's inherited fields. Effective DAW
+   changes rebuild the Phase 3 processors, and display changes refresh the
+   reports. Analysis changes take effect on the relevant rerun. An in-flight
+   Create uses the settings selected and validated when it started.
 
 The CLI is **not** affected by this file — it continues to use its own
 `default_config()` + command-line arguments.

@@ -67,6 +67,7 @@ class PreferencesDialog(QDialog):
             self._config.get("config_presets", {}))
         if "Default" not in self._config_presets_data:
             self._config_presets_data["Default"] = _build_default_config_preset()
+        self._preset_origins = {name: name for name in self._config_presets_data}
 
         # Pipeline widget registry (built by build_config_pages)
         self._cfg_widgets: dict = {}
@@ -106,6 +107,13 @@ class PreferencesDialog(QDialog):
     def result_config(self) -> dict[str, Any]:
         """Return the edited config (only valid after Save)."""
         return self._config
+
+    def preset_name_after_save(self, previous: str) -> str:
+        """Follow the same preset across renames or fall back after deletion."""
+        return next(
+            (name for name, origin in self._preset_origins.items() if origin == previous),
+            "Default",
+        )
 
     # ── UI construction ───────────────────────────────────────────────
 
@@ -447,10 +455,14 @@ class PreferencesDialog(QDialog):
 
     def _on_cfg_renamed(self, old: str, new: str) -> None:
         self._config_presets_data[new] = self._config_presets_data.pop(old, {})
+        origin = self._preset_origins.pop(old, None)
+        if origin is not None:
+            self._preset_origins[new] = origin
         self._update_dirty_indicators()
 
     def _on_cfg_deleted(self, name: str) -> None:
         self._config_presets_data.pop(name, None)
+        self._preset_origins.pop(name, None)
         self._load_cfg_preset_widgets(self._cfg_panel.current_name)
         self._update_dirty_indicators()
 

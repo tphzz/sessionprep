@@ -47,8 +47,7 @@ def _window(qapp):
     window._session_groups = copy.deepcopy(
         window._selected_group_preset_groups())
     window._populate_groups_tab()
-    window._session_config = copy.deepcopy(window._active_preset())
-    window._load_session_widgets(window._session_config)
+    window._init_session_config()
     window._refresh_phase2_dirty_indicators()
     return window
 

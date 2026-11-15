@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import platform
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
 
@@ -594,6 +595,60 @@ def strip_presentation_keys(structured: dict[str, Any]) -> dict[str, Any]:
     return stripped
 
 
+_FLAT_PRESET_SECTIONS = ("analysis", "presentation")
+_COMPONENT_PRESET_SECTIONS = ("detectors", "processors", "daw_processors")
+
+
+def _structured_config_values(config: dict[str, Any]) -> dict[str, Any]:
+    """Index preset fields by the same qualified keys used for change impacts."""
+    values: dict[str, Any] = {}
+    for section in _FLAT_PRESET_SECTIONS:
+        fields = config.get(section)
+        if isinstance(fields, dict):
+            values.update((f"{section}.{key}", value) for key, value in fields.items())
+    for section in _COMPONENT_PRESET_SECTIONS:
+        components = config.get(section)
+        if isinstance(components, dict):
+            for component, fields in components.items():
+                if isinstance(fields, dict):
+                    values.update(
+                        (f"{section}.{component}.{key}", value)
+                        for key, value in fields.items()
+                    )
+    return values
+
+
+def resolve_session_config(
+    preset: dict[str, Any], overrides: dict[str, Any],
+) -> dict[str, Any]:
+    """Combine a preset and explicit per-field overrides without sharing state."""
+    effective = deepcopy(preset)
+    for path, value in overrides.items():
+        section, _, field = path.partition(".")
+        if section in _FLAT_PRESET_SECTIONS and field:
+            effective.setdefault(section, {})[field] = deepcopy(value)
+        elif section in _COMPONENT_PRESET_SECTIONS:
+            component, _, key = field.rpartition(".")
+            if not component or not key:
+                continue
+            effective.setdefault(section, {}).setdefault(component, {})[key] = deepcopy(value)
+    return effective
+
+
+def infer_session_overrides(
+    preset: dict[str, Any], saved_config: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Preserve saved differences when a legacy session lacks override metadata."""
+    if not isinstance(saved_config, dict):
+        return {}
+    defaults = _structured_config_values(preset)
+    return {
+        path: deepcopy(value)
+        for path, value in _structured_config_values(saved_config).items()
+        if path not in defaults or value != defaults[path]
+    }
+
+
 def classify_structured_config_change(
     old: dict[str, Any],
     new: dict[str, Any],
@@ -637,17 +692,6 @@ def classify_structured_config_change(
             impact = "presentation" if spec.presentation_only else "daw"
             known[("daw_processors", dp.id, spec.key)] = impact
 
-    def _section_values(config: dict[str, Any],
-                        section: str,
-                        component: str | None = None) -> dict[str, Any]:
-        root = config.get(section, {})
-        if component is None:
-            return root if isinstance(root, dict) else {}
-        if isinstance(root, dict):
-            value = root.get(component, {})
-            return value if isinstance(value, dict) else {}
-        return {}
-
     def _impact_for(section: str, component: str | None, key: str) -> str:
         known_impact = known.get((section, component, key))
         if known_impact:
@@ -671,30 +715,15 @@ def classify_structured_config_change(
         "daw": set(),
     }
 
-    # Flat sections
-    for section in ("analysis", "presentation"):
-        old_values = _section_values(old, section)
-        new_values = _section_values(new, section)
-        for key in set(old_values) | set(new_values):
-            if old_values.get(key) != new_values.get(key):
-                impact = _impact_for(section, None, key)
-                changed[impact].add(f"{section}.{key}")
-
-    # Component sections
-    for section in ("detectors", "processors", "daw_processors"):
-        old_root = old.get(section, {})
-        new_root = new.get(section, {})
-        if not isinstance(old_root, dict):
-            old_root = {}
-        if not isinstance(new_root, dict):
-            new_root = {}
-        for component in set(old_root) | set(new_root):
-            old_values = _section_values(old, section, component)
-            new_values = _section_values(new, section, component)
-            for key in set(old_values) | set(new_values):
-                if old_values.get(key) != new_values.get(key):
-                    impact = _impact_for(section, component, key)
-                    changed[impact].add(f"{section}.{component}.{key}")
+    old_values = _structured_config_values(old)
+    new_values = _structured_config_values(new)
+    for path in old_values.keys() | new_values.keys():
+        if old_values.get(path) != new_values.get(path):
+            section, _, key = path.partition(".")
+            component = None
+            if section in _COMPONENT_PRESET_SECTIONS:
+                component, _, key = key.rpartition(".")
+            changed[_impact_for(section, component, key)].add(path)
 
     return ConfigChangeImpact(
         phase1_keys=frozenset(changed["phase1"]),

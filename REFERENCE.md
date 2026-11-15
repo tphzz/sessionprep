@@ -580,7 +580,7 @@ Per-track dropdown overriding the global `rms_anchor` analysis setting.
 
 | Label   | Override value | Meaning                                  |
 |---------|----------------|------------------------------------------|
-| Default | *(none)*       | Use the global setting from Preferences  |
+| Default | *(none)*       | Use the session's effective RMS anchor setting |
 | Max     | `max`          | Loudest gated RMS window                 |
 | P99     | `p99`          | 99th percentile of gated RMS windows     |
 | P95     | `p95`          | 95th percentile (default global setting) |

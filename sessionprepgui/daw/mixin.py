@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
+from dataclasses import replace
 import logging
 import os
 
@@ -37,7 +39,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from sessionpreplib.config import flatten_structured_config
 from sessionpreplib.daw_processors import create_runtime_daw_processors
+from sessionpreplib.models import SessionContext
 
 from ..tracks.table_widgets import (
     _FolderDropTree, _SetupDragTable,
@@ -362,19 +366,67 @@ class DawMixin:  # pylint: disable=too-few-public-methods
         Uses the runtime factory so DAWProject templates are expanded
         into individual processor instances.
         """
-        flat = self._flat_config()
-        self._daw_processors = create_runtime_daw_processors(flat)
+        processors = create_runtime_daw_processors(
+            self._flat_config(), include_disabled=True)
+        previous = getattr(self, "_daw_template_bindings", {})
+        self._daw_template_bindings = {dp.id: dp.template_identity for dp in processors}
+        self._daw_processors = [dp for dp in processors if dp.enabled]
+        if self._session:
+            self._session.daw_state = self._rebind_daw_state(
+                self._session.daw_state, previous)
 
-    def _populate_daw_combo(self):
+    def _matching_daw_id(self, previous_id, previous_bindings) -> str | None:
+        """Find the same template, including when its index changes."""
+        identity = previous_bindings.get(previous_id)
+        current = self._daw_template_bindings
+        if identity is None:
+            return None
+        if current.get(previous_id) == identity:
+            return previous_id
+        matching = [dp_id for dp_id, key in current.items() if key == identity]
+        if len(matching) == 1 and list(previous_bindings.values()).count(identity) == 1:
+            return matching[0]
+        return None
+
+    def _rebind_daw_state(self, state, previous_bindings) -> dict:
+        if previous_bindings == self._daw_template_bindings:
+            return state
+        rebound = {
+            dp_id: value for dp_id, value in state.items()
+            if dp_id not in previous_bindings and dp_id not in self._daw_template_bindings
+        }
+        for previous_id in state.keys() & previous_bindings.keys():
+            new_id = self._matching_daw_id(previous_id, previous_bindings)
+            if new_id is not None:
+                rebound[new_id] = state[previous_id]
+        return rebound
+
+    def _restore_daw_bindings(self, data: dict) -> tuple[dict, str | None]:
+        state = deepcopy(data.get("daw_state", {}))
+        active_id = data.get("active_daw_processor_id")
+        saved_config = data.get("session_config")
+        if not isinstance(saved_config, dict):
+            return state, active_id
+        previous = {
+            dp.id: dp.template_identity for dp in create_runtime_daw_processors(
+                flatten_structured_config(saved_config), include_disabled=True)
+        }
+        return self._rebind_daw_state(state, previous), self._matching_daw_id(active_id, previous)
+
+    def _populate_daw_combo(self, preferred_id: str | None = None):
         """Fill the DAW dropdown with enabled processors."""
+        selected = -1
         self._daw_combo.blockSignals(True)
         self._daw_combo.clear()
         for i, dp in enumerate(self._daw_processors):
             if dp.enabled:
                 self._daw_combo.addItem(dp.name, i)
+                if selected < 0 or dp.id == preferred_id:
+                    selected = self._daw_combo.count() - 1
+        self._daw_combo.setCurrentIndex(selected)
         self._daw_combo.blockSignals(False)
         if self._daw_combo.count() > 0:
-            self._on_daw_combo_changed(0)
+            self._on_daw_combo_changed(selected)
         else:
             self._active_daw_processor = None
 
@@ -383,12 +435,7 @@ class DawMixin:  # pylint: disable=too-few-public-methods
         set_action_busy(self._transfer_action,
                         getattr(self, "_daw_transfer_worker", None) is not None,
                         "Creating\u2026")
-        # Check if any async operation is currently running
-        is_working = getattr(self, "_daw_check_worker", None) is not None or \
-                     getattr(self, "_daw_fetch_worker", None) is not None or \
-                     getattr(self, "_daw_transfer_worker", None) is not None
-
-        if is_working:
+        if self._daw_operation_running():
             self._fetch_action.setEnabled(False)
             self._fetch_menu_button.setEnabled(False)
             self._auto_assign_action.setEnabled(False)
@@ -421,6 +468,12 @@ class DawMixin:  # pylint: disable=too-few-public-methods
             self._session and self._session.transfer_manifest)
         self._reset_manifest_action.setEnabled(has_manifest)
 
+    def _daw_operation_running(self) -> bool:
+        return any(
+            getattr(self, worker, None) is not None
+            for worker in ("_daw_check_worker", "_daw_fetch_worker", "_daw_transfer_worker")
+        )
+
     @Slot(int)
     def _on_daw_combo_changed(self, index: int):
         if index < 0 or index >= self._daw_combo.count():
@@ -431,24 +484,23 @@ class DawMixin:  # pylint: disable=too-few-public-methods
         self._daw_check_label.setText("")
         self._update_daw_lifecycle_buttons()
 
-    def _run_daw_check_then(self, on_success):
+    def _run_daw_check_then(self, processor, on_success):
         """Run a connectivity check; on success call *on_success*."""
-        if not self._active_daw_processor:
-            return
         self._pending_after_check = on_success
         self._daw_check_label.setText("Connecting\u2026")
         self._daw_check_label.setStyleSheet(f"color: {COLORS['dim']};")
-        self._update_daw_lifecycle_buttons()
-        self._daw_check_worker = DawCheckWorker(self._active_daw_processor, parent=self)
+        self._daw_check_worker = DawCheckWorker(processor, parent=self)
         self._daw_check_worker.result.connect(self._on_daw_check_result)
+        self._daw_check_worker.finished.connect(self._daw_check_worker.deleteLater)
+        self._update_daw_lifecycle_buttons()
         self._daw_check_worker.start()
 
     @Slot(bool, str)
     def _on_daw_check_result(self, ok: bool, message: str):
         worker = self._daw_check_worker
+        if worker is None:
+            return
         self._daw_check_worker = None
-        if worker:
-            worker.deleteLater()
         if ok:
             self._daw_check_label.setText(message)
             self._daw_check_label.setStyleSheet(f"color: {COLORS['clean']};")
@@ -462,7 +514,7 @@ class DawMixin:  # pylint: disable=too-few-public-methods
             self._pending_after_check = None
             QMessageBox.warning(
                 self, "Connection Failed",
-                f"{self._active_daw_processor.name} connection could "
+                f"{worker._processor.name} connection could "
                 f"not be established.\n\n{message}")
         self._update_daw_lifecycle_buttons()
 
@@ -470,7 +522,8 @@ class DawMixin:  # pylint: disable=too-few-public-methods
 
     @Slot()
     def _on_daw_fetch(self, ignore_cache: bool = False):
-        if not self._active_daw_processor or not self._session:
+        if (not self._active_daw_processor or not self._session
+                or self._daw_operation_running()):
             return
         log.info(
             "DAW fetch: %s ignore_cache=%s",
@@ -503,15 +556,24 @@ class DawMixin:  # pylint: disable=too-few-public-methods
         self._daw_fetch_worker.progress.connect(self._on_transfer_progress)
         self._daw_fetch_worker.progress_value.connect(self._on_transfer_progress_value)
         self._daw_fetch_worker.result.connect(self._on_daw_fetch_result)
-        self._daw_fetch_worker.start()
+        self._daw_fetch_worker.finished.connect(self._daw_fetch_worker.deleteLater)
         self._update_daw_lifecycle_buttons()
+        self._daw_fetch_worker.start()
 
     @Slot(bool, str, object)
     def _on_daw_fetch_result(self, ok: bool, message: str, session):
         worker = self._daw_fetch_worker
+        if worker is None:
+            return
         self._daw_fetch_worker = None
-        if worker:
-            worker.deleteLater()
+        if worker._session is not self._session:
+            self._update_daw_lifecycle_buttons()
+            return
+        processor = worker._processor
+        if self._daw_template_bindings.get(processor.id) != processor.template_identity:
+            self._progress_fail("DAW template changed. Fetch again.")
+            self._update_daw_lifecycle_buttons()
+            return
         self._fetch_action.setEnabled(True)
         self._fetch_menu_button.setEnabled(True)
 
@@ -529,11 +591,8 @@ class DawMixin:  # pylint: disable=too-few-public-methods
             return
 
         if ok and session is not None:
-            self._session = session
-            # Restore project name from session context if it was loaded
-            self._project_name_edit.blockSignals(True)
-            self._project_name_edit.setText(session.project_name)
-            self._project_name_edit.blockSignals(False)
+            if processor.id in session.daw_state:
+                self._session.daw_state[processor.id] = session.daw_state[processor.id]
             self._populate_folder_tree()
             self._setup_right_stack.setCurrentIndex(_SETUP_RIGHT_TREE)
             self._populate_setup_table()
@@ -545,7 +604,7 @@ class DawMixin:  # pylint: disable=too-few-public-methods
             QMessageBox.critical(
                 self,
                 "Fetch Failed",
-                f"Could not fetch folder structure from {self._active_daw_processor.name}.\n\n"
+                f"Could not fetch folder structure from {processor.name}.\n\n"
                 f"{message}"
             )
             self._status_bar.showMessage(f"Fetch failed: {message}")
@@ -592,12 +651,10 @@ class DawMixin:  # pylint: disable=too-few-public-methods
 
     @Slot()
     def _on_daw_transfer(self):
-        import os
-        if not self._active_daw_processor or not self._session:
+        processor, source = self._active_daw_processor, self._session
+        if not processor or not source or self._daw_operation_running():
             return
-        log.info("DAW transfer: %s (%d tracks)",
-                 self._active_daw_processor.name,
-                 len(self._session.transfer_manifest))
+        log.info("DAW transfer: %s (%d tracks)", processor.name, len(source.transfer_manifest))
 
         # 1. Project Name Validation
         project_name = self._project_name_edit.text().strip()
@@ -609,13 +666,13 @@ class DawMixin:  # pylint: disable=too-few-public-methods
             return
 
         # 2. Target Directory Validation
-        if hasattr(self._active_daw_processor, "project_dir"):
-            project_dir = self._active_daw_processor.project_dir.strip()
+        if hasattr(processor, "project_dir"):
+            project_dir = processor.project_dir.strip()
 
             if not project_dir:
                 QMessageBox.critical(
                     self, "Project Directory Not Set",
-                    f"A 'Project directory' must be configured in {self._active_daw_processor.name} preferences before creating a project."
+                    f"A 'Project directory' must be configured in {processor.name} preferences before creating a project."
                 )
                 return
 
@@ -628,7 +685,7 @@ class DawMixin:  # pylint: disable=too-few-public-methods
                 return
 
             # 3. Collision Check (Pro Tools specific)
-            if self._active_daw_processor.id.startswith("protools"):
+            if processor.id.startswith("protools"):
                 target_path = os.path.join(project_dir, project_name)
                 if os.path.exists(target_path):
                     QMessageBox.warning(
@@ -637,91 +694,73 @@ class DawMixin:  # pylint: disable=too-few-public-methods
                         "Please choose a different project name."
                     )
                     return
-        # 4. Enqueue or Transfer
+        # Keep the validated destination and settings together through preflight.
+        snapshot = replace(
+            source,
+            config=self._transfer_config(source),
+            project_name=project_name,
+            daw_state=deepcopy(source.daw_state),
+            transfer_manifest=deepcopy(source.transfer_manifest),
+            output_tracks=list(source.output_tracks),
+        )
+
         batch_mode = getattr(self, "_batch_mode_action", None)
         if batch_mode and batch_mode.isChecked():
             import uuid
             from ..batch import BatchItem
-            from ..theme import PT_DEFAULT_COLORS
 
-            output_folder = self._config.get("app", {}).get(
-                "phase2_output_folder", "sp_02_prepared")
-
-            # Update config like we do in _do_daw_transfer
-            self._session.config.update(self._flat_config())
-            self._session.config.setdefault("gui", {})["groups"] = (
-                self._normalize_session_groups(self._session_groups))
-            colors = self._config.get("colors", PT_DEFAULT_COLORS)
-            self._session.config["gui"]["colors"] = colors
-            self._session.config["_source_dir"] = self._source_dir
-            self._session.config["_output_folder"] = output_folder
-
-            # Resolve output path here so it doesn't prompt during batch execution
-            output_path = self._active_daw_processor.resolve_output_path(
-                self._session, self)
+            output_path = processor.resolve_output_path(snapshot, self)
             if output_path is None:
                 return
 
-            # Capture state and enqueue
-            state = self._capture_session_state()
             item = BatchItem(
                 id=uuid.uuid4().hex,
                 project_name=project_name,
-                daw_processor_id=self._active_daw_processor.id,
-                daw_processor_name=self._active_daw_processor.name,
+                daw_processor_id=processor.id,
+                daw_processor_name=processor.name,
                 output_path=output_path,
-                session_state=state,
+                session_state=self._capture_session_state(),
             )
             if self._batch_dock.add_item(item):
                 self._clear_workspace()
                 self._status_bar.showMessage("Session added to batch queue.")
             return
 
-        self._transfer_action.setEnabled(False)
-        self._fetch_action.setEnabled(False)
-        self._fetch_menu_button.setEnabled(False)
-        self._unassign_all_action.setEnabled(False)
-        self._run_daw_check_then(self._do_daw_transfer)
+        self._run_daw_check_then(
+            processor, lambda: self._do_daw_transfer(processor, source, snapshot))
 
-    def _do_daw_transfer(self):
-        """Actually start the transfer (called after successful connectivity check)."""
-        if not self._active_daw_processor or not self._session:
+    def _transfer_config(self, session: SessionContext) -> dict[str, Any]:
+        config = {**session.config, **self._flat_config()}
+        config["gui"] = {
+            **config.get("gui", {}),
+            "groups": self._normalize_session_groups(self._session_groups),
+            "colors": deepcopy(self._config.get("colors", PT_DEFAULT_COLORS)),
+        }
+        config["_source_dir"] = self._source_dir
+        config["_output_folder"] = self._config.get("app", {}).get(
+            "phase2_output_folder", "sp_02_prepared")
+        return config
+
+    def _do_daw_transfer(self, processor, source: SessionContext, snapshot: SessionContext):
+        """Start a transfer using the settings that passed preflight."""
+        if self._session is not source:
             return
 
-        output_folder = self._config.get("app", {}).get(
-            "phase2_output_folder", "sp_02_prepared")
-
-        # Refresh pipeline config from current session widgets so that
-        # processor enabled/disabled changes made after analysis take effect.
-        self._session.config.update(self._flat_config())
-        # Inject GUI config (groups + colors) into session.config so
-        # transfer() can resolve group → color ARGB
-        self._session.config.setdefault("gui", {})["groups"] = (
-            self._normalize_session_groups(self._session_groups))
-        colors = self._config.get("colors", PT_DEFAULT_COLORS)
-        self._session.config["gui"]["colors"] = colors
-        # Keep source dir / output folder in config for processor.resolve_output_path()
-        self._session.config["_source_dir"] = self._source_dir
-        self._session.config["_output_folder"] = output_folder
-
-        # ── Let the processor decide the output path (shows dialog if needed) ─
-        output_path = self._active_daw_processor.resolve_output_path(
-            self._session, self)
+        output_path = processor.resolve_output_path(snapshot, self)
         if output_path is None:
             self._update_daw_lifecycle_buttons()
             return
 
-        dp_name = self._active_daw_processor.name
-        set_action_busy(self._transfer_action, True, "Creating\u2026")
-        self._progress_start(f"Transferring to {dp_name}\u2026")
-
-        self._daw_transfer_worker = DawTransferWorker(
-            self._active_daw_processor, self._session, output_path, parent=self, close_session=False)
-        self._daw_transfer_worker.progress.connect(self._on_transfer_progress)
-        self._daw_transfer_worker.progress_value.connect(
-            self._on_transfer_progress_value)
-        self._daw_transfer_worker.result.connect(self._on_daw_transfer_result)
-        self._daw_transfer_worker.start()
+        self._progress_start(f"Transferring to {processor.name}\u2026")
+        worker = DawTransferWorker(
+            processor, snapshot, output_path, parent=self, close_session=False)
+        self._daw_transfer_worker = worker
+        worker.progress.connect(self._on_transfer_progress)
+        worker.progress_value.connect(self._on_transfer_progress_value)
+        worker.result.connect(self._on_daw_transfer_result)
+        worker.finished.connect(worker.deleteLater)
+        self._update_daw_lifecycle_buttons()
+        worker.start()
 
     @Slot(str)
     def _on_transfer_progress(self, message: str):
@@ -733,11 +772,10 @@ class DawMixin:  # pylint: disable=too-few-public-methods
 
     @Slot(bool, str, object)
     def _on_daw_transfer_result(self, ok: bool, message: str, results):
+        if self._daw_transfer_worker is None:
+            return
         set_action_busy(self._transfer_action, False)
-        worker = self._daw_transfer_worker
         self._daw_transfer_worker = None
-        if worker:
-            worker.deleteLater()
         self._update_daw_lifecycle_buttons()
         if ok:
             log.info("DAW transfer complete")

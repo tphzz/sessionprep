@@ -612,9 +612,6 @@ def build_config_pages(
     preset: dict[str, Any],
     widgets_dict: dict,
     register_page: Callable[[QTreeWidgetItem, QWidget, str | None], None],
-    *,
-    on_processor_enabled: Callable | None = None,
-    on_daw_config_changed: Callable | None = None,
 ) -> dict[str, QWidget]:
     """Build the common config tree pages (Analysis, Detectors, Processors, DAW Processors).
 
@@ -667,12 +664,6 @@ def build_config_pages(
         pg, wdg = _build_param_page(params, proc_sections.get(proc.id, {}))
         widgets_dict[f"processors.{proc.id}"] = wdg
         register_page(child, pg, f"processors.{proc.id}")
-        if on_processor_enabled is not None:
-            enabled_key = f"{proc.id}_enabled"
-            for key, widget in wdg:
-                if key == enabled_key and isinstance(widget, QCheckBox):
-                    widget.toggled.connect(on_processor_enabled)
-                    break
 
     daw_parent = QTreeWidgetItem(tree, ["DAW Processors"])
     daw_parent.setFont(0, QFont("", -1, QFont.Bold))
@@ -691,26 +682,15 @@ def build_config_pages(
         child = QTreeWidgetItem(daw_parent, [dp.name])
         pg, wdg = _build_param_page(params, dp_sections.get(dp.id, {}))
         widgets_dict[f"daw_processors.{dp.id}"] = wdg
-        if on_daw_config_changed is not None:
-            enabled_key = f"{dp.id}_enabled"
-            for key, widget in wdg:
-                if key == enabled_key and isinstance(widget, QCheckBox):
-                    widget.toggled.connect(on_daw_config_changed)
-                    break
-
         if dp.id == "dawproject":
             tpl_widget = DawProjectTemplatesWidget()
             tpl_widget.set_templates(dp_sections.get(dp.id, {}).get("dawproject_templates", []))
             daw_custom_widgets["dawproject"] = tpl_widget
-            if on_daw_config_changed is not None:
-                tpl_widget.templates_changed.connect(on_daw_config_changed)
             pg.layout().insertWidget(pg.layout().count() - 1, tpl_widget)
         elif dp.id == "protools":
             pt_widget = ProToolsTemplatesWidget()
             pt_widget.set_templates(dp_sections.get(dp.id, {}).get("protools_templates", []))
             daw_custom_widgets["protools"] = pt_widget
-            if on_daw_config_changed is not None:
-                pt_widget.templates_changed.connect(on_daw_config_changed)
             pg.layout().insertWidget(3, pt_widget)
 
         register_page(child, pg, f"daw_processors.{dp.id}")
@@ -778,7 +758,6 @@ def load_config_widgets(
 def read_config_widgets(
     widgets_dict: dict,
     daw_custom_widgets: dict[str, QWidget] | None = None,
-    fallback_daw_sections: dict[str, dict] | None = None,
 ) -> dict[str, Any]:
     """Read current widget values into a structured config dict."""
     from sessionpreplib.detectors import default_detectors
@@ -836,10 +815,6 @@ def read_config_widgets(
         elif dp.id == "protools" and "protools" in daw_custom_widgets:
             section["protools_templates"] = daw_custom_widgets["protools"].get_templates()
 
-        if fallback_daw_sections:
-            for gk, gv in fallback_daw_sections.get(dp.id, {}).items():
-                if gk not in section:
-                    section[gk] = gv
         daw_procs[dp.id] = section
     cfg["daw_processors"] = daw_procs
 

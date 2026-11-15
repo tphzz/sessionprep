@@ -37,7 +37,8 @@ from sessionpreplib.audio import AUDIO_EXTENSIONS, discover_audio_files, discove
 from sessionpreplib.config import (
     classify_structured_config_change,
     default_config,
-    flatten_structured_config,
+    infer_session_overrides,
+    resolve_session_config,
 )
 from sessionpreplib.detectors import default_detectors
 from sessionpreplib.models import SessionContext, TrackContext
@@ -46,9 +47,10 @@ from sessionpreplib.topology import build_default_topology
 from sessionpreplib.utils import protools_sort_key
 
 from ..helpers import track_analysis_label
-from ..prefs.param_widgets import build_config_pages, load_config_widgets, read_config_widgets
+from ..prefs.param_form import _read_widget
+from ..prefs.param_widgets import build_config_pages, load_config_widgets
 from ..session.io import save_session as _save_session_file, load_session as _load_session_file
-from ..settings import build_defaults, resolve_config_preset
+from ..settings import build_defaults
 from ..tracks.table_widgets import (
     DETAIL_TAB_INSET,
     _SETUP_RIGHT_TREE,
@@ -160,8 +162,6 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
             self._active_preset(),
             self._session_widgets,
             _register_page,
-            on_processor_enabled=self._on_processor_enabled_changed,
-            on_daw_config_changed=self._on_daw_config_changed,
         )
         self._connect_session_config_dirty_signals()
 
@@ -173,10 +173,9 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
             self._session_stack.setCurrentIndex(idx)
 
     def _init_session_config(self):
-        """Snapshot the active global config preset into session config."""
-        self._session_config = copy.deepcopy(self._active_preset())
+        """Display the project's effective config and enable its editor."""
         self._populate_config_preset_combo()
-        self._load_session_widgets(self._session_config)
+        self._load_session_widgets(self._effective_session_config())
         self._detail_tabs.setTabEnabled(_TAB_SESSION, True)
         self._refresh_phase2_dirty_indicators()
 
@@ -187,9 +186,6 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
             self._load_session_widgets_inner(preset)
         finally:
             self._loading_session_widgets = False
-        # Single refresh after all widgets are set
-        if self._session:
-            self._on_processor_enabled_changed(False)
         self._refresh_session_config_dirty_indicators()
 
     def _load_session_widgets_inner(self, preset: dict[str, Any]):
@@ -198,32 +194,13 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
             self._session_widgets, preset,
             self._session_daw_custom_widgets)
 
-    def _read_session_config(self) -> dict[str, Any]:
-        """Read current session widget values into a structured config dict."""
-        return read_config_widgets(
-            self._session_widgets,
-            self._session_daw_custom_widgets,
-            fallback_daw_sections=self._active_preset().get(
-                "daw_processors", {}),
-        )
-
-    def _on_daw_config_changed(self, *_args):
-        """Refresh Phase 3 DAW combo when session DAW config changes."""
-        if getattr(self, "_loading_session_widgets", False):
-            return
-        self._session_config = self._read_session_config()
-        self._configure_daw_processors()
-        self._populate_daw_combo()
-        self._update_daw_lifecycle_buttons()
-        self._refresh_session_config_dirty_indicators()
-
     def _on_session_config_reset(self):
         """Revert session config to the selected config preset."""
+        old_config = self._effective_session_config()
+        self._session_overrides.clear()
         preset = self._active_preset()
-        self._session_config = copy.deepcopy(preset)
-        self._load_session_widgets(self._session_config)
-        self._on_daw_config_changed()
-        self._refresh_session_config_dirty_indicators()
+        self._load_session_widgets(preset)
+        self._refresh_effective_config(classify_structured_config_change(old_config, preset))
         self._status_bar.showMessage("Session config reverted to preset.")
 
     # 哪 Phase-2 preset difference indicators 哪哪哪哪哪哪哪哪哪哪哪哪哪哪
@@ -241,36 +218,40 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
                            self._phase2_change_tooltip(index))
 
     def _connect_session_config_dirty_signals(self) -> None:
-        for widgets in self._session_widgets.values():
-            for _key, widget in widgets:
-                self._connect_session_widget_dirty_signal(widget)
-        for widget in getattr(self, "_session_daw_custom_widgets", {}).values():
-            if hasattr(widget, "templates_changed"):
-                widget.templates_changed.connect(
-                    self._on_session_config_value_changed)
+        for section, widgets in self._session_widgets.items():
+            prefix = "presentation" if section == "_presentation" else section
+            for key, widget in widgets:
+                self._connect_session_widget_dirty_signal(f"{prefix}.{key}", widget)
+        for processor_id, widget in self._session_daw_custom_widgets.items():
+            path = f"daw_processors.{processor_id}.{processor_id}_templates"
+            widget.templates_changed.connect(
+                lambda p=path, w=widget: self._on_session_config_value_changed(
+                    p, w.get_templates()))
 
-    def _connect_session_widget_dirty_signal(self, widget: QWidget) -> None:
+    def _connect_session_widget_dirty_signal(self, path: str, widget: QWidget) -> None:
+        def edited(*_args):
+            self._on_session_config_value_changed(path, _read_widget(widget))
+
         if hasattr(widget, "path_changed"):
-            widget.path_changed.connect(self._on_session_config_value_changed)
+            widget.path_changed.connect(edited)
         elif isinstance(widget, QComboBox):
-            widget.currentIndexChanged.connect(
-                self._on_session_config_value_changed)
+            widget.currentIndexChanged.connect(edited)
         elif isinstance(widget, QCheckBox):
-            widget.toggled.connect(self._on_session_config_value_changed)
+            widget.toggled.connect(edited)
         elif isinstance(widget, (QSpinBox, QDoubleSpinBox)):
-            widget.valueChanged.connect(self._on_session_config_value_changed)
+            widget.valueChanged.connect(edited)
         elif isinstance(widget, QLineEdit):
-            widget.textChanged.connect(self._on_session_config_value_changed)
+            widget.textChanged.connect(edited)
 
-    def _on_session_config_value_changed(self, *_args) -> None:
-        if getattr(self, "_loading_session_widgets", False):
+    def _on_session_config_value_changed(self, path: str, value: Any) -> None:
+        if not self._session or getattr(self, "_loading_session_widgets", False):
             return
-        self._session_config = self._read_session_config()
-        self._refresh_session_config_dirty_indicators()
+        old_config = self._effective_session_config()
+        self._session_overrides[path] = value
         impact = classify_structured_config_change(
-            self._active_preset(), self._session_config)
-        if impact.daw_keys and hasattr(self, "_refresh_daw_processors_from_config"):
-            self._refresh_daw_processors_from_config()
+            old_config, self._effective_session_config())
+        self._refresh_session_config_dirty_indicators()
+        self._refresh_effective_config(impact)
         if impact.requires_phase1:
             self._status_bar.showMessage(
                 "Config changed: rerun Track Layout to apply Phase 1 "
@@ -301,7 +282,7 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
             return set()
         if not getattr(self, "_session_widgets", None):
             return set()
-        current = self._read_session_config()
+        current = self._effective_session_config()
         preset = self._active_preset()
         dirty_keys: set[str] = set()
 
@@ -367,7 +348,7 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
                     worker.error.connect(_cleanup)
             setattr(self, worker_attr, None)
 
-    def _clear_workspace(self):
+    def _clear_workspace(self, *, keep_session_config: bool = False):
         """Clear the UI and reset session state."""
         self._on_stop()
         self._cancel_worker("_p1_worker")
@@ -428,7 +409,9 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         self._detail_tabs.setCurrentIndex(_TAB_SUMMARY)
         self._refresh_phase2_dirty_indicators()
         self._right_stack.setCurrentIndex(_PAGE_TABS)
-        self._session_config = None
+        if not keep_session_config:
+            self._session_overrides.clear()
+            self._active_config_preset_name = self._default_config_preset_name()
         self._session_groups = []
         self._groups_tab_table.setRowCount(0)
         self._folder_tree.clear()
@@ -451,14 +434,17 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
     @Slot()
     def _on_topo_reanalyze(self):
         if self._source_dir:
-            self._load_directory(self._source_dir)
+            self._load_directory(self._source_dir, keep_session_config=True)
 
-    def _load_directory(self, path: str):
+    def _load_directory(self, path: str, *, keep_session_config: bool = False):
         log.info("Open folder: %s", path)
-        self._clear_workspace()
+        self._clear_workspace(keep_session_config=keep_session_config)
         self._source_dir = path
         self._track_table.set_source_dir(path)
         self._topo_input_tree.set_source_dir(path)
+        self._populate_config_preset_combo()
+        self._load_session_widgets(self._effective_session_config())
+        self._refresh_daw_processors_from_config()
 
         app_cfg = self._config.get("app", {})
         skip_folders = {
@@ -577,10 +563,6 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
 
     def _capture_session_state(self) -> dict:
         """Capture the current session state into a dictionary."""
-        # Ensure we capture all active edits from the session settings widgets
-        if not getattr(self, "_loading_session_widgets", False):
-            self._session_config = self._read_session_config()
-
         # Ensure project name is synced from widget
         if self._session:
             self._session.project_name = self._project_name_edit.text().strip()
@@ -591,7 +573,8 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         return {
             "source_dir": self._source_dir,
             "active_config_preset": self._active_config_preset_name,
-            "session_config": self._session_config,
+            "session_config": self._effective_session_config(),
+            "session_config_overrides": copy.deepcopy(self._session_overrides),
             "session_groups": self._session_groups,
             "daw_state": self._session.daw_state if self._session else {},
             "active_daw_processor_id": active_dp_id,
@@ -673,16 +656,23 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
 
         # ── Restore session-level state ───────────────────────────────────────
         preset_name = data.get("active_config_preset", "Default")
-        self._active_config_preset_name = preset_name
-        self._session_config = data.get("session_config")
+        self._active_config_preset_name = self._existing_config_preset_name(preset_name)
+        overrides = data.get("session_config_overrides")
+        if isinstance(overrides, dict):
+            self._session_overrides = copy.deepcopy(overrides)
+        else:
+            self._session_overrides = infer_session_overrides(
+                self._active_preset(), data.get("session_config"))
         self._session_groups = data.get("session_groups", [])
 
-        if self._session_config:
-            self._load_session_widgets(self._session_config)
+        self._populate_config_preset_combo()
+        effective = self._effective_session_config()
+        self._load_session_widgets(effective)
 
         # Ensure the DAW processors and combo reflect the newly loaded session config
         self._configure_daw_processors()
-        self._populate_daw_combo()
+        daw_state, active_daw_id = self._restore_daw_bindings(data)
+        self._populate_daw_combo(active_daw_id)
 
         # ── Reconstruct SessionContext from saved tracks ──────────────────────
         from sessionpreplib.models import SessionContext
@@ -721,14 +711,22 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         session_config_flat.update(flat)
         session_config_flat["_source_dir"] = source_dir
 
+        prepare_state = data.get("prepare_state", "none")
+        if prepare_state == "ready":
+            since_saved = infer_session_overrides(effective, data.get("session_config"))
+            saved = resolve_session_config(effective, since_saved)
+            impact = classify_structured_config_change(saved, effective)
+            if impact.requires_phase1 or impact.requires_phase2:
+                prepare_state = "stale"
+
         session = SessionContext(
             tracks=tracks,
             config=session_config_flat,
             groups={},
             detectors=all_detectors,
             processors=all_processors,
-            daw_state=data.get("daw_state", {}),
-            prepare_state=data.get("prepare_state", "none"),
+            daw_state=daw_state,
+            prepare_state=prepare_state,
             transfer_manifest=data.get("transfer_manifest", []),
             base_transfer_manifest=data.get("base_transfer_manifest", []),
             project_name=data.get("project_name", ""),
@@ -834,16 +832,6 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
             self._use_processed_cb.setChecked(True)
         self._update_use_processed_action()
 
-        # ── Restore active DAW processor ──────────────────────────────────────
-        active_daw_id = data.get("active_daw_processor_id")
-        if active_daw_id:
-            for i in range(self._daw_combo.count()):
-                idx = self._daw_combo.itemData(i)
-                if idx is not None and idx < len(self._daw_processors):
-                    if self._daw_processors[idx].id == active_daw_id:
-                        self._daw_combo.setCurrentIndex(i)
-                        break
-
         self._update_daw_lifecycle_buttons()
         # Show folder tree if daw_state already has assignments
         if has_manifest and self._active_daw_processor:
@@ -905,9 +893,7 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         self._detail_tabs.setTabEnabled(_TAB_FILE, False)
         self._track_table.setVisible(False)
 
-        # Initialise session config from global preset (first analysis)
-        # or keep existing session config (re-analysis with user edits)
-        if self._session_config is None:
+        if not self._detail_tabs.isTabEnabled(_TAB_SESSION):
             self._init_session_config()
 
         # Show progress page
@@ -1396,13 +1382,10 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
             self._update_prepare_button()
             self._update_use_processed_action()
 
-    @Slot(bool)
-    def _on_processor_enabled_changed(self, _checked: bool):
+    def _refresh_enabled_processors(self):
         """Live-update session.processors and Processing column when a
         processor enabled toggle changes in the session config widgets."""
         if not self._session:
-            return
-        if getattr(self, "_loading_session_widgets", False):
             return
         # Re-evaluate which processors are enabled from current widget values
         flat = self._flat_config()
@@ -1414,7 +1397,6 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         new_processors.sort(key=lambda p: p.priority)
         self._session.processors = new_processors
         self._refresh_processing_column()
-        self._mark_prepare_stale()
 
     def _refresh_processing_column(self):
         """Rebuild all Processing column buttons from the current
@@ -1474,8 +1456,6 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         # 7. Apply any concurrent GUI-only changes
         cmap = self._config.get("app", {}).get("spectrogram_colormap", "magma")
         self._waveform.set_colormap(cmap)
-
-        self._status_bar.showMessage("Preferences saved (display refreshed).")
 
     def _refresh_analysis_column(self):
         """Update the Analysis column for all rows using current detector config."""

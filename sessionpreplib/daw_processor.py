@@ -81,6 +81,11 @@ class DawProcessor(ABC):
         return self._project_dir
 
     @property
+    def template_identity(self) -> tuple[str, ...]:
+        """Identity of the template that owns fetched folders and assignments."""
+        return (self.id,)
+
+    @property
     def connected(self) -> bool:
         """Whether the last connectivity check succeeded."""
         return self._connected

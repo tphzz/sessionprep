@@ -187,6 +187,10 @@ class ProToolsDawProcessor(DawProcessor):
         self._connected = ok
         return ok, message
 
+    @property
+    def template_identity(self) -> tuple[str, ...]:
+        return ("protools", self._instance_group, self._instance_name)
+
     def _track_list_with_retry(self, engine, *, timeout: float, sleep_time: float):
         """Return the Pro Tools track list, retrying while a new session settles."""
         start_time = time.time()

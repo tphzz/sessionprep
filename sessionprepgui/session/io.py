@@ -6,7 +6,7 @@ without re-running analysis.
 
 Format versioning
 -----------------
-``CURRENT_VERSION`` is bumped whenever the schema changes.  ``_MIGRATIONS``
+``CURRENT_VERSION`` is bumped for incompatible schema changes.  ``_MIGRATIONS``
 maps version N → a callable that upgrades a raw dict from version N to N+1.
 ``load_session()`` applies all necessary migrations before returning.
 """
@@ -382,6 +382,7 @@ def serialize_session_state(data: dict) -> dict:
         "source_dir": data.get("source_dir", ""),
         "active_config_preset": data.get("active_config_preset", "Default"),
         "session_config": data.get("session_config"),
+        "session_config_overrides": data.get("session_config_overrides"),
         "session_groups": data.get("session_groups", []),
         "daw_state": _make_json_safe(data.get("daw_state", {})),
         "tracks": {
@@ -435,6 +436,7 @@ def deserialize_session_state(raw: dict) -> dict:
         "source_dir": source_dir,
         "active_config_preset": raw.get("active_config_preset", "Default"),
         "session_config": raw.get("session_config"),
+        "session_config_overrides": raw.get("session_config_overrides"),
         "session_groups": raw.get("session_groups", []),
         "daw_state": raw.get("daw_state", {}),
         "tracks": tracks,

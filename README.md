@@ -84,14 +84,14 @@ Use **File → Preferences** to customize settings through a two-tab dialog:
   parameter shows a description, expected type, valid range, and default
   value. A reset button next to each widget restores the default.
 
-Changes are saved to `sessionprep.config.json` and trigger an immediate
-re-analysis if a session is loaded.
+Preferences are saved to `sessionprep.config.json`. In Phase 2, use **Config
+Preset** to select the project's defaults and edit individual fields to set
+session overrides. Untouched fields follow that preset when it changes,
+including edits saved from Preferences in Phase 3. Explicit overrides stay
+with the project when it switches presets. **Revert to Preset** clears them.
 
-The analysis toolbar includes **Group:** and **Config:** dropdowns for quick
-preset switching. Changing the config preset with an active session warns you
-before re-analyzing (group assignments are preserved). Each session also has
-a **Config** tab where you can override any parameter for that session only,
-without affecting the global preset.
+DAW and report display changes apply immediately. Changes to analysis
+settings take effect when the relevant phase runs again.
 
 **3. Or use the CLI** for scripting and batch workflows:
 
@@ -142,10 +142,12 @@ If you prefer to run the Python scripts directly:
 ```bash
 git clone <repo-url>
 cd sessionprep
-uv sync --all-extras                        # installs core + CLI + GUI dependencies
-uv run python sessionprep-gui.py             # run the GUI
-uv run python sessionprep.py /path/to/tracks # run the CLI
+uv run python sessionprep-gui.py                        # run the GUI
+uv run --extra cli python sessionprep.py /path/to/tracks # run the CLI
 ```
+
+The GUI command installs the optional desktop dependencies on first use if
+needed.
 
 See [DEVELOPMENT.md](DEVELOPMENT.md) for full development setup, building, and
 distribution instructions.

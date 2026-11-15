@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import copy
 import json
 import logging
 import os
@@ -37,9 +36,9 @@ from sessionpreplib.config import (
     classify_structured_config_change,
     default_config,
     flatten_structured_config,
+    resolve_session_config,
 )
 from sessionpreplib.detectors import detector_help_map
-from sessionpreplib.daw_processors import default_daw_processors
 
 from .settings import (
     DEFAULT_SCALE_FACTOR,
@@ -161,7 +160,7 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
         self._prev_group_assignments: dict[str, str | None] = {}
         self._active_session_preset: str = "Default"
         self._recursive_scan: bool = False
-        self._session_config: dict[str, Any] | None = None
+        self._session_overrides: dict[str, Any] = {}
         self._session_widgets: dict[str, list[tuple[str, QWidget]]] = {}
         self._pt_utils_window = None  # singleton Pro Tools Utils window
         self._log_viewer_window = None  # singleton detached log viewer
@@ -185,8 +184,7 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
         t0 = time.perf_counter()
         self._config = load_config()
         dbg(f"load_config: {(time.perf_counter() - t0) * 1000:.1f} ms")
-        self._active_config_preset_name: str = self._config.get(
-            "app", {}).get("active_config_preset", "Default")
+        self._active_config_preset_name = self._default_config_preset_name()
         self._recursive_scan = self._config.get(
             "app", {}).get("recursive_scan", False)
 
@@ -344,22 +342,22 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
             )
 
     def _flat_config(self) -> dict[str, Any]:
-        """Return a flat config dict from the active config preset.
-
-        If a session config exists (user edited session Config tab), the
-        current widget values take precedence over the global config preset.
-        """
-        if self._session_config is not None:
-            # Read live widget values so edits take effect immediately
-            structured = self._read_session_config()
-            flat = dict(default_config())
-            flat.update(flatten_structured_config(structured))
-            return flat
-        preset = resolve_config_preset(
-            self._config, self._active_config_preset_name)
-        flat = dict(default_config())
-        flat.update(flatten_structured_config(preset))
+        """Return the flattened effective configuration for runtime consumers."""
+        flat = default_config()
+        flat.update(flatten_structured_config(self._effective_session_config()))
         return flat
+
+    def _effective_session_config(self) -> dict[str, Any]:
+        return resolve_session_config(self._active_preset(), self._session_overrides)
+
+    def _existing_config_preset_name(self, name: str) -> str:
+        if isinstance(name, str) and name in self._config.get("config_presets", {}):
+            return name
+        return "Default"
+
+    def _default_config_preset_name(self) -> str:
+        return self._existing_config_preset_name(
+            self._config.get("app", {}).get("active_config_preset", "Default"))
 
     def _active_preset(self) -> dict[str, Any]:
         """Return the active config preset's structured dict."""
@@ -1003,153 +1001,64 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
         return True
 
     def _apply_config_change_impact(self, impact: ConfigChangeImpact) -> None:
-        """Apply the minimum UI refresh/reanalysis for a config change."""
+        """Apply a preset switch, including any confirmed reanalysis."""
+        self._refresh_effective_config(impact)
         if impact.requires_phase1:
             self._on_topo_reanalyze()
-            return
-        if impact.requires_phase2:
+        elif impact.requires_phase2:
             self._on_analyze()
-            return
+        elif not (impact.presentation_keys and self._session):
+            self._refresh_config_changed_display()
+
+    def _refresh_effective_config(self, impact: ConfigChangeImpact) -> None:
+        """Refresh consumers that can apply settings without reanalysis."""
         if impact.daw_keys:
             self._refresh_daw_processors_from_config()
-            if impact.presentation_keys and self._session:
-                self._refresh_presentation()
-            else:
-                self._refresh_config_changed_display()
-            return
+        if any(key.startswith("processors.") and key.endswith("_enabled")
+               for key in impact.phase2_keys):
+            self._refresh_enabled_processors()
+        if impact.requires_phase1 or impact.requires_phase2:
+            self._mark_prepare_stale()
         if impact.presentation_keys and self._session:
             self._refresh_presentation()
-            return
-        self._refresh_config_changed_display()
 
     def _refresh_daw_processors_from_config(self) -> None:
         """Rebuild DAW processors and related Phase 3 UI from current config."""
         active_id = getattr(self._active_daw_processor, "id", None)
+        previous = self._daw_template_bindings
         self._configure_daw_processors()
-        self._populate_daw_combo()
-        if active_id:
-            for row in range(self._daw_combo.count()):
-                proc_idx = self._daw_combo.itemData(row)
-                if not isinstance(proc_idx, int):
-                    continue
-                if self._daw_processors[proc_idx].id == active_id:
-                    self._daw_combo.blockSignals(True)
-                    self._daw_combo.setCurrentIndex(row)
-                    self._daw_combo.blockSignals(False)
-                    self._on_daw_combo_changed(row)
-                    break
+        self._populate_daw_combo(self._matching_daw_id(active_id, previous))
+        if self._session and (
+            previous != self._daw_template_bindings
+            or active_id != getattr(self._active_daw_processor, "id", None)
+        ):
+            self._populate_folder_tree()
+            self._populate_setup_table()
         self._daw_check_label.setText("")
         self._update_daw_lifecycle_buttons()
         self._update_tools_menu()
-
-    @staticmethod
-    def _daw_project_dir_keys() -> set[str]:
-        """Return structured config keys for DAW project directories."""
-        keys: set[str] = set()
-        for processor in default_daw_processors():
-            for spec in processor.config_params():
-                if spec.key.endswith("_project_dir"):
-                    keys.add(f"daw_processors.{processor.id}.{spec.key}")
-        return keys
-
-    @staticmethod
-    def _structured_value(
-        config: dict[str, Any],
-        section: str,
-        component: str,
-        key: str,
-        default: Any = None,
-    ) -> Any:
-        root = config.get(section, {})
-        if not isinstance(root, dict):
-            return default
-        values = root.get(component, {})
-        if not isinstance(values, dict):
-            return default
-        return values.get(key, default)
-
-    @staticmethod
-    def _set_structured_value(
-        config: dict[str, Any],
-        section: str,
-        component: str,
-        key: str,
-        value: Any,
-    ) -> None:
-        root = config.setdefault(section, {})
-        if not isinstance(root, dict):
-            root = {}
-            config[section] = root
-        values = root.setdefault(component, {})
-        if not isinstance(values, dict):
-            values = {}
-            root[component] = values
-        values[key] = value
-
-    def _merge_session_daw_project_dirs(
-        self,
-        old_preset: dict[str, Any],
-        new_preset: dict[str, Any],
-        impact: ConfigChangeImpact,
-    ) -> tuple[int, int]:
-        """Merge inherited DAW project dirs into a session-local config.
-
-        Returns ``(merged, preserved)``.  A value is merged only when the
-        session is still inheriting the old preset value or lacks the key.
-        """
-        if self._session_config is None or not impact.daw_keys:
-            return 0, 0
-
-        project_dir_keys = self._daw_project_dir_keys()
-        merged = 0
-        preserved = 0
-        missing = object()
-
-        for changed_key in sorted(impact.daw_keys & project_dir_keys):
-            parts = changed_key.split(".")
-            if len(parts) != 3:
-                continue
-            section, component, key = parts
-            old_value = self._structured_value(
-                old_preset, section, component, key, missing)
-            new_value = self._structured_value(
-                new_preset, section, component, key, missing)
-            if new_value is missing:
-                continue
-
-            session_value = self._structured_value(
-                self._session_config, section, component, key, missing)
-            if session_value is missing or session_value == old_value:
-                self._set_structured_value(
-                    self._session_config, section, component, key, new_value)
-                merged += 1
-            else:
-                preserved += 1
-
-        if merged:
-            self._load_session_widgets(self._session_config)
-        return merged, preserved
 
     @Slot()
     def _on_preferences(self):
         old_scale = self._config.get("app", {}).get(
             "scale_factor", DEFAULT_SCALE_FACTOR)
-        old_preset = copy.deepcopy(self._active_preset())
+        old_config = self._effective_session_config()
+        old_group_preset = self._config.get("group_presets", {}).get(
+            self._active_session_preset)
 
         dlg = PreferencesDialog(self._config, parent=self)
         dlg.exec()
         if dlg.saved:
             self._config = dlg.result_config()
             save_config(self._config)
-            self._active_config_preset_name = self._config.get(
-                "app", {}).get("active_config_preset", "Default")
-            new_preset = self._active_preset()
+            if self._session is not None:
+                name = dlg.preset_name_after_save(self._active_config_preset_name)
+                self._active_config_preset_name = self._existing_config_preset_name(name)
+            else:
+                self._active_config_preset_name = self._default_config_preset_name()
+            new_config = self._effective_session_config()
             impact = classify_structured_config_change(
-                old_preset, new_preset)
-            merged_daw_dirs, preserved_daw_dirs = (
-                self._merge_session_daw_project_dirs(
-                    old_preset, new_preset, impact)
-            )
+                old_config, new_config)
             self._status_bar.showMessage("Preferences saved.")
             self._waveform.set_invert_scroll(
                 self._config.get("app", {}).get("invert_scroll", "default"))
@@ -1157,6 +1066,8 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
             # Refresh preset combos (presets may have been added/removed/renamed)
             self._populate_group_preset_combo()
             self._populate_config_preset_combo()
+            self._load_session_widgets(new_config)
+            self._refresh_effective_config(impact)
 
             # Offer to merge if the session's active preset was modified
             if self._session:
@@ -1165,7 +1076,8 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
                                           build_defaults().get("group_presets", {}))
                 if preset_name in presets:
                     preset_groups = presets[preset_name]
-                    if preset_groups != self._session_groups:
+                    if (preset_groups != old_group_preset
+                            and preset_groups != self._session_groups):
                         ans = QMessageBox.question(
                             self, "Update session groups?",
                             f'The group preset \u201c{preset_name}\u201d'
@@ -1184,55 +1096,23 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
                             self._status_bar.showMessage(
                                 "Session groups updated from preset.")
 
-            # Re-configure DAW processors (enabled/project dir may have changed)
-            self._refresh_daw_processors_from_config()
+            self._update_tools_menu()
 
             # Update Pro Tools Utils window if open
             if self._pt_utils_window is not None:
                 self._pt_utils_window.update_config(self._config)
 
-            if self._source_dir:
-                if impact.requires_phase1 or impact.requires_phase2:
-                    if self._session_config is not None:
-                        # Session has local config — don't auto-re-analyze
-                        preset_name = self._active_config_preset_name
-                        QMessageBox.information(
-                            self, "Config preset updated",
-                            f"The config preset \u201c{preset_name}\u201d"
-                            " has been updated in Preferences.\n\n"
-                            "Your current session still uses its own"
-                            " config. To apply the new preset defaults,"
-                            " use \u201cRevert to Preset\u201d"
-                            " in the Config tab or choose another"
-                            " Config Preset.",
-                        )
-                    else:
-                        intro = (
-                            "The active config preset has changed in "
-                            "Preferences."
-                        )
-                        if self._confirm_config_change_reanalysis(
-                                impact, intro=intro):
-                            self._apply_config_change_impact(impact)
-                        else:
-                            self._status_bar.showMessage(
-                                "Preferences saved; current analysis not "
-                                "reanalyzed.")
-                elif impact.presentation_keys:
-                    self._refresh_presentation()
-                elif impact.daw_keys:
-                    if merged_daw_dirs:
-                        self._status_bar.showMessage(
-                            "Preferences saved; Phase 3 project directory "
-                            "updated.")
-                    elif preserved_daw_dirs:
-                        self._status_bar.showMessage(
-                            "Preferences saved; session project directory "
-                            "override preserved.")
-                    else:
-                        self._refresh_config_changed_display()
-                else:
-                    self._refresh_config_changed_display()
+            if not (impact.presentation_keys and self._session):
+                self._refresh_config_changed_display()
+            if self._source_dir and (impact.requires_phase1 or impact.requires_phase2):
+                phase = "Track Layout" if impact.requires_phase1 else "Phase 2 analysis"
+                QMessageBox.information(
+                    self, "Config preset updated",
+                    "Inherited settings have been updated from Preferences. "
+                    f"Rerun {phase} to update results for the current session.",
+                )
+            elif impact.daw_keys:
+                self._status_bar.showMessage("Preferences saved. Phase 3 settings updated.")
 
             # Prompt restart if scale factor changed
             new_scale = self._config.get("app", {}).get(
@@ -1299,6 +1179,7 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
                 return
 
         self._playback.stop()
+        self._pending_after_check = None
 
         # Stop active background tasks cleanly so ThreadPoolExecutor can terminate
         from PySide6.QtCore import QThread

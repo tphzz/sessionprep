@@ -28,12 +28,8 @@ class DetailMixin:  # pylint: disable=too-few-public-methods
 
     @property
     def _show_clean(self) -> bool:
-        if self._session_config is not None:
-            cfg = self._read_session_config()
-            return cfg.get("presentation", {}).get(
-                "show_clean_detectors", False)
-        preset = self._active_preset()
-        return preset.get("presentation", {}).get("show_clean_detectors", False)
+        config = self._effective_session_config()
+        return config.get("presentation", {}).get("show_clean_detectors", False)
 
     @property
     def _verbose(self) -> bool:

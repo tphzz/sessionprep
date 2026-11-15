@@ -1,0 +1,460 @@
+from __future__ import annotations
+
+import copy
+
+import pytest
+
+pytest.importorskip("PySide6")
+
+from PySide6.QtWidgets import (
+    QApplication,
+    QFileDialog,
+    QInputDialog,
+    QMessageBox,
+    QPushButton,
+)
+
+from sessionprepgui import settings
+from sessionprepgui.mainwindow import SessionPrepWindow
+from sessionprepgui.prefs.dialog import PreferencesDialog
+from sessionprepgui.session.io import load_session
+from sessionpreplib.daw_processors import protools
+from sessionpreplib.models import TrackContext, TransferEntry
+
+
+PRO_TOOLS = "daw_processors.protools"
+DAWPROJECT = "daw_processors.dawproject"
+NAMED_PRESET = "Studio Mix"
+
+
+@pytest.fixture(scope="module")
+def qapp():
+    app = QApplication.instance()
+    if app is None:
+        app = QApplication([])
+    return app
+
+
+@pytest.fixture
+def app_config(monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "get_app_dir", lambda: str(tmp_path / "settings"))
+    config = settings.build_defaults()
+    preset = config["config_presets"]["Default"]
+    preset["daw_processors"]["protools"].update(
+        protools_project_dir=str(tmp_path / "protools-default"),
+        protools_port=31416,
+        protools_templates=[{"group": "Mix", "name": "Pro Tools Template"}],
+    )
+    preset["daw_processors"]["dawproject"].update(
+        dawproject_project_dir=str(tmp_path / "dawproject-default"),
+        dawproject_templates=[{
+            "name": "DAWproject Template",
+            "template_path": str(tmp_path / "template.dawproject"),
+            "fader_ceiling_db": 6.0,
+        }],
+    )
+    named_preset = copy.deepcopy(preset)
+    named_preset["daw_processors"]["protools"].update(
+        protools_project_dir=str(tmp_path / "protools-studio"),
+        protools_port=32416,
+    )
+    config["config_presets"][NAMED_PRESET] = named_preset
+    settings.save_config(config)
+    return config
+
+
+@pytest.fixture
+def window(qapp, app_config, monkeypatch):
+    monkeypatch.setattr(QMessageBox, "question", lambda *args: QMessageBox.Yes)
+    monkeypatch.setattr(QMessageBox, "information", lambda *args: QMessageBox.Ok)
+
+    def unexpected_dialog(_parent, title, message, *_args):
+        pytest.fail(f"{title}: {message}")
+
+    monkeypatch.setattr(QMessageBox, "warning", unexpected_dialog)
+    monkeypatch.setattr(QMessageBox, "critical", unexpected_dialog)
+
+    win = SessionPrepWindow()
+    try:
+        yield win
+    finally:
+        win.close()
+
+
+def _open_project(window, config, tmp_path, preset="Default", *, tracks=()):
+    source = tmp_path / "audio"
+    source.mkdir()
+    window._restore_session_state({
+        "source_dir": str(source),
+        "active_config_preset": preset,
+        "session_config": copy.deepcopy(config["config_presets"][preset]),
+        "session_groups": config["group_presets"]["Default"],
+        "tracks": list(tracks),
+        "prepare_state": "ready",
+        "transfer_manifest": [TransferEntry("track-1", "Kick.wav", "Kick")],
+        "daw_state": {"protools_0": {"assignments": {"track-1": "drums"}}},
+    })
+
+
+@pytest.fixture
+def project(window, app_config, tmp_path):
+    _open_project(window, app_config, tmp_path)
+    return window
+
+
+@pytest.fixture
+def phase_work(window, monkeypatch):
+    requests = []
+    monkeypatch.setattr(window, "_on_topo_reanalyze", lambda: requests.append("layout"))
+    monkeypatch.setattr(window, "_on_analyze", lambda: requests.append("analysis"))
+    monkeypatch.setattr(window, "_on_prepare", lambda: requests.append("prepare"))
+    return requests
+
+
+def _field(widgets, section, key):
+    return dict(widgets[section])[key]
+
+
+def _save_preferences(window, monkeypatch, edit):
+    def edit_dialog(dialog):
+        edit(dialog)
+        dialog._save_btn.click()
+        assert dialog.saved
+        return dialog.result()
+
+    with monkeypatch.context() as modal:
+        modal.setattr(PreferencesDialog, "exec", edit_dialog)
+        window._on_preferences()
+
+
+def _select_daw(window, processor_id):
+    row = next(
+        row for row in range(window._daw_combo.count())
+        if window._daw_processors[window._daw_combo.itemData(row)].id == processor_id
+    )
+    window._daw_combo.setCurrentIndex(row)
+    assert window._active_daw_processor.id == processor_id
+
+
+def test_cancelled_preferences_keeps_project_fields_and_saved_defaults(
+    project, tmp_path, monkeypatch, phase_work,
+):
+    original = project._active_daw_processor.project_dir
+    before = settings.load_config()
+
+    def edit_and_cancel(dialog):
+        _field(dialog._cfg_widgets, PRO_TOOLS, "protools_project_dir").set_value(
+            str(tmp_path / "cancelled"))
+        dialog.reject()
+        return dialog.result()
+
+    monkeypatch.setattr(PreferencesDialog, "exec", edit_and_cancel)
+    project._on_preferences()
+
+    assert project._active_daw_processor.project_dir == original
+    assert settings.load_config() == before
+    assert phase_work == []
+
+
+def test_declining_preset_switch_keeps_project_selection_and_overrides(
+    project, tmp_path, monkeypatch, phase_work,
+):
+    custom = str(tmp_path / "project-only")
+    _field(project._session_widgets, PRO_TOOLS, "protools_project_dir").set_value(custom)
+    monkeypatch.setattr(QMessageBox, "question", lambda *args: QMessageBox.No)
+
+    project._config_preset_combo.setCurrentText(NAMED_PRESET)
+
+    assert project._config_preset_combo.currentText() == "Default"
+    assert project._active_daw_processor.project_dir == custom
+    assert project._flat_config()["protools_port"] == 31416
+    assert phase_work == []
+
+
+def test_processor_enable_override_updates_processing_controls_without_reanalysis(
+    project, phase_work,
+):
+    switch = _field(
+        project._session_widgets, "processors.bimodal_normalize", "bimodal_normalize_enabled")
+    before = [processor.id for processor in project._session.processors]
+    assert "bimodal_normalize" in before
+
+    switch.setChecked(False)
+    assert "bimodal_normalize" not in [processor.id for processor in project._session.processors]
+    switch.setChecked(True)
+    assert [processor.id for processor in project._session.processors] == before
+    assert project._session.prepare_state == "stale"
+    assert phase_work == []
+
+
+def test_open_project_keeps_its_preset_when_preferences_saves_another_default(
+    project, tmp_path, monkeypatch,
+):
+    new_default_dir = str(tmp_path / "default-updated")
+
+    def edit(dialog):
+        path = _field(dialog._cfg_widgets, PRO_TOOLS, "protools_project_dir")
+        path.set_value(new_default_dir)
+        dialog._cfg_panel._combo.setCurrentText(NAMED_PRESET)
+
+    _save_preferences(project, monkeypatch, edit)
+
+    assert settings.load_config()["app"]["active_config_preset"] == NAMED_PRESET
+    assert project._config_preset_combo.currentText() == "Default"
+    assert project._flat_config()["protools_project_dir"] == new_default_dir
+    assert project._active_daw_processor.project_dir == new_default_dir
+
+
+def test_loading_named_project_selects_its_preset_in_config(window, app_config, tmp_path):
+    _open_project(window, app_config, tmp_path, NAMED_PRESET)
+
+    assert settings.load_config()["app"]["active_config_preset"] == "Default"
+    assert window._config_preset_combo.currentText() == NAMED_PRESET
+    assert window._flat_config()["protools_port"] == 32416
+
+
+def test_rename_and_delete_follow_preset_identity_and_preserve_project_edits(
+    window, app_config, phase_work, tmp_path, monkeypatch,
+):
+    _open_project(window, app_config, tmp_path, NAMED_PRESET)
+    custom_dir = str(tmp_path / "project-only")
+    path = _field(window._session_widgets, PRO_TOOLS, "protools_project_dir")
+    port = _field(window._session_widgets, PRO_TOOLS, "protools_port")
+    path.set_value(custom_dir)
+    renamed = "Renamed Studio Mix"
+    monkeypatch.setattr(QInputDialog, "getText", lambda *args, **kwargs: (renamed, True))
+
+    def rename(dialog):
+        panel = dialog._cfg_panel
+        panel._combo.setCurrentText(NAMED_PRESET)
+        panel._rename_btn.click()
+        panel._combo.setCurrentText("Default")
+
+    _save_preferences(window, monkeypatch, rename)
+
+    assert window._config_preset_combo.currentText() == renamed
+    assert window._config_preset_combo.findText(NAMED_PRESET) == -1
+    assert port.value() == 32416
+    assert path.value() == custom_dir
+    assert window._active_daw_processor.project_dir == custom_dir
+
+    def delete(dialog):
+        panel = dialog._cfg_panel
+        panel._combo.setCurrentText(renamed)
+        panel._delete_btn.click()
+
+    _save_preferences(window, monkeypatch, delete)
+
+    assert window._config_preset_combo.currentText() == "Default"
+    assert renamed not in settings.load_config()["config_presets"]
+    assert port.value() == 31416
+    assert path.value() == custom_dir
+    assert window._active_daw_processor.project_dir == custom_dir
+    assert window._session.prepare_state == "ready"
+    assert phase_work == []
+
+
+@pytest.mark.parametrize("override_protools", [False, True], ids=["inherited", "override"])
+def test_saving_two_daw_directories_updates_inherited_fields_and_keeps_preparation(
+    project, phase_work, tmp_path, monkeypatch, override_protools,
+):
+    protools_dir = str(tmp_path / "protools-updated")
+    dawproject_dir = str(tmp_path / "dawproject-updated")
+    custom_dir = str(tmp_path / "project-only")
+    protools_widget = _field(project._session_widgets, PRO_TOOLS, "protools_project_dir")
+    dawproject_widget = _field(project._session_widgets, DAWPROJECT, "dawproject_project_dir")
+    local_groups = copy.deepcopy(project._session_groups)
+    local_groups[0]["gain_linked"] = not local_groups[0]["gain_linked"]
+    project._session_groups = copy.deepcopy(local_groups)
+    monkeypatch.setattr(QMessageBox, "question", lambda *args: pytest.fail(
+        "A DAW-only save should not prompt to replace local groups"))
+    assert project._session.prepare_state == "ready"
+    if override_protools:
+        protools_widget.set_value(custom_dir)
+    _select_daw(project, "dawproject_0")
+
+    def edit(dialog):
+        _field(dialog._cfg_widgets, PRO_TOOLS, "protools_project_dir").set_value(protools_dir)
+        _field(dialog._cfg_widgets, DAWPROJECT, "dawproject_project_dir").set_value(dawproject_dir)
+
+    _save_preferences(project, monkeypatch, edit)
+
+    assert project._active_daw_processor.id == "dawproject_0"
+    assert project._active_daw_processor.project_dir == dawproject_dir
+    assert dawproject_widget.value() == dawproject_dir
+    expected_protools_dir = custom_dir if override_protools else protools_dir
+    assert protools_widget.value() == expected_protools_dir
+    _select_daw(project, "protools_0")
+    assert project._active_daw_processor.project_dir == expected_protools_dir
+    assert project._session.prepare_state == "ready"
+    assert project._session.daw_state["protools_0"]["assignments"] == {"track-1": "drums"}
+    assert project._session_groups == local_groups
+    assert project._transfer_action.isEnabled()
+    assert phase_work == []
+
+
+def test_mixed_preferences_save_refreshes_summary_and_transfer_without_reanalysis(
+    window, app_config, phase_work, tmp_path, monkeypatch,
+):
+    track = TrackContext(
+        filename="Kick.wav",
+        filepath=str(tmp_path / "audio" / "Kick.wav"),
+        audio_data=None,
+        samplerate=48000,
+        channels=1,
+        total_samples=48000,
+        bitdepth="24-bit PCM",
+        subtype="PCM_24",
+        duration_sec=1.0,
+    )
+    _open_project(window, app_config, tmp_path, tracks=[track])
+    clean_finding = "No digital clipping detected"
+    assert clean_finding not in window._summary_view.toPlainText()
+    new_dir = str(tmp_path / "protools-updated")
+
+    def edit(dialog):
+        _field(dialog._cfg_widgets, "_presentation", "show_clean_detectors").setChecked(True)
+        _field(dialog._cfg_widgets, "analysis", "window").setValue(800)
+        _field(dialog._cfg_widgets, PRO_TOOLS, "protools_project_dir").set_value(new_dir)
+
+    _save_preferences(window, monkeypatch, edit)
+
+    assert clean_finding in window._summary_view.toPlainText()
+    assert window._flat_config()["window"] == 800
+    assert window._active_daw_processor.project_dir == new_dir
+    assert phase_work == []
+
+
+def test_editing_port_back_to_preset_refreshes_phase3_and_pins_that_value(
+    project, phase_work, monkeypatch,
+):
+    observed_ports = []
+
+    def check_connection(connection, **_kwargs):
+        observed_ports.append(connection.port)
+        return True, "Test connection"
+
+    monkeypatch.setattr(protools, "check_ptsl_connectivity", check_connection)
+    port = _field(project._session_widgets, PRO_TOOLS, "protools_port")
+
+    port.setValue(32416)
+    project._active_daw_processor.check_connectivity()
+    port.setValue(31416)
+    project._active_daw_processor.check_connectivity()
+
+    assert observed_ports == [32416, 31416]
+
+    _save_preferences(
+        project, monkeypatch,
+        lambda dialog: _field(dialog._cfg_widgets, PRO_TOOLS, "protools_port").setValue(33416),
+    )
+    project._active_daw_processor.check_connectivity()
+
+    assert port.value() == 31416
+    assert observed_ports[-1] == 31416
+    assert phase_work == []
+
+
+def test_blank_project_directory_remains_an_override_until_revert(
+    project, tmp_path, monkeypatch,
+):
+    path = _field(project._session_widgets, PRO_TOOLS, "protools_project_dir")
+    path.set_value("")
+    new_dir = str(tmp_path / "protools-updated")
+
+    _save_preferences(
+        project, monkeypatch,
+        lambda dialog: _field(dialog._cfg_widgets, PRO_TOOLS, "protools_project_dir").set_value(new_dir),
+    )
+
+    assert path.value() == ""
+    assert project._active_daw_processor.project_dir == ""
+
+    project._on_session_config_reset()
+
+    assert path.value() == new_dir
+    assert project._active_daw_processor.project_dir == new_dir
+
+    later_dir = str(tmp_path / "protools-later")
+    _save_preferences(
+        project, monkeypatch,
+        lambda dialog: _field(dialog._cfg_widgets, PRO_TOOLS, "protools_project_dir").set_value(later_dir),
+    )
+    assert path.value() == later_dir
+    assert project._active_daw_processor.project_dir == later_dir
+
+
+def test_removing_last_pro_tools_template_pins_the_empty_list(
+    project, monkeypatch,
+):
+    templates = project._session_daw_custom_widgets["protools"]
+    templates._table.setCurrentCell(0, 0)
+    remove = next(
+        button for button in templates.findChildren(QPushButton)
+        if button.text() == "Remove"
+    )
+    remove.click()
+
+    assert project._flat_config()["protools_templates"] == []
+    assert project._active_daw_processor.id == "dawproject_0"
+
+    def edit(dialog):
+        templates = dialog._cfg_daw_custom_widgets["protools"]
+        templates._table.item(0, 1).setText("Updated Template")
+
+    _save_preferences(project, monkeypatch, edit)
+
+    assert project._flat_config()["protools_templates"] == []
+    assert project._active_daw_processor.id == "dawproject_0"
+
+    project._on_session_config_reset()
+    _select_daw(project, "protools_0")
+    assert project._active_daw_processor.name.endswith("Updated Template")
+
+
+@pytest.mark.parametrize("explicit_port", [False, True], ids=["inherited", "explicit-equal"])
+def test_reopened_session_resolves_untouched_fields_against_current_preset(
+    project, tmp_path, monkeypatch, explicit_port,
+):
+    port = _field(project._session_widgets, PRO_TOOLS, "protools_port")
+    if explicit_port:
+        port.setValue(32416)
+        port.setValue(31416)
+    session_path = str(tmp_path / "mix.spsession")
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *args: (session_path, ""))
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *args: (session_path, ""))
+    project._on_save_session()
+    snapshot = load_session(session_path)["session_config"]
+    assert snapshot["daw_processors"]["protools"]["protools_port"] == 31416
+
+    updated_dir = str(tmp_path / "updated-projects")
+
+    def edit(dialog):
+        _field(dialog._cfg_widgets, PRO_TOOLS, "protools_port").setValue(33416)
+        _field(dialog._cfg_widgets, PRO_TOOLS, "protools_project_dir").set_value(updated_dir)
+
+    _save_preferences(project, monkeypatch, edit)
+    project._on_load_session()
+
+    expected_port = 31416 if explicit_port else 33416
+    assert port.value() == expected_port
+    assert project._flat_config()["protools_port"] == expected_port
+    assert project._active_daw_processor.project_dir == updated_dir
+
+
+def test_switching_project_preset_preserves_overrides_and_refreshes_phase3_without_analysis(
+    project, phase_work, tmp_path,
+):
+    custom_dir = str(tmp_path / "project-only")
+    path = _field(project._session_widgets, PRO_TOOLS, "protools_project_dir")
+    path.set_value(custom_dir)
+
+    project._config_preset_combo.setCurrentText(NAMED_PRESET)
+
+    assert path.value() == custom_dir
+    assert project._active_daw_processor.project_dir == custom_dir
+    assert _field(project._session_widgets, PRO_TOOLS, "protools_port").value() == 32416
+    assert project._flat_config()["protools_port"] == 32416
+    assert settings.load_config()["app"]["active_config_preset"] == "Default"
+    assert project._session.prepare_state == "ready"
+    assert phase_work == []

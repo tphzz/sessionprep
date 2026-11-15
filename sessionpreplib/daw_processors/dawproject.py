@@ -45,6 +45,10 @@ class DawProjectDawProcessor(DawProcessor):
     name = "DAWproject"
     fader_ceiling_db: float = 6.0
 
+    @property
+    def template_identity(self) -> tuple[str, ...]:
+        return ("dawproject", self._template_name, self._template_path)
+
     def __init__(
         self,
         *,
