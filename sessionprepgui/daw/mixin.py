@@ -784,7 +784,7 @@ class DawMixin:  # pylint: disable=too-few-public-methods
         else:
             log.error("DAW transfer failed: %s", message)
             self._progress_fail(message)
-            self._status_bar.showMessage(f"Transfer failed: {message}")
+            self._status_bar.showMessage(message)
 
     # ── Folder tree ──────────────────────────────────────────────────────
 

@@ -105,14 +105,37 @@ class DawTransferWorker(QThread):
         try:
             results = self._processor.transfer(
                 self._session, self._output_path, progress_cb=self._on_progress, close_when_done=self._close_session)
-            failures = [r for r in results if not r.success]
-            if failures:
-                msg = f"Transfer done: {len(results) - len(failures)}/{len(results)} OK"
-            else:
-                msg = f"Transfer complete ({len(results)} operations)"
-            self.result.emit(True, msg, results)
-        except Exception as e:
-            self.result.emit(False, str(e), None)
+        except Exception as exc:
+            self.result.emit(False, f"Transfer failed. {str(exc) or type(exc).__name__}", None)
+            return
+
+        if not results:
+            self.result.emit(False, "No transfer operations ran. Check the track assignments.", results)
+            return
+
+        failures = [result for result in results if not result.success]
+        if not failures:
+            self.result.emit(True, f"Transfer complete ({len(results)} operations)", results)
+            return
+
+        for failure in failures:
+            log.warning("DAW operation %s failed for %s: %s",
+                        failure.command.command_type, failure.command.target, failure.error)
+
+        first = failures[0]
+        target = first.command.target
+        message = first.error or f"{first.command.command_type.replace('_', ' ').capitalize()} failed."
+        if target:
+            message = f"{message} ({target})"
+        completed = len(results) - len(failures)
+        summary = (
+            f"Transfer incomplete ({completed}/{len(results)} operations)."
+            if completed else "Transfer failed."
+        )
+        message = f"{summary} {message}"
+        if len(failures) > 1:
+            message = f"{message} See the log for the other failed operations."
+        self.result.emit(False, message, results)
 
 
 class Phase1AnalyzeWorker(QThread):

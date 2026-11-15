@@ -114,7 +114,10 @@ points up to open and down to close; keyboard focus remains visible.
 Table Gain fields share the neighboring selectors’ gray surface, with clear focus
 and muted disabled values.
 
-**4. Import** processed tracks into your DAW. Use **DAW Transfer** in the GUI to apply fader offsets automatically (Pro Tools via PTSL, DAWproject via file generation).
+**4. Import** processed tracks into your DAW. **DAW Transfer** writes fader
+offsets into the DAWproject file. Pro Tools transfer imports the audio and
+saves the session. Automatic Pro Tools fader offsets are temporarily disabled.
+The **Fader Gain** column shows the calculated offsets.
 
 ---
 
@@ -162,7 +165,7 @@ SessionPrep operates in three phases:
 |-------|------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|--------------------------------|
 | **1** | Track Layout           | Define how source tracks map to output files: channel routing, reordering, splitting, merging. Automatically optimizes layouts based on Phase 1 diagnostics (e.g. dropping silent files, extracting active channels from dual-mono and one-sided silence). Drag-and-drop between input/output trees with visual insert-position indicator. Optional recursive subfolder scanning. Output written to `sp_01_tracklayout/`. Pre-computed peak cache files written to `sp_peaks/` for fast waveform rendering. | GUI Phase 1 (always available) |
 | **2** | Analysis & Preparation | Format checks, clipping, DC offset, stereo compatibility, silence, subsonic, peak/RMS measurement, classification, tail exceedance. Bimodal normalization (clip gain adjustment) via Prepare. Output written to `sp_02_prepared/`.                                                                                                                                                                                        | GUI Phase 2 / CLI              |
-| **3** | DAW Transfer           | Transfer tracks into DAW session with per-track naming and folder assignment. Duplicate entries for multi-track scenarios (same clip on different tracks). Fader offsets applied automatically (Pro Tools via PTSL, DAWproject via file generation). Support for unattended batch processing of multiple songs.                                                                                                           | GUI Phase 3                    |
+| **3** | DAW Transfer           | Transfer tracks into DAW sessions with per-track naming and folder assignment. Duplicate entries for multi-track scenarios (same clip on different tracks). DAWproject files include fader offsets. Pro Tools transfers display the calculated offsets for manual use. Support for unattended batch processing of multiple songs. | GUI Phase 3 |
 
 
 ### Diagnostic categories

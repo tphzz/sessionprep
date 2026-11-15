@@ -177,6 +177,7 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
         self._prepare_worker: PrepareWorker | None = None
 
         self._batch_manager = BatchManager(self)
+        self._close_after_batch = False
         self._batch_manager.finished.connect(self._on_batch_finished)
         self._batch_manager.item_finished.connect(self._on_batch_item_finished)
 
@@ -676,8 +677,10 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
 
     @Slot()
     def _on_batch_finished(self):
-        self._batch_dock.set_running_state(False)
-        self._status_bar.showMessage("Batch processing complete.")
+        if self._close_after_batch:
+            QTimer.singleShot(0, self.close)
+        else:
+            self._batch_dock.set_running_state(False)
 
     @Slot(str, str, str)
     def _on_batch_item_finished(self, item_id: str, status: str, result_text: str):
@@ -1168,7 +1171,7 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
         )
 
     def closeEvent(self, event):
-        if self._batch_dock.has_items:
+        if self._batch_dock.has_items and not self._close_after_batch:
             reply = QMessageBox.warning(
                 self, "Pending Batch Items",
                 "You have pending sessions in the batch queue. Are you sure you want to quit?",
@@ -1177,6 +1180,13 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
             if reply != QMessageBox.Yes:
                 event.ignore()
                 return
+
+        if self._batch_manager.is_running:
+            self._close_after_batch = True
+            self._batch_manager.stop_after_current()
+            event.ignore()
+            return
+        self._close_after_batch = False
 
         self._playback.stop()
         self._pending_after_check = None

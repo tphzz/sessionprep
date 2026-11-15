@@ -92,6 +92,23 @@ uv run pytest
 uv run pytest --cov=sessionpreplib    # with coverage
 ```
 
+Pro Tools volume automation is temporarily disabled through
+`ptsl_helpers.VOLUME_AUTOMATION_ENABLED`. The opt-in test can verify the
+retained sample-zero write when the feature is enabled and the host permits
+the command. Run it with Pro Tools open and all sessions closed.
+
+```bash
+uv run pytest -q -ra tests/integration/test_ptsl_live.py --ptsl-live -k sample_zero
+```
+
+The test skips before connecting while the feature is disabled. On an enabled
+build, it also skips if the host rejects access. If the write succeeds and
+readback is restricted, run with
+`--basetemp` set to a fresh scratch directory. Reopen the saved test `.ptx`
+from that directory, show the `Sample Zero` track's Volume automation lane in
+the Edit window, and check the point at sample 0. Set the track to Read and
+play from sample 0 to verify −6.0 dB on its fader in the Mix window. [Pro Tools Reference Guide](https://resources.avid.com/SupportFiles/PT/Pro_Tools_Reference_Guide_2026.11.pdf)
+
 ### 1.5 Adding Dependencies
 
 ```bash
@@ -1254,20 +1271,23 @@ through the `py-ptsl` Python client.
 
 **Lifecycle implementation:**
 
-| Method                 | Behaviour                                                                                                                                                                                                                                                                                                                                                                                                               |
-|------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `check_connectivity()` | Opens a `ptsl.Engine`, calls `ptsl.open()`, returns success/failure + PTSL protocol version. On failure, the GUI shows a `QMessageBox.warning` dialog with the error and keeps the toolbar functional.                                                                                                                                                                                                                  |
-| `fetch(session)`       | Retrieves the folder track hierarchy and stores it in `session.daw_state["protools"]["folders"]`. Populates the GUI folder tree for drag-and-drop track assignment.                                                                                                                                                                                                                                                     |
-| `transfer(session)`    | Wrapped in a PTSL batch job for modal progress + user-lock. Phases: (1) batch import all audio files in one call, (2) per-track create + spot clip (parallel, 6 workers), (3) batch colorize by group, (4) set fader offsets (when bimodal normalization is enabled and processed files are used). Accepts a `progress_callback(step, total, message)` for GUI progress. Results appended to `session.daw_command_log`. |
-| `sync(session)`        | Not yet implemented (raises `NotImplementedError`).                                                                                                                                                                                                                                                                                                                                                                     |
+| Method | Behaviour |
+|--------|-----------|
+| `check_connectivity()` | Opens a `ptsl.Engine` and reports the connection result. The GUI shows the error if the connection fails. |
+| `fetch(session)` | Retrieves the folder hierarchy from the template cache or from a disposable Pro Tools session. Stores the result in `session.daw_state[processor.id]["folders"]` for track assignment. |
+| `transfer(session, output_path)` | Creates the project, batch-imports audio, creates and spots tracks in folder order, and applies group colors. Returns `DawCommandResult` entries for transfer operations, including individual failures. Saves the created session and closes it when running in the batch queue. |
+| `sync(session)` | Currently returns an empty list. |
 
 **Batch import optimisation:** All audio files are imported to the Pro Tools
-clip list in a single `CId_ImportData` call (instead of one per track),
+clip list in a single `CId_ImportAudioToClipList` call (instead of one per track),
 significantly reducing round-trip overhead on large sessions.
 
-**Automatic fader adjustment:** When bimodal normalization is enabled and
-processed files are used (`_use_processed`), fader offsets from the processor
-results are applied to newly created tracks via `CId_SetTrackVolume`.
+`VOLUME_AUTOMATION_ENABLED` gates the Pro Tools volume automation code. Gain
+planning calculates offsets and the GUI displays them. The retained write uses
+`CId_SetTrackControlBreakpoints` to place a single
+main-output volume point at sample 0 for playback. If enabled, an explicit
+capability rejection stops further volume writes for that transfer and records
+the PTSL error in the transfer result.
 
 **Color matching:**
 

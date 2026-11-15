@@ -16,6 +16,10 @@ except ImportError:
 from sessionpreplib.daw_processors import ptsl_helpers
 
 def main():
+    if not ptsl_helpers.VOLUME_AUTOMATION_ENABLED:
+        print("Pro Tools volume automation is currently disabled.")
+        return
+
     print("Connecting to Pro Tools Engine...")
     try:
         engine = Engine(

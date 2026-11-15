@@ -9,7 +9,7 @@ from typing import Any
 
 from ..models import ParamSpec
 from ..daw_processor import DawProcessor
-from ..models import DawCommand, DawCommandResult, SessionContext
+from ..models import DawCommand, DawCommandResult, SessionContext, TrackContext
 from ..log import dbg
 from . import ptsl_helpers as ptslh
 from .ptsl_connection import (
@@ -21,7 +21,6 @@ from .ptsl_connection import (
 import logging
 
 log = logging.getLogger(__name__)
-
 
 # Re-export color helpers from ptsl_helpers (private aliases for
 # backward compatibility within this module).
@@ -324,11 +323,12 @@ class ProToolsDawProcessor(DawProcessor):
 
         try:
             from ptsl import PTSL_pb2 as pt
-        except ImportError:
-            return session
+        except ImportError as exc:
+            raise RuntimeError("Pro Tools Fetch requires py-ptsl.") from exc
 
         engine = None
         temp_session_name = None
+        temp_session_path = None
         try:
             if progress_cb:
                 progress_cb(10, 100, "Connecting to Pro Tools...")
@@ -360,6 +360,8 @@ class ProToolsDawProcessor(DawProcessor):
             import uuid
 
             temp_session_name = f"SessionPrep_Temp_{uuid.uuid4().hex[:8]}"
+            temp_session_path = os.path.join(
+                self._temp_dir, temp_session_name, f"{temp_session_name}.ptx")
 
             if progress_cb:
                 progress_cb(
@@ -402,11 +404,15 @@ class ProToolsDawProcessor(DawProcessor):
             if progress_cb:
                 progress_cb(70, 100, "Reading track folder structure...")
 
+            if not ptslh.session_matches_path(engine, temp_session_path):
+                raise RuntimeError("Pro Tools switched sessions before SessionPrep could read the template folders.")
             all_tracks = self._track_list_with_retry(
                 engine,
                 timeout=self._template_create_timeout,
                 sleep_time=self._command_delay,
             )
+            if not ptslh.session_matches_path(engine, temp_session_path):
+                raise RuntimeError("Pro Tools switched sessions while SessionPrep was reading the template folders.")
             folders: list[dict[str, Any]] = []
             for track in all_tracks:
                 if track.type in (pt.TrackType.RoutingFolder, pt.TrackType.BasicFolder):
@@ -462,10 +468,11 @@ class ProToolsDawProcessor(DawProcessor):
             raise
         finally:
             if engine is not None:
-                if temp_session_name:
+                if temp_session_path and os.path.isfile(temp_session_path):
                     try:
-                        dbg(f"Closing temporary Pro Tools session: {temp_session_name!r}")
-                        ptslh.close_session(engine)
+                        if ptslh.session_matches_path(engine, temp_session_path):
+                            dbg(f"Closing temporary Pro Tools session: {temp_session_name!r}")
+                            ptslh.close_session(engine)
                     except Exception as e:
                         log.debug(f"Failed to close temp session: {e}")
                         dbg(f"Failed to close temporary Pro Tools session: {e}")
@@ -478,8 +485,6 @@ class ProToolsDawProcessor(DawProcessor):
             if temp_session_name:
                 # Defensive deletion of the temporary session folder
                 target_dir = os.path.join(self._temp_dir, temp_session_name)
-                ptx_file = os.path.join(target_dir, f"{temp_session_name}.ptx")
-
                 # Extreme safety checks to ensure we only delete what we created:
                 # 1. Ensure target_dir actually exists
                 # 2. Ensure target_dir is exactly a direct child of the configured temp dir
@@ -488,7 +493,8 @@ class ProToolsDawProcessor(DawProcessor):
                     os.path.isdir(target_dir)
                     and os.path.dirname(os.path.abspath(target_dir))
                     == os.path.abspath(self._temp_dir)
-                    and os.path.isfile(ptx_file)
+                    and not os.path.islink(target_dir)
+                    and os.path.isfile(temp_session_path)
                 ):
                     import shutil
                     import time
@@ -587,9 +593,9 @@ class ProToolsDawProcessor(DawProcessor):
           0. Connect and verify empty workspace
           1. Determine optimal specs and create new session
           2. Batch import all audio files in one call
-          3. Per-track: create track + spot clip  (parallel, 6 workers)
+          3. Create tracks in folder order and spot clips
           4. Batch colorize by group
-          5. Set fader offsets
+          5. Set fader offsets when volume automation is enabled
           6. Complete and save session
 
         Args:
@@ -640,9 +646,36 @@ class ProToolsDawProcessor(DawProcessor):
                 work.append((eid, fid))
 
         results: list[DawCommandResult] = []
+
+        def record(operation: str, target: str = "", *, error: str | None = None, **params: Any) -> None:
+            results.append(DawCommandResult(DawCommand(operation, target, params), error is None, error))
+
+        valid_work: list[tuple[str, str, str, TrackContext]] = []
+        for entry_id, folder_id in work:
+            entry = manifest_map.get(entry_id)
+            if entry is None:
+                record("validate_track", entry_id, error="The assigned track is missing from the transfer list.")
+                continue
+            if folder_id not in folder_map:
+                record("validate_track", entry.daw_track_name,
+                       error="The assigned Pro Tools folder is missing. Fetch and assign this track again.")
+                continue
+            track = out_track_map.get(entry.output_filename)
+            path = (track.processed_filepath or track.filepath) if track else None
+            if not path or not os.path.isfile(path):
+                record("validate_track", entry.daw_track_name,
+                       error=f"The audio file for this track could not be found. {path or entry.output_filename}")
+                continue
+            name = os.path.splitext(entry.daw_track_name)[0]
+            valid_work.append((folder_id, os.path.abspath(path), name, track))
+
+        if not valid_work:
+            return results
+
         engine = None
         delay = self._command_delay
         batch_job_id: str | None = None
+        created_session_path: str | None = None
 
         try:
             if progress_cb:
@@ -671,7 +704,9 @@ class ProToolsDawProcessor(DawProcessor):
                 raise RuntimeError("Project name is empty.")
 
             if ptslh.is_session_open(engine):
-                raise RuntimeError("PRO_TOOLS_SESSION_OPEN")
+                raise RuntimeError(
+                    "A Pro Tools session is currently open. Save and close it in Pro Tools, then try again."
+                )
 
             if progress_cb:
                 progress_cb(5, 100, "Calculating audio specifications...")
@@ -683,48 +718,28 @@ class ProToolsDawProcessor(DawProcessor):
             if progress_cb:
                 progress_cb(10, 100, f"Creating session '{session.project_name}'...")
 
-            try:
-                dbg(
-                    "Creating Pro Tools transfer session from template: "
-                    f"name={session.project_name!r} timeout={self._template_create_timeout:.1f}s"
+            ptslh.create_session_from_template(
+                engine,
+                session.project_name,
+                self._project_dir,
+                self._instance_group,
+                self._instance_name,
+                sample_rate=rate_enum,
+                bit_depth=depth_enum,
+                timeout=self._template_create_timeout,
+            )
+            created_session_path = os.path.join(
+                self._project_dir, session.project_name, f"{session.project_name}.ptx")
+            record("create_session", session.project_name)
+            if not ptslh.wait_for_host_ready(
+                engine, timeout=self._template_create_timeout, sleep_time=delay,
+            ):
+                raise RuntimeError(
+                    f"Pro Tools did not become ready within {self._template_create_timeout:g} seconds "
+                    "after creating the session."
                 )
-                ptslh.create_session_from_template(
-                    engine,
-                    session.project_name,
-                    self._project_dir,
-                    self._instance_group,
-                    self._instance_name,
-                    sample_rate=rate_enum,
-                    bit_depth=depth_enum,
-                    timeout=self._template_create_timeout,
-                )
-                dbg(f"Pro Tools transfer session created: {session.project_name!r}")
-                dbg("Waiting for Pro Tools host readiness after transfer session creation")
-                if not ptslh.wait_for_host_ready(
-                    engine,
-                    timeout=self._template_create_timeout,
-                    sleep_time=self._command_delay,
-                ):
-                    dbg("Pro Tools host readiness timed out after transfer session creation")
-                    raise RuntimeError(
-                        "Pro Tools created the session, but did not become ready "
-                        f"within {self._template_create_timeout:.1f} seconds."
-                    )
-                dbg("Pro Tools host ready after transfer session creation")
-                results.append(
-                    DawCommandResult(
-                        command=DawCommand("create_session", session.project_name, {}),
-                        success=True,
-                    )
-                )
-            except Exception as e:
-                return [
-                    DawCommandResult(
-                        command=DawCommand("create_session", session.project_name, {}),
-                        success=False,
-                        error=str(e),
-                    )
-                ]
+            if not ptslh.session_matches_path(engine, created_session_path):
+                raise RuntimeError("Pro Tools is no longer in the session created for this transfer.")
 
             # Re-fetch color palette from the new session
             pt_palette = ptslh.get_color_palette(engine)
@@ -738,35 +753,6 @@ class ProToolsDawProcessor(DawProcessor):
                             if idx is not None:
                                 group_palette_idx[entry.group] = idx
 
-            audio_files_dir = ptslh.get_session_audio_dir(engine)
-
-            # Validate work items and collect filepaths
-            valid_work: list[tuple[str, str, str, str, str, Any]] = []
-            for eid, fid in work:
-                folder = folder_map.get(fid)
-                if not folder:
-                    continue
-                entry = manifest_map.get(eid)
-                if not entry:
-                    continue
-                out_tc = out_track_map.get(entry.output_filename)
-                audio_path = (
-                    (out_tc.processed_filepath or out_tc.filepath) if out_tc else None
-                )
-                if not out_tc or not audio_path:
-                    continue
-
-                filepath = os.path.abspath(audio_path)
-                track_stem = os.path.splitext(entry.daw_track_name)[0]
-                track_format = "TF_Mono" if out_tc.channels == 1 else "TF_Stereo"
-                valid_work.append(
-                    (eid, fid, filepath, track_stem, track_format, out_tc)
-                )
-
-            if not valid_work:
-                log.debug("No valid work items")
-                return results
-
             # ── 2. Batch Import ──────────────────────────────────
 
             batch_job_id = ptslh.create_batch_job(
@@ -776,9 +762,9 @@ class ProToolsDawProcessor(DawProcessor):
             if progress_cb:
                 progress_cb(20, 100, "Importing audio to clip list...")
 
-            all_filepaths = list(dict.fromkeys(fp for _, _, fp, _, _, _ in valid_work))
+            all_filepaths = list(dict.fromkeys(path for _, path, _, _ in valid_work))
             clip_id_map: dict[str, list[str]] = {}
-            import_failures: set[str] = set()
+            import_failures: dict[str, str] = {}
 
             try:
                 import_resp = ptslh.batch_import_audio(
@@ -795,46 +781,33 @@ class ProToolsDawProcessor(DawProcessor):
                             if ids:
                                 clip_id_map[os.path.normcase(orig)] = list(ids)
                     for fail in import_resp.get("failure_list", []):
-                        fail_path = fail.get("original_input_path", "")
-                        import_failures.add(os.path.normcase(fail_path))
-
-                results.append(
-                    DawCommandResult(
-                        command=DawCommand("batch_import", "", {}), success=True
-                    )
-                )
-            except Exception as e:
-                if batch_job_id:
-                    ptslh.cancel_batch_job(engine, batch_job_id)
-                return [
-                    DawCommandResult(
-                        command=DawCommand("batch_import", "", {}),
-                        success=False,
-                        error=str(e),
-                    )
-                ]
+                        fail_path = fail.get("file_path") or fail.get("original_input_path", "")
+                        import_failures[os.path.normcase(fail_path)] = (
+                            fail.get("failure_message") or "Pro Tools rejected the audio file."
+                        )
+            except Exception as exc:
+                record("batch_import", error=str(exc))
+                return results
 
             # ── 3. Ordered Track Creation + Spot ────────────────
 
             color_groups: dict[int, list[str]] = {}
-            created_tracks: list[tuple[str, str, Any]] = []
-            spot_work = []
-            for step, (_, fid, filepath_val, track_stem, track_format, tc) in enumerate(
-                valid_work
-            ):
-                clip_ids = clip_id_map.get(os.path.normcase(filepath_val))
-                if not clip_ids or os.path.normcase(filepath_val) in import_failures:
+            created_tracks: list[tuple[str, str, TrackContext]] = []
+            work_by_folder: dict[str, list[tuple[str, TrackContext, list[str]]]] = {}
+            for folder_id, path, name, track in valid_work:
+                key = os.path.normcase(path)
+                clip_ids = clip_id_map.get(key)
+                if not clip_ids or key in import_failures:
+                    record("import_audio", name, error=import_failures.get(
+                        key, f"Pro Tools returned no clips for '{path}'."))
                     continue
-                spot_work.append(
-                    (step, fid, filepath_val, track_stem, track_format, tc, clip_ids)
-                )
+                work_by_folder.setdefault(folder_id, []).append((name, track, clip_ids))
 
-            work_by_folder: dict[str, list[tuple[Any, ...]]] = {}
-            for item in spot_work:
-                work_by_folder.setdefault(item[1], []).append(item)
+            total_spot = sum(len(items) for items in work_by_folder.values())
+            if total_spot == len(valid_work):
+                record("batch_import")
 
-            created_count = 0
-            total_spot = len(spot_work)
+            attempted = 0
             for fid, folder_items in work_by_folder.items():
                 folder_name = folder_map[fid]["name"]
 
@@ -842,23 +815,16 @@ class ProToolsDawProcessor(DawProcessor):
                 # cannot reorder tracks after creation. Creating the folder's
                 # tracks in reverse with TIPoint_First preserves SessionPrep's
                 # final order while pushing template tracks to the end.
-                for item in reversed(folder_items):
-                    (
-                        _step_val,
-                        _fid_val,
-                        _,
-                        track_stem_val,
-                        track_format_val,
-                        tc_val,
-                        clip_ids_val,
-                    ) = item
-                    pct = 30 + int(50 * (created_count + 1) / max(total_spot, 1))
+                for name, track, clip_ids in reversed(folder_items):
+                    track_format = "TF_Mono" if track.channels == 1 else "TF_Stereo"
+                    attempted += 1
+                    pct = 30 + int(50 * attempted / total_spot)
 
                     try:
                         tid, created_name = ptslh.create_track_with_name(
                             engine,
-                            track_stem_val,
-                            track_format_val,
+                            name,
+                            track_format,
                             insertion_point_track_name=folder_name,
                             insertion_point_position="TIPoint_First",
                             batch_job_id=batch_job_id,
@@ -866,31 +832,24 @@ class ProToolsDawProcessor(DawProcessor):
                         )
                         ptslh.spot_clips(
                             engine,
-                            clip_ids_val,
+                            clip_ids,
                             tid,
                             batch_job_id=batch_job_id,
                             progress=pct,
                         )
 
-                        created_tracks.append((created_name, tid, tc_val))
-                        if tc_val.group in group_palette_idx:
-                            color_groups.setdefault(
-                                group_palette_idx[tc_val.group], []
-                            ).append(created_name)
-                    except Exception as ex:
-                        log.debug(
-                            "Create/spot failed for %s in %s: %s",
-                            track_stem_val,
-                            folder_name,
-                            ex,
-                        )
+                        record("spot_clip", created_name)
+                        created_tracks.append((created_name, tid, track))
+                        if track.group in group_palette_idx:
+                            color_groups.setdefault(group_palette_idx[track.group], []).append(created_name)
+                    except Exception as exc:
+                        record("spot_clip", name, error=str(exc))
 
-                    created_count += 1
-                    if progress_cb and total_spot:
+                    if progress_cb:
                         progress_cb(
-                            30 + int(50 * created_count / total_spot),
+                            pct,
                             100,
-                            f"Created {created_count}/{total_spot} tracks",
+                            f"Transferred {len(created_tracks)}/{total_spot} tracks",
                         )
 
             # ── 4. Colorize ──────────────────────────────────────
@@ -900,15 +859,16 @@ class ProToolsDawProcessor(DawProcessor):
                     ptslh.colorize_tracks(
                         engine, names, cidx, batch_job_id=batch_job_id, progress=90
                     )
-                except Exception:
-                    pass
+                    record("colorize_tracks", ", ".join(names))
+                except Exception as exc:
+                    record("colorize_tracks", ", ".join(names), error=str(exc))
 
             # ── 5. Faders ────────────────────────────────────────
 
             proc_id = "bimodal_normalize"
             bn_enabled = session.config.get(f"{proc_id}_enabled", True)
-            if bn_enabled:
-                for _, t_id, tc in created_tracks:
+            if ptslh.VOLUME_AUTOMATION_ENABLED and bn_enabled:
+                for name, t_id, tc in created_tracks:
                     if proc_id in tc.processor_skip:
                         continue
                     pr = tc.processor_results.get(proc_id)
@@ -928,59 +888,52 @@ class ProToolsDawProcessor(DawProcessor):
                             batch_job_id=batch_job_id,
                             progress=95,
                         )
-                    except Exception as e:
-                        log.debug(f"Fader set failed for {t_id}: {e}")
+                        record("set_fader", name, fader_db=fader_db)
+                    except Exception as exc:
+                        detail = str(exc)
+                        error = f"Could not write volume automation at sample 0. {detail}"
+                        command_error = detail.casefold()
+                        volume_unavailable = (
+                            "private api has not been enabled in this session" in command_error
+                            or "pt_unsupportedcommand" in command_error
+                        )
+                        if volume_unavailable:
+                            error += " SessionPrep stopped volume automation writes for this transfer."
+                        record("set_fader", name, fader_db=fader_db, error=error)
+                        if volume_unavailable:
+                            break
 
             # ── 6. Save & Close ──────────────────────────────────
-
-            if progress_cb:
-                msg = "Saving and closing session..." if close_when_done else "Saving session..."
-                progress_cb(98, 100, msg)
 
             if batch_job_id:
                 ptslh.complete_batch_job(engine, batch_job_id)
                 batch_job_id = None
 
-            try:
-                if close_when_done:
-                    ptslh.close_session(engine, save_on_close=True, delay=delay)
-                    results.append(
-                        DawCommandResult(
-                            command=DawCommand("close_session", "", {}), success=True
-                        )
-                    )
-                else:
-                    ptslh.save_session(engine)
-                    results.append(
-                        DawCommandResult(
-                            command=DawCommand("save_session", "", {}), success=True
-                        )
-                    )
-            except Exception as e:
-                cmd_name = "close_session" if close_when_done else "save_session"
-                results.append(
-                    DawCommandResult(
-                        command=DawCommand(cmd_name, "", {}),
-                        success=False,
-                        error=str(e),
-                    )
-                )
-
-        except Exception as e:
-            results.append(
-                DawCommandResult(
-                    command=DawCommand("create_project", "", {}),
-                    success=False,
-                    error=str(e),
-                )
-            )
+        except Exception as exc:
+            operation = "transfer" if created_session_path else "create_session"
+            record(operation, session.project_name, error=str(exc))
         finally:
-            if batch_job_id and engine:
-                ptslh.cancel_batch_job(engine, batch_job_id)
-            if engine:
+            if engine is not None:
+                if batch_job_id:
+                    ptslh.cancel_batch_job(engine, batch_job_id)
+                if created_session_path:
+                    operation = "close_session" if close_when_done else "save_session"
+                    try:
+                        if progress_cb:
+                            msg = "Saving and closing session..." if close_when_done else "Saving session..."
+                            progress_cb(98, 100, msg)
+                        if not ptslh.session_matches_path(engine, created_session_path):
+                            raise RuntimeError("Pro Tools switched sessions before SessionPrep could save this project.")
+                        if close_when_done:
+                            ptslh.close_session(engine, save_on_close=True, delay=delay)
+                        else:
+                            ptslh.save_session(engine)
+                        record(operation, session.project_name)
+                    except Exception as exc:
+                        record(operation, session.project_name, error=str(exc))
                 engine.close()
 
-        if progress_cb:
+        if progress_cb and all(result.success for result in results):
             progress_cb(100, 100, "Project creation complete")
         return results
 

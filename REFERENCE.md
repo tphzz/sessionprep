@@ -413,15 +413,12 @@ In execute mode (`-x/--execute`), the script generates a text report and a
 machine-readable JSON file (`sessionprep.json`) for applying fader offsets.
 In dry-run mode (no `-x`), it prints a session overview to the terminal.
 
-This ensures that when you hit play, the mix balance is 100% identical to
-the producer's rough mix, your files are error-checked, and your starting levels
-are more consistent. Per-insert gain staging is still part of mixing.
+Applying the offsets preserves the producer's rough-mix balance while keeping
+the prepared levels ahead of your inserts.
 
-**Fader offset application:** The GUI's **DAW Transfer** action applies offsets
-automatically:
-- **Pro Tools** — faders are set via `CId_SetTrackVolume` through the
-  [Pro Tools Scripting SDK (PTSL)](https://developer.avid.com/) (requires
-  bimodal normalization enabled and processed files in use).
+- **Pro Tools** — **DAW Transfer** imports the audio and saves the session.
+  Automatic volume automation is temporarily disabled. The **Fader Gain**
+  column lists the calculated offsets for manual application.
 - **DAWproject** — fader volumes are written directly into the generated
   `.dawproject` file.
 

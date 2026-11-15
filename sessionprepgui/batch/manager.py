@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Callable
 
 log = logging.getLogger(__name__)
 
@@ -34,12 +34,21 @@ class BatchManager(QObject):
         self._current_index: int = 0
         self._running: bool = False
 
-        # Workers
-        self._check_worker: DawCheckWorker | None = None
-        self._transfer_worker: DawTransferWorker | None = None
+        self._worker: DawCheckWorker | DawTransferWorker | None = None
+        self._worker_result: tuple[bool, str] | None = None
         self._current_dp: DawProcessor | None = None
         self._current_session: SessionContext | None = None
         self._is_single_job: bool = False
+        self._stop_requested = False
+
+    @property
+    def is_running(self) -> bool:
+        return self._running
+
+    def stop_after_current(self) -> None:
+        """Finish the active transfer before yielding the queue to shutdown."""
+        if self._running:
+            self._stop_requested = True
 
     def start_batch(self, items: list[BatchItem]):
         if self._running or not items:
@@ -67,62 +76,69 @@ class BatchManager(QObject):
         self._process_next()
 
     def _process_next(self):
-        if self._current_index >= len(self._queue):
-            self._finish_batch()
+        while not self._stop_requested and self._current_index < len(self._queue):
+            self._on_transfer_progress_value(0, 1)
+
+            item = self._queue[self._current_index]
+            item.status = "Running"
+            item.result_text = "Checking DAW..."
+            self.item_finished.emit(item.id, item.status, item.result_text)
+            self.batch_progress_message.emit(f"[{item.project_name}] Checking DAW...")
+
+            try:
+                self._current_session = self._rehydrate_session(item.session_state)
+                self._current_dp = self._get_daw_processor(
+                    item.daw_processor_id, self._current_session.config)
+            except Exception as exc:
+                self._complete_item("Failed", f"Failed to prepare job: {exc}")
+                continue
+
+            if not self._current_dp:
+                self._complete_item("Failed", f"DAW Processor '{item.daw_processor_id}' not found.")
+                continue
+
+            worker = DawCheckWorker(self._current_dp, parent=self)
+            self._start_worker(worker, self._on_check_finished)
             return
 
-        # Emit baseline progress for this job
-        self._on_transfer_progress_value(0, 1)
+        self._finish_batch()
+
+    def _start_worker(self, worker: DawCheckWorker | DawTransferWorker, on_finished: Callable[[], None]):
+        self._worker = worker
+        worker.result.connect(self._record_worker_result)
+        worker.finished.connect(on_finished)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+
+    @Slot(bool, str)
+    def _record_worker_result(self, ok: bool, message: str):
+        self._worker_result = (ok, message)
+
+    def _take_worker_result(self) -> tuple[bool, str]:
+        # A worker can emit its result before run() unwinds.
+        result = self._worker_result
+        self._worker_result = None
+        self._worker = None
+        return result if result is not None else (False, "DAW worker finished without a result.")
+
+    @Slot()
+    def _on_check_finished(self):
+        ok, message = self._take_worker_result()
+        if not ok:
+            self._complete_item("Failed", f"DAW Check Failed: {message}")
+            self._process_next()
+            return
 
         item = self._queue[self._current_index]
-        item.status = "Running"
-        item.result_text = "Checking DAW..."
-        self.item_finished.emit(item.id, item.status, item.result_text)
-        self.batch_progress_message.emit(f"[{item.project_name}] Checking DAW...")
-
-        # 1. Rehydrate Session and Processor
-        try:
-            self._current_session = self._rehydrate_session(item.session_state)
-            self._current_dp = self._get_daw_processor(item.daw_processor_id, self._current_session.config)
-        except Exception as e:
-            self._handle_item_failure(item, f"Failed to prepare job: {e}")
-            return
-
-        if not self._current_dp:
-            self._handle_item_failure(item, f"DAW Processor '{item.daw_processor_id}' not found.")
-            return
-
-        # 2. Run Pre-flight Check (connectivity & open session)
-        self._check_worker = DawCheckWorker(self._current_dp)
-        self._check_worker.result.connect(lambda ok, msg: self._on_check_result(item, ok, msg))
-        self._check_worker.start()
-
-    @Slot(object, bool, str)
-    def _on_check_result(self, item: BatchItem, ok: bool, message: str):
-        self._check_worker = None
-
-        if not ok:
-            self._handle_item_failure(item, f"DAW Check Failed: {message}")
-            return
-
-        # Optional: Further checks against the DAW state could be placed here if needed.
-        # e.g., if message indicates a session is already open and shouldn't be.
-        # We rely on the fetch/check logic for now.
-        if "PRO_TOOLS_SESSION_OPEN" in message:
-            self._handle_item_failure(item, "DAW Check Failed: Pro Tools session is open. Close it first.")
-            return
-
-        # 3. Start Transfer
         item.result_text = "Transferring..."
         self.item_finished.emit(item.id, item.status, item.result_text)
         self.batch_progress_message.emit(f"[{item.project_name}] Transferring...")
 
-        self._transfer_worker = DawTransferWorker(
-            self._current_dp, self._current_session, item.output_path)
-        self._transfer_worker.progress.connect(self._on_transfer_progress)
-        self._transfer_worker.progress_value.connect(self._on_transfer_progress_value)
-        self._transfer_worker.result.connect(lambda ok, msg, results: self._on_transfer_result(item, ok, msg))
-        self._transfer_worker.start()
+        worker = DawTransferWorker(
+            self._current_dp, self._current_session, item.output_path, parent=self)
+        worker.progress.connect(self._on_transfer_progress)
+        worker.progress_value.connect(self._on_transfer_progress_value)
+        self._start_worker(worker, self._on_transfer_finished)
 
     @Slot(str)
     def _on_transfer_progress(self, message: str):
@@ -142,33 +158,33 @@ class BatchManager(QObject):
 
         self.batch_progress_value.emit(overall_current, overall_total)
 
-    @Slot(object, bool, str)
-    def _on_transfer_result(self, item: BatchItem, ok: bool, message: str):
-        self._transfer_worker = None
-
-        if ok:
-            item.status = "Success"
-            item.result_text = "Success"
-        else:
-            item.status = "Failed"
-            item.result_text = message
-
-        self.item_finished.emit(item.id, item.status, item.result_text)
-
-        self._current_index += 1
+    @Slot()
+    def _on_transfer_finished(self):
+        ok, message = self._take_worker_result()
+        self._complete_item("Success" if ok else "Failed", message)
         self._process_next()
 
-    def _handle_item_failure(self, item: BatchItem, error_msg: str):
-        item.status = "Failed"
-        item.result_text = error_msg
+    def _complete_item(self, status: str, message: str):
+        item = self._queue[self._current_index]
+        item.status = status
+        item.result_text = message
         self.item_finished.emit(item.id, item.status, item.result_text)
-
-        # In a batch, we proceed to next item even if one fails
         self._current_index += 1
-        self._process_next()
 
     def _finish_batch(self):
+        completed = self._queue[:self._current_index]
+        if completed:
+            failures = sum(item.status == "Failed" for item in completed)
+            if self._is_single_job:
+                message = completed[0].result_text
+            elif failures:
+                message = f"Batch finished with {failures} failed item(s)."
+            else:
+                message = "Batch processing complete."
+            self.batch_progress_message.emit(message)
+
         self._running = False
+        self._stop_requested = False
         self._current_index = 0
         self._queue = []
         self._current_dp = None

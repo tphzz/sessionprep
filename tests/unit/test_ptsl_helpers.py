@@ -1,4 +1,5 @@
 import json
+import os
 import pytest
 
 try:
@@ -306,7 +307,7 @@ def test_create_session_from_template_honors_timeout(
     monkeypatch.setattr("time.sleep", lambda _seconds: None)
     monkeypatch.setattr(ptsl_helpers.os.path, "isfile", lambda _path: False)
 
-    with pytest.raises(RuntimeError, match="failed to create the session"):
+    with pytest.raises(RuntimeError, match="failed to create the session") as error:
         ptsl_helpers.create_session_from_template(
             mock_engine,
             "TempSession",
@@ -315,3 +316,61 @@ def test_create_session_from_template_honors_timeout(
             "Template",
             timeout=0.01,
         )
+
+    assert str(tmp_path / "TempSession" / "TempSession.ptx") in str(error.value)
+    assert "0.01 seconds" in str(error.value)
+
+
+def test_create_session_checks_writability_before_calling_pro_tools(mock_engine, monkeypatch, tmp_path):
+    mkdir = os.mkdir
+    probes = []
+
+    def deny_subdirectory(path, *args, **kwargs):
+        if os.path.basename(path).startswith(".sessionprep-write-"):
+            assert os.path.dirname(path) == str(tmp_path)
+            probes.append(path)
+            raise PermissionError("Access denied")
+        return mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "mkdir", deny_subdirectory)
+    monkeypatch.setattr(ptsl_helpers.os.path, "isfile", lambda _path: False)
+
+    with pytest.raises(RuntimeError, match="not writable") as error:
+        ptsl_helpers.create_session_from_template(
+            mock_engine, "TempSession", str(tmp_path), "SessionPrep", "Template", timeout=0.01,
+        )
+
+    assert str(tmp_path) in str(error.value)
+    assert len(probes) == 1
+    mock_engine.client.raw_client.SendGrpcRequest.assert_not_called()
+
+
+def test_create_session_rejects_existing_destination_without_touching_it(mock_engine, monkeypatch, tmp_path):
+    existing = tmp_path / "Taken"
+    existing.mkdir()
+    sentinel = existing / "keep.txt"
+    sentinel.write_bytes(b"existing session data")
+    monkeypatch.setattr(ptsl_helpers.os.path, "isfile", lambda _path: False)
+
+    with pytest.raises(RuntimeError, match="already exists"):
+        ptsl_helpers.create_session_from_template(
+            mock_engine, "Taken", str(tmp_path), "SessionPrep", "Template", timeout=0.01,
+        )
+
+    assert sentinel.read_bytes() == b"existing session data"
+    mock_engine.client.raw_client.SendGrpcRequest.assert_not_called()
+
+
+def test_track_volume_writes_one_main_output_automation_point_at_sample_zero(mock_engine):
+    ptsl_helpers.set_track_volume(mock_engine, "track-123", -3.75, batch_job_id="batch-123")
+
+    req = mock_engine.client.raw_client.SendGrpcRequest.call_args.args[0]
+    assert req.header.command == pt.CommandId.CId_SetTrackControlBreakpoints
+    assert json.loads(req.header.versioned_request_header_json)["batch_job_header"]["id"] == "batch-123"
+    assert json.loads(req.request_body_json) == {
+        "track_id": "track-123",
+        "control_id": {"section": "TSId_MainOut", "control_type": "TCType_Volume"},
+        "breakpoints": [
+            {"time": {"location": "0", "time_type": "TLType_Samples"}, "value": -3.75},
+        ],
+    }

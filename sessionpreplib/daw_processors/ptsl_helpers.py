@@ -12,12 +12,16 @@ import json
 import math
 import os
 from typing import Any
+from uuid import uuid4
 
 import logging
 
 from sessionpreplib.log import dbg
 
 log = logging.getLogger(__name__)
+
+# Private PTSL volume breakpoint writes are temporarily disabled.
+VOLUME_AUTOMATION_ENABLED = False
 
 PTSL_COMMAND_ID_FALLBACKS: dict[str, int] = {
     # Pro Tools 2025.10 additions.
@@ -208,6 +212,26 @@ def is_session_open(engine) -> bool:
         # PTSL commands typically fail if no session is open.
         return False
 
+
+def session_matches_path(engine, expected_path: str) -> bool:
+    """Check ownership before saving or closing a session created by a transfer."""
+    from ptsl.errors import CommandError
+
+    try:
+        current_path = engine.session_path()
+    except CommandError as exc:
+        if exc.error_name != "PT_NoOpenedSession":
+            raise
+        return False
+    if not current_path:
+        return False
+    if os.path.normcase(os.path.abspath(current_path)) == os.path.normcase(os.path.abspath(expected_path)):
+        return True
+    try:
+        return os.path.samefile(current_path, expected_path)
+    except OSError:
+        return False
+
 def wait_for_host_ready(engine, timeout: float = 25.0, sleep_time: float = 0.5) -> bool:
     """
     Poll the Pro Tools HostReadyCheck endpoint.
@@ -305,7 +329,24 @@ def create_session_from_template(  # pylint: disable=too-many-positional-argumen
     from ptsl import PTSL_pb2 as pt
 
     location = os.path.abspath(session_location)
-    os.makedirs(location, exist_ok=True)
+    if not session_name or session_name in (".", "..") or any(char in session_name for char in "/\\:"):
+        raise ValueError("Choose a Pro Tools project name without path separators.")
+    session_dir = os.path.join(location, session_name)
+    session_path = os.path.join(session_dir, f"{session_name}.ptx")
+    if os.path.lexists(session_dir):
+        raise RuntimeError(f"The Pro Tools project directory already exists at '{session_dir}'. Choose a different project name.")
+    write_probe = os.path.join(location, f".sessionprep-write-{uuid4().hex}")
+    try:
+        os.makedirs(location, exist_ok=True)
+        # tempfile.mkdtemp can retry PermissionError on Windows when os.access
+        # says the directory is writable even though its ACL denies new folders.
+        os.mkdir(write_probe)
+        os.rmdir(write_probe)
+    except OSError as exc:
+        raise RuntimeError(
+            f"The Pro Tools session directory '{location}' is not writable. "
+            "Choose a writable directory in Preferences or Phase 2."
+        ) from exc
 
     body = {
         "session_name": session_name,
@@ -335,18 +376,15 @@ def create_session_from_template(  # pylint: disable=too-many-positional-argumen
     # Wait until Pro Tools actually loads the template and writes the PTX file.
     # It can take a few seconds for the background creation to finish.
     import time
-    session_dir = os.path.join(location, session_name)
-    session_path = os.path.join(session_dir, f"{session_name}.ptx")
-
     dbg(f"Waiting for Pro Tools session file: {session_path!r}")
-    start_time = time.time()
+    start_time = time.monotonic()
     last_log_second = -1
     success = False
-    while time.time() - start_time < timeout:
+    while time.monotonic() - start_time < timeout:
         if os.path.isfile(session_path):
             success = True
             break
-        elapsed = time.time() - start_time
+        elapsed = time.monotonic() - start_time
         elapsed_second = int(elapsed)
         if elapsed_second != last_log_second and elapsed_second % 5 == 0:
             dbg(
@@ -357,18 +395,18 @@ def create_session_from_template(  # pylint: disable=too-many-positional-argumen
         time.sleep(0.5)
 
     if not success:
-        elapsed = time.time() - start_time
+        elapsed = time.monotonic() - start_time
         dbg(
             "Timed out waiting for Pro Tools session file: "
             f"elapsed={elapsed:.1f}s timeout={timeout:.1f}s path={session_path!r}"
         )
         raise RuntimeError(
-            f"Pro Tools failed to create the session. Please check if the "
-            f"template '{template_group} / {template_name}' actually exists."
+            f"Pro Tools failed to create the session at '{session_path}' within {timeout:g} seconds. "
+            f"Check the destination and template '{template_group} / {template_name}' in Pro Tools."
         )
     dbg(
         "Pro Tools session file appeared: "
-        f"elapsed={time.time() - start_time:.1f}s path={session_path!r}"
+        f"elapsed={time.monotonic() - start_time:.1f}s path={session_path!r}"
     )
 
 def close_session(engine, save_on_close: bool = False, delay: float = 0.5) -> None:
@@ -623,7 +661,8 @@ def set_track_volume(
         batch_job_id: Optional batch job ID (from ``create_batch_job``).
         progress:     Batch job progress percentage (0–100).
 
-    Requires Pro Tools 2025.10+.
+    Introduced in Pro Tools 2025.10. The host must allow the private
+    volume automation command for this connection.
     """
     from ptsl import PTSL_pb2 as pt
     log.debug(f"set_track_volume: id={track_id}, value={volume_db}")
@@ -666,7 +705,8 @@ def set_track_volume_by_trackname(
         batch_job_id: Optional batch job ID (from ``create_batch_job``).
         progress:     Batch job progress percentage (0–100).
 
-    Requires Pro Tools 2025.10+.
+    Introduced in Pro Tools 2025.10. The host must allow the private
+    volume automation command for this connection.
     """
     from ptsl import PTSL_pb2 as pt
     log.debug(f"set_track_volume_by_trackname: name={track_name}, value={volume}")

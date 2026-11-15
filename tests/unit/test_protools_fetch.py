@@ -21,6 +21,7 @@ class _FakeEngine:
         self._tracks = tracks or []
         self._fail_first_track_list = fail_first_track_list
         self.track_list_calls = 0
+        self.open_path = ""
 
     def track_list(self):
         self.track_list_calls += 1
@@ -30,6 +31,9 @@ class _FakeEngine:
 
     def close(self):
         self.closed = True
+
+    def session_path(self):
+        return self.open_path
 
 
 @pytest.fixture
@@ -60,6 +64,9 @@ def fake_ptsl(monkeypatch):
 
     module.Engine = engine_factory
     monkeypatch.setitem(sys.modules, "ptsl", module)
+    errors = types.ModuleType("ptsl.errors")
+    errors.CommandError = RuntimeError
+    monkeypatch.setitem(sys.modules, "ptsl.errors", errors)
     return engines
 
 
@@ -116,6 +123,10 @@ def _cache_file(tmp_path, monkeypatch):
     return cache_dir / "pt_template_cache.json"
 
 
+def _fake_create_session(engine, name, directory, *_args, **_kwargs):
+    engine.open_path = str(Path(directory) / name / f"{name}.ptx")
+
+
 def _allow_fresh_fetch(monkeypatch):
     monkeypatch.setattr(protools.ptslh, "wait_for_host_ready", lambda *a, **k: True)
     monkeypatch.setattr(protools.ptslh, "is_session_open", lambda _engine: False)
@@ -123,7 +134,7 @@ def _allow_fresh_fetch(monkeypatch):
     monkeypatch.setattr(
         protools.ptslh,
         "create_session_from_template",
-        lambda *args, **kwargs: None,
+        _fake_create_session,
     )
 
 
@@ -138,6 +149,7 @@ def test_fetch_passes_template_timeout_and_retries_track_list(
 
     def fake_create_session_from_template(*args, **kwargs):
         create_calls.append((args, kwargs))
+        _fake_create_session(*args, **kwargs)
 
     monkeypatch.setattr(
         protools.ptslh,
@@ -162,7 +174,8 @@ def test_fetch_failure_does_not_emit_fetch_complete(
 ):
     monkeypatch.setattr(protools.ptslh, "wait_for_host_ready", lambda *a, **k: True)
     monkeypatch.setattr(protools.ptslh, "is_session_open", lambda _engine: False)
-    monkeypatch.setattr(protools.ptslh, "close_session", lambda _engine: None)
+    closed_sessions = []
+    monkeypatch.setattr(protools.ptslh, "close_session", closed_sessions.append)
 
     def fail_create_session_from_template(*args, **kwargs):
         raise RuntimeError("template creation failed")
@@ -181,6 +194,23 @@ def test_fetch_failure_does_not_emit_fetch_complete(
         )
 
     assert "Fetch complete" not in progress
+    assert closed_sessions == []
+
+
+def test_fetch_refuses_to_read_folders_from_another_open_session(fake_ptsl, monkeypatch, tmp_path):
+    _allow_fresh_fetch(monkeypatch)
+
+    def create_then_switch(engine, *_args, **_kwargs):
+        engine.open_path = str(tmp_path / "other.ptx")
+
+    monkeypatch.setattr(protools.ptslh, "create_session_from_template", create_then_switch)
+    session = _session()
+
+    with pytest.raises(RuntimeError, match="Pro Tools switched sessions"):
+        _processor(tmp_path).fetch(session, ignore_cache=True)
+
+    assert fake_ptsl[0].track_list_calls == 0
+    assert session.daw_state == {}
 
 
 @pytest.mark.usefixtures("supported_template_platform")
