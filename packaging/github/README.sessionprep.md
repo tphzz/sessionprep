@@ -217,7 +217,12 @@ version. Older runs cannot overwrite newer previews. Tag mode checks the remote
 lightweight/annotated tag's commit again before retirement.
 
 Replacement assets are uploaded and verified on a provisional draft before the
-old draft is retired. Every destructive cleanup rechecks draft/tag/body state.
+old draft is retired. The publisher logs each asset and attempt. It makes up to
+three attempts per asset for timeouts and temporary upload failures. The publisher
+checks the provisional draft after an ambiguous upload result. It accepts a
+completed upload with the expected size and can clear an empty `starter` asset
+before retrying. A preparation failure keeps the previous draft available.
+Every destructive cleanup rechecks draft/tag/body state.
 Published releases are protected. If retirement has begun and promotion fails,
 the complete provisional draft is retained for review/retry. GitHub does not
 provide a single atomic transaction across these operations; changed state or

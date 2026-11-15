@@ -87,7 +87,7 @@ class FakeGitHub:
     def upload(self, release, path):
         if self.upload_failure:
             raise RuntimeError("simulated upload failure")
-        self.uploaded.append(dict(name=path.name, size=path.stat().st_size))
+        self.uploaded.append(dict(name=path.name, size=path.stat().st_size, state="uploaded"))
 
     def assets(self, identifier):
         return self.uploaded

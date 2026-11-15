@@ -10,6 +10,8 @@ import textwrap
 import zipfile
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "packaging" / "github" / "publish-draft-release.sh"
@@ -284,6 +286,83 @@ def test_release_script_replaces_branch_drafts_and_uploads_to_new_release_id(tmp
     assert "Draft release ready: id=999" in result.stdout
 
 
+@pytest.mark.parametrize(
+    ("event", "attempts", "deleted_assets"),
+    [
+        ({"status": 408}, 2, []),
+        ({"status": 502, "state": "starter"}, 2, [2001]),
+        ({"status": 408, "state": "uploaded"}, 1, []),
+        ({"status": 408, "state": "uploaded", "visible_after": 2}, 2, []),
+        ({"status": 0, "exit_code": 28}, 2, []),
+    ],
+    ids=["http-timeout", "starter-asset", "stored-before-timeout", "late-asset-visibility", "curl-timeout"],
+)
+def test_release_script_recovers_uploads_before_replacing_the_preview(tmp_path, event, attempts, deleted_assets):
+    prior = owned_release(101)
+    state, environment = write_release_server(tmp_path, [prior], upload_events=[event])
+    artifact_root, allowlist = publication_fixture(tmp_path)
+
+    result = run_script(tmp_path, *publish_args(tmp_path, artifact_root, allowlist), extra_env=environment)
+
+    assert result.returncode == 0, result.stderr + result.stdout
+    final = json.loads(state.read_text())
+    assert final["upload_attempts"] == ["example-1.2.3.dmg"] * attempts + ["example-1.2.3.pkg"]
+    assert final["deleted_assets"] == deleted_assets
+    assert final["deleted"] == [101]
+    assert [asset["state"] for asset in final["assets"]] == ["uploaded", "uploaded"]
+    assert final["releases"]["999"]["draft"] is True
+    assert "sessionprep-candidate" not in final["releases"]["999"]["body"]
+
+
+@pytest.mark.parametrize(("status", "attempts"), [(408, 3), (403, 1), (422, 1)])
+def test_release_script_keeps_existing_preview_when_upload_fails(tmp_path, status, attempts):
+    prior = owned_release(101)
+    prior["assets"] = [{"name": "previous.dmg", "state": "uploaded", "size": 3}]
+    state, environment = write_release_server(
+        tmp_path, [prior], upload_events=[{"status": 201}] + [{"status": status}] * 3,
+    )
+    artifact_root, allowlist = publication_fixture(tmp_path)
+
+    result = run_script(tmp_path, *publish_args(tmp_path, artifact_root, allowlist), extra_env=environment)
+
+    assert result.returncode != 0
+    assert "example-1.2.3.pkg" in result.stderr and f"HTTP {status}" in result.stderr
+    final = json.loads(state.read_text())
+    assert final["upload_attempts"] == ["example-1.2.3.dmg"] + ["example-1.2.3.pkg"] * attempts
+    assert final["deleted"] == [999]
+    assert final["releases"] == {"101": prior}
+
+
+def test_release_script_rejects_unfinished_assets_before_replacement(tmp_path):
+    prior = owned_release(101)
+    state, environment = write_release_server(
+        tmp_path, [prior], upload_events=[{"status": 201, "state": "starter", "size": 3}],
+    )
+    artifact_root, allowlist = publication_fixture(tmp_path)
+
+    result = run_script(tmp_path, *publish_args(tmp_path, artifact_root, allowlist), extra_env=environment)
+
+    assert result.returncode != 0 and "unfinished" in result.stderr
+    final = json.loads(state.read_text())
+    assert final["deleted"] == [999] and final["releases"] == {"101": prior}
+
+
+def test_release_script_preserves_a_candidate_published_during_an_upload_failure(tmp_path):
+    prior = owned_release(101)
+    state, environment = write_release_server(
+        tmp_path, [prior], upload_events=[{"status": 502, "state": "starter", "publish_draft": True}],
+    )
+    artifact_root, allowlist = publication_fixture(tmp_path)
+
+    result = run_script(tmp_path, *publish_args(tmp_path, artifact_root, allowlist), extra_env=environment)
+
+    assert result.returncode != 0 and "was published" in result.stderr
+    final = json.loads(state.read_text())
+    assert final["deleted"] == [] and final["deleted_assets"] == []
+    assert final["releases"]["101"] == prior
+    assert final["releases"]["999"]["draft"] is False
+
+
 def test_release_script_refuses_matching_published_branch_release(tmp_path):
     prior = owned_release(101)
     prior["draft"] = False
@@ -362,23 +441,38 @@ def write_release_server(tmp_path, releases, **settings):
     fake_bin=tmp_path/"bin"
     fake_bin.mkdir()
     state=tmp_path/"api-state.json"
-    state.write_text(json.dumps(dict(releases={str(r["id"]):r for r in releases}, deleted=[], assets=[], **settings)))
+    state.write_text(json.dumps(dict(releases={str(r["id"]):r for r in releases}, deleted=[], assets=[],
+                                     upload_attempts=[], deleted_assets=[], **settings)))
     server=tmp_path/"api-server.py"
     server.write_text(r"""import json,sys,re
 from pathlib import Path
 from urllib.parse import urlparse,parse_qs
 state=Path(sys.argv[1]); tool=sys.argv[2]; args=sys.argv[3:]
 data=json.loads(state.read_text())
-def finish(value=None,code=0,message=''):
+def finish(value=None,code=0,message='',output=''):
     state.write_text(json.dumps(data))
     if value is not None: print(json.dumps(value))
     if message: print(message,file=sys.stderr)
+    if output: print(output)
     raise SystemExit(code)
 if tool=='curl':
     source=args[args.index('--data-binary')+1].removeprefix('@')
     name=parse_qs(urlparse(args[-1]).query)['name'][0]
-    data['assets'].append(dict(name=name,size=Path(source).stat().st_size))
-    finish()
+    data['upload_attempts'].append(name)
+    if any(asset['name'] == name for asset in data['assets']):
+        finish(code=22, message='Duplicate asset', output='422')
+    events=data.get('upload_events', [])
+    event=events.pop(0) if events else {}
+    status=event.get('status', 201)
+    asset_state=event.get('state', 'uploaded' if status == 201 else None)
+    if asset_state:
+        size=event.get('size', 0 if asset_state == 'starter' else Path(source).stat().st_size)
+        data['assets'].append(dict(id=2000+len(data['upload_attempts']), name=name, size=size, state=asset_state,
+                                   visible_after=event.get('visible_after', 0)))
+    if event.get('publish_draft'):
+        data['releases']['999']['draft']=False
+    code=event.get('exit_code', 0 if status == 201 else 22)
+    finish(code=code, message=f'HTTP {status}' if code else '', output=f'{status:03d}')
 if args[:2]==['auth','status']: finish()
 if not args or args[0]!='api': finish(code=97,message='Unexpected network command')
 method=args[args.index('--method')+1] if '--method' in args else 'GET'
@@ -392,11 +486,18 @@ if path.endswith('/releases') and method=='POST':
     payload.update(id=999,upload_url='https://uploads.github.com/repos/owner/repo/releases/999/assets{?name,label}')
     data['releases']['999']=payload
     finish(payload)
+asset_path=re.search(r'/releases/assets/([0-9]+)$',path)
+if asset_path and method=='DELETE':
+    asset_id=int(asset_path[1])
+    data['deleted_assets'].append(asset_id)
+    data['assets']=[asset for asset in data['assets'] if asset['id'] != asset_id]
+    finish()
 match=re.search(r'/releases/([0-9]+)(/assets)?',path)
 if match:
     identifier=match[1]
     if match[2]:
-        assets=data['assets'][:1] if data.get('mismatch') else data['assets']
+        assets=[asset for asset in data['assets'] if len(data['upload_attempts']) >= asset['visible_after']]
+        if data.get('mismatch'): assets=assets[:1]
         finish([assets])
     if method=='GET': finish(data['releases'][identifier])
     if method=='DELETE':

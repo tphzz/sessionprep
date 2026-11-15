@@ -7,8 +7,14 @@ import re
 import sys
 import os
 import subprocess
+import time
 import uuid
 from urllib.parse import quote, urlsplit
+
+
+_UPLOAD_ATTEMPTS = 3
+_TRANSIENT_UPLOAD_STATUS = {"408", "500", "502", "503", "504"}
+_TRANSIENT_CURL_ERRORS = {5, 6, 7, 18, 28, 52, 55, 56, 92}
 
 
 def branch_tag(ref_name):
@@ -45,11 +51,15 @@ def replacement_plan(releases, mode, ref_name, release_tag, producer_run_id):
     return {"delete": [] if skip else selected, "skip": skip, "owns_tag": owns_tag}
 
 
-def assert_deletable(current, snapshot, mode, ref_name):
-    """Recheck user-visible state immediately before a destructive operation."""
+def assert_draft_unchanged(current, snapshot):
     if (current.get("draft") is not True or current.get("tag_name") != snapshot.get("tag_name")
             or current.get("body") != snapshot.get("body")):
         raise ValueError("Release changed or was published; refusing automatic deletion")
+
+
+def assert_deletable(current, snapshot, mode, ref_name):
+    """Recheck user-visible state immediately before a destructive operation."""
+    assert_draft_unchanged(current, snapshot)
     if mode == "branch" and f"<!-- github-draft-release-key: branch:{ref_name} -->" not in (current.get("body") or ""):
         raise ValueError("Draft ownership changed; refusing automatic deletion")
 
@@ -114,15 +124,54 @@ class GitHub:
         if parsed.scheme != "https" or parsed.hostname != "uploads.github.com" or parsed.username or parsed.password:
             raise ValueError("Unexpected release upload host")
         url = endpoint + "?name=" + quote(path.name, safe="")
+        command = ["curl", "--config", "-", "--fail", "--silent", "--show-error",
+                   "--output", os.devnull, "--write-out", "%{http_code}", "--retry", "0",
+                   "-X", "POST", "-H", "Accept: application/vnd.github+json",
+                   "-H", "Content-Type: application/octet-stream",
+                   "--data-binary", "@" + str(path), url]
+        identifier = release["id"]
+        expected_size = path.stat().st_size
         # Credentials travel through stdin, never in process arguments or exceptions.
-        result = subprocess.run(["curl", "--config", "-", "--fail", "--silent", "--show-error",
-                                 "-X", "POST", "-H", "Accept: application/vnd.github+json",
-                                 "-H", "Content-Type: application/octet-stream",
-                                 "--data-binary", "@" + str(path), url],
-                                input=f'header = "Authorization: Bearer {token}"\n',
-                                capture_output=True, text=True)
-        if result.returncode:
-            raise RuntimeError("Asset upload failed: " + result.stderr.strip())
+        config = f'header = "Authorization: Bearer {token}"\n'
+        for attempt in range(1, _UPLOAD_ATTEMPTS + 1):
+            if attempt > 1:
+                assert_draft_unchanged(self.get_release(identifier), release)
+            print(f"Uploading {path.name} to draft {identifier} (attempt {attempt}/{_UPLOAD_ATTEMPTS}).", flush=True)
+            result = subprocess.run(command, input=config, capture_output=True, text=True)
+            status = result.stdout.strip()
+            if result.returncode == 0 and status == "201":
+                return
+
+            response = f"HTTP {status}" if status and status != "000" else "no HTTP response"
+            detail = result.stderr.strip().replace(token, "[redacted]")
+            error = f"Asset upload failed for {path.name} ({response}, curl exit {result.returncode}). {detail}".rstrip()
+            transient = status in _TRANSIENT_UPLOAD_STATUS or (
+                status in {"", "000", "100", "201"} and result.returncode in _TRANSIENT_CURL_ERRORS
+            )
+            duplicate_after_retry = attempt > 1 and status == "422"
+            if not (transient or duplicate_after_retry):
+                raise RuntimeError(error)
+
+            # A timed-out POST can still leave a complete asset or an empty starter.
+            print(f"{error} Checking the provisional draft.", file=sys.stderr, flush=True)
+            matches = [asset for asset in self.assets(identifier) if asset.get("name") == path.name]
+            assert_draft_unchanged(self.get_release(identifier), release)
+            if len(matches) > 1:
+                raise ValueError(f"Multiple assets named {path.name} on draft {identifier}")
+            asset = matches[0] if matches else None
+            if asset and asset.get("state") == "uploaded" and asset.get("size") == expected_size:
+                print(f"GitHub already stored {path.name} on draft {identifier}.", flush=True)
+                return
+            if attempt == _UPLOAD_ATTEMPTS or (duplicate_after_retry and asset is None):
+                raise RuntimeError(error)
+            if asset:
+                if asset.get("state") != "starter" or asset.get("size") != 0:
+                    raise ValueError(f"Unexpected asset state or size for {path.name} on draft {identifier}")
+                asset_id = asset.get("id")
+                if type(asset_id) is not int or asset_id <= 0:
+                    raise ValueError(f"Invalid starter asset identifier for {path.name}")
+                self.api(self.root + f"/releases/assets/{asset_id}", "DELETE")
+            time.sleep(2 ** (attempt - 1))
 
     def assets(self, identifier):
         pages = self.api(self.root + f"/releases/{identifier}/assets?per_page=100", pages=True)
@@ -153,8 +202,9 @@ def publish(client, *, mode, ref_name, release_tag, target, run_id, title, asset
             client.upload(candidate, path)
         uploaded = client.assets(identifier)
         expected = {path.name: path.stat().st_size for path in assets}
-        if len(uploaded) != len(expected) or {item["name"]: item["size"] for item in uploaded} != expected:
-            raise ValueError(f"Uploaded asset count/name/size mismatch for release {identifier}")
+        completed = {item["name"]: item["size"] for item in uploaded if item.get("state") == "uploaded"}
+        if len(uploaded) != len(expected) or completed != expected:
+            raise ValueError(f"Uploaded asset count/name/size mismatch or unfinished upload for release {identifier}")
         # Another producer or a human may have acted during uploads.
         fresh = [item for item in client.releases() if item["id"] != identifier]
         fresh_plan = replacement_plan(fresh, mode, ref_name, release_tag, run_id)
@@ -194,6 +244,8 @@ def publish(client, *, mode, ref_name, release_tag, target, run_id, title, asset
             client.delete_release(identifier)
         except Exception:
             print(f"Candidate {identifier} changed or cleanup failed; left for review.", file=sys.stderr)
+        if plan["delete"]:
+            print("Draft replacement stopped before retiring any prior draft.", file=sys.stderr)
         raise
 
 

@@ -201,6 +201,8 @@ macOS with an architecture selector. Every build is manually triggered.
 All Platforms alone creates unpublished tag-release or per-branch preview drafts;
 Debug builds and individual platforms attach artifacts only to their run.
 Notarization is an optional checkbox, default off even for tags.
+The release step logs asset filenames and retries transient uploads on the
+provisional draft. It retires the previous draft after verifying the full set.
 
 See [the build workflow guide](packaging/github/README.sessionprep.md) for the
 hardware dependency lanes, runner prerequisites, adaptive Windows installer,
