@@ -8,6 +8,7 @@ pytest.importorskip("PySide6")
 
 from PySide6.QtWidgets import QApplication, QTextBrowser
 
+from sessionprepgui.detail.browser import ReportBrowser
 from sessionprepgui.detail.report import render_summary_html, render_track_detail_html
 from sessionprepgui.detail.report_style import (
     configure_report_browser,
@@ -15,11 +16,13 @@ from sessionprepgui.detail.report_style import (
     report_font_scale,
     wrap_report_html,
 )
+from sessionprepgui.theme import COLORS, REPORT_INSET
 from sessionpreplib.detectors.silence import SilenceDetector
 from sessionpreplib.detectors.stereo_compat import StereoCompatDetector
 from sessionpreplib.models import (
     DetectorResult,
     ProcessorResult,
+    SessionContext,
     Severity,
     TrackContext,
 )
@@ -122,7 +125,124 @@ def test_summary_report_uses_relative_typography():
     _assert_no_fixed_report_typography(html)
     # Title role uses a CSS keyword Qt honours; category headings keep their size.
     assert "font-size:x-large" in html
-    assert "font-size:1.15em" in html
+    assert "font-size:medium" in html
+
+
+def _report_cursor(browser, text):
+    cursor = browser.document().find(text)
+    assert not cursor.isNull(), text
+    return cursor
+
+
+def _header_band_height(browser, text):
+    position = browser.cursorRect(_report_cursor(browser, text)).center()
+    image = browser.viewport().grab().toImage()
+    dpr = image.devicePixelRatio()
+    x = round((REPORT_INSET + 3) * dpr)
+    y = round(position.y() * dpr)
+    column = [image.pixelColor(x, row).name() for row in range(image.height())]
+    surface = COLORS["surface"]
+    assert column[y] == surface
+    first = y
+    while first > 0 and column[first - 1] == surface:
+        first -= 1
+    last = y
+    while last + 1 < len(column) and column[last + 1] == surface:
+        last += 1
+    return last - first + 1
+
+
+@pytest.mark.parametrize("width", [1200, 620])
+def test_summary_and_file_share_finding_font_and_header_height(form_font, qapp, width):
+    track = TrackContext(
+        "Bass direct input alternate full take with performance notes.wav",
+        "missing.wav", None, 48000, 1, 96000, "24-bit", "PCM_24", 2.0,
+    )
+    long_detail = "The alternate print has a long result that can wrap across several lines."
+    long_guidance = (
+        "Check the entire affected recording and compare the original export "
+        "with the alternate print before preparing this session for transfer."
+    )
+    track.detector_results = {
+        "Early finding": DetectorResult("Early finding", Severity.PROBLEM, "First result", {}),
+        "Later finding": DetectorResult("Later finding", Severity.INFO, long_detail, {},
+                                        hint=long_guidance),
+    }
+    session = SessionContext([track], {})
+    summary = {
+        "clean_count": 0,
+        "total_ok": 1,
+        "problems": [{
+            "title": "Early finding",
+            "items": ["First result"],
+            "item_refs": [{"filename": track.filename, "detail": "First result"}],
+        }],
+        "information": [{
+            "title": "Later finding",
+            "items": [long_detail],
+            "item_refs": [{"filename": track.filename, "detail": long_detail}],
+            "hint": long_guidance,
+        }],
+    }
+    summary_view, file_view = ReportBrowser({}), ReportBrowser({})
+    try:
+        for view in (summary_view, file_view):
+            view.resize(width, 560)
+            view.show()
+        summary_view.present_summary(summary, session)
+        file_view.present_track(track, session)
+        for scale in (1.0, 1.15, 1.5, 1.75, 1.0):
+            screen = _FakeScreen(scale, 96.0)
+            for view in (summary_view, file_view):
+                view.refresh_font(screen)
+            qapp.processEvents()
+
+            body_size = qapp.font().pointSizeF() * report_font_scale(screen)
+            for view, labels in (
+                (summary_view, ("Affected file", "Early finding", "Later finding",
+                                track.filename, long_detail, long_guidance, "Review file")),
+                (file_view, ("Severity", "Early finding", "Later finding", long_guidance)),
+            ):
+                for label in labels:
+                    fmt = _report_cursor(view, label).charFormat()
+                    assert fmt.font().pointSizeF() == pytest.approx(body_size), label
+            for view, labels in (
+                (summary_view, ("Problems · 1 finding", "Information · 1 finding",
+                                "0 of 1 files clean")),
+                (file_view, ("Detector findings", "48000 Hz")),
+            ):
+                for label in labels:
+                    fmt = _report_cursor(view, label).charFormat()
+                    assert fmt.font().pointSizeF() == pytest.approx(body_size * REPORT_CONTENT_SCALE)
+
+            summary_height = _header_band_height(summary_view, "Affected file")
+            file_height = _header_band_height(file_view, "Severity")
+            tolerance = 0 if summary_view.devicePixelRatioF().is_integer() else 1
+            assert abs(summary_height - file_height) <= tolerance
+            assert _report_cursor(summary_view, long_guidance).block().layout().lineCount() > 1
+    finally:
+        summary_view.close()
+        file_view.close()
+
+
+def test_empty_summary_and_file_share_finding_font(qapp):
+    track = TrackContext("Clean.wav", "missing.wav", None, 48000, 1, 96000,
+                         "24-bit", "PCM_24", 2.0)
+    session = SessionContext([track], {})
+    summary = {"clean": [{"title": "Safe levels", "items": ["Clean.wav"]}],
+               "clean_count": 1, "total_ok": 1}
+    summary_view, file_view = ReportBrowser({}), ReportBrowser({})
+    try:
+        for view in (summary_view, file_view):
+            view.refresh_font(_FakeScreen(1.0, 96.0))
+        summary_view.present_summary(summary, session, show_clean=False)
+        file_view.present_track(track, session, show_clean=False)
+        for view in (summary_view, file_view):
+            empty = _report_cursor(view, "No findings to show.").charFormat()
+            assert empty.font().pointSizeF() == pytest.approx(qapp.font().pointSizeF())
+    finally:
+        summary_view.close()
+        file_view.close()
 
 
 def test_track_detail_and_report_fragments_use_relative_typography():
@@ -233,8 +353,6 @@ def test_fallback_detector_report_uses_compact_row():
 
 @pytest.mark.parametrize("screen_scale", [1.0, 2.0])
 def test_finding_ui_role_matches_application_size_and_preserves_report_header(qapp, screen_scale):
-    from sessionprepgui.detail.browser import ReportBrowser
-
     current = TrackContext("UI role.wav", "missing.wav", None, 48000, 1, 96000,
                            "24-bit", "PCM_24", 2.0)
     current.detector_results["example"] = DetectorResult(
@@ -254,9 +372,6 @@ def test_finding_ui_role_matches_application_size_and_preserves_report_header(qa
 
 
 def test_custom_pixel_and_point_font_sizes_survive_finding_role_and_refresh(qapp):
-    from sessionprepgui.detail.browser import ReportBrowser
-    from sessionpreplib.models import SessionContext
-
     class Detector:
         id = "format"
         name = "Custom formatting"

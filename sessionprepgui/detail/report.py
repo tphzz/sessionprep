@@ -82,19 +82,8 @@ def _link(scheme, key, label, title=""):
             f'style="color:{COLORS["information"]}; text-decoration:none;">{label}</a>')
 
 
-def _cell(body, width, index=0, header=False):
-    left = 12 if index == 0 else 6
-    right = 12 if index == 3 else 6
-    padding = 4
-    background = " background-color:#2d2d2d;" if header else ""
-    return (f'<td width="{width}%" valign="top" style="padding:{padding}px {right}px '
-            f'{padding}px {left}px; border-bottom:1px solid #3a3a3a;'
-            f' color:{COLORS["text"]};{background}">'
-            f'<p style="margin-top:0; margin-bottom:0; line-height:120%;">{body}</p></td>')
-
-
 def _table_header(labels, widths):
-    cells = [_cell(esc(label), width, i, True)
+    cells = [_finding_cell(esc(label), width, header=True, index=i, columns=len(widths))
              for i, (label, width) in enumerate(zip(labels, widths))]
     # Qt drops a heading's bottom margin before a table; the table carries it.
     return ('<table width="100%" cellpadding="0" cellspacing="0" '
@@ -119,7 +108,8 @@ def render_summary_html(summary, *, show_faders=True, show_clean=True, session=N
     parts.append(f'<p style="color:{COLORS["metadata"]}; margin-top:0; margin-bottom:8px;">'
                  f'Attention {counts["attention"]} &middot; Information {counts["information"]}</p>')
     tracks = {t.filename: t for t in session.tracks} if session else {}
-    widths = (22.13, 22.72, 42.62, 12.53)
+    widths = ("22.13%", "22.72%", "42.62%", "12.53%")
+    findings_anchor = '<a name="report-findings"></a>'
     for category in categories:
         if category == "clean" and not show_clean:
             continue
@@ -130,9 +120,10 @@ def render_summary_html(summary, *, show_faders=True, show_clean=True, session=N
         color, label = _severity_meta(severity)
         count = counts[category]
         parts.append(f'<p style="font-size:{REPORT_SECTION_SIZE}; color:{color};'
-                     f' font-weight:bold; margin-bottom:6px;">'
+                     f' font-weight:bold; margin-bottom:6px;">{findings_anchor}'
                      f'{label if category != "problems" else "Problems"} &middot; '
                      f'{count} {"finding" if count == 1 else "findings"}</p>')
+        findings_anchor = ""
         parts.append(_table_header(("Finding", "Affected file", "Next step", "Action"), widths))
         for group in groups:
             items = group.get("items") or []
@@ -154,11 +145,13 @@ def render_summary_html(summary, *, show_faders=True, show_clean=True, session=N
                 file_text += f'<span style="color:{COLORS["metadata"]};">{esc(detail)}</span>'
                 action = _link("report-review", filename, "Review file", f"Review {filename}") if filename else ""
                 values = (finding, file_text, esc(_guidance(group.get("hint"))), action)
-                parts.append('<tr>' + "".join(_cell(value, width, i)
-                             for i, (value, width) in enumerate(zip(values, widths))) + '</tr>')
+                parts.append("<tr>" + "".join(
+                    _finding_cell(value, width, index=i, columns=len(widths))
+                    for i, (value, width) in enumerate(zip(values, widths))) + "</tr>")
         parts.append("</table>")
-    if not any(counts[k] for k in categories if k != "clean" or show_clean):
-        parts.append(f'<p style="color:{COLORS["metadata"]};">No findings to show.</p>')
+    if findings_anchor:
+        parts.append(f'<p style="color:{COLORS["metadata"]};">'
+                     f'{findings_anchor}No findings to show.</p>')
     return "\n".join(parts)
 
 
@@ -318,13 +311,7 @@ def render_prepared_track_report(data, *, expanded=(), compact=False, narrow=Fal
     widths = ("100", None, "80") if compact else ("100", None, "96", "216", "136")
     labels = (("Severity", "Finding, location and next step", "Actions") if compact
               else ("Severity", "Finding", "Location", "Next step", "Actions"))
-    # Qt drops the heading's bottom margin before a table; the table carries it.
-    parts.append('<table width="100%" cellpadding="0" cellspacing="0"'
-                 ' style="margin-top:8px; border-collapse:collapse;"><tr>')
-    parts.extend(_finding_cell("<nobr>Help</nobr>" if label == "Help" else esc(label),
-                               width, header=True, index=i, columns=len(widths))
-                 for i, (label, width) in enumerate(zip(labels, widths)))
-    parts.append("</tr>")
+    parts.append(_table_header(labels, widths))
     for row in rows:
         key = row["id"]
         token = quote(key, safe="")
