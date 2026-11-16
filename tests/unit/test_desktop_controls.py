@@ -5,12 +5,21 @@ import pytest
 
 pytest.importorskip("PySide6")
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QAction
+from PySide6.QtGui import QAction, QImage, QPainter
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QToolBar
+from PySide6.QtWidgets import (
+    QApplication,
+    QMainWindow,
+    QScrollBar,
+    QStyle,
+    QStyleFactory,
+    QStyleOptionSlider,
+    QToolBar,
+)
 
 from sessionprepgui.controls import bind_primary_action, set_action_busy
 from sessionprepgui.icons import icon
+from sessionprepgui.theme import apply_dark_theme
 
 
 @pytest.fixture(scope="module")
@@ -18,6 +27,62 @@ def qapp():
     app = QApplication.instance() or QApplication([])
     app.setStyle("Fusion")
     return app
+
+
+@pytest.mark.parametrize("orientation", [Qt.Horizontal, Qt.Vertical])
+def test_shared_scrollbar_colors_use_native_geometry_and_buttons(qapp, orientation):
+    host = QMainWindow()
+    apply_dark_theme(host)
+    bar = QScrollBar(orientation)
+    bar.setRange(0, 100)
+    bar.setPageStep(25)
+    bar.setValue(50)
+    if orientation == Qt.Horizontal:
+        bar.resize(260, 14)
+    else:
+        bar.resize(14, 260)
+    bar.show()
+    qapp.processEvents()
+    baseline = QStyleFactory.create("Fusion")
+    style = bar.style()
+    control = QStyle.CC_ScrollBar
+    try:
+        option = QStyleOptionSlider()
+        bar.initStyleOption(option)
+        option.subControls = QStyle.SC_All
+        for part in (
+            QStyle.SC_ScrollBarGroove, QStyle.SC_ScrollBarSlider,
+            QStyle.SC_ScrollBarAddLine, QStyle.SC_ScrollBarSubLine,
+            QStyle.SC_ScrollBarAddPage, QStyle.SC_ScrollBarSubPage,
+        ):
+            assert style.subControlRect(control, option, part, bar) == (
+                baseline.subControlRect(control, option, part, bar)
+            )
+        thumb = style.subControlRect(control, option, QStyle.SC_ScrollBarSlider, bar)
+        trough = style.subControlRect(control, option, QStyle.SC_ScrollBarSubPage, bar)
+        step = style.subControlRect(control, option, QStyle.SC_ScrollBarAddLine, bar)
+        for state, color in (
+            (QStyle.State_Enabled, "#7d7d7d"),
+            (QStyle.State_Enabled | QStyle.State_MouseOver, "#909090"),
+            (QStyle.State_Enabled | QStyle.State_MouseOver | QStyle.State_Sunken, "#9e9e9e"),
+            (QStyle.State_None, "#555555"),
+        ):
+            option.state = state
+            if orientation == Qt.Horizontal:
+                option.state |= QStyle.State_Horizontal
+            option.activeSubControls = QStyle.SC_ScrollBarSlider
+            image = QImage(bar.size(), QImage.Format_RGB32)
+            image.fill(Qt.black)
+            with QPainter(image) as painter:
+                style.drawComplexControl(control, option, painter, bar)
+            assert image.pixelColor(thumb.center()).name() == color
+            assert image.pixelColor(trough.center()).name() == "#2d2d2d"
+        QTest.mouseClick(bar, Qt.LeftButton, pos=step.center())
+        assert bar.value() == 51
+        assert host.style().pixelMetric(QStyle.PM_DockWidgetSeparatorExtent, None, host) == 1
+    finally:
+        bar.close()
+        host.close()
 
 
 def test_busy_action_stays_disabled_and_restores_label(qapp):

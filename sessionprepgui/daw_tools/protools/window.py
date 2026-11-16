@@ -550,7 +550,7 @@ class _ConnectionDialog(QDialog):
 
     def _init_ui(self):
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setContentsMargins(*(WINDOW_MARGIN,) * 4)
         layout.setSpacing(10)
 
         self._title = QLabel("")

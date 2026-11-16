@@ -23,9 +23,6 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMessageBox,
-    QPushButton,
-    QScrollArea,
-    QSplitter,
     QSpinBox,
     QStackedWidget,
     QTreeWidget,
@@ -47,7 +44,8 @@ from sessionpreplib.topology import build_default_topology
 from sessionpreplib.utils import protools_sort_key
 
 from ..helpers import track_analysis_label
-from ..prefs.param_form import _read_widget
+from ..prefs.config_pages import _config_section_values
+from ..prefs.param_form import ConfigResetButton, _read_widget, _set_widget_value
 from ..prefs.param_widgets import build_config_pages, load_config_widgets
 from ..session.io import save_session as _save_session_file, load_session as _load_session_file
 from ..settings import build_defaults
@@ -60,7 +58,9 @@ from ..tracks.table_widgets import (
     _PHASE_ANALYSIS, _PHASE_TOPOLOGY, _PHASE_SETUP,
 )
 from ..change_marker import MARKER_COLUMN_WIDTH, set_item_marker, set_tab_marker
-from ..controls import fit_navigation_pane, set_action_busy
+from ..controls import (
+    content_splitter, fit_navigation_pane, inset_pane, set_action_busy, settings_scroll_area,
+)
 from ..theme import COLORS, FILE_COLOR_OK, FILE_COLOR_ERROR
 from .worker import AnalyzeWorker, PrepareWorker, Phase1AnalyzeWorker
 
@@ -78,8 +78,8 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         page = QWidget()
         page.setAutoFillBackground(True)
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(
-            DETAIL_TAB_INSET, DETAIL_TAB_INSET, DETAIL_TAB_INSET, DETAIL_TAB_INSET)
+        layout.setContentsMargins(DETAIL_TAB_INSET, DETAIL_TAB_INSET, DETAIL_TAB_INSET, 0)
+        layout.setSpacing(0)
 
         desc = QLabel(
             "Session-local config adjustments. Changes here apply only to "
@@ -88,6 +88,7 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         desc.setWordWrap(True)
         desc.setStyleSheet("color: #888; font-size: 9pt;")
         layout.addWidget(desc)
+        layout.addSpacing(DETAIL_TAB_INSET)
 
         # Header row
         header = QHBoxLayout()
@@ -100,7 +101,7 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
             self._on_config_preset_changed)
         header.addWidget(self._config_preset_combo)
         header.addStretch()
-        reset_btn = QPushButton("Revert to Preset")
+        reset_btn = ConfigResetButton("Revert to Preset")
         reset_btn.setToolTip(
             "Discard all session-specific changes and reload from the "
             "selected config preset.")
@@ -109,7 +110,7 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         layout.addLayout(header)
 
         # Tree + Stack
-        splitter = QSplitter(Qt.Horizontal)
+        splitter = content_splitter()
 
         self._session_tree = QTreeWidget()
         self._session_tree.setColumnCount(2)
@@ -122,10 +123,11 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         self._session_tree.setColumnWidth(1, MARKER_COLUMN_WIDTH)
         self._session_tree.currentItemChanged.connect(
             self._on_session_tree_selection)
-        splitter.addWidget(self._session_tree)
+        splitter.addWidget(inset_pane(
+            self._session_tree, (0, DETAIL_TAB_INSET, DETAIL_TAB_INSET, DETAIL_TAB_INSET)))
 
         self._session_stack = QStackedWidget()
-        splitter.addWidget(self._session_stack)
+        splitter.addWidget(inset_pane(self._session_stack, (0, 0, 0, DETAIL_TAB_INSET)))
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         fit_navigation_pane(splitter)
@@ -148,10 +150,7 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         """Populate the session config tree + stack from the active preset."""
 
         def _register_page(tree_item, page, dirty_key=None):
-            scroll = QScrollArea()
-            scroll.setWidgetResizable(True)
-            scroll.setFrameShape(QScrollArea.NoFrame)
-            scroll.setWidget(page)
+            scroll = settings_scroll_area(page)
             idx = self._session_stack.addWidget(scroll)
             self._session_page_index[id(tree_item)] = idx
             if dirty_key:
@@ -162,6 +161,7 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
             self._active_preset(),
             self._session_widgets,
             _register_page,
+            on_reset=self._on_session_config_field_reset,
         )
         self._connect_session_config_dirty_signals()
 
@@ -192,7 +192,9 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         """Inner loader — sets widget values without triggering column refresh."""
         load_config_widgets(
             self._session_widgets, preset,
-            self._session_daw_custom_widgets)
+            self._session_daw_custom_widgets,
+            reference_preset=self._active_preset(),
+        )
 
     def _on_session_config_reset(self):
         """Revert session config to the selected config preset."""
@@ -202,6 +204,23 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         self._load_session_widgets(preset)
         self._refresh_effective_config(classify_structured_config_change(old_config, preset))
         self._status_bar.showMessage("Session config reverted to preset.")
+
+    def _on_session_config_field_reset(self, path: str, widget: QWidget) -> None:
+        """Release one override and restore the field from the selected preset."""
+        if not self._session or getattr(self, "_loading_session_widgets", False):
+            return
+        old_config = self._effective_session_config()
+        section, key = path.rsplit(".", 1)
+        values = _config_section_values(self._active_preset(), section)
+        preset_value = values.get(key, widget._param_spec.default)
+        self._session_overrides.pop(path, None)
+        self._loading_session_widgets = True
+        try:
+            _set_widget_value(widget, preset_value)
+            widget._set_param_reference(preset_value=preset_value)
+        finally:
+            self._loading_session_widgets = False
+        self._apply_session_config_edit(old_config)
 
     # 哪 Phase-2 preset difference indicators 哪哪哪哪哪哪哪哪哪哪哪哪哪哪
 
@@ -248,6 +267,9 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
             return
         old_config = self._effective_session_config()
         self._session_overrides[path] = value
+        self._apply_session_config_edit(old_config)
+
+    def _apply_session_config_edit(self, old_config: dict[str, Any]) -> None:
         impact = classify_structured_config_change(
             old_config, self._effective_session_config())
         self._refresh_session_config_dirty_indicators()

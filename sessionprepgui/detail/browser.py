@@ -8,7 +8,8 @@ from urllib.parse import quote, unquote
 from PySide6.QtCore import QPoint, Qt, QUrl, Signal
 from PySide6.QtGui import QTextCharFormat, QTextCursor, QTextDocument, QTextFormat
 
-from ..tracks.table_widgets import DETAIL_TAB_INSET, _HelpBrowser
+from ..theme import REPORT_INSET
+from ..tracks.table_widgets import _HelpBrowser
 from .report import prepare_track_report, render_prepared_track_report, render_summary_html
 from .report_style import REPORT_CONTENT_SCALE, configure_report_browser, wrap_report_html
 
@@ -65,10 +66,10 @@ def _apply_report_inset(document):
     """Inset report text by the shared detail-tab inset on every side."""
     root = document.rootFrame()
     fmt = root.frameFormat()
-    fmt.setLeftMargin(DETAIL_TAB_INSET)
-    fmt.setRightMargin(DETAIL_TAB_INSET)
-    fmt.setTopMargin(DETAIL_TAB_INSET)
-    fmt.setBottomMargin(DETAIL_TAB_INSET)
+    fmt.setLeftMargin(REPORT_INSET)
+    fmt.setRightMargin(REPORT_INSET)
+    fmt.setTopMargin(REPORT_INSET)
+    fmt.setBottomMargin(REPORT_INSET)
     root.setFrameFormat(fmt)
 
 

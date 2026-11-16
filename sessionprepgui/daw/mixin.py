@@ -26,9 +26,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMenu,
     QMessageBox,
-    QPushButton,
     QSizePolicy,
-    QSplitter,
     QStackedWidget,
     QTableWidget,
     QToolBar,
@@ -48,8 +46,8 @@ from ..tracks.table_widgets import (
     _SETUP_RIGHT_PLACEHOLDER, _SETUP_RIGHT_TREE,
     _PHASE_SETUP,
 )
-from ..controls import bind_primary_action, set_action_busy
-from ..theme import COLORS, PT_DEFAULT_COLORS, tune_toolbar_checkbox
+from ..controls import FormActionButton, bind_primary_action, content_splitter, set_action_busy
+from ..theme import COLORS, CONTENT_INSET, PT_DEFAULT_COLORS, tune_toolbar_checkbox
 from ..analysis.worker import DawCheckWorker, DawFetchWorker, DawTransferWorker
 
 
@@ -196,7 +194,7 @@ class DawMixin:  # pylint: disable=too-few-public-methods
         layout.addWidget(self._setup_toolbar)
 
         # Splitter: track table (left) + routing panel placeholder (right)
-        self._setup_splitter = setup_splitter = QSplitter(Qt.Horizontal)
+        self._setup_splitter = setup_splitter = content_splitter()
 
         # ── Left: track table ─────────────────────────────────────────────
         self._setup_table = _SetupDragTable()
@@ -244,7 +242,7 @@ class DawMixin:  # pylint: disable=too-few-public-methods
         # Page 0: placeholder
         right_placeholder = QWidget()
         right_layout = QVBoxLayout(right_placeholder)
-        right_layout.setContentsMargins(40, 0, 40, 0)
+        right_layout.setContentsMargins(*(CONTENT_INSET,) * 4)
         right_layout.addStretch(2)
         placeholder_label = QLabel("Connect to a DAW to configure routing")
         placeholder_label.setAlignment(Qt.AlignCenter)
@@ -257,13 +255,13 @@ class DawMixin:  # pylint: disable=too-few-public-methods
         # Page 1: folder tree + transfer progress panel
         tree_page = QWidget()
         tree_page_layout = QVBoxLayout(tree_page)
-        tree_page_layout.setContentsMargins(0, 0, 0, 0)
-        tree_page_layout.setSpacing(0)
+        tree_page_layout.setContentsMargins(*(CONTENT_INSET,) * 4)
+        tree_page_layout.setSpacing(CONTENT_INSET)
 
         # Project Name input
         proj_name_container = QWidget()
         proj_name_layout = QHBoxLayout(proj_name_container)
-        proj_name_layout.setContentsMargins(8, 8, 8, 4)
+        proj_name_layout.setContentsMargins(0, 0, 0, 0)
         proj_name_layout.setSpacing(8)
         proj_name_label = QLabel("<b>Project Name:</b>")
         self._project_name_edit = QLineEdit()
@@ -272,7 +270,7 @@ class DawMixin:  # pylint: disable=too-few-public-methods
         proj_name_layout.addWidget(proj_name_label)
         proj_name_layout.addWidget(self._project_name_edit, 1)
 
-        self._open_project_btn = QPushButton("Open Project Folder")
+        self._open_project_btn = FormActionButton("Open Project Folder")
         self._open_project_btn.clicked.connect(self._on_open_active_project_folder)
         proj_name_layout.addWidget(self._open_project_btn)
 
@@ -327,17 +325,18 @@ class DawMixin:  # pylint: disable=too-few-public-methods
         """Fit the setup splitter so the left table starts without clipping."""
         if not hasattr(self, "_setup_splitter"):
             return
-        total_width = self._setup_splitter.width()
+        total_width = self._setup_splitter.width() - self._setup_splitter.handleWidth()
         if total_width <= 0:
             return
 
         table_width = self._setup_table_content_width()
+        min_left_width = self._setup_table.minimumWidth()
         max_left_width = max(
-            self._setup_table.minimumWidth(),
-            total_width - _SETUP_RIGHT_MIN_WIDTH,
+            min_left_width,
+            total_width - _SETUP_RIGHT_MIN_WIDTH - 2 * CONTENT_INSET,
         )
         left_width = min(
-            max(table_width, self._setup_table.minimumWidth()),
+            max(table_width, min_left_width),
             max_left_width,
         )
         right_width = max(0, total_width - left_width)

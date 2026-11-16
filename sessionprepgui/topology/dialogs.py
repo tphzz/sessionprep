@@ -1,11 +1,24 @@
 """Dialogs specifically for the Track Layout tab."""
 
 from PySide6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QSpinBox,
-    QLineEdit, QDialogButtonBox, QSizePolicy
+    QDialog, QVBoxLayout, QHBoxLayout, QLabel,
+    QLineEdit, QDialogButtonBox, QInputDialog, QSizePolicy
 )
 from PySide6.QtCore import Qt
-from ..theme import COLORS
+from ..controls import FormSpinBox
+from ..theme import COLORS, CONTENT_INSET
+
+
+def output_name_dialog(parent, title: str, label: str, name: str = "") -> QInputDialog:
+    """Build the standard Qt filename prompt with the content inset."""
+    dialog = QInputDialog(parent)
+    dialog.setWindowTitle(title)
+    dialog.setLabelText(label)
+    dialog.setTextValue(name)
+    dialog.sizeHint()  # Create Qt's lazy layout before setting its margins.
+    dialog.layout().setContentsMargins(*(CONTENT_INSET,) * 4)
+    return dialog
+
 
 def add_output_tracks_dialog(parent, topology, colors=None) -> list[tuple[str, int]]:
     """
@@ -20,7 +33,7 @@ def add_output_tracks_dialog(parent, topology, colors=None) -> list[tuple[str, i
     dlg.setMinimumWidth(520)
     outer = QVBoxLayout(dlg)
     outer.setSpacing(8)
-    outer.setContentsMargins(12, 12, 12, 10)
+    outer.setContentsMargins(*(CONTENT_INSET,) * 4)
 
     # Inline row: Create [n] new [ch]-ch tracks  Name: [____]
     row = QHBoxLayout()
@@ -31,7 +44,7 @@ def add_output_tracks_dialog(parent, topology, colors=None) -> list[tuple[str, i
     create_lbl.setStyleSheet(lbl_style)
     row.addWidget(create_lbl)
 
-    count_spin = QSpinBox()
+    count_spin = FormSpinBox()
     count_spin.setRange(1, 99)
     count_spin.setValue(1)
     count_spin.setFixedWidth(52)
@@ -41,7 +54,7 @@ def add_output_tracks_dialog(parent, topology, colors=None) -> list[tuple[str, i
     new_lbl.setStyleSheet(lbl_style)
     row.addWidget(new_lbl)
 
-    ch_spin = QSpinBox()
+    ch_spin = FormSpinBox()
     ch_spin.setRange(1, 64)
     ch_spin.setValue(2)
     ch_spin.setFixedWidth(52)

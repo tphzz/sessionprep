@@ -13,7 +13,6 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
-    QPushButton,
     QSizePolicy,
     QSpacerItem,
     QTableWidget,
@@ -22,6 +21,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ...controls import FormActionButton
 from ...prefs.preset_panel import NamedPresetPanel
 from ...settings import save_config
 from ...theme import WINDOW_MARGIN
@@ -221,7 +221,7 @@ class TrackHeightTool(QWidget):
 
     def _init_ui(self):
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(*(WINDOW_MARGIN,) * 4)
+        layout.setContentsMargins(0, WINDOW_MARGIN, 0, 0)
         layout.setSpacing(6)
 
         self._desc = QLabel(
@@ -280,10 +280,10 @@ class TrackHeightTool(QWidget):
         controls.addWidget(self._all_summary)
 
         controls.addStretch()
-        self._refresh_btn = QPushButton("Preview")
+        self._refresh_btn = FormActionButton("Preview")
         self._refresh_btn.clicked.connect(self._refresh_preview)
         controls.addWidget(self._refresh_btn)
-        self._apply_btn = QPushButton("Apply")
+        self._apply_btn = FormActionButton("Apply")
         self._apply_btn.clicked.connect(self._apply_preset)
         controls.addWidget(self._apply_btn)
         layout.addLayout(controls)

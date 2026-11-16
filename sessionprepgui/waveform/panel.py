@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QEvent, Qt, Signal, QSize
-from PySide6.QtGui import QAction, QActionGroup
+from PySide6.QtCore import QEvent, QPointF, QSize, Qt, Signal
+from PySide6.QtGui import QAction, QActionGroup, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -12,6 +12,8 @@ from PySide6.QtWidgets import (
     QMenu,
     QPushButton,
     QStyle,
+    QStyleOptionToolButton,
+    QStylePainter,
     QSplitter,
     QSizePolicy,
     QToolButton,
@@ -19,8 +21,12 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..icons import icon
+from ..icons import icon, icon_path
+from ..theme import CONTENT_INSET
 from .widget import WaveformWidget
+
+
+_PREVIEW_CHEVRON_SIZE = 16
 
 
 class _PreviewDisclosureButton(QToolButton):
@@ -30,6 +36,23 @@ class _PreviewDisclosureButton(QToolButton):
         super().__init__(parent)
         self.setObjectName("waveformPreviewDisclosure")
         self.setProperty("keyboardFocus", False)
+
+    def paintEvent(self, _event):
+        option = QStyleOptionToolButton()
+        self.initStyleOption(option)
+        if not option.icon.isNull():
+            artwork = option.icon.pixmap(option.iconSize, self.devicePixelRatioF())
+            scale = artwork.devicePixelRatio()
+            aligned = QPixmap(artwork.size())
+            aligned.setDevicePixelRatio(scale)
+            aligned.fill(Qt.transparent)
+            # The shared menu centerline is one logical pixel below the
+            # disclosure artwork's default Fusion placement.
+            with QPainter(aligned) as painter:
+                painter.drawPixmap(QPointF(0, round(scale) / scale), artwork)
+            option.icon = QIcon(aligned)
+        with QStylePainter(self) as painter:
+            painter.drawComplexControl(QStyle.CC_ToolButton, option)
 
     def _set_keyboard_focus(self, enabled: bool) -> None:
         if self.property("keyboardFocus") == enabled:
@@ -249,7 +272,7 @@ class WaveformPanel(QWidget):
             QToolButton:disabled { color: #aaa; }
         """)
         row = QHBoxLayout(header)
-        row.setContentsMargins(0, 0, 8, 0)
+        row.setContentsMargins(CONTENT_INSET, 0, CONTENT_INSET, 0)
         row.setSpacing(0)
         self.disclosure_button = _PreviewDisclosureButton()
         self.disclosure_button.setText("Waveform preview")
@@ -257,7 +280,7 @@ class WaveformPanel(QWidget):
         self.disclosure_button.setToolTip("Show or hide the waveform preview")
         self.disclosure_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         self.disclosure_button.setIcon(icon("chevron-down"))
-        self.disclosure_button.setIconSize(QSize(16, 16))
+        self.disclosure_button.setIconSize(QSize(_PREVIEW_CHEVRON_SIZE, _PREVIEW_CHEVRON_SIZE))
         self.disclosure_button.setCheckable(True)
         self.disclosure_button.setChecked(True)
         self.disclosure_button.setFocusPolicy(Qt.StrongFocus)
@@ -360,12 +383,14 @@ class WaveformPanel(QWidget):
             "QToolButton:checked { background-color: #2a6db5;"
             " color: #ffffff; }")
 
-        # The chevron sits about 4 px after the label with 8 px right padding
-        # (approved header design); the padding reserves its slot.
+        # Reserve the existing menu-label gap and use the disclosure artwork.
+        chevron = icon_path("chevron-down").as_posix()
         dropdown_style = (
             "QToolButton { padding-right: 21px; }"
             "QToolButton::menu-indicator { subcontrol-position: right center;"
-            " subcontrol-origin: padding; right: 8px; }")
+            " subcontrol-origin: padding; right: 7px; top: 2px;"
+            f" width: {_PREVIEW_CHEVRON_SIZE}px; height: {_PREVIEW_CHEVRON_SIZE}px;"
+            f' image: url("{chevron}"); }}')
 
         # Display mode dropdown
         self.display_mode_btn = QToolButton()
@@ -574,7 +599,7 @@ class WaveformPanel(QWidget):
             "#wfTransport { background-color: #2d2d2d;"
             " border-top: 1px solid #555; }")
         layout = QHBoxLayout(transport)
-        layout.setContentsMargins(4, 2, 4, 2)
+        layout.setContentsMargins(CONTENT_INSET, 2, CONTENT_INSET, 2)
         layout.setSpacing(4)
 
         _BTN_H = 24

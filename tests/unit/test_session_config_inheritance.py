@@ -1,23 +1,29 @@
 from __future__ import annotations
 
 import copy
+from html import unescape
 
 import pytest
 
 pytest.importorskip("PySide6")
 
+from PySide6.QtCore import Qt
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
     QInputDialog,
+    QLabel,
     QMessageBox,
     QPushButton,
 )
 
 from sessionprepgui import settings
+from sessionprepgui.change_marker import is_tab_marked
 from sessionprepgui.mainwindow import SessionPrepWindow
 from sessionprepgui.prefs.dialog import PreferencesDialog
 from sessionprepgui.session.io import load_session
+from sessionprepgui.tracks.table_widgets import _TAB_SESSION
 from sessionpreplib.daw_processors import protools
 from sessionpreplib.models import TrackContext, TransferEntry
 
@@ -42,6 +48,7 @@ def app_config(monkeypatch, tmp_path):
     preset = config["config_presets"]["Default"]
     preset["daw_processors"]["protools"].update(
         protools_project_dir=str(tmp_path / "protools-default"),
+        protools_temp_dir=str(tmp_path / "protools-temp-default"),
         protools_port=31416,
         protools_templates=[{"group": "Mix", "name": "Pro Tools Template"}],
     )
@@ -56,6 +63,7 @@ def app_config(monkeypatch, tmp_path):
     named_preset = copy.deepcopy(preset)
     named_preset["daw_processors"]["protools"].update(
         protools_project_dir=str(tmp_path / "protools-studio"),
+        protools_temp_dir=str(tmp_path / "protools-temp-studio"),
         protools_port=32416,
     )
     config["config_presets"][NAMED_PRESET] = named_preset
@@ -113,6 +121,15 @@ def phase_work(window, monkeypatch):
 
 def _field(widgets, section, key):
     return dict(widgets[section])[key]
+
+
+def _reset_button(container, label):
+    return next(
+        button for button in container.findChildren(QPushButton)
+        if button.accessibleName() in {
+            f"Reset {label} to default", f"Use preset value for {label}",
+        }
+    )
 
 
 def _save_preferences(window, monkeypatch, edit):
@@ -353,6 +370,264 @@ def test_editing_port_back_to_preset_refreshes_phase3_and_pins_that_value(
     assert port.value() == 31416
     assert observed_ports[-1] == 31416
     assert phase_work == []
+
+
+@pytest.mark.parametrize("equal_override", [False, True], ids=["different", "matching"])
+def test_phase2_port_reset_uses_the_selected_project_preset(
+    window, app_config, phase_work, tmp_path, monkeypatch, equal_override,
+):
+    _open_project(window, app_config, tmp_path, NAMED_PRESET)
+    port = _field(window._session_widgets, PRO_TOOLS, "protools_port")
+    port.setValue(33416)
+    if equal_override:
+        port.setValue(32416)
+
+    state = window._capture_session_state()
+    saved_overrides = state["session_config_overrides"]
+    assert saved_overrides[f"{PRO_TOOLS}.protools_port"] == port.value()
+
+    daw_tree_item = window._session_dirty_items[PRO_TOOLS]
+    daws_tree_item = window._session_dirty_items["_daw_processors"]
+    assert daw_tree_item.icon(1).isNull() == equal_override
+    assert daws_tree_item.icon(1).isNull() == equal_override
+    assert is_tab_marked(window._detail_tabs, _TAB_SESSION) == (not equal_override)
+
+    observed_ports = []
+
+    def check_connection(connection, **_kwargs):
+        observed_ports.append(connection.port)
+        return True, "Test connection"
+
+    monkeypatch.setattr(protools, "check_ptsl_connectivity", check_connection)
+    reset = _reset_button(port.parentWidget(), "Port")
+    tooltip_before_reset = reset.toolTip()
+    subtext_before_reset = [
+        label.text() for label in port.parentWidget().findChildren(QLabel)
+    ]
+    reset.click()
+
+    window._active_daw_processor.check_connectivity()
+    assert port.value() == 32416
+    assert window._flat_config()["protools_port"] == 32416
+    assert observed_ports == [32416]
+    assert reset.accessibleName() == "Use preset value for Port"
+    assert "32416" in tooltip_before_reset
+    assert any("Preset: 32416" in text for text in subtext_before_reset)
+    assert "32416" in reset.toolTip()
+    assert "Preset:" in port.toolTip()
+    assert "32416" in port.toolTip()
+    assert daw_tree_item.icon(1).isNull()
+    assert daws_tree_item.icon(1).isNull()
+    assert not is_tab_marked(window._detail_tabs, _TAB_SESSION)
+    assert window._capture_session_state()["session_config_overrides"] == {}
+
+    def update_preset(dialog):
+        dialog._cfg_panel._combo.setCurrentText(NAMED_PRESET)
+        _field(dialog._cfg_widgets, PRO_TOOLS, "protools_port").setValue(34416)
+
+    _save_preferences(window, monkeypatch, update_preset)
+
+    window._active_daw_processor.check_connectivity()
+    assert port.value() == 34416
+    assert observed_ports == [32416, 34416]
+    assert "34416" in reset.toolTip()
+    assert "Preset:" in port.toolTip()
+    assert "34416" in port.toolTip()
+    assert window._session.prepare_state == "ready"
+    assert phase_work == []
+
+
+@pytest.mark.parametrize("value", [0.1234, 0.12345678901])
+def test_phase2_float_reset_displays_the_loaded_preset_precision(window, app_config, tmp_path, value):
+    key = "protools_command_delay"
+    app_config["config_presets"][NAMED_PRESET]["daw_processors"]["protools"][key] = value
+    window._config = app_config
+    _open_project(window, app_config, tmp_path, NAMED_PRESET)
+    delay = _field(window._session_widgets, PRO_TOOLS, key)
+    delay.setValue(0.8)
+
+    _reset_button(delay.parentWidget(), "Command Delay (s)").click()
+
+    assert delay.value() == value
+    assert window._flat_config()[key] == value
+    assert f"{PRO_TOOLS}.{key}" not in window._session_overrides
+
+
+def test_switching_config_presets_preserves_float_editor_step(qapp, app_config):
+    key = "protools_command_delay"
+    value = 0.12345678901
+    app_config["config_presets"][NAMED_PRESET]["daw_processors"]["protools"][key] = value
+    dialog = PreferencesDialog(app_config)
+    try:
+        delay = _field(dialog._cfg_widgets, PRO_TOOLS, key)
+        original_step = delay.singleStep()
+        original_decimals = delay.decimals()
+        dialog._cfg_panel._combo.setCurrentText(NAMED_PRESET)
+        assert delay.value() == value
+        assert delay.singleStep() == original_step
+
+        dialog._cfg_panel._combo.setCurrentText("Default")
+        assert delay.decimals() == original_decimals
+        assert delay.singleStep() == original_step
+    finally:
+        dialog.close()
+
+
+@pytest.mark.parametrize("key, label", [
+    ("protools_port", "Port"),
+    ("protools_project_dir", "Project directory"),
+])
+def test_space_activates_the_focused_field_reset(qapp, project, key, label):
+    editor = _field(project._session_widgets, PRO_TOOLS, key)
+    if key == "protools_port":
+        editor.setValue(32416)
+    else:
+        editor.set_value("C:/override")
+    project._phase_tabs.setCurrentIndex(1)
+    project._detail_tabs.setCurrentIndex(_TAB_SESSION)
+    project._session_tree.setCurrentItem(project._session_dirty_items[PRO_TOOLS])
+    reset = _reset_button(project._session_stack.currentWidget(), label)
+    project.show()
+    qapp.processEvents()
+    reset.setFocus(Qt.TabFocusReason)
+    qapp.processEvents()
+    assert reset.hasFocus()
+
+    QTest.keyClick(reset, Qt.Key_Space)
+
+    assert f"{PRO_TOOLS}.{key}" not in project._session_overrides
+    assert reset.hasFocus()
+
+
+def test_phase2_project_directory_reset_follows_preset_on_reopen_and_switch(
+    window, app_config, phase_work, tmp_path, monkeypatch,
+):
+    _open_project(window, app_config, tmp_path, NAMED_PRESET)
+    path = _field(window._session_widgets, PRO_TOOLS, "protools_project_dir")
+    temporary_path = _field(window._session_widgets, PRO_TOOLS, "protools_temp_dir")
+    studio_dir = str(tmp_path / "protools-studio")
+    custom_temp = str(tmp_path / "session-temp")
+    path.set_value(str(tmp_path / "session-projects"))
+    temporary_path.set_value(custom_temp)
+
+    reset = _reset_button(path, "Project directory")
+    tooltip_before_reset = reset.toolTip()
+    reset.click()
+
+    assert path.value() == studio_dir
+    assert window._active_daw_processor.project_dir == studio_dir
+    assert reset.accessibleName() == "Use preset value for Project directory"
+    assert studio_dir in unescape(tooltip_before_reset)
+    assert studio_dir in unescape(reset.toolTip())
+    assert temporary_path.value() == custom_temp
+    assert not window._session_dirty_items[PRO_TOOLS].icon(1).isNull()
+    assert is_tab_marked(window._detail_tabs, _TAB_SESSION)
+
+    session_path = str(tmp_path / "reset.spsession")
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *args: (session_path, ""))
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *args: (session_path, ""))
+    window._on_save_session()
+    state = load_session(session_path)
+    assert state["active_config_preset"] == NAMED_PRESET
+    assert state["session_config_overrides"] == {f"{PRO_TOOLS}.protools_temp_dir": custom_temp}
+    assert state["session_config"]["daw_processors"]["protools"]["protools_project_dir"] == studio_dir
+
+    updated_dir = str(tmp_path / "studio-updated")
+
+    def update_preset(dialog):
+        dialog._cfg_panel._combo.setCurrentText(NAMED_PRESET)
+        _field(dialog._cfg_widgets, PRO_TOOLS, "protools_project_dir").set_value(updated_dir)
+        _field(dialog._cfg_widgets, PRO_TOOLS, "protools_temp_dir").set_value(
+            str(tmp_path / "studio-temp-updated"))
+        dialog._cfg_panel._combo.setCurrentText("Default")
+
+    _save_preferences(window, monkeypatch, update_preset)
+    assert path.value() == updated_dir
+    assert window._active_daw_processor.project_dir == updated_dir
+    assert updated_dir in unescape(reset.toolTip())
+
+    window._on_load_session()
+    assert window._config_preset_combo.currentText() == NAMED_PRESET
+    assert path.value() == updated_dir
+    assert window._active_daw_processor.project_dir == updated_dir
+    assert temporary_path.value() == custom_temp
+
+    window._config_preset_combo.setCurrentText("Default")
+    default_dir = str(tmp_path / "protools-default")
+    assert path.value() == default_dir
+    assert window._active_daw_processor.project_dir == default_dir
+    assert default_dir in unescape(reset.toolTip())
+    assert temporary_path.value() == custom_temp
+    assert window._session.prepare_state == "ready"
+    assert phase_work == []
+
+
+def test_phase2_temporary_directory_reset_refreshes_the_phase3_fetch_path(
+    window, app_config, phase_work, tmp_path, monkeypatch,
+):
+    _open_project(window, app_config, tmp_path, NAMED_PRESET)
+    path = _field(window._session_widgets, PRO_TOOLS, "protools_temp_dir")
+    preset_path = str(tmp_path / "protools-temp-studio")
+    path.set_value("")
+
+    def unexpected_engine(_processor):
+        pytest.fail("An invalid temporary project directory must fail before connecting")
+
+    monkeypatch.setattr(protools.ProToolsDawProcessor, "_open_engine", unexpected_engine)
+    _reset_button(path, "Temporary project directory").click()
+
+    assert path.value() == preset_path
+    assert window._flat_config()["protools_temp_dir"] == preset_path
+    with pytest.raises(RuntimeError) as error:
+        window._active_daw_processor.fetch(window._session)
+    assert preset_path in str(error.value)
+    assert not is_tab_marked(window._detail_tabs, _TAB_SESSION)
+    assert window._session.prepare_state == "ready"
+    assert phase_work == []
+
+
+def test_phase2_presentation_reset_uses_the_current_presets_value(
+    project, phase_work, monkeypatch,
+):
+    page = "_presentation"
+    field = "show_clean_detectors"
+    _save_preferences(
+        project, monkeypatch,
+        lambda dialog: _field(dialog._cfg_widgets, page, field).setChecked(True),
+    )
+    checkbox = _field(project._session_widgets, page, field)
+    assert checkbox.isChecked()
+    checkbox.setChecked(False)
+    assert is_tab_marked(project._detail_tabs, _TAB_SESSION)
+
+    _reset_button(checkbox.parentWidget(), "Show clean detector results").click()
+
+    assert checkbox.isChecked()
+    assert project._show_clean
+    assert not is_tab_marked(project._detail_tabs, _TAB_SESSION)
+    assert project._session.prepare_state == "ready"
+    assert phase_work == []
+
+
+def test_preferences_port_and_path_resets_still_use_built_in_defaults(qapp, app_config):
+    dialog = PreferencesDialog(app_config)
+    try:
+        dialog._cfg_panel._combo.setCurrentText(NAMED_PRESET)
+        port = _field(dialog._cfg_widgets, PRO_TOOLS, "protools_port")
+        path = _field(dialog._cfg_widgets, PRO_TOOLS, "protools_project_dir")
+        assert port.value() == 32416
+        assert path.value()
+
+        _reset_button(port.parentWidget(), "Port").click()
+        _reset_button(path, "Project directory").click()
+        dialog._save_btn.click()
+
+        assert dialog.saved
+        saved = dialog.result_config()["config_presets"][NAMED_PRESET]["daw_processors"]["protools"]
+        assert saved["protools_port"] == 31416
+        assert saved["protools_project_dir"] == ""
+    finally:
+        dialog.close()
 
 
 def test_blank_project_directory_remains_an_override_until_revert(

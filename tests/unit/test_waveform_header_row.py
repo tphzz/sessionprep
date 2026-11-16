@@ -2,9 +2,10 @@
 import pytest
 
 pytest.importorskip("PySide6")
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QPoint, Qt
 from PySide6.QtWidgets import QApplication, QToolButton
 
+from sessionprepgui.theme import CONTENT_INSET
 from sessionprepgui.waveform.panel import WaveformPanel
 
 
@@ -50,6 +51,57 @@ def test_collapsing_hides_the_controls_but_keeps_disclosure_and_zoom(qapp):
     qapp.processEvents()
     assert panel._view_toolbar.isVisible()
     panel.close()
+
+
+@pytest.mark.parametrize("analysis_mode", [False, True])
+def test_disclosure_and_view_menus_share_the_painted_chevron_centerline(qapp, analysis_mode):
+    panel = _panel(qapp, 1600, analysis_mode)
+    header = panel.preview_header
+    disclosure = panel.disclosure_button
+
+    def glyph(button, *, left_side=False):
+        image = header.grab().toImage()
+        scale = image.devicePixelRatio()
+        origin = button.mapTo(header, QPoint())
+        if left_side:
+            left, right = origin.x() + 5, origin.x() + 28
+        else:
+            left = origin.x() + button.width() - 23
+            right = origin.x() + button.width() - 3
+        points = [
+            (x, y)
+            for y in range(round(7 * scale), round(26 * scale))
+            for x in range(round(left * scale), round(right * scale))
+            if image.pixelColor(x, y).red() > 138
+        ]
+        assert points, button.text()
+        xs, ys = zip(*points)
+        return max(xs) - min(xs) + 1, (min(ys) + max(ys)) / 2
+
+    try:
+        panel.set_expanded(False)
+        qapp.processEvents()
+        closed_width, closed_center = glyph(disclosure, left_side=True)
+        panel.set_expanded(True)
+        for action, display in (
+            (panel.wf_action, panel.wf_settings_btn),
+            (panel.spec_action, panel.spec_settings_btn),
+        ):
+            action.trigger()
+            qapp.processEvents()
+            width, center = glyph(disclosure, left_side=True)
+            assert abs(closed_width - width) <= 1
+            assert abs(closed_center - center) <= 1
+            menus = [panel.display_mode_btn, display]
+            if analysis_mode:
+                menus.append(panel.overlay_btn)
+            for menu in menus:
+                assert menu.isVisible()
+                menu_width, menu_center = glyph(menu)
+                assert abs(menu_width - width) <= 1
+                assert abs(menu_center - center) <= 1
+    finally:
+        panel.close()
 
 
 def test_controls_overflow_from_the_end_into_the_more_menu(qapp):
@@ -206,13 +258,12 @@ def test_header_keeps_disclosure_left_and_zoom_group_packed_right(qapp, analysis
     panel.set_expanded(expanded)
     qapp.processEvents()
     header = panel.preview_header
-    assert panel.disclosure_button.x() == 0
+    assert panel.disclosure_button.x() == CONTENT_INSET
     zoom = panel._zoom_buttons
     # Zoom/scale buttons sit side by side at the right edge, not spread out.
     for left, right in zip(zoom, zoom[1:]):
         assert right.x() == left.x() + left.width()
-    margins = header.layout().contentsMargins()
-    assert zoom[-1].x() + zoom[-1].width() == header.width() - margins.right()
+    assert zoom[-1].x() + zoom[-1].width() == header.width() - CONTENT_INSET
     gap = zoom[0].x() - (panel.disclosure_button.x() + panel.disclosure_button.width())
     assert gap > 0
     if not expanded:

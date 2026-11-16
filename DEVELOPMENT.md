@@ -1795,7 +1795,7 @@ stacks actions; and narrow (viewport below 460 px, left again only at 476 px so
 a scroll bar appearing after the switch cannot flip it back, or the compact
 header would scroll), which stacks each finding in one column with inline
 actions. The Help panel prefers 360 logical pixels (minimum 140) with an 8 px
-gap and keeps `DETAIL_TAB_INSET` from the File pane's top, right and bottom
+gap and keeps `REPORT_INSET` from the File pane's top, right and bottom
 edges; it gives space back to the report when needed, and below a 240 px body
 its simple two-column Help tables stack (`stack_two_column_rows`). Detector Help
 HTML is normalised centrally by `normalize_help_tables` (no blank line around
@@ -1805,20 +1805,28 @@ Fixed and auto-filled by `_DraggableTrackTable.fit_file_column` to
 max(160 px, free width); long names elide in the middle and the table scrolls
 horizontally when the pane is too narrow. String settings fields are at least
 `param_form.LINE_EDIT_MIN_WIDTH` (200 px) or their value's width.
-`DETAIL_TAB_INSET` (4 logical px, `sessionprepgui/tracks/table_widgets.py`) is
-the shared padding of detail-tab content: the Summary/File report text
-(root-frame margins on every document), the Groups and Config page content and
-the Help dock edges. The track table and the detail tab bar stay flush. The
-generated settings pages (Phase 2 Config and Preferences) use
-`SETTINGS_PAGE_MARGIN` (4 px, `prefs/param_form.py`). Navigation-tree | page
-splitters call `controls.fit_navigation_pane()` so a width-capped tree never
-leaves an unpainted strip beside the handle. Tool windows and dialogs (Log
-Viewer, Pro Tools Utils, Preferences) use `theme.WINDOW_MARGIN` (4 logical px)
-as their content margin, and the Pro Tools tool pages pad their content by the
-same 4 px inside the tab area (the Color Picker's `ColorGridPanel` adds no
-margin of its own there). Their status lines are shown only while they hold a
-message and never change the preferred window height. The waveform preview stays full
-width. A measurement of the cached stock header
+`theme.CONTENT_INSET` sets the 6 logical px margin on inset content. It
+starts at the owning pane edge. `controls.content_splitter()` and the dock
+style reserve 1 logical px for the painted separator and keep Qt's wider drag
+target. Both Track Layout panes and the area beside the Batch Queue dock use
+6 px on each side of their divider. In Phase 2 the track table and detail tab
+bar start directly below the command bar and fill their pane widths. The
+left pane keeps its bounds while reanalysis hides the table. Summary and File
+apply `theme.REPORT_INSET` (12 logical px) to every report document's root
+frame. The waveform plot spans the pane, and its controls and transport use
+a 6 px side inset. In Phase 3 the track table fills the left pane. The Project
+Name row, folder tree and offline view use 6 px in the right pane.
+
+Navigation splitters use `controls.fit_navigation_pane()` for the capped
+tree width. The settings scroll area adds a 6 px gap between form content
+and a visible scroll rail. The outer pane provides its edge inset. The
+Preferences tab strip fills the top of the client area, and its pages and
+Save/Cancel footer own their 6 px insets. Pro Tools tool pages add 6 px
+below the tab header, with the tool
+window providing the sides and bottom. Status lines are visible while they
+hold a message and keep the existing preferred window height.
+
+A measurement of the cached stock header
 (its narrow variant, the narrowest layout), keyed by content and font, protects
 normalization values at larger scales without suppressing legitimate
 horizontal scrolling in custom result HTML.
@@ -1874,6 +1882,8 @@ bottom of its splitter, and remembers expanded sizes. Reopening restores those
 sizes proportionally against the current splitter extent. It retains requests,
 selection and viewport. Existing context changes still govern data
 invalidation. Its disclosure uses an upward opening and downward closing chevron.
+The disclosure and view menus use the same 16 px chevron artwork on a shared
+optical centerline in the preview row. Qt retains the menu actions and focus order.
 A local input-origin property suppresses only pointer-focus painting; native
 focus, checked state, Tab/Backtab and Space activation remain intact. Keyboard
 activation after a mouse click restores the outline. Other header controls keep
@@ -1899,6 +1909,11 @@ borderless stepper surfaces and existing hover/pressed palette colors. The
 native `QDoubleSpinBox` still owns hit targets, limits, keyboard/mouse stepping,
 locale formatting, suffixes and value signals. No fixed editor or row geometry
 is introduced.
+
+The application-wide Fusion style paints both scrollbar axes with a `#2d2d2d`
+track and a `#7d7d7d` idle thumb. Native scrollbar subcontrols retain their
+geometry, hit testing and arrow buttons. The style also supplies the 1 px dock
+separator.
 
 ### 18.2 Package Architecture
 
@@ -2065,6 +2080,14 @@ leaves. `prefs/` reads `ParamSpec` metadata from detectors and processors.
     `QLineEdit` + Browse + reset button + optional recursive checkbox).
     Activated by `widget_hint="path_picker_folder"` / `"path_picker_file"` /
     `"path_picker_save"`.
+  - Use `FormSpinBox` and `FormDoubleSpinBox` from `sessionprepgui.controls`
+    for numeric form fields. Use `FormActionButton` and `FormBrowseButton` for
+    paired actions. The shared theme matches their painted height to dropdowns
+    and text fields at the current font size. Numeric fields retain Qt steppers.
+    DAWproject template rows size to these editors' preferred heights.
+  - **Field Reset** paints 16 px artwork within a target of at least 32 × 32 px.
+    Its face follows the painted height of the companion field or Browse
+    button. A checkbox row centers a 24 px face on the indicator.
   - **Page interface** — every page class (`GeneralPage`, `ColorsPage`,
     `GroupsPage`) implements `load(config)`, `commit(config)`, and
     `validate() → str | None`. All read/write goes through `_set_widget_value`
@@ -2270,7 +2293,11 @@ the selected preset name and explicit overrides keyed by field, such as
 `daw_processors.protools.protools_temp_dir`. `resolve_session_config()`
 overlays those values on the current preset. The GUI renders the effective
 fields, and `_flat_config()` flattens that model for workers. An edit that
-equals the preset still records an override.
+equals the preset still records an override. A generated field reset in
+Phase 2 removes that override and reloads the value from the selected preset.
+It uses the same effective-change routing as a field edit. The per-field
+reference text, tooltip, and change markers draw on the selected preset.
+Global Preferences field resets use the built-in defaults.
 
 Session files store `session_config_overrides` as optional metadata alongside
 the resolved `session_config` snapshot. Interactive reopen resolves inherited

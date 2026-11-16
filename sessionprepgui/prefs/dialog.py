@@ -21,8 +21,6 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLineEdit,
     QMessageBox,
-    QScrollArea,
-    QSplitter,
     QSpinBox,
     QStackedWidget,
     QTabWidget,
@@ -38,7 +36,7 @@ from .page_colors import ColorsPage
 from .page_general import GeneralPage
 from .page_groups import GroupsPage
 from .preset_panel import NamedPresetPanel
-from ..controls import fit_navigation_pane
+from ..controls import content_splitter, fit_navigation_pane, inset_pane, settings_scroll_area
 from ..theme import WINDOW_MARGIN
 from ..change_marker import (
     MARKER_COLUMN_WIDTH, install_button_marker, install_tab_marker,
@@ -119,7 +117,8 @@ class PreferencesDialog(QDialog):
 
     def _init_ui(self) -> None:
         root = QVBoxLayout(self)
-        root.setContentsMargins(*(WINDOW_MARGIN,) * 4)
+        root.setContentsMargins(0, 0, 0, WINDOW_MARGIN)
+        root.setSpacing(0)
 
         self._tabs = QTabWidget()
         use_marker_tab_bar(self._tabs)
@@ -134,6 +133,7 @@ class PreferencesDialog(QDialog):
         install_tab_marker(self._tabs, self._preset_tab_index)
 
         btn_box = QDialogButtonBox(QDialogButtonBox.Cancel | QDialogButtonBox.Save)
+        btn_box.setContentsMargins(WINDOW_MARGIN, 0, WINDOW_MARGIN, 0)
         self._save_btn = btn_box.button(QDialogButtonBox.Save)
         self._save_btn.setText("Save Preferences")
         install_button_marker(self._save_btn)
@@ -145,9 +145,9 @@ class PreferencesDialog(QDialog):
     def _build_global_tab(self) -> QWidget:
         tab = QWidget()
         layout = QVBoxLayout(tab)
-        layout.setContentsMargins(0, 4, 0, 0)
+        layout.setContentsMargins(WINDOW_MARGIN, 0, WINDOW_MARGIN, 0)
 
-        splitter = QSplitter(Qt.Horizontal)
+        splitter = content_splitter()
         self._global_tree = QTreeWidget()
         self._global_tree.setColumnCount(2)
         self._global_tree.setHeaderHidden(True)
@@ -157,10 +157,11 @@ class PreferencesDialog(QDialog):
         self._global_tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
         self._global_tree.header().setSectionResizeMode(1, QHeaderView.Fixed)
         self._global_tree.setColumnWidth(1, MARKER_COLUMN_WIDTH)
-        splitter.addWidget(self._global_tree)
+        splitter.addWidget(inset_pane(
+            self._global_tree, (0, WINDOW_MARGIN, WINDOW_MARGIN, WINDOW_MARGIN)))
 
         self._global_stack = QStackedWidget()
-        splitter.addWidget(self._global_stack)
+        splitter.addWidget(inset_pane(self._global_stack, (0, 0, 0, WINDOW_MARGIN)))
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         fit_navigation_pane(splitter)
@@ -192,7 +193,8 @@ class PreferencesDialog(QDialog):
     def _build_preset_tab(self) -> QWidget:
         tab = QWidget()
         layout = QVBoxLayout(tab)
-        layout.setContentsMargins(0, 4, 0, 0)
+        layout.setContentsMargins(WINDOW_MARGIN, WINDOW_MARGIN, WINDOW_MARGIN, 0)
+        layout.setSpacing(0)
 
         self._cfg_panel = NamedPresetPanel(
             list(self._config_presets_data),
@@ -206,7 +208,7 @@ class PreferencesDialog(QDialog):
         self._cfg_panel.preset_deleted.connect(self._on_cfg_deleted)
         layout.addWidget(self._cfg_panel)
 
-        splitter = QSplitter(Qt.Horizontal)
+        splitter = content_splitter()
         self._preset_tree = QTreeWidget()
         self._preset_tree.setColumnCount(2)
         self._preset_tree.setHeaderHidden(True)
@@ -216,10 +218,11 @@ class PreferencesDialog(QDialog):
         self._preset_tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
         self._preset_tree.header().setSectionResizeMode(1, QHeaderView.Fixed)
         self._preset_tree.setColumnWidth(1, MARKER_COLUMN_WIDTH)
-        splitter.addWidget(self._preset_tree)
+        splitter.addWidget(inset_pane(
+            self._preset_tree, (0, WINDOW_MARGIN, WINDOW_MARGIN, WINDOW_MARGIN)))
 
         self._preset_stack = QStackedWidget()
-        splitter.addWidget(self._preset_stack)
+        splitter.addWidget(inset_pane(self._preset_stack, (0, 0, 0, WINDOW_MARGIN)))
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         fit_navigation_pane(splitter)
@@ -248,10 +251,7 @@ class PreferencesDialog(QDialog):
     def _register_page(self, item: QTreeWidgetItem, page: QWidget,
                        stack: QStackedWidget,
                        index: dict[int, int]) -> None:
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QScrollArea.NoFrame)
-        scroll.setWidget(page)
+        scroll = settings_scroll_area(page)
         idx = stack.addWidget(scroll)
         index[id(item)] = idx
 

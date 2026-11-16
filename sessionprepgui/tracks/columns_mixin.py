@@ -831,15 +831,15 @@ class TrackColumnsMixin:  # pylint: disable=too-few-public-methods
     def _auto_fit_track_table(self):
         """Fit the left pane around the Phase 2 table controls."""
         layout = apply_track_table_layout(self._track_table)
-        needed = max(layout.table_width, self._track_table.minimumWidth())
+        left_min = self._track_table.minimumWidth()
+        needed = max(layout.table_width, left_min)
 
-        splitter_total = self._main_splitter.width()
+        splitter_total = self._main_splitter.width() - self._main_splitter.handleWidth()
         if splitter_total > 0:
             right_min = TRACK_TABLE_RIGHT_MIN_WIDTH
             if hasattr(self, "_right_stack"):
                 right_min = max(right_min, self._right_stack.minimumWidth())
-            max_left = max(splitter_total - right_min,
-                           self._track_table.minimumWidth())
+            max_left = max(splitter_total - right_min, left_min)
             left_w = min(needed, max_left)
             right_w = max(splitter_total - left_w, right_min)
             self._main_splitter.setSizes([left_w, right_w])

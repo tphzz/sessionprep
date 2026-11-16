@@ -56,7 +56,7 @@ from PySide6.QtWidgets import (
 )
 
 from .prefs.param_form import _argb_to_qcolor
-from .theme import COLORS, normalize_color_name
+from .theme import COLORS, CONTENT_INSET, normalize_color_name
 
 
 _SELECTION_COLOR = QColor(42, 109, 181, 160)  # semi-transparent blue
@@ -72,7 +72,7 @@ class ProgressPanel(QWidget):
 
     AUTO_HIDE_MS = 2000
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, *, horizontal_inset: int = CONTENT_INSET):
         super().__init__(parent)
         self.setAttribute(Qt.WA_StyledBackground, True)
         self.setStyleSheet(
@@ -82,7 +82,7 @@ class ProgressPanel(QWidget):
             "}"
         )
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(6, 4, 6, 6)
+        layout.setContentsMargins(horizontal_inset, CONTENT_INSET, horizontal_inset, CONTENT_INSET)
         layout.setSpacing(3)
         self._label = QLabel("")
         self._label.setStyleSheet(

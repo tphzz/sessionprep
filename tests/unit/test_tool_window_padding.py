@@ -1,11 +1,11 @@
-"""Tool windows share a 4 px window margin; tool pages pad 4 px; empty status lines hide."""
+"""Tool-window and Preferences content insets."""
 import copy
 
 import pytest
 
 pytest.importorskip("PySide6")
 from PySide6.QtCore import QPoint
-from PySide6.QtWidgets import QApplication, QTableWidget
+from PySide6.QtWidgets import QApplication, QDialogButtonBox, QTableWidget
 
 from sessionprepgui import settings
 from sessionprepgui.daw_tools.protools.window import ProToolsUtilsWindow
@@ -27,11 +27,11 @@ def _margins(widget):
     return m.left(), m.top(), m.right(), m.bottom()
 
 
-def test_window_margin_is_four_logical_pixels():
-    assert WINDOW_MARGIN == 4
+def test_window_margin_is_six_logical_pixels():
+    assert WINDOW_MARGIN == 6
 
 
-def test_log_viewer_content_sits_four_pixels_from_every_edge(qapp):
+def test_log_viewer_content_sits_six_pixels_from_every_edge(qapp):
     viewer = LogViewerWindow()
     viewer.resize(1000, 650)
     viewer.show()
@@ -44,14 +44,48 @@ def test_log_viewer_content_sits_four_pixels_from_every_edge(qapp):
     viewer.close()
 
 
-def test_preferences_window_margin(qapp):
+def test_detached_log_viewer_uses_shared_form_control_sizes(qapp, form_font):
+    viewer = LogViewerWindow()
+    viewer.show()
+    try:
+        qapp.processEvents()
+        height = viewer._level_combo.height()
+        assert viewer._line_count.height() == height + 2  # Fusion frame inset
+        assert all(button.height() == height for button in (
+            viewer._copy_all_btn, viewer._copy_btn, viewer._clear_btn,
+            viewer._open_folder_btn,
+        ))
+    finally:
+        viewer.close()
+
+
+def test_preferences_tabs_are_flush_with_the_client_area(qapp):
     dialog = PreferencesDialog(copy.deepcopy(settings.build_defaults()))
-    assert _margins(dialog) == (WINDOW_MARGIN,) * 4
-    dialog.close()
+    dialog.show()
+    try:
+        for index, tree, form in (
+            (0, dialog._global_tree, dialog._global_stack),
+            (1, dialog._preset_tree, dialog._preset_stack),
+        ):
+            dialog._tabs.setCurrentIndex(index)
+            qapp.processEvents()
+            tabs = dialog._tabs.tabBar()
+            assert tabs.mapTo(dialog, QPoint()) == QPoint()
+            assert tabs.width() == dialog.width()
+            assert tree.mapTo(dialog, QPoint()).x() == WINDOW_MARGIN
+            assert form.mapTo(dialog, QPoint(form.width(), 0)).x() == dialog.width() - WINDOW_MARGIN
+        button_box = dialog.findChild(QDialogButtonBox)
+        right = max(b.mapTo(dialog, QPoint(b.width(), 0)).x() for b in button_box.buttons())
+        bottom = max(b.mapTo(dialog, QPoint(0, b.height())).y() for b in button_box.buttons())
+        assert right == dialog.width() - WINDOW_MARGIN
+        assert bottom == dialog.height() - WINDOW_MARGIN
+    finally:
+        dialog.close()
 
 
 @pytest.fixture
-def protools(qapp):
+def protools(qapp, monkeypatch):
+    monkeypatch.setattr(ProToolsUtilsWindow, "_schedule_start_connect", lambda *_: None)
     window = ProToolsUtilsWindow(settings.build_defaults())
     window.resize(1600, 720)
     window.show()
@@ -60,11 +94,11 @@ def protools(qapp):
     window.close()
 
 
-def test_protools_window_and_tool_pages_pad_four_pixels(protools):
+def test_protools_tool_pages_share_the_window_inset(protools):
     assert _margins(protools) == (WINDOW_MARGIN,) * 4
     for tool in (protools._color_tool, protools._track_height_tool):
-        assert _margins(tool) == (WINDOW_MARGIN,) * 4  # not 8 + 8
-    # The colour grid adds no margin of its own inside the padded page...
+        assert _margins(tool) == (0, WINDOW_MARGIN, 0, 0)
+    # The colour grid sits on the same bounds as the tool's other controls.
     assert _margins(protools._color_tool._grid) == (0, 0, 0, 0)
 
 

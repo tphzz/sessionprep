@@ -1,8 +1,6 @@
 """Generic PySide6 widget factory for parameter-spec-driven forms.
 
-No dependency on sessionpreplib.  Works with any object that satisfies the
-ParamSpec protocol (key, label, type, default, choices, min, max, description).
-Portable: copy param_form.py to any PySide6 project.
+Uses shared desktop controls with any object satisfying the ParamSpec protocol.
 """
 
 from __future__ import annotations
@@ -10,13 +8,18 @@ from __future__ import annotations
 import enum
 import re
 from decimal import Decimal
-from typing import Any, Protocol, runtime_checkable
+from functools import partial
+from html import escape
+from typing import Any, Callable, Protocol, runtime_checkable
 
-from PySide6.QtCore import Signal, QSize
-from PySide6.QtGui import QColor, QIcon, QPixmap
+from PySide6.QtCore import QEvent, QPoint, QRect, QSize, Qt, Signal
+from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap
 
+from ..controls import FormActionButton, FormBrowseButton, FormDoubleSpinBox, FormSpinBox
 from ..icons import icon
+from ..theme import CONTENT_INSET
 from PySide6.QtWidgets import (
+    QAbstractSpinBox,
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
@@ -26,6 +29,10 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QPushButton,
     QSpinBox,
+    QStyle,
+    QStyleOptionButton,
+    QStyleOptionSpinBox,
+    QStylePainter,
     QVBoxLayout,
     QWidget,
 )
@@ -95,7 +102,22 @@ def _fit_line_edit(w: QLineEdit) -> None:
     w.setMinimumWidth(min(max(LINE_EDIT_MIN_WIDTH, text_width + 24), LINE_EDIT_MAX_MIN_WIDTH))
 
 
-def _build_widget(spec: Any, value: Any) -> QWidget:
+def _decimal_places(value: Any) -> int:
+    if value is None:
+        return 0
+    exponent = Decimal(str(float(value))).as_tuple().exponent
+    return max(0, -exponent) if isinstance(exponent, int) else 0
+
+
+def _spin_decimals(spec: Any, value: Any) -> int:
+    refs = (spec.default, spec.min, spec.max, value)
+    return max(2, *map(_decimal_places, refs))
+
+
+def _build_widget(
+    spec: Any, value: Any,
+    *, reset_to_preset: Callable[[QWidget], None] | None = None,
+) -> QWidget:
     """Create an appropriate input widget for a ParamSpec and set its value.
 
     Resolution order
@@ -115,12 +137,15 @@ def _build_widget(spec: Any, value: Any) -> QWidget:
     # getattr with default keeps third-party ParamSpec implementations working
     # even when they pre-date this field.
     hint = getattr(spec, "widget_hint", None)
-    if hint == "path_picker_folder":
-        return PathPicker(spec, mode=PathPickerMode.FOLDER)
-    if hint == "path_picker_file":
-        return PathPicker(spec, mode=PathPickerMode.OPEN_FILE)
-    if hint == "path_picker_save":
-        return PathPicker(spec, mode=PathPickerMode.SAVE_FILE)
+    path_modes = {
+        "path_picker_folder": PathPickerMode.FOLDER,
+        "path_picker_file": PathPickerMode.OPEN_FILE,
+        "path_picker_save": PathPickerMode.SAVE_FILE,
+    }
+    if hint in path_modes:
+        picker = PathPicker(spec, mode=path_modes[hint], reset_to_preset=reset_to_preset)
+        _set_widget_value(picker, value)
+        return picker
 
     # ── 2. choices → QComboBox ────────────────────────────────────────────────
     if spec.choices is not None:
@@ -140,7 +165,7 @@ def _build_widget(spec: Any, value: Any) -> QWidget:
         return w
 
     if spec.type is int:
-        w = QSpinBox()
+        w = FormSpinBox()
         w.setMinimum(int(spec.min) if spec.min is not None else -999999)
         w.setMaximum(int(spec.max) if spec.max is not None else 999999)
         w.setValue(int(value) if value is not None else int(spec.default))
@@ -148,19 +173,11 @@ def _build_widget(spec: Any, value: Any) -> QWidget:
         return w
 
     if spec.type in ((int, float), float):
-        w = QDoubleSpinBox()
+        w = FormDoubleSpinBox()
         lo = float(spec.min) if spec.min is not None else -999999.0
         hi = float(spec.max) if spec.max is not None else 999999.0
-        decimals = 2
-        for ref in (spec.default, value, lo if spec.min is not None else None):
-            if ref is not None and ref != 0:
-                try:
-                    d = Decimal(str(float(ref)))
-                    exp = -d.as_tuple().exponent
-                    decimals = max(decimals, exp)
-                except Exception:
-                    pass
-        w.setDecimals(min(decimals, 10))
+        decimals = _spin_decimals(spec, value)
+        w.setDecimals(decimals)
         w.setMinimum(lo)
         w.setMaximum(hi)
         span = hi - lo
@@ -210,6 +227,7 @@ def _set_widget_value(widget: QWidget, value: Any) -> None:
     elif isinstance(widget, QSpinBox):
         widget.setValue(int(value))
     elif isinstance(widget, QDoubleSpinBox):
+        widget.setDecimals(_spin_decimals(widget._param_spec, value))
         widget.setValue(float(value))
     elif isinstance(widget, QLineEdit):
         if isinstance(value, list):
@@ -252,13 +270,23 @@ def _type_label(t: Any) -> str:
     return t.__name__
 
 
-def _build_tooltip(spec: Any) -> str:
-    """Build a rich tooltip with key, default, and range info."""
+_BUILT_IN = object()
+
+
+def _reference(spec: Any, preset_value: Any) -> tuple[str, Any]:
+    if preset_value is _BUILT_IN:
+        return "Default", spec.default
+    return "Preset", "(empty)" if preset_value == "" else preset_value
+
+
+def _build_tooltip(spec: Any, *, preset_value: Any = _BUILT_IN) -> str:
+    """Build a rich tooltip with key, reference value, and range info."""
     parts = [f"<b>{spec.label}</b>"]
     if spec.description:
         parts.append(f"<br/>{spec.description}")
     parts.append(f"<br/><br/>Config key: <code>{spec.key}</code>")
-    parts.append(f"<br/>Default: <b>{spec.default}</b>")
+    label, value = _reference(spec, preset_value)
+    parts.append(f"<br/>{label}: <b>{escape(str(value))}</b>")
     if spec.min is not None or spec.max is not None:
         lo = str(spec.min) if spec.min is not None else "\u2212\u221e"
         hi = str(spec.max) if spec.max is not None else "\u221e"
@@ -268,8 +296,8 @@ def _build_tooltip(spec: Any) -> str:
     return "".join(parts)
 
 
-def _build_subtext(spec: Any) -> str:
-    """Build visible subtext with description, type, and range info."""
+def _build_subtext(spec: Any, *, preset_value: Any = _BUILT_IN) -> str:
+    """Build visible subtext with description, type, range, and reference."""
     parts = []
     if spec.description:
         parts.append(spec.description)
@@ -280,9 +308,114 @@ def _build_subtext(spec: Any) -> str:
         meta.append(f"Range: {lo} \u2013 {hi}")
     if spec.choices:
         meta.append(f"Choices: {', '.join(str(c) for c in spec.choices)}")
-    meta.append(f"Default: {spec.default}")
+    label, value = _reference(spec, preset_value)
+    meta.append(f"{label}: {value}")
     parts.append("  \u2022  ".join(meta))
     return "\n".join(parts)
+
+
+class ConfigResetButton(FormActionButton):
+    """Let focused reset buttons use Space even in the playback window."""
+
+    def event(self, event):
+        if event.type() == QEvent.ShortcutOverride and event.key() == Qt.Key_Space:
+            event.accept()
+            return True
+        return super().event(event)
+
+
+class _FieldResetButton(ConfigResetButton):
+    """Paint a compact face while the full button stays available to input."""
+
+    def __init__(self, companion: QWidget):
+        super().__init__()
+        self._companion = companion
+        self.setIcon(icon("reset"))
+        self.setIconSize(QSize(16, 16))
+        self.setFixedWidth(32)
+        self.setMinimumHeight(32)
+
+    def sizeHint(self) -> QSize:
+        companion = self._companion
+        height = companion.sizeHint().height()
+        if isinstance(companion, QAbstractSpinBox):
+            height -= 2 * self._spin_frame_width()
+        elif isinstance(companion, QCheckBox):
+            height = 24
+        return QSize(32, max(self.minimumHeight(), height))
+
+    def minimumSizeHint(self) -> QSize:
+        return self.sizeHint()
+
+    def paintEvent(self, _event):
+        companion = self._companion
+        top = companion.y() - self.y()
+        option = QStyleOptionButton()
+        self.initStyleOption(option)
+        if isinstance(companion, QAbstractSpinBox):
+            self._paint_spin_box_face(option, top)
+            return
+        if isinstance(companion, QCheckBox):
+            check = QStyleOptionButton()
+            companion.initStyleOption(check)
+            indicator = companion.style().subElementRect(
+                QStyle.SE_CheckBoxIndicator, check, companion
+            )
+            height = 24
+            top += indicator.y() + (indicator.height() - height) // 2
+        else:
+            height = min(companion.height(), self.height())
+            top += (companion.height() - height) // 2
+        option.rect = QRect(0, top, self.width(), height)
+        with QStylePainter(self) as painter:
+            painter.drawControl(QStyle.CE_PushButton, option)
+
+    def _paint_spin_box_face(self, option: QStyleOptionButton, top: int) -> None:
+        spin_box = self._companion
+        # Fusion places a locally painted spin frame on the form. Use the same
+        # raster origin and truncate the logical height of the rounded pixmap.
+        scale = self.devicePixelRatioF()
+        surface = QPixmap(QSize(self.width(), spin_box.height()) * scale)
+        surface.setDevicePixelRatio(scale)
+        surface.fill(Qt.transparent)
+
+        spin_option = QStyleOptionSpinBox()
+        spin_box.initStyleOption(spin_option)
+        style = spin_box.style()
+        frame = style.subControlRect(QStyle.CC_SpinBox, spin_option, QStyle.SC_SpinBoxFrame, spin_box)
+        frame.setHeight(min(frame.height(), int(surface.deviceIndependentSize().height())))
+        inset = self._spin_frame_width(spin_option)
+        frame = frame.adjusted(0, inset, 0, -inset)
+        height = min(frame.height(), self.height())
+        option.rect = QRect(0, frame.y() + (frame.height() - height) // 2, self.width(), height)
+
+        with QStylePainter(surface, self) as painter:
+            painter.drawControl(QStyle.CE_PushButton, option)
+        with QPainter(self) as painter:
+            painter.drawPixmap(QPoint(0, top), surface)
+
+    def _spin_frame_width(self, option=None) -> int:
+        companion = self._companion
+        return companion.style().pixelMetric(QStyle.PM_DefaultFrameWidth, option, companion)
+
+
+def _set_param_reference(
+    spec: Any, editor: QWidget, label: QLabel, subtext: QLabel, reset: QPushButton,
+    *, preset_value: Any = _BUILT_IN,
+) -> None:
+    tooltip = _build_tooltip(spec, preset_value=preset_value)
+    for widget in (editor, label, subtext):
+        widget.setToolTip(tooltip)
+    subtext.setText(_build_subtext(spec, preset_value=preset_value))
+    name = spec.label or spec.key
+    if preset_value is _BUILT_IN:
+        reset.setAccessibleName(f"Reset {name} to default")
+        value = "empty" if spec.default == "" else spec.default
+        reset.setToolTip(f"Reset to default ({value})")
+    else:
+        reset.setAccessibleName(f"Use preset value for {name}")
+        _, value = _reference(spec, preset_value)
+        reset.setToolTip(f"<p>Use preset value for {escape(name)}<br/>{escape(str(value))}</p>")
 
 
 # ---------------------------------------------------------------------------
@@ -324,13 +457,16 @@ class PathPicker(QWidget):
         mode: PathPickerMode = PathPickerMode.FOLDER,
         file_filter: str = "",
         show_recursive: bool = False,
+        reset_to_preset: Callable[[QWidget], None] | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self._spec = spec
+        self._param_spec = spec
         self._mode = mode
         self._file_filter = file_filter
         self._show_recursive = show_recursive
+        self._reset_to_preset = reset_to_preset
         self._line_edit: QLineEdit
         self._recursive_cb: QCheckBox | None = None
         self._build_ui()
@@ -362,31 +498,21 @@ class PathPicker(QWidget):
 
     def _build_ui(self) -> None:
         spec = self._spec
-        tooltip = _build_tooltip(spec)
         placeholder = "" if spec.default else "(system default)"
 
         # Input row: label | line-edit | Browse… | ↺
         self._line_edit = QLineEdit()
         self._line_edit.setPlaceholderText(placeholder)
-        self._line_edit.setToolTip(tooltip)
         self._line_edit.textEdited.connect(self._on_text_edited)
 
-        browse_btn = QPushButton("Browse\u2026")
-        browse_btn.setFixedWidth(80)
+        browse_btn = FormBrowseButton()
         browse_btn.setToolTip("Open file browser")
         browse_btn.clicked.connect(self._browse)
 
-        default_repr = repr(spec.default) if spec.default else "empty"
-        reset_btn = QPushButton()
-        reset_btn.setAccessibleName(f"Reset {spec.label or spec.key} to default")
-        reset_btn.setIcon(icon("reset"))
-        reset_btn.setIconSize(QSize(20, 20))
-        reset_btn.setFixedSize(32, 32)
-        reset_btn.setToolTip(f"Reset to default ({default_repr})")
-        reset_btn.clicked.connect(lambda: self.set_value(spec.default))
+        reset_btn = _FieldResetButton(browse_btn)
+        reset_btn.clicked.connect(self._reset_path)
 
         name_lbl = QLabel(f"<b>{spec.label}</b>")
-        name_lbl.setToolTip(tooltip)
 
         input_row = QHBoxLayout()
         input_row.setContentsMargins(0, 0, 0, 0)
@@ -407,11 +533,20 @@ class PathPicker(QWidget):
             outer.addWidget(self._recursive_cb)
 
         # Description subtext — matches _build_param_page visual style
-        sub = QLabel(_build_subtext(spec))
+        sub = QLabel()
+        sub.setTextFormat(Qt.TextFormat.PlainText)
         sub.setWordWrap(True)
         sub.setStyleSheet("color: #888; font-size: 9pt;")
-        sub.setToolTip(tooltip)
         outer.addWidget(sub)
+        self._set_param_reference = partial(
+            _set_param_reference, spec, self._line_edit, name_lbl, sub, reset_btn)
+        self._set_param_reference()
+
+    def _reset_path(self) -> None:
+        if self._reset_to_preset is None:
+            self.set_value(self._spec.default)
+        else:
+            self._reset_to_preset(self)
 
     def _browse(self) -> None:
         start = self.value() or ""
@@ -440,14 +575,13 @@ class PathPicker(QWidget):
 # Page builder
 # ---------------------------------------------------------------------------
 
-# Inner margin of generated settings pages (Preferences and Phase 2 Config),
-# matching the 4 px detail-tab padding.
-SETTINGS_PAGE_MARGIN = 4
+SETTINGS_PAGE_MARGIN = CONTENT_INSET
 
 
 def _build_param_page(
     params: list[Any],
     values: dict[str, Any],
+    *, on_reset: Callable[[str, QWidget], None] | None = None,
 ) -> tuple[QWidget, list[tuple[str, QWidget]]]:
     """Build a scrollable form page for a list of ParamSpecs.
 
@@ -461,34 +595,29 @@ def _build_param_page(
     widgets: list[tuple[str, QWidget]] = []
     for spec in params:
         val = values.get(spec.key, spec.default)
-        w = _build_widget(spec, val)
+        reset_to_preset = partial(on_reset, spec.key) if on_reset is not None else None
+        w = _build_widget(spec, val, reset_to_preset=reset_to_preset)
+        reference = val if reset_to_preset is not None else _BUILT_IN
 
         # Self-contained widgets (e.g. PathPicker) already render their own
         # label, subtext, and reset button — add them directly.
         if isinstance(w, PathPicker):
+            w._set_param_reference(preset_value=reference)
             outer.addWidget(w)
             widgets.append((spec.key, w))
             continue
-
-        tooltip = _build_tooltip(spec)
-        w.setToolTip(tooltip)
 
         row = QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(8)
         name_label = QLabel(f"<b>{spec.label}</b>")
-        name_label.setToolTip(tooltip)
         row.addWidget(name_label, 1)
         row.addWidget(w, 0)
 
-        reset_btn = QPushButton()
-        reset_btn.setAccessibleName(f"Reset {spec.label or spec.key} to default")
-        reset_btn.setIcon(icon("reset"))
-        reset_btn.setIconSize(QSize(20, 20))
-        reset_btn.setFixedSize(32, 32)
-        reset_btn.setToolTip(f"Reset to default ({spec.default})")
-        reset_btn.clicked.connect(
-            lambda _checked=False, ww=w, dv=spec.default: _set_widget_value(ww, dv))
+        reset_btn = _FieldResetButton(w)
+        reset = (partial(_set_widget_value, w, spec.default)
+                 if reset_to_preset is None else partial(reset_to_preset, w))
+        reset_btn.clicked.connect(lambda _checked=False, action=reset: action())
         row.addWidget(reset_btn)
 
         param_box = QVBoxLayout()
@@ -496,11 +625,14 @@ def _build_param_page(
         param_box.setSpacing(2)
         param_box.addLayout(row)
 
-        sub_label = QLabel(_build_subtext(spec))
+        sub_label = QLabel()
+        sub_label.setTextFormat(Qt.TextFormat.PlainText)
         sub_label.setWordWrap(True)
         sub_label.setStyleSheet("color: #888; font-size: 9pt;")
-        sub_label.setToolTip(tooltip)
         param_box.addWidget(sub_label)
+        w._set_param_reference = partial(
+            _set_param_reference, spec, w, name_label, sub_label, reset_btn)
+        w._set_param_reference(preset_value=reference)
 
         outer.addLayout(param_box)
         widgets.append((spec.key, w))

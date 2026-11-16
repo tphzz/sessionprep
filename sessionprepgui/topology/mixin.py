@@ -20,7 +20,6 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QSizePolicy,
     QSpinBox,
-    QSplitter,
     QToolBar,
     QTreeWidget,
     QTreeWidgetItem,
@@ -31,8 +30,8 @@ from PySide6.QtWidgets import (
 from sessionpreplib.topology import build_default_topology
 from sessionpreplib.utils import protools_sort_key
 
-from ..controls import bind_primary_action, set_action_busy
-from ..theme import COLORS, tune_toolbar_checkbox
+from ..controls import bind_primary_action, content_splitter, set_action_busy
+from ..theme import COLORS, CONTENT_INSET, tune_toolbar_checkbox
 from ..tracks.table_widgets import _PHASE_TOPOLOGY, _PHASE_ANALYSIS, _PHASE_SETUP
 from ..waveform import WaveformPanel
 
@@ -64,6 +63,7 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
 
         # Toolbar
         toolbar = QToolBar()
@@ -149,12 +149,12 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
         layout.addWidget(toolbar)
 
         # ── Dual-panel splitter (input + output trees) ────────────────
-        h_splitter = QSplitter(Qt.Horizontal)
+        h_splitter = content_splitter()
 
         # Left: Input tree
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
-        left_layout.setContentsMargins(4, 4, 4, 4)
+        left_layout.setContentsMargins(*(CONTENT_INSET,) * 4)
         left_label = QLabel("Input Tracks")
         left_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         left_label.setStyleSheet(
@@ -170,7 +170,7 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
         # Right: Output tree
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
-        right_layout.setContentsMargins(4, 4, 4, 4)
+        right_layout.setContentsMargins(*(CONTENT_INSET,) * 4)
         right_label = QLabel("Output Tracks")
         right_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         right_label.setStyleSheet(
@@ -218,7 +218,7 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
         self._topo_wf_panel.ceil_group.triggered.connect(self._on_topo_spec_ceil_changed)
 
         # Vertical splitter: trees on top, waveform at bottom
-        v_splitter = QSplitter(Qt.Vertical)
+        v_splitter = content_splitter(Qt.Vertical)
         v_splitter.addWidget(h_splitter)
         v_splitter.addWidget(self._topo_wf_panel)
         v_splitter.setCollapsible(1, False)

@@ -88,7 +88,10 @@ Preferences are saved to `sessionprep.config.json`. In Phase 2, use **Config
 Preset** to select the project's defaults and edit individual fields to set
 session overrides. Untouched fields follow that preset when it changes,
 including edits saved from Preferences in Phase 3. Explicit overrides stay
-with the project when it switches presets. **Revert to Preset** clears them.
+with the project when it switches presets. A field's reset arrow clears that
+override and restores the selected preset value. **Revert to Preset** clears
+all Config overrides. The blue Config markers show where effective values
+differ from the selected preset.
 
 DAW and report display changes apply immediately. Changes to analysis
 settings take effect when the relevant phase runs again.
@@ -167,6 +170,8 @@ SessionPrep operates in three phases:
 | **2** | Analysis & Preparation | Format checks, clipping, DC offset, stereo compatibility, silence, subsonic, peak/RMS measurement, classification, tail exceedance. Bimodal normalization (clip gain adjustment) via Prepare. Output written to `sp_02_prepared/`.                                                                                                                                                                                        | GUI Phase 2 / CLI              |
 | **3** | DAW Transfer           | Transfer tracks into DAW sessions with per-track naming and folder assignment. Duplicate entries for multi-track scenarios (same clip on different tracks). DAWproject files include fader offsets. Pro Tools transfers display the calculated offsets for manual use. Support for unattended batch processing of multiple songs. | GUI Phase 3 |
 
+
+In Track Layout, **Unassigned** marks an input channel with no output routes. Collapse the input file to see how many of its channels are unassigned.
 
 ### Diagnostic categories
 

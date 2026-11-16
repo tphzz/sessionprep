@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (
     QTreeWidget,
 )
 
-from ..theme import COLORS
+from ..theme import COLORS, CONTENT_INSET
 from ..widgets import BatchEditTableWidget
 
 # ── Constants ────────────────────────────────────────────────────────────────
@@ -24,10 +24,8 @@ _TAB_FILE = 1
 _TAB_GROUPS = 2
 _TAB_SESSION = 3
 
-# Logical-pixel padding of Phase 2 detail-tab content: the Summary/File report
-# text inset, the Groups and Config page content and the File Help dock edges.
-# The track table and the detail tab bar themselves stay flush.
-DETAIL_TAB_INSET = 4
+# Groups and Config use the regular pane inset.
+DETAIL_TAB_INSET = CONTENT_INSET
 
 _PAGE_TABS = 0
 

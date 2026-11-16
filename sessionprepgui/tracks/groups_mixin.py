@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
 
 from sessionpreplib.config import classify_structured_config_change, resolve_session_config
 
+from ..controls import FormActionButton
 from ..prefs.param_form import _argb_to_qcolor
 from ..settings import build_defaults, save_config
 from .table_widgets import DETAIL_TAB_INSET, _SortableItem, _TAB_GROUPS
@@ -71,7 +72,7 @@ class GroupsMixin:  # pylint: disable=too-few-public-methods
             self._on_group_preset_changed)
         header.addWidget(self._group_preset_combo)
         header.addStretch()
-        revert_btn = QPushButton("Revert to Preset")
+        revert_btn = FormActionButton("Revert to Preset")
         revert_btn.setToolTip(
             "Replace session-local groups with the selected group preset")
         revert_btn.clicked.connect(self._on_groups_tab_reset)

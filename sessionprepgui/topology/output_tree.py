@@ -23,7 +23,6 @@ from PySide6.QtWidgets import (
     QLabel,
     QMenu,
     QMessageBox,
-    QSpinBox,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
@@ -31,7 +30,9 @@ from PySide6.QtWidgets import (
 
 from sessionpreplib.topology import ChannelRoute, TopologySource
 
-from ..theme import COLORS, FILE_COLOR_OK
+from ..controls import FormSpinBox
+from ..theme import COLORS, CONTENT_INSET, FILE_COLOR_OK
+from .dialogs import output_name_dialog
 from .input_tree import MIME_CHANNEL, COL_NAME, COL_CH, COL_SR, COL_BIT, COL_DUR
 from .operations import (
     add_channel,
@@ -930,13 +931,15 @@ class OutputTree(QTreeWidget):
                 for item in payload
             ]
             first_name = channels[0][0]
-            name, ok = QInputDialog.getText(
+            dialog = output_name_dialog(
                 self, "New Output Track",
                 "Name for the new output track (with extension):",
-                text=first_name)
-            if not ok or not name.strip():
+                first_name)
+            if dialog.exec() != QDialog.Accepted:
                 return
-            name = name.strip()
+            name = dialog.textValue().strip()
+            if not name:
+                return
             stem, _, ext = name.rpartition(".")
             if not stem:
                 stem, ext = ext, "wav"
@@ -1087,8 +1090,9 @@ class OutputTree(QTreeWidget):
         dlg = QDialog(self)
         dlg.setWindowTitle("Add Channels")
         layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(*(CONTENT_INSET,) * 4)
         layout.addWidget(QLabel("Number of channels to add:"))
-        spin = QSpinBox()
+        spin = FormSpinBox()
         spin.setRange(1, 64)
         spin.setValue(1)
         spin.selectAll()

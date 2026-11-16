@@ -7,13 +7,22 @@ channel children.  Supports drag of individual channels or whole files.
 from __future__ import annotations
 
 import json
+from html import escape
 from typing import TYPE_CHECKING
 
-from PySide6.QtCore import QByteArray, QMimeData, QPoint, Qt, Signal
-from PySide6.QtGui import QColor, QDrag, QPixmap
-from PySide6.QtWidgets import QAbstractItemView, QHeaderView, QTreeWidget, QTreeWidgetItem
+from PySide6.QtCore import QByteArray, QMimeData, QPoint, QRect, Qt, Signal
+from PySide6.QtGui import QColor, QDrag, QFont, QFontMetrics, QPalette, QPixmap
+from PySide6.QtWidgets import (
+    QAbstractItemView,
+    QHeaderView,
+    QStyle,
+    QStyledItemDelegate,
+    QStyleOptionViewItem,
+    QTreeWidget,
+    QTreeWidgetItem,
+)
 
-from ..theme import COLORS, FILE_COLOR_OK, FILE_COLOR_ERROR, FILE_COLOR_WARNING
+from ..theme import COLORS, FILE_COLOR_OK, FILE_COLOR_WARNING, UNASSIGNED_INPUT_TEXT
 from .operations import channel_label, used_channels
 
 if TYPE_CHECKING:
@@ -31,11 +40,89 @@ COL_BIT = 3
 COL_DUR = 4
 
 _DIM = QColor(COLORS["metadata"])
+_ROUTING_STATUS_ROLE = Qt.UserRole + 1
+_ROUTING_STATUS_COLOR = QColor(COLORS["clean"])
+_ROUTING_STATUS_GAP = 8
 
 
 def _format_duration(seconds: float) -> str:
     m, s = divmod(int(seconds), 60)
     return f"{m}:{s:02d}"
+
+
+def _set_routing_status(item: QTreeWidgetItem, status: str) -> None:
+    name = item.text(COL_NAME)
+    item.setData(COL_NAME, _ROUTING_STATUS_ROLE, status)
+    item.setData(COL_NAME, Qt.AccessibleTextRole, f"{name}, {status}")
+    tooltip = f"<p>{escape(name)}<br>{escape(status)}</p>"
+    for column in range(COL_DUR + 1):
+        item.setToolTip(column, tooltip)
+
+
+def _status_font(font: QFont) -> QFont:
+    font = QFont(font)
+    font.setWeight(QFont.DemiBold)
+    return font
+
+
+class _RoutingStatusDelegate(QStyledItemDelegate):
+    """Show source availability within the File cell."""
+
+    def _status(self, index):
+        if not index.parent().isValid() and self.parent().isExpanded(index):
+            return None
+        return index.data(_ROUTING_STATUS_ROLE)
+
+    def sizeHint(self, option, index):
+        size = super().sizeHint(option, index)
+        status = self._status(index)
+        if status:
+            opt = QStyleOptionViewItem(option)
+            self.initStyleOption(opt, index)
+            metrics = QFontMetrics(_status_font(opt.font))
+            size.setWidth(size.width() + _ROUTING_STATUS_GAP + metrics.horizontalAdvance(status))
+        return size
+
+    def paint(self, painter, option, index):
+        status = self._status(index)
+        if not status:
+            super().paint(painter, option, index)
+            return
+
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        widget = self.parent()
+        style = widget.style()
+        text_rect = style.subElementRect(QStyle.SE_ItemViewItemText, opt, widget)
+        margin = style.pixelMetric(QStyle.PM_FocusFrameHMargin, opt, widget) + 1
+        text_rect.adjust(margin, 0, -margin, 0)
+
+        font = _status_font(opt.font)
+        status_width = QFontMetrics(font).horizontalAdvance(status)
+        name_width = text_rect.width() - _ROUTING_STATUS_GAP - status_width
+        if name_width < opt.fontMetrics.horizontalAdvance("…"):
+            super().paint(painter, option, index)
+            return
+
+        opt.text = opt.fontMetrics.elidedText(opt.text, opt.textElideMode, name_width)
+        style.drawControl(QStyle.CE_ItemViewItem, opt, painter, widget)
+
+        start = text_rect.left() + opt.fontMetrics.horizontalAdvance(opt.text)
+        status_rect = QRect(start + _ROUTING_STATUS_GAP, text_rect.top(),
+                            status_width, text_rect.height())
+        status_rect = QStyle.visualRect(opt.direction, text_rect, status_rect)
+        if opt.state & QStyle.State_Selected:
+            color = opt.palette.color(QPalette.HighlightedText)
+        elif opt.state & QStyle.State_Enabled:
+            color = _ROUTING_STATUS_COLOR
+        else:
+            color = opt.palette.color(QPalette.Disabled, QPalette.Text)
+        painter.save()
+        painter.setClipRect(opt.rect, Qt.IntersectClip)
+        painter.setFont(font)
+        painter.setPen(color)
+        painter.drawText(status_rect, Qt.AlignLeft | Qt.AlignVCenter, status)
+        painter.restore()
 
 
 class InputTree(QTreeWidget):
@@ -50,6 +137,7 @@ class InputTree(QTreeWidget):
 
         self.setColumnCount(5)
         self.setHeaderLabels(["File", "Ch", "SR", "Bit", "Duration"])
+        self.setItemDelegateForColumn(COL_NAME, _RoutingStatusDelegate(self))
         self.header().setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         h = self.header()
         h.setSectionsMovable(True)
@@ -124,15 +212,11 @@ class InputTree(QTreeWidget):
         used = used_channels(topology) if topology else set()
 
         for track in ok_tracks:
-            # Check if ALL channels of this file are used
-            all_used = all(
-                (track.filename, ch) in used
+            unassigned = {
+                ch
                 for ch in range(track.channels)
-            )
-            any_used = any(
-                (track.filename, ch) in used
-                for ch in range(track.channels)
-            )
+                if (track.filename, ch) not in used
+            }
 
             # Check for Phase 1 detector warnings/suggestions
             p1_warnings = []
@@ -140,10 +224,9 @@ class InputTree(QTreeWidget):
                 if res.severity and res.severity.name != "CLEAN":
                     p1_warnings.append(res.summary)
 
+            file_color = FILE_COLOR_OK if unassigned else _DIM
             if p1_warnings:
                 file_color = FILE_COLOR_WARNING
-            else:
-                file_color = _DIM if all_used else FILE_COLOR_OK
 
             file_item = QTreeWidgetItem()
 
@@ -166,16 +249,19 @@ class InputTree(QTreeWidget):
                 COL_NAME, Qt.UserRole, ("file", track.filename))
             file_item.setFlags(
                 file_item.flags() | Qt.ItemIsDragEnabled)
+            if unassigned:
+                _set_routing_status(file_item, f"{len(unassigned)} unassigned")
 
             # Channel children
             for ch in range(track.channels):
                 label = channel_label(ch, track.channels)
                 ch_item = QTreeWidgetItem()
-                ch_text = f"{ch} ({label}): {track.filename}"
-                ch_item.setText(COL_NAME, ch_text)
-                ch_used = (track.filename, ch) in used
-                ch_item.setForeground(
-                    COL_NAME, _DIM if ch_used else FILE_COLOR_OK)
+                ch_item.setText(COL_NAME, f"{ch} ({label}): {track.filename}")
+                if ch in unassigned:
+                    ch_item.setForeground(COL_NAME, UNASSIGNED_INPUT_TEXT)
+                    _set_routing_status(ch_item, "Unassigned")
+                else:
+                    ch_item.setForeground(COL_NAME, _DIM)
                 ch_item.setData(
                     COL_NAME, Qt.UserRole,
                     ("channel", track.filename, ch))

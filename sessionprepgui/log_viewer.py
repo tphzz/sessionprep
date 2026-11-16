@@ -18,9 +18,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
-    QPushButton,
     QSizePolicy,
-    QSpinBox,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -35,7 +33,8 @@ from sessionpreplib.logging_setup import (
     set_runtime_log_level,
 )
 
-from .theme import WINDOW_MARGIN
+from .controls import FormActionButton, FormSpinBox
+from .theme import WINDOW_MARGIN, apply_dark_theme
 
 
 _LOG_LINE_RE = re.compile(
@@ -121,6 +120,7 @@ class LogViewerWindow(QDialog):
         self._timer.timeout.connect(self._poll_log_file)
 
         self._init_ui()
+        apply_dark_theme(self)
         self._refresh_level_combo()
         self._reload_from_tail()
 
@@ -164,7 +164,7 @@ class LogViewerWindow(QDialog):
         bottom = QHBoxLayout()
         bottom.setSpacing(8)
         bottom.addWidget(QLabel("Lines:"))
-        self._line_count = QSpinBox(self)
+        self._line_count = FormSpinBox(self)
         self._line_count.setRange(0, 50000)
         self._line_count.setValue(5000)
         self._line_count.setSingleStep(100)
@@ -179,20 +179,20 @@ class LogViewerWindow(QDialog):
         spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         bottom.addWidget(spacer)
 
-        self._copy_all_btn = QPushButton("Copy All Rows", self)
+        self._copy_all_btn = FormActionButton("Copy All Rows", self)
         self._copy_all_btn.clicked.connect(self._copy_all_rows)
         bottom.addWidget(self._copy_all_btn)
 
-        self._copy_btn = QPushButton("Copy Selected Rows", self)
+        self._copy_btn = FormActionButton("Copy Selected Rows", self)
         self._copy_btn.setEnabled(False)
         self._copy_btn.clicked.connect(self._copy_selection)
         bottom.addWidget(self._copy_btn)
 
-        self._clear_btn = QPushButton("Clear Rows", self)
+        self._clear_btn = FormActionButton("Clear Rows", self)
         self._clear_btn.clicked.connect(self._clear_list)
         bottom.addWidget(self._clear_btn)
 
-        self._open_folder_btn = QPushButton("Open Log Folder", self)
+        self._open_folder_btn = FormActionButton("Open Log Folder", self)
         self._open_folder_btn.clicked.connect(self._open_log_folder)
         bottom.addWidget(self._open_folder_btn)
         layout.addLayout(bottom)

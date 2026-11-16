@@ -1,7 +1,4 @@
-"""Generic reusable preset-management toolbar widget.
-
-No app-specific dependency.  Portable: copy preset_panel.py to any PySide6 project.
-"""
+"""Shared preset-management toolbar widget."""
 
 from __future__ import annotations
 
@@ -12,9 +9,10 @@ from PySide6.QtWidgets import (
     QInputDialog,
     QLabel,
     QMessageBox,
-    QPushButton,
     QWidget,
 )
+
+from ..controls import FormActionButton
 
 
 class NamedPresetPanel(QWidget):
@@ -92,9 +90,9 @@ class NamedPresetPanel(QWidget):
 
     # ── UI setup ─────────────────────────────────────────────────────────
 
-    def add_trailing_button(self, text: str, *, tooltip: str = "") -> QPushButton:
+    def add_trailing_button(self, text: str, *, tooltip: str = "") -> FormActionButton:
         """Add a caller-owned preset action at the end of the preset row."""
-        btn = QPushButton(text)
+        btn = FormActionButton(text)
         if tooltip:
             btn.setToolTip(tooltip)
         self.layout().addWidget(btn)
@@ -114,21 +112,21 @@ class NamedPresetPanel(QWidget):
             self._combo.addItem(name)
         layout.addWidget(self._combo, 1)
 
-        add_btn = QPushButton("+")
+        add_btn = FormActionButton("+")
         add_btn.setFixedWidth(36)
         add_btn.setToolTip("New preset")
         add_btn.clicked.connect(self._on_add)
         layout.addWidget(add_btn)
 
-        dup_btn = QPushButton("Duplicate")
+        dup_btn = FormActionButton("Duplicate")
         dup_btn.clicked.connect(self._on_duplicate)
         layout.addWidget(dup_btn)
 
-        self._rename_btn = QPushButton("Rename")
+        self._rename_btn = FormActionButton("Rename")
         self._rename_btn.clicked.connect(self._on_rename)
         layout.addWidget(self._rename_btn)
 
-        self._delete_btn = QPushButton("Delete")
+        self._delete_btn = FormActionButton("Delete")
         self._delete_btn.clicked.connect(self._on_delete)
         layout.addWidget(self._delete_btn)
 

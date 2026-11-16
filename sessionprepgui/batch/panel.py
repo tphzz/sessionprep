@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
     QHeaderView,
 )
 
-from ..theme import COLORS
+from ..theme import COLORS, CONTENT_INSET
 from ..widgets import ProgressPanel
 from ..session.io import serialize_session_state, deserialize_session_state
 
@@ -233,7 +233,7 @@ class BatchQueueDock(QDockWidget):
         container = QWidget()
         container.setMinimumWidth(450)
         layout = QVBoxLayout(container)
-        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setContentsMargins(*(CONTENT_INSET,) * 4)
 
         # Table
         self._table = _BatchTable()
@@ -254,7 +254,7 @@ class BatchQueueDock(QDockWidget):
 
         layout.addWidget(self._table)
 
-        self._progress_panel = ProgressPanel()
+        self._progress_panel = ProgressPanel(horizontal_inset=0)
         layout.addWidget(self._progress_panel)
 
         # Bottom bar

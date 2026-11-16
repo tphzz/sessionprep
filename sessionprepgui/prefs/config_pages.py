@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ..controls import FormBrowseButton, FormDoubleSpinBox
 from ..widgets import ColorPickerButton
 
 from .param_form import (
@@ -409,6 +410,8 @@ class DawProjectTemplatesWidget(QWidget):
         layout.addWidget(QLabel("<b>Mix Templates</b>"))
 
         self._table = QTableWidget()
+        self._table.setProperty("formCellEditors", True)
+        self._table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self._table.setColumnCount(3)
         self._table.setHorizontalHeaderLabels(
             ["Name", "Template Path", "Fader Ceiling (dB)"])
@@ -458,7 +461,8 @@ class DawProjectTemplatesWidget(QWidget):
                 le = path_container.findChild(QLineEdit)
                 if le:
                     path = le.text().strip()
-            ceiling_widget = self._table.cellWidget(row, 2)
+            ceiling_cell = self._table.cellWidget(row, 2)
+            ceiling_widget = ceiling_cell.findChild(QDoubleSpinBox) if ceiling_cell else None
             ceiling = ceiling_widget.value() if ceiling_widget else 24.0
             if name or path:
                 templates.append({
@@ -480,20 +484,23 @@ class DawProjectTemplatesWidget(QWidget):
         path_edit.setPlaceholderText("Path to .dawproject file")
         path_edit.textChanged.connect(lambda *_: self.templates_changed.emit())
         path_layout.addWidget(path_edit, 1)
-        browse_btn = QPushButton("Browse\u2026")
-        browse_btn.setFixedWidth(80)
+        browse_btn = FormBrowseButton()
         browse_btn.clicked.connect(
             lambda _checked=False, le=path_edit: self._browse_template(le))
         path_layout.addWidget(browse_btn)
         self._table.setCellWidget(row, 1, path_container)
 
-        ceiling_spin = QDoubleSpinBox()
+        ceiling_spin = FormDoubleSpinBox()
         ceiling_spin.setRange(0.0, 48.0)
         ceiling_spin.setDecimals(1)
         ceiling_spin.setSuffix(" dB")
         ceiling_spin.setValue(fader_ceiling_db)
         ceiling_spin.valueChanged.connect(lambda *_: self.templates_changed.emit())
-        self._table.setCellWidget(row, 2, ceiling_spin)
+        ceiling_cell = QWidget()
+        ceiling_layout = QHBoxLayout(ceiling_cell)
+        ceiling_layout.setContentsMargins(0, 0, 0, 0)
+        ceiling_layout.addWidget(ceiling_spin, 1, Qt.AlignVCenter)
+        self._table.setCellWidget(row, 2, ceiling_cell)
 
     def _browse_template(self, line_edit: QLineEdit):
         path, _ = QFileDialog.getOpenFileName(
@@ -607,11 +614,21 @@ class ProToolsTemplatesWidget(QWidget):
 # Shared config page builder / loader / reader
 # ---------------------------------------------------------------------------
 
+def _config_section_values(preset: dict[str, Any], section: str) -> dict[str, Any]:
+    if section == "_presentation":
+        section = "presentation"
+    category, _, component = section.partition(".")
+    values = preset.get(category, {})
+    return values.get(component, {}) if component else values
+
+
 def build_config_pages(
     tree,
     preset: dict[str, Any],
     widgets_dict: dict,
     register_page: Callable[[QTreeWidgetItem, QWidget, str | None], None],
+    *,
+    on_reset: Callable[[str, QWidget], None] | None = None,
 ) -> dict[str, QWidget]:
     """Build the common config tree pages (Analysis, Detectors, Processors, DAW Processors).
 
@@ -624,26 +641,34 @@ def build_config_pages(
 
     daw_custom_widgets: dict[str, QWidget] = {}
 
+    def build_page(section: str, params: list[Any]) -> QWidget:
+        prefix = "presentation" if section == "_presentation" else section
+
+        def reset(key: str, widget: QWidget) -> None:
+            on_reset(f"{prefix}.{key}", widget)
+
+        page, widgets_dict[section] = _build_param_page(
+            params, _config_section_values(preset, section),
+            on_reset=reset if on_reset is not None else None,
+        )
+        return page
+
     item = QTreeWidgetItem(tree, ["Analysis"])
     item.setFont(0, QFont("", -1, QFont.Bold))
-    pg, wdg = _build_param_page(ANALYSIS_PARAMS, preset.get("analysis", {}))
-    widgets_dict["analysis"] = wdg
+    pg = build_page("analysis", ANALYSIS_PARAMS)
     register_page(item, pg, "analysis")
 
     det_parent = QTreeWidgetItem(tree, ["Detectors"])
     det_parent.setFont(0, QFont("", -1, QFont.Bold))
-    pg, wdg = _build_param_page(PRESENTATION_PARAMS, preset.get("presentation", {}))
-    widgets_dict["_presentation"] = wdg
+    pg = build_page("_presentation", PRESENTATION_PARAMS)
     register_page(det_parent, pg, "_presentation")
 
-    det_sections = preset.get("detectors", {})
     for det in default_detectors():
         params = det.config_params()
         if not params:
             continue
         child = QTreeWidgetItem(det_parent, [det.name])
-        pg, wdg = _build_param_page(params, det_sections.get(det.id, {}))
-        widgets_dict[f"detectors.{det.id}"] = wdg
+        pg = build_page(f"detectors.{det.id}", params)
         register_page(child, pg, f"detectors.{det.id}")
 
     proc_parent = QTreeWidgetItem(tree, ["Processors"])
@@ -655,14 +680,12 @@ def build_config_pages(
     pl.addStretch()
     register_page(proc_parent, placeholder, "_processors")
 
-    proc_sections = preset.get("processors", {})
     for proc in default_processors():
         params = proc.config_params()
         if not params:
             continue
         child = QTreeWidgetItem(proc_parent, [proc.name])
-        pg, wdg = _build_param_page(params, proc_sections.get(proc.id, {}))
-        widgets_dict[f"processors.{proc.id}"] = wdg
+        pg = build_page(f"processors.{proc.id}", params)
         register_page(child, pg, f"processors.{proc.id}")
 
     daw_parent = QTreeWidgetItem(tree, ["DAW Processors"])
@@ -680,8 +703,7 @@ def build_config_pages(
         if not params:
             continue
         child = QTreeWidgetItem(daw_parent, [dp.name])
-        pg, wdg = _build_param_page(params, dp_sections.get(dp.id, {}))
-        widgets_dict[f"daw_processors.{dp.id}"] = wdg
+        pg = build_page(f"daw_processors.{dp.id}", params)
         if dp.id == "dawproject":
             tpl_widget = DawProjectTemplatesWidget()
             tpl_widget.set_templates(dp_sections.get(dp.id, {}).get("dawproject_templates", []))
@@ -702,57 +724,24 @@ def load_config_widgets(
     widgets_dict: dict,
     preset: dict[str, Any],
     daw_custom_widgets: dict[str, QWidget] | None = None,
+    *,
+    reference_preset: dict[str, Any] | None = None,
 ) -> None:
-    """Load values from *preset* into widgets stored in *widgets_dict*."""
-    from sessionpreplib.detectors import default_detectors
-    from sessionpreplib.processors import default_processors
-    from sessionpreplib.daw_processors import default_daw_processors
+    """Load editor values and optionally refresh their selected-preset reference."""
+    for section, widgets in widgets_dict.items():
+        values = _config_section_values(preset, section)
+        reference = (None if reference_preset is None
+                     else _config_section_values(reference_preset, section))
+        for key, widget in widgets:
+            if key in values:
+                _set_widget_value(widget, values[key])
+            if reference is not None:
+                widget._set_param_reference(
+                    preset_value=reference.get(key, widget._param_spec.default))
 
-    if daw_custom_widgets is None:
-        daw_custom_widgets = {}
-
-    for key, widget in widgets_dict.get("analysis", []):
-        if key in preset.get("analysis", {}):
-            _set_widget_value(widget, preset["analysis"][key])
-
-    for key, widget in widgets_dict.get("_presentation", []):
-        if key in preset.get("presentation", {}):
-            _set_widget_value(widget, preset["presentation"][key])
-
-    det_sections = preset.get("detectors", {})
-    for det in default_detectors():
-        wkey = f"detectors.{det.id}"
-        if wkey not in widgets_dict:
-            continue
-        vals = det_sections.get(det.id, {})
-        for key, widget in widgets_dict[wkey]:
-            if key in vals:
-                _set_widget_value(widget, vals[key])
-
-    proc_sections = preset.get("processors", {})
-    for proc in default_processors():
-        wkey = f"processors.{proc.id}"
-        if wkey not in widgets_dict:
-            continue
-        vals = proc_sections.get(proc.id, {})
-        for key, widget in widgets_dict[wkey]:
-            if key in vals:
-                _set_widget_value(widget, vals[key])
-
-    dp_sections = preset.get("daw_processors", {})
-    for dp in default_daw_processors():
-        wkey = f"daw_processors.{dp.id}"
-        if wkey not in widgets_dict:
-            continue
-        vals = dp_sections.get(dp.id, {})
-        for key, widget in widgets_dict[wkey]:
-            if key in vals:
-                _set_widget_value(widget, vals[key])
-
-        if dp.id == "dawproject" and "dawproject" in daw_custom_widgets:
-            daw_custom_widgets["dawproject"].set_templates(vals.get("dawproject_templates", []))
-        elif dp.id == "protools" and "protools" in daw_custom_widgets:
-            daw_custom_widgets["protools"].set_templates(vals.get("protools_templates", []))
+    for processor_id, widget in (daw_custom_widgets or {}).items():
+        values = _config_section_values(preset, f"daw_processors.{processor_id}")
+        widget.set_templates(values.get(f"{processor_id}_templates", []))
 
 
 def read_config_widgets(

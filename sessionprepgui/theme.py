@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QPalette
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QProxyStyle, QStyle, QStyleOptionSlider
 from .icons import icon_path
 
 
@@ -29,12 +30,20 @@ COLORS = {
     "alt_row": "#2c2c2c",  # alternating (zebra) table/tree rows; subtle on bg_alt
 }
 
-# Logical-pixel content margin of tool windows and dialogs (Log Viewer,
-# Pro Tools Utils, Preferences) and of tool pages inside their tabs.
-WINDOW_MARGIN = 4
+# Logical-pixel margins measured from the content's own pane or window.
+CONTENT_INSET = 6
+REPORT_INSET = 12
+WINDOW_MARGIN = CONTENT_INSET
+
+_SCROLLBAR_TRACK = QColor("#2d2d2d")
+_SCROLLBAR_THUMB = QColor("#7d7d7d")
+_SCROLLBAR_HOVER = QColor("#909090")
+_SCROLLBAR_DRAG = QColor("#9e9e9e")
+_SCROLLBAR_DISABLED = QColor("#555555")
 
 # File list item colors by status
 FILE_COLOR_OK = QColor("#cccccc")
+UNASSIGNED_INPUT_TEXT = QColor("#e0e0e0")
 FILE_COLOR_ERROR = QColor("#ff4444")
 FILE_COLOR_WARNING = QColor(COLORS["attention"])
 FILE_COLOR_SILENT = QColor("#888888")
@@ -152,6 +161,7 @@ def normalize_color_name(
 
 STYLESHEET = """
     QMainWindow, QDialog { background-color: #1e1e1e; }
+    QMainWindow::separator { background-color: #555; }
     QMenuBar { background-color: #252525; color: #dddddd; }
     QMenuBar::item:selected { background-color: #3a3a3a; }
     QMenu { background-color: #2d2d2d; color: #dddddd; border: 1px solid #555; }
@@ -218,14 +228,16 @@ STYLESHEET = """
         subcontrol-position: right center; right: 8px;
     }
     QToolButton[compactMenu="true"]:focus { border-color: #4499ff; }
-    QSplitter::handle { background-color: #555; width: 2px; }
+    QSplitter::handle { background-color: #555; }
     QTableWidget { background-color: #252525; border: none; outline: none; gridline-color: #3a3a3a; }
     QTableWidget::item { padding: 2px 6px; }
+    QTableWidget[formCellEditors="true"]::item { padding-top: 0; padding-bottom: 0; }
     QTreeWidget { background-color: #252525; border: none; outline: none; }
     QTreeWidget::item { padding: 3px 4px; }
     QHeaderView::section { background-color: #2d2d2d; color: #dddddd; border: none; border-bottom: 1px solid #555; padding: 4px 6px; }
     QTextBrowser { background-color: #1e1e1e; border: none; }
     QPushButton { background-color: #3a3a3a; color: #dddddd; border: 1px solid #555; padding: 4px 12px; border-radius: 2px; }
+    QPushButton[formRowAction="true"] { padding-top: 3px; padding-bottom: 3px; }
     QPushButton:hover { background-color: #4a4a4a; }
     QPushButton:pressed { background-color: #2a6db5; }
     QPushButton:disabled { color: #666666; background-color: #2d2d2d; }
@@ -277,6 +289,45 @@ def tune_toolbar_checkbox(checkbox) -> None:
     checkbox.setFont(font)
 
 
+class _DesktopStyle(QProxyStyle):
+    def sizeFromContents(self, contents_type, option, contents_size, widget=None):
+        size = super().sizeFromContents(contents_type, option, contents_size, widget)
+        if (contents_type == QStyle.CT_SpinBox and widget is not None
+                and widget.property("formNumericEditor")):
+            # Fusion's spin hint is 3 px shorter and its frame paints 1 px
+            # inside each edge. Keep the font-dependent hint and add both gaps.
+            size.setHeight(size.height() + 5)
+        return size
+
+    def pixelMetric(self, metric, option=None, widget=None):
+        if metric == QStyle.PixelMetric.PM_DockWidgetSeparatorExtent:
+            # QMainWindow keeps its wider native drag target around the line.
+            return 1
+        return super().pixelMetric(metric, option, widget)
+
+    def drawComplexControl(self, control, option, painter, widget=None):
+        super().drawComplexControl(control, option, painter, widget)
+        if control != QStyle.CC_ScrollBar or not isinstance(option, QStyleOptionSlider):
+            return
+
+        # Paint inside the native rail, retaining Fusion's frame and step buttons.
+        inset = (0, 1, 0, -1) if option.orientation == Qt.Horizontal else (1, 0, -1, 0)
+        if option.subControls & QStyle.SC_ScrollBarGroove:
+            groove = self.subControlRect(control, option, QStyle.SC_ScrollBarGroove, widget)
+            painter.fillRect(groove.adjusted(*inset), _SCROLLBAR_TRACK)
+        if option.subControls & QStyle.SC_ScrollBarSlider:
+            thumb = self.subControlRect(control, option, QStyle.SC_ScrollBarSlider, widget)
+            color = _SCROLLBAR_THUMB
+            if not option.state & QStyle.State_Enabled or option.minimum == option.maximum:
+                color = _SCROLLBAR_DISABLED
+            elif option.activeSubControls & QStyle.SC_ScrollBarSlider:
+                if option.state & QStyle.State_Sunken:
+                    color = _SCROLLBAR_DRAG
+                elif option.state & QStyle.State_MouseOver:
+                    color = _SCROLLBAR_HOVER
+            painter.fillRect(thumb.adjusted(*inset), color)
+
+
 def apply_dark_theme(window) -> None:
     """Apply the dark palette and stylesheet to the application and window."""
     app = QApplication.instance()
@@ -306,5 +357,7 @@ def apply_dark_theme(window) -> None:
     palette.setColor(QPalette.Disabled, QPalette.Text, QColor("#666666"))
     palette.setColor(QPalette.Disabled, QPalette.ButtonText, QColor("#666666"))
 
+    if not isinstance(app.style(), _DesktopStyle):
+        app.setStyle(_DesktopStyle("Fusion"))
     app.setPalette(palette)
     window.setStyleSheet(STYLESHEET)

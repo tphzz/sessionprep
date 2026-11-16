@@ -32,7 +32,7 @@ class ColorTool(QWidget):
 
     def _init_ui(self):
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(*(WINDOW_MARGIN,) * 4)
+        layout.setContentsMargins(0, WINDOW_MARGIN, 0, 0)
         layout.setSpacing(6)
 
         self._desc = QLabel(

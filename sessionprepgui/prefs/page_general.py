@@ -147,6 +147,7 @@ class GeneralPage(QWidget):
 
     def _init_ui(self) -> None:
         page, self._widgets = _build_param_page(_APP_PARAMS, {})
+        page.layout().setContentsMargins(0, 0, 0, 0)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(page)

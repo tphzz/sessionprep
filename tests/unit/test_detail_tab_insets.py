@@ -1,16 +1,18 @@
-"""Phase 2 detail-tab content shares a 4 px padding: report text, Groups/Config pages, Help dock."""
+"""Measure the content gutters and report insets in the running Qt widgets."""
 from urllib.parse import quote
 
 import pytest
 
 pytest.importorskip("PySide6")
 from PySide6.QtCore import QPoint, QSignalBlocker, Qt, QUrl
-from PySide6.QtWidgets import QApplication, QLabel, QPushButton, QTableWidgetItem, QWidget
+from PySide6.QtWidgets import QApplication, QLabel, QPushButton, QSplitter, QTableWidgetItem, QToolBar
 
 from sessionprepgui import mainwindow, settings
 from sessionprepgui.detail import report
 from sessionprepgui.detail.browser import ReportBrowser
 from sessionprepgui.detail.help_panel import FileReportPane
+from sessionprepgui.theme import CONTENT_INSET, REPORT_INSET
+from sessionprepgui.tracks.table_layout import calculate_track_table_layout
 from sessionprepgui.tracks.table_widgets import (
     DETAIL_TAB_INSET, _TAB_FILE, _TAB_GROUPS, _TAB_SESSION, _TAB_SUMMARY)
 from sessionpreplib.detectors.clipping import ClippingDetector
@@ -18,12 +20,12 @@ from sessionpreplib.models import DetectorResult, ProcessorResult, SessionContex
 from sessionpreplib.processors import default_processors
 from sessionpreplib.rendering import build_diagnostic_summary
 
-INSET = 4
 GAP = 8  # report-to-Help-dock gap
 
 
-def test_detail_tab_inset_is_four_logical_pixels():
-    assert DETAIL_TAB_INSET == INSET
+def test_content_insets_in_logical_pixels():
+    assert DETAIL_TAB_INSET == CONTENT_INSET == 6
+    assert REPORT_INSET == 12
 
 
 @pytest.fixture(scope="module")
@@ -115,13 +117,13 @@ def _first_text_origin(browser, page):
 def test_summary_and_file_reports_inset_text_on_every_side(qapp, window):
     owner, tracks = window
     summary_page = _show_tab(qapp, owner, _TAB_SUMMARY)
-    assert _root_margins(owner._summary_view) == (INSET,) * 4
+    assert _root_margins(owner._summary_view) == (REPORT_INSET,) * 4
     summary_origin = _first_text_origin(owner._summary_view, summary_page)
 
     owner._detail_tabs.setTabEnabled(_TAB_FILE, True)
     owner._file_report.present_track(tracks[0], owner._session)
     file_page = _show_tab(qapp, owner, _TAB_FILE)
-    assert _root_margins(owner._file_report) == (INSET,) * 4
+    assert _root_margins(owner._file_report) == (REPORT_INSET,) * 4
     file_origin = _first_text_origin(owner._file_report, file_page)
 
     # The report widgets are flush with the tab page; only their text is inset.
@@ -132,8 +134,8 @@ def test_summary_and_file_reports_inset_text_on_every_side(qapp, window):
         frame = browser.frameWidth()
         assert browser.viewport().mapTo(page, QPoint(0, 0)) == QPoint(frame, frame)
     frame = owner._summary_view.frameWidth()
-    assert summary_origin == (frame + INSET, frame + INSET)
-    assert file_origin == (frame + INSET, frame + INSET)
+    assert summary_origin == (frame + REPORT_INSET,) * 2
+    assert file_origin == (frame + REPORT_INSET,) * 2
 
 
 def test_report_message_path_keeps_the_same_inset(qapp, window):
@@ -142,8 +144,8 @@ def test_report_message_path_keeps_the_same_inset(qapp, window):
         '<div style="font-weight:bold;">Analysis Error</div><div>Message</div>'))
     page = _show_tab(qapp, owner, _TAB_SUMMARY)
     frame = owner._summary_view.frameWidth()
-    assert _root_margins(owner._summary_view) == (INSET,) * 4
-    assert _first_text_origin(owner._summary_view, page) == (frame + INSET, frame + INSET)
+    assert _root_margins(owner._summary_view) == (REPORT_INSET,) * 4
+    assert _first_text_origin(owner._summary_view, page) == (frame + REPORT_INSET,) * 2
 
 
 def test_report_header_minimum_width_follows_the_shared_inset(qapp, window, monkeypatch):
@@ -154,7 +156,7 @@ def test_report_header_minimum_width_follows_the_shared_inset(qapp, window, monk
     browser.present_track(tracks[0], owner._session)
     minimum = browser.minimum_header_width()
     browser._minimum_header_cache = None
-    monkeypatch.setattr(browser_module, "DETAIL_TAB_INSET", INSET + 10)
+    monkeypatch.setattr(browser_module, "REPORT_INSET", REPORT_INSET + 10)
     # Help-width give-back measures the header with the same left/right inset.
     assert browser.minimum_header_width() == minimum + 20
 
@@ -163,20 +165,23 @@ def test_report_header_minimum_width_follows_the_shared_inset(qapp, window, monk
 def test_groups_and_config_pages_inset_every_edge(qapp, window, tab):
     owner, _tracks = window
     page = _show_tab(qapp, owner, tab)
-    margins = page.layout().contentsMargins()
-    assert (margins.left(), margins.top(), margins.right(), margins.bottom()) == (INSET,) * 4
-
     description = next(w for w in page.findChildren(QLabel)
                        if w.text().startswith("Session-local") and w.parentWidget() is page)
-    assert description.mapTo(page, QPoint(0, 0)) == QPoint(INSET, INSET)
+    assert description.mapTo(page, QPoint(0, 0)) == QPoint(CONTENT_INSET, CONTENT_INSET)
     revert = next(b for b in page.findChildren(QPushButton)
                   if b.text() == "Revert to Preset")
     right = revert.mapTo(page, QPoint(revert.width(), 0)).x()
-    assert right == page.width() - INSET
-    bottom = max(w.mapTo(page, QPoint(0, w.height())).y()
-                 for w in page.findChildren(QWidget, options=Qt.FindDirectChildrenOnly)
-                 if w.isVisible())
-    assert bottom == page.height() - INSET
+    assert right == page.width() - CONTENT_INSET
+    if tab == _TAB_SESSION:
+        bottom_control = owner._session_stack
+    else:
+        bottom_control = next(b for b in page.findChildren(QPushButton)
+                              if b.text() == "Add")
+        table = owner._groups_tab_table
+        assert table.mapTo(page, QPoint()).x() == CONTENT_INSET
+        assert table.width() == page.width() - 2 * CONTENT_INSET
+    bottom = bottom_control.mapTo(page, QPoint(0, bottom_control.height())).y()
+    assert bottom == page.height() - CONTENT_INSET
 
 
 def test_waveform_preview_stays_full_width_in_file_tab(qapp, window):
@@ -239,7 +244,7 @@ def test_help_dock_keeps_the_inset_from_top_right_and_bottom(qapp, pane):
     _open_help(qapp, pane)
     assert pane.help_browser.isVisible()
     left, top, right, bottom = _panel_rect(pane)
-    assert (top, pane.width() - right, pane.height() - bottom) == (INSET, INSET, INSET)
+    assert (top, pane.width() - right, pane.height() - bottom) == (REPORT_INSET,) * 3
     assert pane._help_panel.width() == 360
     report_right = pane.report.mapTo(pane, QPoint(pane.report.width(), 0)).x()
     assert left - report_right == GAP
@@ -263,8 +268,7 @@ def test_help_width_gives_back_gap_and_header_minimum(qapp, pane, monkeypatch):
     _open_help(qapp, pane)
     pane.resize(800, 620)
     _settle(qapp, pane)
-    # preferred min(360, 0.4 * 800) = 320; available = 800 - 8 gap - 4 inset - 500.
-    assert pane._help_panel.width() == 800 - GAP - INSET - 500
+    assert pane._help_panel.width() == 800 - GAP - REPORT_INSET - 500
 
 
 def test_constrained_help_dock_keeps_its_inset_and_minimum(qapp, pane, monkeypatch):
@@ -273,8 +277,8 @@ def test_constrained_help_dock_keeps_its_inset_and_minimum(qapp, pane, monkeypat
     _settle(qapp, pane)
     left, top, right, bottom = _panel_rect(pane)
     assert pane._help_panel.width() == 140
-    assert pane._help_dock.width() == 140 + INSET
-    assert (top, pane.width() - right, pane.height() - bottom) == (INSET, INSET, INSET)
+    assert pane._help_dock.width() == 140 + REPORT_INSET
+    assert (top, pane.width() - right, pane.height() - bottom) == (REPORT_INSET,) * 3
     report_right = pane.report.mapTo(pane, QPoint(pane.report.width(), 0)).x()
     assert left - report_right == GAP
 
@@ -301,23 +305,23 @@ def test_scrolling_report_keeps_text_inset_inside_the_viewport(qapp, monkeypatch
     viewport = browser.viewport()
     frame = browser.frameWidth()
     assert viewport.mapTo(browser, QPoint(0, 0)) == QPoint(frame, frame)
-    # The bar sits outside the viewport at the pane edge; text keeps 16 inside it.
+    # The text keeps its inset inside the viewport when the scroll rail appears.
     assert bar.mapTo(browser, QPoint(0, 0)).x() >= viewport.width() + frame
     document = browser.document()
     rect = document.documentLayout().blockBoundingRect(document.begin())
-    assert round(rect.left()) == INSET
+    assert round(rect.left()) == REPORT_INSET
     assert round(document.textWidth()) == viewport.width()
-    assert _root_margins(browser) == (INSET,) * 4
+    assert _root_margins(browser) == (REPORT_INSET,) * 4
     bar.setValue(bar.maximum())
     _settle(qapp, browser)
-    assert _root_margins(browser) == (INSET,) * 4
+    assert _root_margins(browser) == (REPORT_INSET,) * 4
     browser.close()
 
 
 def test_cleared_report_keeps_the_inset(qapp):
     browser = ReportBrowser({})
     browser.clear()
-    assert _root_margins(browser) == (INSET,) * 4
+    assert _root_margins(browser) == (REPORT_INSET,) * 4
 
 
 def test_narrow_help_header_wraps_instead_of_clipping(qapp, pane, monkeypatch):
@@ -340,12 +344,108 @@ def test_narrow_help_header_wraps_instead_of_clipping(qapp, pane, monkeypatch):
     assert context.heightForWidth(context.width()) <= context.height()
 
 
-def test_phase2_config_tree_has_no_gap_beside_the_splitter(qapp, window):
-    from PySide6.QtWidgets import QSplitter
-
+def test_phase2_config_tree_and_form_have_matching_splitter_gutters(qapp, window):
     owner, _tracks = window
-    page = _show_tab(qapp, owner, _TAB_SESSION)
-    splitter = owner._session_tree.parentWidget()
+    _show_tab(qapp, owner, _TAB_SESSION)
+    splitter = owner._session_tree.parentWidget().parentWidget()
     assert isinstance(splitter, QSplitter)
-    assert splitter.sizes()[0] == owner._session_tree.width()
+    scroll = owner._session_stack.currentWidget()
+    left = owner._session_tree.mapTo(splitter, QPoint(owner._session_tree.width(), 0)).x()
+    divider = splitter.widget(1).x() - splitter.handleWidth()
+    start = scroll.widget().layout().contentsMargins().left()
+    right = scroll.widget().mapTo(splitter, QPoint(start, 0)).x()
+    assert (divider - left, splitter.handleWidth(), right - divider - 1) == (6, 1, 6)
     assert owner._session_tree.width() == owner._session_tree.maximumWidth()
+
+
+def _assert_centered_splitter_gutters(splitter, left, right):
+    left_end = left.mapTo(splitter, QPoint(left.width(), 0)).x()
+    right_start = right.mapTo(splitter, QPoint()).x()
+    divider = splitter.widget(1).x() - splitter.handleWidth()
+    assert (divider - left_end, splitter.handleWidth(), right_start - divider - 1) == (6, 1, 6)
+    assert left.mapTo(splitter, QPoint()).x() == CONTENT_INSET
+    assert right_start + right.width() == splitter.width() - CONTENT_INSET
+
+
+def test_track_layout_panes_keep_centered_splitter_gutters(qapp, window):
+    owner, _tracks = window
+    owner._phase_tabs.setCurrentIndex(0)
+    _settle(qapp, owner)
+    splitter = owner._topo_input_tree.parentWidget().parentWidget()
+    page = owner._phase_tabs.currentWidget()
+    toolbar = page.findChild(QToolBar)
+    assert splitter.mapTo(page, QPoint()).y() == toolbar.geometry().bottom() + 1
+    _assert_centered_splitter_gutters(splitter, owner._topo_input_tree, owner._topo_output_tree)
+
+
+def _assert_flush_track_table(splitter, table):
+    assert table.mapTo(splitter, QPoint()) == QPoint()
+    assert table.height() == splitter.height()
+    assert table.horizontalHeader().mapTo(splitter, QPoint()).y() == 0
+    assert splitter.widget(1).x() == table.width() + 1
+    scrollbar = table.verticalScrollBar()
+    assert scrollbar.isVisible()
+    assert scrollbar.mapTo(splitter, QPoint(scrollbar.width(), 0)).x() == table.width()
+
+
+def test_phase2_table_and_detail_tabs_start_at_the_toolbar(qapp, window):
+    owner, _tracks = window
+    owner._track_table.setRowCount(80)
+    _settle(qapp, owner)
+    splitter = owner._main_splitter
+    page = owner._phase_tabs.currentWidget()
+    assert splitter.mapTo(page, QPoint()).y() == owner._analysis_toolbar.geometry().bottom() + 1
+    _assert_flush_track_table(splitter, owner._track_table)
+    tab_bar = owner._detail_tabs.tabBar()
+    assert tab_bar.mapTo(splitter, QPoint()) == QPoint(splitter.widget(1).x(), 0)
+    assert tab_bar.width() == splitter.widget(1).width()
+
+
+def test_phase2_keeps_the_split_while_reanalysis_hides_the_table(qapp, window):
+    owner, _tracks = window
+    splitter = owner._main_splitter
+    detail_x = splitter.widget(1).x()
+    owner._track_table.hide()
+    _settle(qapp, owner)
+    assert splitter.handle(1).isVisible()
+    assert splitter.widget(1).x() == detail_x
+
+    owner._track_table.show()
+    _settle(qapp, owner)
+    assert splitter.widget(1).x() == detail_x
+    assert owner._track_table.mapTo(splitter, QPoint()) == QPoint()
+
+
+@pytest.mark.parametrize("routing_visible", [False, True], ids=["offline", "routing"])
+def test_transfer_table_is_flush_and_the_right_pane_keeps_insets(qapp, window, routing_visible):
+    owner, _tracks = window
+    owner._phase_tabs.setTabEnabled(2, True)
+    owner._phase_tabs.setCurrentIndex(2)
+    owner._setup_right_stack.setCurrentIndex(int(routing_visible))
+    owner._setup_table.setRowCount(80)
+    _settle(qapp, owner)
+    splitter = owner._setup_splitter
+    page = owner._phase_tabs.currentWidget()
+    assert splitter.mapTo(page, QPoint()).y() == owner._setup_toolbar.geometry().bottom() + 1
+    _assert_flush_track_table(splitter, owner._setup_table)
+    right = owner._setup_right_stack.currentWidget()
+    assert right.layout().contentsRect() == right.rect().adjusted(6, 6, -6, -6)
+    if routing_visible:
+        tree = owner._folder_tree
+        assert tree.x() == CONTENT_INSET
+        assert tree.x() + tree.width() == right.width() - CONTENT_INSET
+        project_row = owner._project_name_edit.parentWidget()
+        assert project_row.pos() == QPoint(CONTENT_INSET, CONTENT_INSET)
+
+
+def test_phase2_auto_fit_shows_every_column_with_the_scrollbar_visible(qapp, window):
+    owner, _tracks = window
+    table = owner._track_table
+    owner.resize(2100, owner.height())
+    table.setRowCount(80)
+    _settle(qapp, owner)
+    owner._auto_fit_track_table()
+    _settle(qapp, owner)
+    assert table.width() == calculate_track_table_layout(table).table_width
+    assert table.verticalScrollBar().maximum() > 0
+    assert table.horizontalScrollBar().maximum() == 0

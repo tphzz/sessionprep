@@ -21,7 +21,6 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QSizePolicy,
-    QSplitter,
     QStackedWidget,
     QTableWidget,
     QTabWidget,
@@ -45,7 +44,7 @@ from .settings import (
     load_config, save_config,
     resolve_config_preset, build_defaults,
 )
-from .controls import bind_primary_action
+from .controls import bind_primary_action, content_splitter, inset_pane
 from .theme import COLORS, apply_dark_theme
 from .log import dbg
 from .prefs import PreferencesDialog
@@ -394,7 +393,7 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
         analysis_layout.setSpacing(0)
         self._init_analysis_toolbar()
         analysis_layout.addWidget(self._analysis_toolbar)
-        self._main_splitter = QSplitter(Qt.Horizontal)
+        self._main_splitter = content_splitter()
         self._main_splitter.addWidget(self._build_left_panel())
         self._main_splitter.addWidget(self._build_right_panel())
         self._main_splitter.setStretchFactor(0, 3)
@@ -754,12 +753,6 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
     # ── Panel builders ────────────────────────────────────────────────────
 
     def _build_left_panel(self) -> QWidget:
-        panel = QWidget()
-        layout = QVBoxLayout(panel)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
-
-        # Track table
         self._track_table = _DraggableTrackTable()
         self._track_table.setColumnCount(8)
         self._track_table.setHorizontalHeaderLabels(
@@ -801,9 +794,8 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
 
         self._track_table.cellClicked.connect(self._on_row_clicked)
         self._track_table.currentCellChanged.connect(self._on_current_cell_changed)
-        layout.addWidget(self._track_table)
-
-        return panel
+        # Reanalysis hides the table while keeping its splitter pane visible.
+        return inset_pane(self._track_table, (0, 0, 0, 0))
 
     def _build_right_panel(self) -> QWidget:
         """Build the right-hand side analysis detail tabs."""
@@ -821,7 +813,7 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
         self._detail_tabs.addTab(self._summary_view, "Summary")
 
         # File tab — vertical splitter (report + waveform)
-        self._file_splitter = QSplitter(Qt.Vertical)
+        self._file_splitter = content_splitter(Qt.Vertical)
 
         self._file_report = self._make_report_browser()
         self._file_report.visualizeRequested.connect(self._visualize_detector)
@@ -884,14 +876,7 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
         install_tab_marker(self._detail_tabs, _TAB_SESSION)
         self._detail_tabs.setTabEnabled(_TAB_SESSION, False)
 
-        # Container for detail tabs
-        tabs_container = QWidget()
-        tabs_layout = QVBoxLayout(tabs_container)
-        tabs_layout.setContentsMargins(0, 0, 0, 0)
-        tabs_layout.setSpacing(0)
-        tabs_layout.addWidget(self._detail_tabs, 1)
-
-        self._right_stack.addWidget(tabs_container)
+        self._right_stack.addWidget(self._detail_tabs)
 
         # Start on the tabs page (summary empty until first analysis)
         self._right_stack.setCurrentIndex(_PAGE_TABS)

@@ -1,7 +1,85 @@
-"""Shared desktop action behavior, independent of phase eligibility."""
+"""Shared desktop controls and action behavior."""
 from PySide6.QtCore import QEvent, QObject, QSize, Qt
 from PySide6.QtGui import QAction, QIcon
-from PySide6.QtWidgets import QSplitter, QToolBar, QToolButton
+from PySide6.QtWidgets import (
+    QDoubleSpinBox, QPushButton, QScrollArea, QSpinBox, QSplitter,
+    QToolBar, QToolButton, QVBoxLayout, QWidget,
+)
+
+from .theme import CONTENT_INSET
+
+
+class FormSpinBox(QSpinBox):
+    """Integer input sized to match the other controls in a form."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setProperty("formNumericEditor", True)
+
+
+class FormDoubleSpinBox(QDoubleSpinBox):
+    """Decimal input with the same sizing as the integer form input."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setProperty("formNumericEditor", True)
+
+
+class FormActionButton(QPushButton):
+    """An action that shares a row with a form input."""
+
+    def __init__(self, text="", parent=None):
+        super().__init__(text, parent)
+        self.setProperty("formRowAction", True)
+
+
+class FormBrowseButton(FormActionButton):
+    """A path picker action with room for larger label fonts."""
+
+    def __init__(self, parent=None):
+        super().__init__("Browse\u2026", parent)
+
+    def sizeHint(self):
+        return super().sizeHint().expandedTo(QSize(80, 0))
+
+
+def content_splitter(orientation=Qt.Horizontal) -> QSplitter:
+    """Use one painted logical pixel while Qt keeps its larger drag region."""
+    splitter = QSplitter(orientation)
+    splitter.setHandleWidth(1)
+    return splitter
+
+
+def inset_pane(
+    content: QWidget, margins: tuple[int, int, int, int] = (CONTENT_INSET,) * 4,
+) -> QWidget:
+    """Give one pane ownership of the gutters surrounding its content."""
+    pane = QWidget()
+    layout = QVBoxLayout(pane)
+    layout.setContentsMargins(*margins)
+    layout.setSpacing(0)
+    layout.addWidget(content)
+    max_width = content.maximumWidth()
+    if max_width < pane.maximumWidth():
+        pane.setMaximumWidth(max_width + margins[0] + margins[2])
+    return pane
+
+
+def settings_scroll_area(page: QWidget) -> QScrollArea:
+    """Inset a settings form from the divider and from a visible scroll rail."""
+    scroll = QScrollArea()
+    scroll.setWidgetResizable(True)
+    scroll.setFrameShape(QScrollArea.NoFrame)
+    layout = page.layout()
+
+    def fit_right_gutter(low: int, high: int) -> None:
+        right = CONTENT_INSET if high > low else 0
+        layout.setContentsMargins(CONTENT_INSET, CONTENT_INSET, right, 0)
+
+    fit_right_gutter(0, 0)
+    scroll.verticalScrollBar().rangeChanged.connect(fit_right_gutter)
+    scroll.setWidget(page)
+    return scroll
 
 
 class _PrimaryActionBinding(QObject):

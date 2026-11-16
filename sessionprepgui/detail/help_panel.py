@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (
 
 from ..icons import icon
 from ..theme import COLORS
-from ..tracks.table_widgets import DETAIL_TAB_INSET
+from ..theme import REPORT_INSET
 from .report_style import configure_report_browser
 
 # Report-to-dock gap; the report's own text inset sits inside the report.
@@ -165,7 +165,7 @@ class FileReportPane(QWidget):
         # bottom edges; the report keeps the full height beside it.
         self._help_dock = QWidget()
         dock_layout = QVBoxLayout(self._help_dock)
-        dock_layout.setContentsMargins(0, DETAIL_TAB_INSET, DETAIL_TAB_INSET, DETAIL_TAB_INSET)
+        dock_layout.setContentsMargins(0, REPORT_INSET, REPORT_INSET, REPORT_INSET)
         dock_layout.setSpacing(0)
         dock_layout.addWidget(self._help_panel)
         layout.addWidget(self._help_dock)
@@ -199,7 +199,7 @@ class FileReportPane(QWidget):
         # space when the user makes the File region narrower.
         preferred = min(360, max(140, round(self.width() * 0.4)))
         if self._active_detector_id is not None:
-            available = (self.width() - _HELP_GAP - DETAIL_TAB_INSET
+            available = (self.width() - _HELP_GAP - REPORT_INSET
                          - self.report.minimum_header_width())
             preferred = min(preferred, max(140, available))
         # The panel's 1 px border on each side surrounds the Help body.
