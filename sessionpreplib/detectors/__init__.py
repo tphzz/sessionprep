@@ -5,6 +5,7 @@ from .stereo_compat import StereoCompatDetector
 from .dual_mono import DualMonoDetector
 from .one_sided_silence import OneSidedSilenceDetector
 from .subsonic import SubsonicDetector
+from .ultrasonic import UltrasonicDetector
 from .audio_classifier import AudioClassifierDetector
 from .tail_exceedance import TailExceedanceDetector
 from .format_consistency import FormatConsistencyDetector
@@ -21,6 +22,7 @@ def default_detectors():
         DualMonoDetector(),
         OneSidedSilenceDetector(),
         SubsonicDetector(),
+        UltrasonicDetector(),
         AudioClassifierDetector(),
         TailExceedanceDetector(),
         FormatConsistencyDetector(),
@@ -42,6 +44,7 @@ __all__ = [
     "DualMonoDetector",
     "OneSidedSilenceDetector",
     "SubsonicDetector",
+    "UltrasonicDetector",
     "AudioClassifierDetector",
     "TailExceedanceDetector",
     "FormatConsistencyDetector",

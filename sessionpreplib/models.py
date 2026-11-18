@@ -7,6 +7,8 @@ from typing import Any
 
 import numpy as np
 
+from .repairs import RepairRecipe
+
 
 @dataclass(frozen=True)
 class ParamSpec:
@@ -144,6 +146,13 @@ class TrackContext:
     applied_processors: list[str] = field(default_factory=list)
     processor_skip: set[str] = field(default_factory=set)
     _cache: dict[str, Any] = field(default_factory=dict, repr=False)
+    repair_overrides: dict[str, bool | float] = field(default_factory=dict)
+    repair_recipe: RepairRecipe = field(default_factory=RepairRecipe)
+    repair_measurements: dict[str, Any] = field(default_factory=dict)
+    manual_gain_db: float | None = None
+    prepared_fader_db: float | None = None
+    prepared_file_signature: tuple[int, int] | None = None
+    source_file_signature: tuple[int, int] | None = None
 
 
 @dataclass

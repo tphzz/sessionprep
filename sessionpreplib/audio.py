@@ -70,6 +70,7 @@ def discover_track(filepath: str) -> TrackContext:
     total_samples, bitdepth, subtype, duration_sec populated.
     ``audio_data`` is left as ``None``.
     """
+    stat = os.stat(filepath)
     info = sf.info(filepath)
     return TrackContext(
         filename=os.path.basename(filepath),
@@ -81,13 +82,20 @@ def discover_track(filepath: str) -> TrackContext:
         bitdepth=_SUBTYPE_MAP.get(info.subtype, info.subtype),
         subtype=info.subtype,
         duration_sec=info.duration,
+        source_file_signature=(stat.st_size, stat.st_mtime_ns),
     )
 
 
 def load_track(filepath: str) -> TrackContext:
     """Read an audio file (WAV/AIFF) and return a fully populated TrackContext."""
-    info = sf.info(filepath)
-    data, samplerate = sf.read(filepath, dtype='float64')
+    stat = os.stat(filepath)
+    with sf.SoundFile(filepath) as stream:
+        samplerate, subtype = stream.samplerate, stream.subtype
+        data = stream.read(dtype='float64')
+    signature = (stat.st_size, stat.st_mtime_ns)
+    latest = os.stat(filepath)
+    if signature != (latest.st_size, latest.st_mtime_ns):
+        raise ValueError("Source changed while it was being read")
     channels = 1 if data.ndim == 1 else data.shape[1]
     try:
         cids = _chunk_ids(filepath)
@@ -99,11 +107,12 @@ def load_track(filepath: str) -> TrackContext:
         audio_data=data,
         samplerate=samplerate,
         channels=channels,
-        total_samples=info.frames,
-        bitdepth=_SUBTYPE_MAP.get(info.subtype, info.subtype),
-        subtype=info.subtype,
-        duration_sec=info.duration,
+        total_samples=len(data),
+        bitdepth=_SUBTYPE_MAP.get(subtype, subtype),
+        subtype=subtype,
+        duration_sec=len(data) / samplerate,
         chunk_ids=cids,
+        source_file_signature=signature,
     )
 
 

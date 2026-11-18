@@ -72,6 +72,7 @@ class ConfigChangeImpact:
     phase2_keys: frozenset[str] = frozenset()
     presentation_keys: frozenset[str] = frozenset()
     daw_keys: frozenset[str] = frozenset()
+    repair_keys: frozenset[str] = frozenset()
 
     @property
     def changed(self) -> bool:
@@ -80,6 +81,7 @@ class ConfigChangeImpact:
             or self.phase2_keys
             or self.presentation_keys
             or self.daw_keys
+            or self.repair_keys
         )
 
     @property
@@ -93,13 +95,13 @@ class ConfigChangeImpact:
     @property
     def presentation_only(self) -> bool:
         return self.changed and not (
-            self.phase1_keys or self.phase2_keys or self.daw_keys
+            self.phase1_keys or self.phase2_keys or self.daw_keys or self.repair_keys
         )
 
     @property
     def daw_only(self) -> bool:
         return self.changed and not (
-            self.phase1_keys or self.phase2_keys or self.presentation_keys
+            self.phase1_keys or self.phase2_keys or self.presentation_keys or self.repair_keys
         )
 
 
@@ -112,6 +114,10 @@ def default_config() -> dict[str, Any]:
         "clip_consecutive": 3,
         "clip_report_max_ranges": 10,
         "dc_offset_warn_db": -40.0,
+        "repair_auto_dc": False,
+        "repair_auto_low_cut": False,
+        "repair_auto_ultrasonic": False,
+        "repair_low_cut_hz": 10.0,
         "corr_warn": -0.3,
         "dual_mono_eps": 1e-5,
         "mono_loss_warn_db": 6.0,
@@ -464,6 +470,18 @@ def validate_param_values(
     return errors
 
 
+REPAIR_PARAMS = [
+    ParamSpec("repair_auto_dc", bool, False, "DC removal",
+              "Automatically select 2 Hz DC removal when a track has a persistent signed bias."),
+    ParamSpec("repair_auto_low_cut", bool, False, "Subsonic filter",
+              "Automatically select the low cut for sustained infrasonic energy after DC treatment."),
+    ParamSpec("repair_auto_ultrasonic", bool, False, "Ultrasonic filter",
+              "Automatically select filtering for sustained ultrasonic content on high-rate sources."),
+    ParamSpec("repair_low_cut_hz", (int, float), 10.0, "Low-cut cutoff (Hz)",
+              "Whole-track high-pass corner for subsonic filtering.", min=5, max=40),
+]
+
+
 def _all_param_specs() -> list[ParamSpec]:
     """Collect every :class:`ParamSpec` from analysis, detectors,
     and processors.  Used by the flat-config validators."""
@@ -472,7 +490,7 @@ def _all_param_specs() -> list[ParamSpec]:
 
     from .daw_processors import default_daw_processors
 
-    specs = list(ANALYSIS_PARAMS)
+    specs = [*ANALYSIS_PARAMS, *REPAIR_PARAMS]
     for det in default_detectors():
         specs.extend(det.config_params())
     for proc in default_processors():
@@ -547,6 +565,7 @@ def build_structured_defaults() -> dict[str, Any]:
         params = proc.config_params()
         if params:
             structured["processors"][proc.id] = {p.key: p.default for p in params}
+    structured["processors"]["corrective"] = {p.key: p.default for p in REPAIR_PARAMS}
 
     for dp in default_daw_processors():
         params = dp.config_params()
@@ -672,6 +691,8 @@ def classify_structured_config_change(
 
     for spec in PRESENTATION_PARAMS:
         known[("presentation", None, spec.key)] = "presentation"
+    for spec in REPAIR_PARAMS:
+        known[("processors", "corrective", spec.key)] = "repair"
 
     detector_phase: dict[str, str] = {}
     for det in default_detectors():
@@ -713,6 +734,7 @@ def classify_structured_config_change(
         "phase2": set(),
         "presentation": set(),
         "daw": set(),
+        "repair": set(),
     }
 
     old_values = _structured_config_values(old)
@@ -730,6 +752,7 @@ def classify_structured_config_change(
         phase2_keys=frozenset(changed["phase2"]),
         presentation_keys=frozenset(changed["presentation"]),
         daw_keys=frozenset(changed["daw"]),
+        repair_keys=frozenset(changed["repair"]),
     )
 
 
@@ -796,9 +819,10 @@ def validate_structured_config(
     proc_sections = structured.get("processors", {})
     for proc_id, section in proc_sections.items():
         proc = proc_map.get(proc_id)
-        if proc is None or not isinstance(section, dict):
+        if (proc is None and proc_id != "corrective") or not isinstance(section, dict):
             continue
-        for err in validate_param_values(proc.config_params(), section):
+        specs = REPAIR_PARAMS if proc_id == "corrective" else proc.config_params()
+        for err in validate_param_values(specs, section):
             errors.append(
                 ConfigFieldError(
                     f"processors.{proc_id}.{err.key}",

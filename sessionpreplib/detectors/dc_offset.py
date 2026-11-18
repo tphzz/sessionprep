@@ -56,25 +56,19 @@ class DCOffsetDetector(TrackDetector):
             )
 
         data = track.audio_data
-        if data.size > 0:
-            if data.ndim > 1 and data.shape[1] > 1:
-                dc_linear = float(np.max(np.abs(np.mean(data, axis=0))))
-            else:
-                flat = data.flatten() if data.ndim > 1 else data
-                dc_linear = float(np.abs(np.mean(flat)))
-        else:
-            dc_linear = 0.0
-
+        means = np.atleast_1d(np.mean(data, axis=0, dtype=np.float64)) if data.size else np.array([])
+        dc_linear = float(np.max(np.abs(means), initial=0))
         dc_db = linear_to_db(dc_linear)
         dc_warn = bool(np.isfinite(dc_db) and dc_db > self.warn_db)
         dc_db_display = dc_db + self._db_offset
+        evidence = {"dc_db": dc_db, "dc_warn": dc_warn, "signed_dc": means.tolist()}
 
         if dc_warn:
             return DetectorResult(
                 detector_id=self.id,
                 severity=Severity.ATTENTION,
                 summary=f"DC offset {dc_db_display:.1f} dBFS",
-                data={"dc_db": dc_db, "dc_warn": True},
+                data=evidence,
                 hint="consider DC removal",
                 issues=[IssueLocation(
                     sample_start=0,
@@ -90,7 +84,7 @@ class DCOffsetDetector(TrackDetector):
             detector_id=self.id,
             severity=Severity.CLEAN,
             summary="no DC offset issue",
-            data={"dc_db": dc_db, "dc_warn": False},
+            data=evidence,
         )
 
     def clean_message(self) -> str | None:

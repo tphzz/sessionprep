@@ -8,7 +8,7 @@ import os
 import zipfile
 from typing import Any
 
-from ..daw_processor import DawProcessor
+from ..daw_processor import DawProcessor, resolve_transfer_audio
 from ..models import DawCommand, DawCommandResult, SessionContext
 
 
@@ -318,11 +318,6 @@ class DawProjectDawProcessor(DawProcessor):
         if project.arrangement.lanes is None:
             project.arrangement.lanes = Lanes(time_unit=TimeUnit.SECONDS)
 
-        proc_id = "bimodal_normalize"
-        bn_enabled = session.config.get(f"{proc_id}_enabled", True)
-
-        log.debug(f"transfer: bn_enabled={bn_enabled}")
-
         # ── Create tracks and clips ─────────────────────────────
         for step, (eid, fid) in enumerate(work):
             folder_track = folder_track_map.get(fid)
@@ -342,26 +337,15 @@ class DawProjectDawProcessor(DawProcessor):
                           f"{fid} / {eid}"))
                 continue
 
-            # Resolve audio file path (always from output_tracks)
-            audio_path = os.path.abspath(
-                out_tc.processed_filepath or out_tc.filepath)
-
-            # Compute fader volume (clip gain is baked into processed files)
-            fader_db = 0.0
-            pr = out_tc.processor_results.get(proc_id)
-            skip = proc_id in getattr(out_tc, "processor_skip", set())
-            log.debug(
-                f"  {eid}: bn_enabled={bn_enabled}, "
-                f"has_pr={pr is not None}, "
-                f"classification={pr.classification if pr else None}, "
-                f"skip={skip}, "
-                f"fader_offset={pr.data.get('fader_offset') if pr else None}"
-            )
-            if bn_enabled and pr:
-                if pr.classification not in ("Silent", "Skip") and not skip:
-                    fader_db = pr.data.get("fader_offset", 0.0)
-            log.debug(f"  → fader_db={fader_db:.2f}")
-            volume_linear = _db_to_linear(fader_db)
+            try:
+                media = resolve_transfer_audio(session, out_tc)
+            except ValueError as exc:
+                results.append(DawCommandResult(
+                    command=DawCommand("add_track", eid, {"folder_id": fid}),
+                    success=False, error=str(exc)))
+                continue
+            log.debug("%s: file=%s, fader=%+.2f dB", eid, media.filepath, media.fader_db)
+            volume_linear = _db_to_linear(media.fader_db)
 
             # Resolve group color → #rrggbb
             track_color = self._resolve_track_color(entry.group, session)
@@ -394,7 +378,7 @@ class DawProjectDawProcessor(DawProcessor):
             audio = Audio(
                 time_unit=TimeUnit.SECONDS,
                 file=FileReference(
-                    path=audio_path.replace("\\", "/"),
+                    path=media.filepath.replace("\\", "/"),
                     external=True),
                 sample_rate=out_tc.samplerate,
                 channels=out_tc.channels,
@@ -420,12 +404,16 @@ class DawProjectDawProcessor(DawProcessor):
             results.append(DawCommandResult(
                 command=DawCommand("add_track", eid,
                                    {"folder": folder_dict.get("name", ""),
-                                    "fader_db": fader_db}),
+                                    "fader_db": media.fader_db}),
                 success=True))
 
             if progress_cb:
                 progress_cb(step + 1, total,
                             f"Added {track_name} ({step + 1}/{total})")
+
+        if results and not any(result.success for result in results):
+            session.daw_command_log.extend(results)
+            return results
 
         # ── Save ──────────────────────────────────────────────────
         try:

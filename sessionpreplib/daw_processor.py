@@ -3,10 +3,78 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
+import math
+import os
+import stat
 from typing import Any
 
 from .models import ParamSpec
-from .models import DawCommand, DawCommandResult, SessionContext
+from .models import DawCommand, DawCommandResult, SessionContext, TrackContext
+
+
+@dataclass(frozen=True)
+class TransferAudio:
+    """Media path and corresponding DAW fader offset for a transfer entry."""
+
+    filepath: str
+    fader_db: float
+
+
+def resolve_transfer_audio(session: SessionContext, track: TrackContext) -> TransferAudio:
+    """Resolve and verify the selected output before creating a DAW track."""
+    choice = session.config.get("_use_processed")
+    prepared = bool(track.processed_filepath) if choice is None else choice
+    path = track.processed_filepath if prepared else track.filepath
+    if not path:
+        raise ValueError("The selected audio is unavailable. Run Prepare again.")
+    if prepared:
+        if session.prepare_state == "stale" or (choice is True and session.prepare_state != "ready"):
+            raise ValueError("Prepared audio is out of date. Run Prepare again.")
+    elif track.processed_filepath and _same_audio_path(path, track.processed_filepath):
+        # Older saved outputs stored the prepared path in both fields.
+        source = next((t for t in session.tracks if t.filename == track.filename), None)
+        if source is None or _same_audio_path(source.filepath, track.processed_filepath):
+            raise ValueError("The routed source is unavailable. Apply Track Layout and Prepare again.")
+        path = source.filepath
+
+    try:
+        info = os.stat(path)
+    except OSError as exc:
+        raise ValueError(f"The selected audio file could not be opened. {path}") from exc
+    if not stat.S_ISREG(info.st_mode):
+        raise ValueError(f"The selected audio path is not a file. {path}")
+    signature = track.prepared_file_signature if prepared else track.source_file_signature
+    if signature is not None and signature != (info.st_size, info.st_mtime_ns):
+        if prepared:
+            raise ValueError("The prepared file has changed. Run Prepare again.")
+        raise ValueError("The routed source file has changed. Reanalyze this track.")
+
+    fader_db = 0.0
+    if prepared and track.prepared_fader_db is not None:
+        fader_db = track.prepared_fader_db
+    elif prepared or choice is None:
+        fader_db = _legacy_fader_db(session, track)
+    if not isinstance(fader_db, (int, float)) or not math.isfinite(fader_db):
+        raise ValueError("Invalid saved fader offset. Run Prepare again.")
+    return TransferAudio(os.path.abspath(path), fader_db)
+
+
+def _same_audio_path(first: str, second: str) -> bool:
+    return os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second))
+
+
+def _legacy_fader_db(session: SessionContext, track: TrackContext) -> float:
+    """Read legacy normalization evidence, including skips saved only on the source."""
+    proc_id = "bimodal_normalize"
+    source = next((t for t in session.tracks if t.filename == track.filename), track)
+    if (not session.config.get(f"{proc_id}_enabled", True)
+            or proc_id in track.processor_skip or proc_id in source.processor_skip):
+        return 0.0
+    result = track.processor_results.get(proc_id) or source.processor_results.get(proc_id)
+    if result is None or result.error or result.classification in ("Skip", "Silent"):
+        return 0.0
+    return result.data.get("fader_offset", 0.0)
 
 
 class DawProcessor(ABC):

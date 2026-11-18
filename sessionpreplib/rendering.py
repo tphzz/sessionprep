@@ -223,6 +223,7 @@ def build_diagnostic_summary(
     silent_items = []
     one_sided_items = []
     subsonic_items = []
+    ultrasonic_items = []
     tail_items = []
 
     issue_names = set(mismatch_names) | set(length_mismatch_names)
@@ -336,6 +337,11 @@ def build_diagnostic_summary(
                         f'subsonic content detected')
                 issue_names.add(t.filename)
 
+        ultrasonic = t.detector_results.get("ultrasonic")
+        if ultrasonic and ultrasonic.data.get("regions") and not _is_skipped("ultrasonic"):
+            add_item(ultrasonic_items, t.filename, ultrasonic.summary)
+            issue_names.add(t.filename)
+
         # Tail exceedance
         if not _is_skipped("tail_exceedance"):
             tail_r = t.detector_results.get("tail_exceedance")
@@ -373,6 +379,8 @@ def build_diagnostic_summary(
         ("subsonic",          "Subsonic content",
          f"consider HPF ~{float(session.config.get('subsonic_hz', 30.0)):g} Hz",
          subsonic_items),
+        ("ultrasonic",        "Ultrasonic content",
+         "review ultrasonic filtering", ultrasonic_items),
         ("tail_exceedance",   "Tail regions exceeded anchor",
          "check for section-based riding", tail_items),
     ]

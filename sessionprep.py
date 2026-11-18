@@ -1,6 +1,7 @@
 import os
 import sys
 import argparse
+from pathlib import Path
 
 from sessionpreplib.logging_setup import setup_logging
 setup_logging()
@@ -24,7 +25,7 @@ from sessionpreplib.config import default_config, merge_configs
 from sessionpreplib.rendering import build_diagnostic_summary, render_diagnostic_summary_text
 from sessionpreplib.reports import generate_report, save_json, build_warnings
 from sessionpreplib.utils import protools_sort_key
-from sessionpreplib.audio import AUDIO_EXTENSIONS
+from sessionpreplib.audio import AUDIO_EXTENSIONS, discover_audio_files
 from sessionpreplib.events import EventBus
 
 console = Console()
@@ -77,6 +78,10 @@ def parse_arguments():
                         help="Subsonic detector cutoff frequency (Hz)")
     parser.add_argument("--subsonic_warn_ratio_db", type=float, default=-20.0,
                         help="Warn if subsonic power ratio (<= cutoff) exceeds this level (dB relative to full-band power)")
+    parser.add_argument("--fix", action="append", choices=["dc", "subsonic", "ultrasonic"], default=[],
+                        help="Select this repair on matching tracks. May be repeated.")
+    parser.add_argument("--low-cut-hz", type=float, default=10.0, metavar="HZ",
+                        help="High-pass corner when subsonic filtering is selected (5–40 Hz)")
 
     # Analysis
     parser.add_argument("--window", type=positive_int, default=400,
@@ -148,6 +153,8 @@ def parse_arguments():
 
     if args.subsonic_hz <= 0.0:
         parser.error("--subsonic_hz must be > 0")
+    if not 5 <= args.low_cut_hz <= 40:
+        parser.error("--low-cut-hz must be between 5 and 40 Hz")
 
     if args.one_sided_silence_db > 0.0:
         parser.error("--one_sided_silence_db must be <= 0")
@@ -217,36 +224,75 @@ def print_diagnostic_summary(summary):
 # Main process_files() — thin wrapper around the sessionpreplib pipeline
 # ---------------------------------------------------------------------------
 
+def _prepare_cli_destinations(source, output, backup, filenames, report, json_report):
+    """Check every requested write against the input audio, rendered audio and backups."""
+    source, output = Path(source).resolve(), Path(output).resolve()
+    backup = Path(backup).resolve() if backup is not None else None
+    if backup is None and output == source:
+        raise ValueError("Choose a different output folder or use --overwrite for in-place processing.")
+    if backup == source:
+        raise ValueError("The backup folder must be separate from the input folder.")
+
+    # Existing hard links share a file ID even when their resolved names differ.
+    claimed = {}
+
+    def reserve(path, role):
+        if os.name == "nt" and os.path.isreserved(path):
+            raise ValueError(f"The {role} path contains a reserved Windows name. {path}")
+        resolved = path.resolve()
+        keys = [resolved]
+        try:
+            info = resolved.stat()
+        except FileNotFoundError:
+            pass
+        else:
+            if info.st_ino:
+                keys.append((info.st_dev, info.st_ino))
+        for key in keys:
+            other = claimed.get(key)
+            if other and not (other == role == "input audio"):
+                raise ValueError(f"The {role} path conflicts with {other}. {path}")
+            claimed[key] = role
+
+    for name in filenames:
+        reserve(source / name, "input audio")
+    for name in filenames:
+        if backup is None:
+            reserve(output / name, "rendered audio")
+        else:
+            path = backup / name
+            if path.exists() and not path.is_file():
+                raise ValueError(f"The backup must name a file. {path}")
+            reserve(path, "backup audio")
+    reports = [output / report, output / json_report]
+    for path, role in zip(reports, ("text report", "JSON report")):
+        if path.exists() and not path.is_file():
+            raise ValueError(f"The {role} must name a file. {path}")
+        reserve(path, role)
+        if path.is_file() and path.resolve().suffix.lower() in AUDIO_EXTENSIONS:
+            raise ValueError(f"The {role} would replace an existing audio file. {path}")
+
+    directories = [output, *(path.parent for path in reports)]
+    if backup is not None:
+        directories.append(backup)
+    for directory in directories:
+        resolved = directory.resolve()
+        if any(parent in claimed for parent in (resolved, *resolved.parents)):
+            raise ValueError(f"A file destination is also needed as a folder. {directory}")
+    for directory in directories:
+        directory.mkdir(parents=True, exist_ok=True)
+
+
 def process_files():
     args = parse_arguments()
     source_dir = args.directory
 
     if not os.path.isdir(source_dir):
-        console.print(f"[bold red]Error:[/] Directory '{source_dir}' not found.")
-        return
-
-    # --- OUTPUT SETUP (only in execute mode) ---
-    output_dir = None
-    backup_dir = None
-    is_overwriting = False
-    source_dir_norm = os.path.normcase(os.path.abspath(source_dir))
-
-    if args.execute:
-        if args.overwrite:
-            output_dir = source_dir
-            is_overwriting = True
-        else:
-            output_dir = os.path.join(source_dir, args.output_folder)
-            output_dir_norm = os.path.normcase(os.path.abspath(output_dir))
-            if source_dir_norm == output_dir_norm:
-                console.print("[bold red]Error:[/] Output folder resolves to the source directory. Use --overwrite to overwrite in-place, or choose a different --output_folder.")
-                return
-            if not os.path.exists(output_dir):
-                os.makedirs(output_dir)
-
-        backup_dir = os.path.join(source_dir, args.backup)
-        if is_overwriting:
-            os.makedirs(backup_dir, exist_ok=True)
+        console.print(f"Input directory does not exist. {source_dir}", style="bold red", markup=False)
+        return 1
+    is_overwriting = args.execute and args.overwrite
+    output_dir = source_dir if is_overwriting else os.path.join(source_dir, args.output_folder)
+    backup_dir = os.path.join(source_dir, args.backup) if is_overwriting else None
 
     # --- BUILD CONFIG FROM CLI ARGS ---
     config = default_config()
@@ -257,6 +303,10 @@ def process_files():
         "clip_consecutive": args.clip_consecutive,
         "clip_report_max_ranges": args.clip_report_max_ranges,
         "dc_offset_warn_db": args.dc_offset_warn_db,
+        "repair_auto_dc": "dc" in args.fix,
+        "repair_auto_low_cut": "subsonic" in args.fix,
+        "repair_auto_ultrasonic": "ultrasonic" in args.fix,
+        "repair_low_cut_hz": args.low_cut_hz,
         "corr_warn": args.corr_warn,
         "dual_mono_eps": args.dual_mono_eps,
         "mono_loss_warn_db": args.mono_loss_warn_db,
@@ -317,13 +367,14 @@ def process_files():
         console=console,
     ) as progress:
         # Count files first for the progress bar
-        wav_files = sorted(
-            [f for f in os.listdir(source_dir) if f.lower().endswith(AUDIO_EXTENSIONS)],
-            key=protools_sort_key,
-        )
+        try:
+            wav_files = discover_audio_files(source_dir)
+        except OSError as exc:
+            console.print(str(exc), style="bold red", markup=False)
+            return 1
         if not wav_files:
-            console.print(f"[red]No audio files found in {source_dir}[/]")
-            return
+            console.print(f"No audio files found in {source_dir}", style="red", markup=False)
+            return 1
 
         task_id = progress.add_task("[cyan]Loading & analyzing tracks...", total=len(wav_files) * 2)
 
@@ -334,9 +385,14 @@ def process_files():
 
         try:
             session = load_session(source_dir, config, event_bus=event_bus)
-        except ValueError as e:
-            console.print(f"[bold red]Error:[/] {e}")
-            return
+            if not session.tracks:
+                raise ValueError(f"No audio files found in {source_dir}")
+            if args.execute:
+                _prepare_cli_destinations(source_dir, output_dir, backup_dir,
+                                          [track.filename for track in session.tracks], args.report, args.json)
+        except (OSError, ValueError) as exc:
+            console.print(str(exc), style="bold red", markup=False)
+            return 1
 
         # --- ANALYZE ---
         session = pipeline.analyze_phase1(session)
@@ -363,14 +419,9 @@ def process_files():
         group_table.add_column("Gain", justify="right", style="bold green")
         group_table.add_column("Members", style="dim")
 
-        def _get_primary_pr(track):
-            if track.processor_results:
-                return next(iter(track.processor_results.values()))
-            return None
-
         for gname in sorted(grouped.keys()):
             members = grouped[gname]
-            pr = _get_primary_pr(members[0])
+            pr = members[0].processor_results.get("bimodal_normalize")
             gain_str = f"{pr.gain_db:+.1f} dB" if pr else "—"
             member_list = ", ".join(m.filename for m in members)
             group_table.add_row(gname, gain_str, member_list)
@@ -385,11 +436,29 @@ def process_files():
 
     # --- BUILD DIAGNOSTIC SUMMARY ---
     diagnostic_summary = build_diagnostic_summary(session)
+    for track in session.tracks:
+        if track.repair_recipe.active:
+            console.print("Repairs", track.filename, "·", ", ".join(track.repair_recipe.applied_ids()),
+                          markup=False)
+        suggestions = track.repair_measurements.get("suggested", {})
+        flags = {"dc_remove": "dc", "low_cut": "subsonic", "ultrasonic": "ultrasonic"}
+        available = [f"--fix {flag}" for key, flag in flags.items()
+                     if suggestions.get(key) and key not in track.repair_recipe.applied_ids()]
+        if available:
+            console.print("Suggested repairs", track.filename, "·", ", ".join(available), markup=False)
 
     # --- DRY-RUN: print diagnostics and exit ---
     if not args.execute:
         print_diagnostic_summary(diagnostic_summary)
-        return
+        failed = False
+        for track in session.tracks:
+            error = track.status if track.status != "OK" else track._cache.get("repair_error")
+            if not error:
+                error = next((r.error for r in track.processor_results.values() if r.error), None)
+            if error:
+                console.print(f"{track.filename}: {error}", style="red", markup=False)
+                failed = True
+        return int(failed)
 
     # --- EXECUTE: write processed files ---
     with Progress(
@@ -413,6 +482,9 @@ def process_files():
         )
 
         event_bus.unsubscribe("track.write_complete", on_track_write_complete)
+    write_errors = dict(session.config.get("_execute_errors", []))
+    for filename, reason in write_errors.items():
+        console.print(f"{filename}: {reason}", style="red", markup=False)
 
     # --- PRINT DIAGNOSTICS ---
     print_diagnostic_summary(diagnostic_summary)
@@ -427,20 +499,21 @@ def process_files():
     table.add_column("Status", justify="right")
 
     for t in session.tracks:
-        if t.status != "OK":
+        if t.status != "OK" or t.filename in write_errors:
             table.add_row(t.filename, "Error", "\u2014", "\u2014", "\u2014", "[red]ERR[/]")
             continue
 
         fmt_str = f"{t.samplerate/1000:.0f}k/{t.bitdepth}"
-        pr = _get_primary_pr(t)
+        pr = t.processor_results.get("bimodal_normalize")
 
         if pr and pr.classification == "Silent":
             table.add_row(t.filename, fmt_str, "Silent", "0.0 dB", "0.0 dB", "[yellow]SILENT[/]")
             continue
 
         classification = pr.classification if pr else "Unknown"
-        gain_db = pr.gain_db if pr else 0.0
-        fader_offset = pr.data.get("fader_offset", 0.0) if pr else 0.0
+        receipt = session.config["_executed_files"][t.filename]
+        gain_db = receipt["gain_db"]
+        fader_offset = receipt["fader_db"]
         is_clipped = False
         clip_r = t.detector_results.get("clipping")
         if clip_r:
@@ -465,13 +538,17 @@ def process_files():
     diagnostic_summary_text = render_diagnostic_summary_text(diagnostic_summary)
 
     report_path = os.path.join(output_dir, args.report)
-    generate_report(session, config, report_path, warnings, diagnostic_summary_text=diagnostic_summary_text)
-
     json_path = os.path.join(output_dir, args.json)
-    save_json(session, config, json_path, warnings)
+    try:
+        generate_report(session, config, report_path, warnings, diagnostic_summary_text=diagnostic_summary_text)
+        save_json(session, config, json_path, warnings)
+    except OSError as exc:
+        console.print(f"Could not save the processing reports. {exc}", style="bold red", markup=False)
+        return 1
 
     console.print(f"\n[dim]Report saved to: {report_path}[/]")
+    return 1 if write_errors else 0
 
 
 if __name__ == "__main__":
-    process_files()
+    sys.exit(process_files())

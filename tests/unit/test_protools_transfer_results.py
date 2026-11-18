@@ -19,6 +19,7 @@ def transfer(tmp_path, monkeypatch):
     closes = []
     faders = []
     spotted = []
+    imports = []
     engine = SimpleNamespace(session_path=lambda: "", close=lambda: None)
 
     def create_session(_engine, name, location, *_args, **_kwargs):
@@ -28,6 +29,7 @@ def transfer(tmp_path, monkeypatch):
         engine.session_path = lambda: str(session_path)
 
     def import_audio(_engine, paths, **_kwargs):
+        imports.extend(paths)
         return {
             "file_list": [
                 {
@@ -74,7 +76,31 @@ def transfer(tmp_path, monkeypatch):
         }},
     )
     return SimpleNamespace(processor=processor, session=session, engine=engine, closes=closes,
-                           spotted=spotted, faders=faders)
+                           spotted=spotted, faders=faders, imports=imports)
+
+
+@pytest.mark.parametrize("use_processed", [False, True])
+def test_selected_media_and_faders_travel_together(transfer, tmp_path, monkeypatch, use_processed):
+    monkeypatch.setattr(protools.ptslh, "VOLUME_AUTOMATION_ENABLED", True)
+    session = transfer.session
+    session.prepare_state = "ready"
+    session.config["_use_processed"] = use_processed
+    processed_dir = tmp_path / "processed"
+    processed_dir.mkdir()
+    for track in session.output_tracks:
+        prepared = processed_dir / track.filename
+        prepared.write_bytes(b"rendered fixture")
+        track.processed_filepath = str(prepared)
+        track.prepared_fader_db = -2.5 if track.filename == "Kick.wav" else 0.0
+        track.processor_results["bimodal_normalize"] = ProcessorResult(
+            "bimodal_normalize", 8.0, "Sustained", "Bimodal", {"fader_offset": -8.0})
+
+    results = transfer.processor.transfer(session, "")
+
+    assert all(result.success for result in results)
+    assert set(transfer.imports) == {
+        t.processed_filepath if use_processed else t.filepath for t in session.output_tracks}
+    assert transfer.faders == ([("pt-Kick", -2.5, "pt-batch")] if use_processed else [])
 
 
 def test_pro_tools_reports_a_rejected_file_and_spots_the_remaining_track(transfer, monkeypatch):

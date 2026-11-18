@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import json
+import math
 import os
+import stat
 from collections import Counter
+from contextlib import contextmanager
 from datetime import datetime
+from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import numpy as np
 
@@ -13,11 +18,64 @@ from .models import SessionContext
 from .utils import protools_sort_key
 
 
-def _get_primary_processor_result(track):
-    """Return the first processor result on a track, or None."""
-    if track.processor_results:
-        return next(iter(track.processor_results.values()))
-    return None
+@contextmanager
+def _atomic_report(output_path):
+    """Close the complete report before replacing its directory entry."""
+    target = Path(output_path)
+    temporary = target.with_name(f".sp-report-{uuid4().hex}.tmp")
+    stream = temporary.open("x", encoding="utf-8")
+    try:
+        with stream:
+            yield stream
+        if os.name != "nt":
+            try:
+                previous_mode = target.lstat().st_mode
+            except FileNotFoundError:
+                pass
+            else:
+                if stat.S_ISREG(previous_mode):
+                    temporary.chmod(stat.S_IMODE(previous_mode))
+        os.replace(temporary, target)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _report_db(value) -> float | None:
+    return round(value, 2) if isinstance(value, (int, float)) and math.isfinite(value) else None
+
+
+def _processing_outcomes(session: SessionContext) -> dict[str, dict[str, Any]]:
+    """Report the last execution receipt separately from the current plan."""
+    receipts = session.config.get("_executed_files", {})
+    failures = dict(session.config.get("_execute_errors", []))
+    outcomes = {}
+    for track in session.tracks:
+        result = track.processor_results.get("bimodal_normalize")
+        normalizing = (session.config.get("bimodal_normalize_enabled", True)
+                       and result is not None and "bimodal_normalize" not in track.processor_skip
+                       and result.classification not in ("Skip", "Silent"))
+        error = failures.get(track.filename) or track._cache.get("repair_error")
+        if track.status != "OK":
+            error = error or track.status
+        if normalizing and result.error:
+            error = error or result.error
+        receipt = None if error else receipts.get(track.filename)
+        planned_gain = result.gain_db if normalizing else (track.manual_gain_db or 0.0)
+        outcomes[track.filename] = {
+            "status": "failed" if error else "written" if receipt is not None else "planned",
+            "error": error,
+            "classification": result.classification if result else "Unknown",
+            "planned_repairs": track.repair_recipe.applied_ids(),
+            "applied_repairs": [p for p in receipt["applied_processors"]
+                                if p in ("dc_remove", "low_cut", "ultrasonic")] if receipt else [],
+            "planned_gain_db": _report_db(planned_gain),
+            "gain_applied_db": _report_db(receipt["gain_db"]) if receipt else None,
+            "fader_db": _report_db(receipt["fader_db"]) if receipt else None,
+            "gain_individual_db": _report_db(result.data.get("gain_db_individual", planned_gain))
+                                  if result else _report_db(planned_gain),
+            "group": track.group,
+        }
+    return outcomes
 
 
 def generate_report(
@@ -30,6 +88,7 @@ def generate_report(
     """Generate a text report with fader positions and diagnostics."""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     source_dir = config.get("_source_dir", "")
+    outcomes = _processing_outcomes(session)
 
     lines = [
         "=" * 80,
@@ -52,12 +111,11 @@ def generate_report(
     # Track groups section
     grouped = {}
     for t in session.tracks:
-        if t.status != "OK" or t.group is None:
+        outcome = outcomes[t.filename]
+        if t.group is None:
             continue
-        pr = _get_primary_processor_result(t)
-        gain = pr.gain_db if pr else 0.0
-        grouped.setdefault(t.group, {"gain_db": gain, "members": []})
-        grouped[t.group]["members"].append(t.filename)
+        gain = outcome["gain_applied_db"]
+        grouped.setdefault(t.group, []).append((t.filename, gain))
 
     if grouped:
         lines.extend([
@@ -67,10 +125,11 @@ def generate_report(
             "",
         ])
         for gid in sorted(grouped.keys()):
-            g = grouped[gid]
-            gain_db = g.get("gain_db", 0.0)
-            lines.append(f"{gid} | Group level: {gain_db:+.1f} dB")
-            for name in sorted(g.get("members") or [], key=protools_sort_key):
+            members = grouped[gid]
+            gains = {gain for _, gain in members}
+            gain = next(iter(gains)) if len(gains) == 1 else None
+            lines.append(f"{gid} | Group level {gain:+.2f} dB" if gain is not None else gid)
+            for name in sorted((name for name, _ in members), key=protools_sort_key):
                 lines.append(f"  - {name}")
             lines.append("")
 
@@ -80,18 +139,19 @@ def generate_report(
         "FADER POSITIONS (Set these in your DAW to restore original balance)",
         "-" * 80,
         "",
-        f"{'TRACK':<40} {'FADER':>12} {'TYPE':>12}",
+        f"{'TRACK':<32} {'STATUS':<8} {'APPLIED GAIN':>12} {'FADER':>12}  TYPE / REPAIRS",
         "-" * 80,
     ])
 
     for t in session.tracks:
-        if t.status != "OK":
-            continue
-        pr = _get_primary_processor_result(t)
-        fader = pr.data.get("fader_offset", 0) if pr else 0
-        classification = pr.classification if pr else "Unknown"
-        fader_str = f"{fader:+.1f} dB"
-        lines.append(f"{t.filename[:38]:<40} {fader_str:>12} {classification:>12}")
+        outcome = outcomes[t.filename]
+        gain = outcome["gain_applied_db"]
+        fader = outcome["fader_db"]
+        gain_str = f"{gain:+.2f} dB" if gain is not None else "—"
+        fader_str = f"{fader:+.2f} dB" if fader is not None else "—"
+        repairs = outcome["applied_repairs"] if outcome["status"] == "written" else outcome["planned_repairs"]
+        detail = ", ".join([outcome["classification"], *repairs])
+        lines.append(f"{t.filename:<32} {outcome['status']:<8} {gain_str:>12} {fader_str:>12}  {detail}")
 
     # Tail report
     rms_anchor = config.get("rms_anchor", "percentile")
@@ -167,8 +227,9 @@ def generate_report(
 
     errors = []
     for t in session.tracks:
+        if outcomes[t.filename]["error"]:
+            errors.append((t.filename, outcomes[t.filename]["error"]))
         if t.status != "OK":
-            errors.append((t.filename, t.status))
             continue
 
         sr_khz = f"{t.samplerate/1000:.1f}"
@@ -189,15 +250,15 @@ def generate_report(
         "",
         "=" * 80,
         "HOW TO USE:",
-        "1. Use this output folder as the source for a fresh DAW session import",
+        "1. Import the files marked written into your DAW",
         "2. Apply the fader offsets (manually or via automation from the JSON export)",
-        "3. Your original balance is restored with optimal gain staging",
+        "3. These offsets compensate the normalization gain applied to the prepared audio",
         "=" * 80,
     ])
 
     report_text = "\n".join(lines)
 
-    with open(output_path, "w", encoding="utf-8") as f:
+    with _atomic_report(output_path) as f:
         f.write(report_text)
 
     return report_text
@@ -211,9 +272,10 @@ def save_json(
 ) -> None:
     """Generate JSON output for automation tools."""
     source_dir = config.get("_source_dir", "")
+    outcomes = _processing_outcomes(session)
 
     data = {
-        "schema_version": "1.0",
+        "schema_version": "2.0",
         "session": {
             "timestamp": datetime.now().isoformat(),
             "source_directory": os.path.abspath(source_dir),
@@ -233,10 +295,6 @@ def save_json(
 
     sort_index = 0
     for t in session.tracks:
-        if t.status != "OK":
-            continue
-
-        pr = _get_primary_processor_result(t)
         clip_r = t.detector_results.get("clipping")
         sil_r = t.detector_results.get("silence")
         sc_r = t.detector_results.get("stereo_compat")
@@ -245,11 +303,6 @@ def save_json(
         is_silent = bool(sil_r.data.get("is_silent")) if sil_r else False
         mono_loss_db = sc_r.data.get("mono_loss_db") if sc_r else None
         mono_warn = bool(sc_r.data.get("mono_warn")) if sc_r else False
-
-        fader_offset = pr.data.get("fader_offset", 0) if pr else 0
-        classification = pr.classification if pr else "Unknown"
-        gain_db = pr.gain_db if pr else 0
-        gain_db_individual = pr.data.get("gain_db_individual", gain_db) if pr else 0
 
         data["tracks"].append({
             "sort_index": sort_index,
@@ -264,17 +317,11 @@ def save_json(
                 "mono_loss_db": None if mono_loss_db is None else float(mono_loss_db),
                 "mono_loss_warn": bool(mono_warn),
             },
-            "processing": {
-                "fader_db": round(float(fader_offset), 2),
-                "classification": classification,
-                "gain_applied_db": round(float(gain_db), 2),
-                "gain_individual_db": round(float(gain_db_individual), 2),
-                "group": t.group,
-            }
+            "processing": outcomes[t.filename],
         })
         sort_index += 1
 
-    with open(output_path, "w", encoding="utf-8") as f:
+    with _atomic_report(output_path) as f:
         json.dump(data, f, indent=4, ensure_ascii=False)
 
 

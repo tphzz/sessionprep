@@ -8,7 +8,7 @@ import time
 from typing import Any
 
 from ..models import ParamSpec
-from ..daw_processor import DawProcessor
+from ..daw_processor import DawProcessor, TransferAudio, resolve_transfer_audio
 from ..models import DawCommand, DawCommandResult, SessionContext, TrackContext
 from ..log import dbg
 from . import ptsl_helpers as ptslh
@@ -650,7 +650,7 @@ class ProToolsDawProcessor(DawProcessor):
         def record(operation: str, target: str = "", *, error: str | None = None, **params: Any) -> None:
             results.append(DawCommandResult(DawCommand(operation, target, params), error is None, error))
 
-        valid_work: list[tuple[str, str, str, TrackContext]] = []
+        valid_work: list[tuple[str, TransferAudio, str, TrackContext]] = []
         for entry_id, folder_id in work:
             entry = manifest_map.get(entry_id)
             if entry is None:
@@ -661,13 +661,17 @@ class ProToolsDawProcessor(DawProcessor):
                        error="The assigned Pro Tools folder is missing. Fetch and assign this track again.")
                 continue
             track = out_track_map.get(entry.output_filename)
-            path = (track.processed_filepath or track.filepath) if track else None
-            if not path or not os.path.isfile(path):
+            if track is None:
+                record("validate_track", entry.daw_track_name, error="The output track is missing.")
+                continue
+            try:
+                media = resolve_transfer_audio(session, track)
+            except ValueError as exc:
                 record("validate_track", entry.daw_track_name,
-                       error=f"The audio file for this track could not be found. {path or entry.output_filename}")
+                       error=str(exc))
                 continue
             name = os.path.splitext(entry.daw_track_name)[0]
-            valid_work.append((folder_id, os.path.abspath(path), name, track))
+            valid_work.append((folder_id, media, name, track))
 
         if not valid_work:
             return results
@@ -762,7 +766,7 @@ class ProToolsDawProcessor(DawProcessor):
             if progress_cb:
                 progress_cb(20, 100, "Importing audio to clip list...")
 
-            all_filepaths = list(dict.fromkeys(path for _, path, _, _ in valid_work))
+            all_filepaths = list(dict.fromkeys(media.filepath for _, media, _, _ in valid_work))
             clip_id_map: dict[str, list[str]] = {}
             import_failures: dict[str, str] = {}
 
@@ -792,16 +796,16 @@ class ProToolsDawProcessor(DawProcessor):
             # ── 3. Ordered Track Creation + Spot ────────────────
 
             color_groups: dict[int, list[str]] = {}
-            created_tracks: list[tuple[str, str, TrackContext]] = []
-            work_by_folder: dict[str, list[tuple[str, TrackContext, list[str]]]] = {}
-            for folder_id, path, name, track in valid_work:
-                key = os.path.normcase(path)
+            created_tracks: list[tuple[str, str, float]] = []
+            work_by_folder: dict[str, list[tuple[str, TrackContext, list[str], float]]] = {}
+            for folder_id, media, name, track in valid_work:
+                key = os.path.normcase(media.filepath)
                 clip_ids = clip_id_map.get(key)
                 if not clip_ids or key in import_failures:
                     record("import_audio", name, error=import_failures.get(
-                        key, f"Pro Tools returned no clips for '{path}'."))
+                        key, f"Pro Tools returned no clips for '{media.filepath}'."))
                     continue
-                work_by_folder.setdefault(folder_id, []).append((name, track, clip_ids))
+                work_by_folder.setdefault(folder_id, []).append((name, track, clip_ids, media.fader_db))
 
             total_spot = sum(len(items) for items in work_by_folder.values())
             if total_spot == len(valid_work):
@@ -815,7 +819,7 @@ class ProToolsDawProcessor(DawProcessor):
                 # cannot reorder tracks after creation. Creating the folder's
                 # tracks in reverse with TIPoint_First preserves SessionPrep's
                 # final order while pushing template tracks to the end.
-                for name, track, clip_ids in reversed(folder_items):
+                for name, track, clip_ids, fader_db in reversed(folder_items):
                     track_format = "TF_Mono" if track.channels == 1 else "TF_Stereo"
                     attempted += 1
                     pct = 30 + int(50 * attempted / total_spot)
@@ -839,7 +843,7 @@ class ProToolsDawProcessor(DawProcessor):
                         )
 
                         record("spot_clip", created_name)
-                        created_tracks.append((created_name, tid, track))
+                        created_tracks.append((created_name, tid, fader_db))
                         if track.group in group_palette_idx:
                             color_groups.setdefault(group_palette_idx[track.group], []).append(created_name)
                     except Exception as exc:
@@ -865,19 +869,8 @@ class ProToolsDawProcessor(DawProcessor):
 
             # ── 5. Faders ────────────────────────────────────────
 
-            proc_id = "bimodal_normalize"
-            bn_enabled = session.config.get(f"{proc_id}_enabled", True)
-            if ptslh.VOLUME_AUTOMATION_ENABLED and bn_enabled:
-                for name, t_id, tc in created_tracks:
-                    if proc_id in tc.processor_skip:
-                        continue
-                    pr = tc.processor_results.get(proc_id)
-                    if not pr or pr.classification in ("Silent", "Skip"):
-                        continue
-                    fader_db = pr.data.get("fader_offset", 0.0)
-                    log.debug(
-                        f"Fader logic for {t_id}: classification={pr.classification}, fader_db={fader_db}"
-                    )
+            if ptslh.VOLUME_AUTOMATION_ENABLED:
+                for name, t_id, fader_db in created_tracks:
                     if fader_db == 0.0:
                         continue
                     try:
