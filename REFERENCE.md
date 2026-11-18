@@ -211,6 +211,10 @@ visible issue.
 
 ---
 
+### 2.13 Ultrasonic content
+
+Sources at 50 kHz or higher are eligible. Five consecutive 100 ms windows with 50% overlap must exceed both −60 dBFS RMS and −35 dB relative to program energy in the band from 24.1 kHz to Nyquist. Each channel is evaluated separately.
+
 ## 3. Analysis Metrics (Stage B)
 
 Stage B is where SessionPrep extracts level and dynamic information from each
@@ -392,10 +396,13 @@ range (default `--target_rms -18` for sustained material or `--target_peak -6`
 for transient material). This primarily affects the level feeding the first
 insert on each channel.
 
-*Crucially, this is non-destructive.* Your original files are never touched.
-The processed files are sample-accurate, gain-shifted copies.
-This is mathematically identical to adjusting "Clip Gain" in Pro Tools or other
-DAWs, but done with sample-accurate precision across 100+ files very quickly.
+### Optional corrective processing
+
+**DC removal** uses a first-order 2 Hz high-pass. **Subsonic filter** uses a second-order high-pass with a 10 Hz default and a 5–40 Hz range. Selecting both applies the stronger high-pass once. Automatic low-cut selection looks for sustained infrasonic energy on individual channels after any selected DC removal. The broader subsonic advisory can also describe intentional bass. **Ultrasonic filter** preserves the band through 20 kHz and attenuates frequencies from 24 kHz by at least 80 dB on eligible sources. Its FIR delay is compensated. All three preserve the sample count and channel layout.
+
+Use **Preferences → Config Presets → Processors → Corrective processing** for automatic selection defaults. Phase 2 Config can override these for one project. **Review repair** in File and **Track repairs…** in Processing open the same per-track choices and measurements. **Use preset** releases a track override. Stereo compatibility remains a review finding.
+
+Corrections run before gain calculation. **Prepare** checks the final, routed samples against the destination encoding. If the level is too high, **Adjust Gain** offers the minimum safe reduction rounded up to 0.1 dB. Confirm the change and retry. Files are replaced after a successful render. A failed retry retains the previous file and marks it stale.
 
 ---
 
@@ -425,6 +432,8 @@ the prepared levels ahead of your inserts.
 The `sessionprep.json` export remains available for custom workflows and
 third-party tools.
 
+In JSON schema `2.0`, use only tracks with `processing.status == "written"` for delivery automation. Planned and failed tracks have null applied gain and fader values. Each written track records the repairs and gain applied in that execution. Manual trim with normalization bypassed carries a 0 dB DAW fader offset.
+
 ---
 
 ## 6. GUI Waveform Controls
@@ -451,6 +460,8 @@ third-party tools.
 > shortcuts to work.
 
 ### 6.3 Preview Header and View Settings
+
+In Phase 2, **Original** and **Corrected** select the routed source or its repaired audio before normalization and output gain. The filled segment identifies the active source. Left and Right switch at the current sample, and Space activates the focused choice. Playback uses a 10 ms crossfade. A common monitor pad protects both choices when either would overload playback. Inspect low frequencies from 0–100 Hz or high frequencies from 20 kHz to the source's Nyquist frequency using the same axes and dBFS scale.
 
 **Waveform preview** is a local disclosure in both Track Layout and File detail.
 Track Layout starts collapsed. The header stays visible while the preview is

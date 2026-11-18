@@ -9,6 +9,7 @@ from urllib.parse import quote
 from ..icons import icon_path
 
 from sessionpreplib.chunks import read_chunks, STANDARD_CHUNKS, detect_origin
+from sessionpreplib.models import DetectorResult, Severity
 from ..theme import COLORS, FILE_COLOR_TRANSIENT, FILE_COLOR_SUSTAINED
 from ..helpers import esc
 from .report_style import REPORT_SECTION_HEADING, REPORT_SECTION_SIZE, REPORT_TITLE_SIZE
@@ -221,8 +222,14 @@ def visualizable_issues(result, track):
     return valid
 
 
-def _finding_actions(row, compact):
+def _finding_actions(row, compact, *, narrow=False):
     links = []
+    repair = ""
+    if row.get("review_repair"):
+        repair = _link("report-repair", row["id"], "<nobr>Review repair</nobr>",
+                       "Review corrective processing for this track")
+        if not narrow:
+            links.append((100, repair))
     if row.get("visualize_labels"):
         links.append((80, _link("report-visualize", row["id"], "<nobr>Visualize</nobr>",
                                 "Show only this detector's locations and fit the whole file")))
@@ -237,7 +244,8 @@ def _finding_actions(row, compact):
         cells = [f'<td height="32" width="{width}" align="center" valign="middle">'
                  f'{link}</td>' for width, link in links]
         body = "<tr>" + '<td width="8"></td>'.join(cells) + "</tr>"
-    return '<table cellpadding="0" cellspacing="0">' + body + "</table>" if links else ""
+    result = '<table cellpadding="0" cellspacing="0">' + body + "</table>" if links else ""
+    return _finding_line(repair, 32) + result if narrow and repair else result
 
 
 def _render_narrow_findings(rows, expanded, active_help):
@@ -267,7 +275,7 @@ def _render_narrow_findings(rows, expanded, active_help):
         if details:
             lines.append(f'<tr><td style="padding-left:24px; color:{COLORS["metadata"]};">'
                          + "<br>".join(details) + '</td></tr>')
-        actions = _finding_actions(row, False)
+        actions = _finding_actions(row, False, narrow=True)
         if actions:
             lines.append(f'<tr><td style="padding:6px 0;">{actions}</td></tr>')
         body = ('<table width="100%" cellpadding="0" cellspacing="0">'
@@ -308,7 +316,9 @@ def render_prepared_track_report(data, *, expanded=(), compact=False, narrow=Fal
         parts.extend(_render_narrow_findings(rows, expanded, active_help))
         parts.append("</div>")
         return "\n".join(parts)
-    widths = ("100", None, "80") if compact else ("100", None, "96", "216", "136")
+    repair_links = any(row.get("review_repair") for row in rows)
+    widths = (("100", None, "100" if repair_links else "80") if compact else
+              ("100", None, "96", "216", "244" if repair_links else "136"))
     labels = (("Severity", "Finding, location and next step", "Actions") if compact
               else ("Severity", "Finding", "Location", "Next step", "Actions"))
     parts.append(_table_header(labels, widths))
@@ -349,6 +359,21 @@ def render_track_detail_html(track, session=None, *, show_clean=True, verbose=Fa
     """Render a static compact view; interactive browsers cache prepared data."""
     return render_prepared_track_report(
         prepare_track_report(track, session, show_clean=show_clean, verbose=verbose))
+
+
+def _track_findings(track):
+    """Keep the source detector and a qualifying local repair observation distinct."""
+    for key, result in track.detector_results.items():
+        yield key, key, result
+        if key != "subsonic" or result.error or result.data.get("subsonic_warn"):
+            continue
+        measures = track.repair_measurements
+        regions = measures.get("low_band", {}).get("regions", [])
+        if measures.get("suggested", {}).get("low_cut") and regions:
+            count = len(regions)
+            summary = f"Sustained infrasonic energy in {count} local {'region' if count == 1 else 'regions'}"
+            local = DetectorResult(key, Severity.INFO, summary, {"ranges": regions}, hint="review rumble")
+            yield "subsonic-local", key, local
 
 
 # ---------------------------------------------------------------------------
@@ -522,7 +547,8 @@ def prepare_track_report(track, session=None, *, show_clean: bool = True,
                 )
 
         severity_order = {"problem": 0, "attention": 1, "information": 2, "info": 2, "clean": 3}
-        for det_id, result in track.detector_results.items():
+        for row_id, det_id, result in _track_findings(track):
+            is_local = row_id != det_id
             detector = det_map.get(det_id)
             severity = (detector.effective_severity(result)
                         if detector and hasattr(detector, "effective_severity")
@@ -539,16 +565,26 @@ def prepare_track_report(track, session=None, *, show_clean: bool = True,
             else:
                 fragment = f'<tr><td>{esc(result.summary)}</td></tr>'
             location, locations = _location_text(result)
+            suggested = track.repair_measurements.get("suggested", {})
+            review_repair = not result.error and (
+                (det_id == "dc_offset" and (result.data.get("dc_warn") or suggested.get("dc_remove")))
+                or (det_id == "subsonic" and (result.data.get("subsonic_warn") or is_local))
+                or (det_id == "ultrasonic" and track.samplerate >= 50000
+                    and (result.data.get("regions") or suggested.get("ultrasonic"))))
+            if det_id == "dc_offset" and result.data.get("dc_warn"):
+                location = "Whole track"
             runs = result.data.get("runs")
             count = f'{runs} {"range" if runs == 1 else "ranges"}' if isinstance(runs, int) else ""
             help_html = getattr(detector, "html_help", "") if detector else ""
             if callable(help_html):
                 help_html = help_html()
+            title = detector.name if detector else det_id
             rows.append({
-                "id": det_id, "title": detector.name if detector else det_id,
+                "id": row_id, "title": f"{title} · local energy" if is_local else title,
                 "severity": severity, "summary": result.summary, "fragment": fragment,
                 "location": location, "locations": locations, "count": count,
                 "hint": _guidance(result.hint),
+                "review_repair": bool(review_repair),
                 "help": help_html,
                 "visualize_labels": tuple(sorted({issue.label
                     for issue in visualizable_issues(result, track)})),

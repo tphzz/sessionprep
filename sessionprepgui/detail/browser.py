@@ -88,7 +88,9 @@ class ReportBrowser(_HelpBrowser):
     reviewRequested = Signal(str)
     helpRequested = Signal(str)
     visualizeRequested = Signal(str)
+    repairRequested = Signal(str)
     reportChanged = Signal()
+    reportLayoutChanged = Signal()
 
     def __init__(self, help_map, parent=None):
         super().__init__(help_map, parent)
@@ -222,6 +224,7 @@ class ReportBrowser(_HelpBrowser):
                 self._prepared, expanded=self._states[self._track_key],
                 compact=self._layout == "compact", narrow=self._layout == "narrow",
                 active_help=self._active_help))
+            self.reportLayoutChanged.emit()
 
     def _anchor_cursor(self, *, name=None, href=None):
         position = (self._named_positions.get(name) if name is not None
@@ -341,6 +344,7 @@ class ReportBrowser(_HelpBrowser):
         anchor = self.capture_reading_anchor()
         super().resizeEvent(event)
         self._update_layout()
+        self.reportLayoutChanged.emit()
         self.restore_reading_anchor(anchor)
 
     def keyPressEvent(self, event):
@@ -351,7 +355,7 @@ class ReportBrowser(_HelpBrowser):
             if not href:
                 cursor.movePosition(QTextCursor.NextCharacter, QTextCursor.KeepAnchor)
                 href = cursor.charFormat().anchorHref()
-            if QUrl(href).scheme() in {"report-review", "report-details", "report-help", "report-visualize"}:
+            if QUrl(href).scheme() in {"report-review", "report-details", "report-help", "report-visualize", "report-repair"}:
                 self.activate_report_link(QUrl(href))
                 event.accept()
                 return
@@ -372,6 +376,9 @@ class ReportBrowser(_HelpBrowser):
         elif scheme == "report-visualize":
             if self.visualization_labels(key):
                 self.visualizeRequested.emit(key)
+        elif scheme == "report-repair":
+            if any(row["id"] == key and row.get("review_repair") for row in self._prepared["rows"]):
+                self.repairRequested.emit(key)
         elif scheme == "report-details" and any(r["id"] == key for r in self._prepared["rows"]):
             anchor = self.capture_reading_anchor()
             self._states[self._track_key].symmetric_difference_update({key})

@@ -494,7 +494,7 @@ sessionprepgui/                  # GUI package (PySide6)
     mainwindow.py                # SessionPrepWindow (QMainWindow) + main() — thin orchestrator composing all mixins
     analysis/
         mixin.py                 # AnalysisMixin — open/save session, analyze, prepare, session Config tab
-        worker.py                # QThread workers: AnalyzeWorker, BatchReanalyzeWorker, PrepareWorker,
+        worker.py                # QThread workers: AnalyzeWorker, RepairPlanWorker, PrepareWorker,
                                  #   DawCheckWorker, DawFetchWorker, DawTransferWorker
     daw/
         mixin.py                 # DawMixin — DAW processor selection, fetch, transfer, folder tree, assignments
@@ -1040,6 +1040,12 @@ def default_detectors() -> list[TrackDetector | SessionDetector]:
 ---
 
 ## 7. Audio Processors
+
+Whole-track repairs form a pre-normalization stage. `repair_plan.plan_repairs` combines numeric evidence with preset defaults and sparse per-track choices. The immutable `RepairRecipe` and `repairs.render_corrected` are shared by planning, print and audition. Preserve source detector results when recalculating the classifier and normalization on repaired samples. A change to a repair setting requires replanning. It does not require rerunning the source detectors.
+
+`audition.RepairAudition` holds sample-aligned unity signals, computes one monitor gain and renders callback-sized crossfades. `inspection_spectrogram` returns the same native frequency bins for both choices. The GUI owns requests, cancellation, playback position and view state.
+
+`Pipeline.prepare` validates routed output samples and replaces each file atomically. The prepared track records its actual fader offset, routed source path and file signatures. DAW adapters resolve the media and fader together through `resolve_transfer_audio`. CLI text and JSON reports derive delivered gain from the current execution's successful write receipts.
 
 ### 7.1 Abstract Base Class
 
@@ -1926,7 +1932,7 @@ separator.
 | `widgets.py`              | `BatchEditTableWidget`, `BatchComboBox` — reusable batch-edit base classes preserving multi-row selection across cell-widget clicks (zero app imports)                                                                                                                                                                                                                                        |
 | `log.py`                  | `dbg(msg)` — lightweight debug logging to stderr, gated by `SP_LOG_LEVEL=DEBUG`. Timestamped output with caller class name. Used by `pipeline.py`, `dawproject.py`, and other modules via conditional import.                                                                                                                                                                                   |
 | `analysis/mixin.py`       | `AnalysisMixin` — open/save/load session, analyze, prepare, session Config tab wiring                                                                                                                                                                                                                                                                                                         |
-| `analysis/worker.py`      | QThread workers: `AnalyzeWorker` (pipeline in background, thread-safe progress, per-track signals), `BatchReanalyzeWorker` (subset re-analysis after batch overrides), `PrepareWorker` (runs `Pipeline.prepare()` in background with progress), `DawCheckWorker` (connectivity check), `DawFetchWorker` (folder fetch), `DawTransferWorker` (transfer with progress + progress_value signals) |
+| `analysis/worker.py` | Background workers for analysis, per-track and batch repair planning, Prepare, DAW connectivity, folder discovery and transfer. |
 | `daw/mixin.py`            | `DawMixin` — DAW processor selection, check/fetch/transfer/sync, folder tree, drag-and-drop track assignment, Track Name inline editing, duplication with `-[N]` naming                                                                                                                                                                                                                       |
 | `topology/mixin.py`       | `TopologyMixin` — Phase 1 Channel Topology UI, "Scan subfolders" checkbox (recursive discovery), Apply worker, collapsible waveform preview                                                                                                                                                                                                                                                   |
 | `topology/input_tree.py`  | `InputTree` — QTreeWidget for source tracks, drag-out of channels via custom MIME                                                                                                                                                                                                                                                                                                             |
@@ -1992,11 +1998,10 @@ leaves. `prefs/` reads `ParamSpec` metadata from detectors and processors.
   value still triggers the batch path.  `batch_selected_keys(key_column)` and
   `restore_selection(keys, key_column)` accept a configurable identifier
   column (default 0) so the pattern works regardless of table layout.
-  `BatchReanalyzeWorker` runs the re-analysis asynchronously with progress
-  signals; its custom signal is named `batch_finished` to avoid collision with
-  `QThread.finished`.  App-level integration uses a single generic method
-  `_batch_apply_combo(combo, column, value, prepare_fn, run_detectors)` that
-  any dropdown batch-change can delegate to.
+  `_batch_apply_combo` submits the selected tracks to the same `RepairPlanWorker`
+  used for individual repair edits. An RMS anchor edit also refreshes original
+  classification and its dependent findings. Older worker results are discarded
+  when a newer choice exists or the user opens another project.
 - **PlaybackController** encapsulates all `sounddevice` state with a
   signal-based API (`cursor_updated`, `playback_finished`, `error`).
   `mainwindow.py` has zero direct `sd` usage.
@@ -2123,23 +2128,25 @@ leaves. `prefs/` reads `ParamSpec` metadata from detectors and processors.
     `AudioProcessor` instances. Label shows "Default" (current selection
     matches each processor's configured `default` value), "None" (all
     skipped), or comma-separated shorthands (e.g. `BN, MD`) for a
-    non-default partial selection. Tooltip always uses full names. When no
-    processors are enabled globally, the button is disabled and shows
-    "None". Toggling a processor adds/removes its ID from
+    non-default partial selection. Active corrections give the button the
+    label "Repairs". The **Track repairs…** action is also available with
+    normalization disabled. Toggling a processor adds/removes its ID from
     `track.processor_skip` and marks the Prepare state as stale. Editable
     only in the analysis phase.
   - **Use Processed toggle** (setup toolbar) — checkable `QAction` that
     sets `session.config["_use_processed"]`. Label shows "Use Processed:
     On/Off" with "(!) " appended when `prepare_state == "stale"`. Enabled
-    only when `prepare_state` is `"ready"` or `"stale"`. When on,
-    `ProToolsDawProcessor.transfer()` uses `track.processed_filepath`
-    instead of `track.filepath` for each track that has a processed file.
+    only when `prepare_state` is `"ready"` or `"stale"`. Both DAW adapters
+    verify the selected file revision. Processed transfer requires a current
+    Prepare and uses the fader offset recorded with the output. Original
+    transfer uses the routed source at zero fader compensation.
   - **Staleness triggers** — changing gain, classification, RMS anchor,
-    per-track processor selection, or re-analyzing transitions
+    per-track processor or repair selection, or re-analyzing transitions
     `prepare_state` from `"ready"` to `"stale"`, updating both the Prepare
-    button and Use Processed toggle labels.
-  - **Output directory** — resolved from `config["app"]["output_folder"]`
-    (default: `"processed"`), relative to the session source directory.
+    button and Use Processed toggle labels. Prepare takes a snapshot of its
+    inputs. An edit during writing makes that output stale until the next Prepare.
+  - **Output directory** — `config["app"]["phase2_output_folder"]` defaults
+    to `sp_02_prepared`, relative to the session source directory.
 - **Recursive folder scanning** — the Phase 1 toolbar includes a "Scan
   subfolders" checkbox (`QCheckBox`) that enables recursive audio file
   discovery via `discover_audio_files()`. When enabled:

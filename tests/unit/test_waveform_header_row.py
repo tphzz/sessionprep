@@ -156,9 +156,11 @@ def test_display_mode_and_analysis_mode_decide_which_controls_are_wanted(qapp):
     panel.set_analysis_mode(False)
     qapp.processEvents()
     assert not panel.overlay_btn.isVisible()
+    assert not row.is_wanted(panel.band_btn) and not panel.power_legend.isVisible()
     panel.wf_action.trigger()
     panel.set_analysis_mode(True)
     qapp.processEvents()
+    assert not row.is_wanted(panel.band_btn)
     assert all(c.isVisible() for c in (panel.overlay_btn, panel.markers_toggle,
                                        panel.rms_lr_toggle, panel.rms_avg_toggle))
     panel.close()

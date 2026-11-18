@@ -108,6 +108,7 @@ def test_opening_another_audio_folder_uses_app_preset_and_drops_previous_overrid
     project._load_directory(str(other))
     project._on_topo_apply()
     project._on_prepare()
+    QApplication.processEvents()
 
     assert project._session.prepare_state == "ready"
     assert project._phase_tabs.currentIndex() == 2
@@ -148,6 +149,18 @@ def test_opening_prepared_session_reflects_changed_analysis_defaults_and_marks_a
     assert project._flat_config()["target_rms"] == -21.0
     assert project._session.prepare_state == "stale"
     assert project._session.transfer_manifest
+
+
+def test_source_choice_survives_reopen_and_resets_between_projects(project):
+    saved = _queued_state(project)
+    for choice in (True, False, True):
+        saved["use_processed"] = choice
+        project._restore_session_state(saved)
+        assert project._use_processed_cb.isChecked() is choice
+        assert project._transfer_config(project._session)["_use_processed"] is choice
+        assert project._batch_manager._rehydrate_session(saved).config["_use_processed"] is choice
+    project._clear_workspace()
+    assert not project._use_processed_cb.isChecked()
 
 
 def test_reopening_with_missing_preset_uses_default_and_preserves_explicit_values(project):

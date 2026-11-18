@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import collections
+from concurrent.futures import CancelledError
+from dataclasses import replace
+from pathlib import Path
 import logging
 import threading
 
@@ -10,6 +13,9 @@ import numpy as np
 
 from PySide6.QtCore import QThread, Signal
 from scipy.signal import stft as scipy_stft
+
+from sessionpreplib.audition import RepairAudition, inspection_spectrogram
+from sessionpreplib.repair_plan import source_for_render
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +119,8 @@ def compute_mel_spectrogram(channels: list[np.ndarray], sr: int, *,
                             n_fft: int = _SPEC_N_FFT,
                             hop: int | None = None,
                             window: str = "hann",
+                            compare_channels: bool = False,
+                            cancelled=None,
                             ) -> np.ndarray | None:
     """Compute a full-file mel spectrogram from channel data.
 
@@ -124,7 +132,7 @@ def compute_mel_spectrogram(channels: list[np.ndarray], sr: int, *,
     if hop is None:
         hop = n_fft  # optimized for UI speed (4x faster than n_fft // 4)
     # Mix to mono in-place to avoid massive memory allocations
-    if len(channels) == 1:
+    if len(channels) == 1 or compare_channels:
         mono = channels[0]
     else:
         mono = channels[0].copy()
@@ -134,15 +142,19 @@ def compute_mel_spectrogram(channels: list[np.ndarray], sr: int, *,
     if len(mono) < n_fft:
         return None
     # STFT
-    _f, _t, Zxx = scipy_stft(
-        mono, fs=sr, nperseg=n_fft,
-        noverlap=n_fft - hop, window=window, boundary=None,
-    )
-    power = np.abs(Zxx) ** 2
-    # Mel filterbank
-    f_max = min(_SPEC_F_MAX, sr / 2.0)
+    f_max = sr / 2 if compare_channels else min(_SPEC_F_MAX, sr / 2.0)
     fb = _mel_filterbank(sr, n_fft, _SPEC_N_MELS, _SPEC_F_MIN, f_max)
-    mel_spec = fb @ power  # (n_mels, n_frames)
+    mel_spec = None
+    for channel in channels if compare_channels else (mono,):
+        if cancelled is not None and cancelled():
+            raise CancelledError()
+        _, _, spectrum = scipy_stft(channel, fs=sr, nperseg=n_fft,
+                                    noverlap=n_fft - hop, window=window, boundary=None)
+        channel_spec = fb @ (np.abs(spectrum) ** 2)
+        if mel_spec is None:
+            mel_spec = channel_spec
+        else:
+            np.maximum(mel_spec, channel_spec, out=mel_spec)
     # To dB
     mel_spec = 10.0 * np.log10(np.maximum(mel_spec, 1e-10))
     return mel_spec.astype(np.float32)
@@ -160,12 +172,17 @@ class WaveformLoadWorker(QThread):
     """
 
     finished = Signal(object)  # emits a dict with all computed results
+    source_ready = Signal()
+    failed = Signal(str)
+    settled = Signal()
 
     def __init__(self, audio_data: np.ndarray, samplerate: int,
                  rms_window_samples: int, *,
                  spec_n_fft: int = _SPEC_N_FFT,
                  spec_window: str = "hann",
                  compute_spectrogram: bool = True,
+                 preview_track=None, audition=None, corrected=False, band="full", cached=None,
+                 source_signature=None,
                  parent=None):
         super().__init__(parent)
         self._audio_data = audio_data
@@ -174,6 +191,13 @@ class WaveformLoadWorker(QThread):
         self._spec_n_fft = spec_n_fft
         self._spec_window = spec_window
         self._compute_spectrogram = compute_spectrogram
+        self.track = preview_track
+        self.recipe = getattr(preview_track, "repair_recipe", None)
+        self.audition = audition
+        self.corrected = corrected
+        self.band = band
+        self._cached = cached
+        self.source_signature = source_signature
         self._cancelled = threading.Event()
 
     def cancel(self):
@@ -181,6 +205,42 @@ class WaveformLoadWorker(QThread):
         self._cancelled.set()
 
     def run(self):
+        try:
+            if self.track is not None and not self._cancelled.is_set():
+                if self.source_signature is None:
+                    self.source_signature = self.track.source_file_signature
+                    if self.source_signature is None and self.track.audio_data is None:
+                        stat = Path(self.track.filepath).stat()
+                        self.source_signature = (stat.st_size, stat.st_mtime_ns)
+                source_track = replace(
+                    self.track, source_file_signature=self.source_signature,
+                    audio_data=self.track.audio_data if self.audition is None else self.audition.original)
+                source = source_for_render(source_track)
+                if self.audition is None:
+                    if source.audio_data is None or not source.audio_data.size:
+                        raise ValueError("Source audio is empty.")
+                    self.audition = RepairAudition(source.audio_data, source.samplerate, self.recipe)
+                if not self._cancelled.is_set():
+                    self.source_ready.emit()
+                if self._cached is not None:
+                    self.finished.emit(self._cached)
+                    return
+                self._audio_data = self.audition.corrected if self.corrected else self.audition.original
+            if not self._cancelled.is_set():
+                self._compute()
+        except CancelledError:
+            pass
+        except FileNotFoundError:
+            if not self._cancelled.is_set():
+                self.failed.emit("Source file is missing. Restore the source and retry.")
+        except Exception as exc:
+            if not self._cancelled.is_set():
+                log.exception("Waveform preview failed")
+                self.failed.emit(str(exc))
+        finally:
+            self.settled.emit()
+
+    def _compute(self):
         import time, logging
         t_start = time.perf_counter()
         log = logging.getLogger(__name__)
@@ -203,9 +263,6 @@ class WaveformLoadWorker(QThread):
             return
         nch = len(channels)
         total = len(channels[0])
-
-        if self._cancelled.is_set():
-            return
 
         if self._cancelled.is_set():
             return
@@ -275,12 +332,17 @@ class WaveformLoadWorker(QThread):
 
         # --- Spectrogram ---
         spec_db = None
+        spec_freq = None
+        spec_times = None
         if self._compute_spectrogram:
             t0 = time.perf_counter()
-            spec_db = compute_mel_spectrogram(
-                channels, sr,
-                n_fft=self._spec_n_fft, window=self._spec_window,
-            )
+            if self.band == "full":
+                spec_db = compute_mel_spectrogram(
+                    channels, sr, n_fft=self._spec_n_fft, window=self._spec_window,
+                    compare_channels=self.track is not None, cancelled=self._cancelled.is_set)
+            else:
+                spec_times, spec_freq, spec_db = inspection_spectrogram(
+                    data, sr, self.band, cancelled=self._cancelled.is_set)
             log.debug("[Trace] WaveformLoadWorker STFT: %.2f ms", (time.perf_counter() - t0) * 1000)
 
             if self._cancelled.is_set():
@@ -302,6 +364,11 @@ class WaveformLoadWorker(QThread):
             "rms_max_amplitude": rms_max_amplitude,
             "rms_cumsums": rms_cumsums,
             "spec_db": spec_db,
+            "spec_freq": spec_freq,
+            "spec_times": spec_times,
+            "inspection_band": self.band,
+            "audition": self.audition,
+            "corrected": self.corrected,
         })
 
 

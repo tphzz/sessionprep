@@ -10,6 +10,7 @@ from sessionpreplib.models import SessionContext
 from sessionpreplib.daw_processor import DawProcessor
 from sessionpreplib.daw_processors import create_runtime_daw_processors
 from sessionprepgui.analysis.worker import DawCheckWorker, DawTransferWorker
+from sessionprepgui.session.io import restore_layout_sources
 
 from .panel import BatchItem
 
@@ -201,6 +202,8 @@ class BatchManager(QObject):
 
         tracks = state_dict.get("tracks", [])
         source_dir = state_dict.get("source_dir", "")
+        app_config = getattr(self._main_window, "_config", {}).get("app", {})
+        restore_layout_sources(state_dict, app_config.get("phase1_output_folder", "sp_01_tracklayout"))
 
         flat_config = dict(default_config())
 
@@ -233,6 +236,8 @@ class BatchManager(QObject):
         flat_config["gui"]["colors"] = colors
 
         flat_config["_source_dir"] = source_dir
+        flat_config["_use_processed"] = state_dict.get("use_processed", False)
+        flat_config["_prepare_errors"] = state_dict.get("prepare_errors", [])
 
         all_detectors = default_detectors()
         for d in all_detectors:

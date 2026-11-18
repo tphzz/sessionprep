@@ -36,6 +36,7 @@ def draw_issue_overlays(
     num_channels: int,
     mel_view_min: float,
     mel_view_max: float,
+    linear_frequency: bool = False,
 ):  # pylint: disable=too-many-positional-arguments
     """Draw detector issue overlays.  Works in both waveform and spectrogram modes."""
     if not issues or not enabled_overlays:
@@ -66,8 +67,8 @@ def draw_issue_overlays(
         rw = max(ix2 - ix1, 2)
 
         if is_spec and issue.freq_min_hz is not None and issue.freq_max_hz is not None and mel_range > 0:
-            mel_lo = _hz_to_mel(issue.freq_min_hz)
-            mel_hi = _hz_to_mel(issue.freq_max_hz)
+            mel_lo = issue.freq_min_hz if linear_frequency else _hz_to_mel(issue.freq_min_hz)
+            mel_hi = issue.freq_max_hz if linear_frequency else _hz_to_mel(issue.freq_max_hz)
             frac_top = (mel_hi - mel_view_min) / mel_range
             frac_bot = (mel_lo - mel_view_min) / mel_range
             y_top = int(draw_h * (1.0 - frac_top))

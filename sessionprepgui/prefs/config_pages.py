@@ -634,7 +634,7 @@ def build_config_pages(
 
     Returns a dict mapping processor IDs to their custom widgets (e.g. dawproject, protools).
     """
-    from sessionpreplib.config import ANALYSIS_PARAMS, PRESENTATION_PARAMS
+    from sessionpreplib.config import ANALYSIS_PARAMS, PRESENTATION_PARAMS, REPAIR_PARAMS
     from sessionpreplib.detectors import default_detectors
     from sessionpreplib.processors import default_processors
     from sessionpreplib.daw_processors import default_daw_processors
@@ -688,6 +688,11 @@ def build_config_pages(
         pg = build_page(f"processors.{proc.id}", params)
         register_page(child, pg, f"processors.{proc.id}")
 
+    repair_item = QTreeWidgetItem(proc_parent, ["Corrective processing"])
+    repairs = build_page("processors.corrective", REPAIR_PARAMS)
+    repairs.layout().insertWidget(0, QLabel("<b>Automatically select matching repairs</b>"))
+    register_page(repair_item, repairs, "processors.corrective")
+
     daw_parent = QTreeWidgetItem(tree, ["DAW Processors"])
     daw_parent.setFont(0, QFont("", -1, QFont.Bold))
     placeholder2 = QWidget()
@@ -733,8 +738,7 @@ def load_config_widgets(
         reference = (None if reference_preset is None
                      else _config_section_values(reference_preset, section))
         for key, widget in widgets:
-            if key in values:
-                _set_widget_value(widget, values[key])
+            _set_widget_value(widget, values.get(key, widget._param_spec.default))
             if reference is not None:
                 widget._set_param_reference(
                     preset_value=reference.get(key, widget._param_spec.default))
@@ -750,7 +754,6 @@ def read_config_widgets(
 ) -> dict[str, Any]:
     """Read current widget values into a structured config dict."""
     from sessionpreplib.detectors import default_detectors
-    from sessionpreplib.processors import default_processors
     from sessionpreplib.daw_processors import default_daw_processors
 
     if daw_custom_widgets is None:
@@ -779,16 +782,10 @@ def read_config_widgets(
         detectors[det.id] = section
     cfg["detectors"] = detectors
 
-    processors: dict[str, dict] = {}
-    for proc in default_processors():
-        wkey = f"processors.{proc.id}"
-        if wkey not in widgets_dict:
-            continue
-        section = {}
-        for key, widget in widgets_dict[wkey]:
-            section[key] = _read_widget(widget)
-        processors[proc.id] = section
-    cfg["processors"] = processors
+    cfg["processors"] = {
+        section.removeprefix("processors."): {key: _read_widget(w) for key, w in fields}
+        for section, fields in widgets_dict.items() if section.startswith("processors.")
+    }
 
     daw_procs: dict[str, dict] = {}
     for dp in default_daw_processors():

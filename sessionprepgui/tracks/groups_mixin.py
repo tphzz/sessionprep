@@ -957,6 +957,8 @@ class GroupsMixin:  # pylint: disable=too-few-public-methods
         if not self._session or not self._session.processors:
             return
 
+        previous = [(pr, pr.gain_db, pr.data.get("fader_offset", 0.0))
+                    for t in self._session.tracks for pr in t.processor_results.values()]
         glm = self._gain_linked_map()
         linked_names = {name for name, linked in glm.items() if linked}
 
@@ -967,7 +969,7 @@ class GroupsMixin:  # pylint: disable=too-few-public-methods
                 if track.status != "OK":
                     continue
                 pr = track.processor_results.get(pid)
-                if pr is None or pr.classification == "Silent":
+                if pr is None or pr.error or pr.classification in ("Skip", "Silent") or pid in track.processor_skip:
                     continue
                 if "original_gain_db" not in pr.data:
                     pr.data["original_gain_db"] = pr.gain_db
@@ -979,7 +981,7 @@ class GroupsMixin:  # pylint: disable=too-few-public-methods
                 if track.status != "OK" or track.group is None:
                     continue
                 pr = track.processor_results.get(pid)
-                if pr is None or pr.classification == "Silent":
+                if pr is None or pr.error or pr.classification in ("Skip", "Silent") or pid in track.processor_skip:
                     continue
                 by_group.setdefault(track.group, []).append(track)
 
@@ -1000,7 +1002,8 @@ class GroupsMixin:  # pylint: disable=too-few-public-methods
                 pr = track.processor_results.get(pid)
                 if pr is None:
                     continue
-                if pr.classification == "Silent":
+                pr.data.pop("fader_rebalance_shift", None)
+                if pr.error or pr.classification in ("Skip", "Silent") or pid in track.processor_skip:
                     pr.data["fader_offset"] = 0.0
                 else:
                     pr.data["fader_offset"] = -float(pr.gain_db)
@@ -1034,6 +1037,10 @@ class GroupsMixin:  # pylint: disable=too-few-public-methods
                     pr = track.processor_results.get(pid)
                     if pr:
                         pr.data["fader_offset"] = pr.data.get("fader_offset", 0.0) - anchor_offset
+
+        if any(pr.gain_db != gain or pr.data.get("fader_offset", 0.0) != fader
+               for pr, gain, fader in previous):
+            self._mark_prepare_stale()
 
         # 4. Update UI
         self._track_table.setSortingEnabled(False)

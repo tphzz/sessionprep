@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+from dataclasses import asdict
 from typing import Any, Callable
 
 from sessionpreplib.models import (
@@ -31,12 +32,13 @@ from sessionpreplib.topology import (
     TopologyMapping,
     TopologySource,
 )
+from sessionpreplib.repairs import RepairRecipe
 
 # ---------------------------------------------------------------------------
 # Version & migration table
 # ---------------------------------------------------------------------------
 
-CURRENT_VERSION: int = 6
+CURRENT_VERSION: int = 7
 
 # Each entry upgrades from key-version to key+1.
 _MIGRATIONS: dict[int, Callable[[dict], dict]] = {
@@ -66,6 +68,7 @@ _MIGRATIONS: dict[int, Callable[[dict], dict]] = {
         "output_tracks": {},
         "version": 6,
     },
+    6: lambda d: {**d, "version": 7},
 }
 
 
@@ -186,7 +189,7 @@ def _make_json_safe(obj: Any) -> Any:
 
 
 def _serialize_track(track: TrackContext) -> dict:
-    return {
+    data = {
         "status": track.status,
         "channels": track.channels,
         "samplerate": track.samplerate,
@@ -207,16 +210,25 @@ def _serialize_track(track: TrackContext) -> dict:
             for k, v in track.processor_results.items()
         },
     }
+    if track.repair_overrides:
+        data["repair_overrides"] = dict(track.repair_overrides)
+    if track.repair_recipe.active:
+        data["repair_recipe"] = asdict(track.repair_recipe)
+    if track.repair_measurements:
+        data["repair_measurements"] = _make_json_safe(track.repair_measurements)
+    if "repair_error" in track._cache:
+        data["repair_error"] = track._cache["repair_error"]
+    if track.manual_gain_db is not None:
+        data["manual_gain_db"] = track.manual_gain_db
+    if track.applied_processors:
+        data["applied_processors"] = list(track.applied_processors)
+    if track.source_file_signature is not None:
+        data["source_file_signature"] = list(track.source_file_signature)
+    return data
 
 
-def _deserialize_track(filename: str, source_dir: str, d: dict) -> TrackContext:
-    filepath = os.path.join(source_dir, filename)
-    # If file no longer exists, mark as error
-    if not os.path.isfile(filepath):
-        status = "Error"
-    else:
-        status = d.get("status", "OK")
-
+def _deserialize_track(filename: str, filepath: str, d: dict, *, output: bool = False) -> TrackContext:
+    status = d.get("status", "OK") if output or os.path.isfile(filepath) else "Error"
     track = TrackContext(
         filename=filename,
         filepath=filepath,
@@ -233,6 +245,15 @@ def _deserialize_track(filename: str, source_dir: str, d: dict) -> TrackContext:
     track.classification_override = d.get("classification_override")
     track.rms_anchor_override = d.get("rms_anchor_override")
     track.processor_skip = set(d.get("processor_skip", []))
+    track.repair_overrides = dict(d.get("repair_overrides", {}))
+    track.repair_recipe = RepairRecipe(**d.get("repair_recipe", {}))
+    track.repair_measurements = d.get("repair_measurements", {})
+    if d.get("repair_error"):
+        track._cache["repair_error"] = d["repair_error"]
+    track.manual_gain_db = d.get("manual_gain_db")
+    track.applied_processors = list(d.get("applied_processors", []))
+    if d.get("source_file_signature") is not None:
+        track.source_file_signature = tuple(d["source_file_signature"])
     track.detector_results = {
         k: _deser_detector_result(v)
         for k, v in d.get("detector_results", {}).items()
@@ -241,6 +262,12 @@ def _deserialize_track(filename: str, source_dir: str, d: dict) -> TrackContext:
         k: _deser_processor_result(v)
         for k, v in d.get("processor_results", {}).items()
     }
+    if output:
+        track.processed_filepath = d.get("processed_filepath")
+        track.prepared_fader_db = d.get("prepared_fader_db")
+        signature = d.get("prepared_file_signature")
+        if signature is not None:
+            track.prepared_file_signature = tuple(signature)
     return track
 
 
@@ -248,39 +275,25 @@ def _serialize_output_track(track: TrackContext) -> dict:
     d = _serialize_track(track)
     d["filepath"] = track.filepath
     d["processed_filepath"] = track.processed_filepath
+    if track.prepared_fader_db is not None:
+        d["prepared_fader_db"] = track.prepared_fader_db
+    if track.prepared_file_signature is not None:
+        d["prepared_file_signature"] = list(track.prepared_file_signature)
     return d
 
 
-def _deserialize_output_track(filename: str, d: dict) -> TrackContext:
-    filepath = d.get("filepath", filename)
-    status = d.get("status", "OK")
-
-    track = TrackContext(
-        filename=filename,
-        filepath=filepath,
-        audio_data=None,
-        samplerate=d.get("samplerate", 0),
-        channels=d.get("channels", 0),
-        total_samples=d.get("total_samples", 0),
-        bitdepth=d.get("bitdepth", ""),
-        subtype=d.get("subtype", ""),
-        duration_sec=d.get("duration_sec", 0.0),
-        status=status,
-    )
-    track.processed_filepath = d.get("processed_filepath")
-    track.group = d.get("group")
-    track.classification_override = d.get("classification_override")
-    track.rms_anchor_override = d.get("rms_anchor_override")
-    track.processor_skip = set(d.get("processor_skip", []))
-    track.detector_results = {
-        k: _deser_detector_result(v)
-        for k, v in d.get("detector_results", {}).items()
-    }
-    track.processor_results = {
-        k: _deser_processor_result(v)
-        for k, v in d.get("processor_results", {}).items()
-    }
-    return track
+def restore_layout_sources(data: dict, default_folder: str) -> str | None:
+    """Rebind Phase 2 tracks to their routed sources, including legacy sessions."""
+    if not data.get("topology_applied"):
+        return None
+    layout_dir = data.get("topology_dir") or os.path.join(data["source_dir"], default_folder)
+    for track in data.get("tracks", []):
+        track.filepath = os.path.join(layout_dir, track.filename)
+        if not os.path.isfile(track.filepath):
+            track.status = "Error"
+        elif track.status == "Error":
+            track.status = "OK"
+    return layout_dir
 
 
 # ---------------------------------------------------------------------------
@@ -399,7 +412,10 @@ def serialize_session_state(data: dict) -> dict:
             for e in data.get("transfer_manifest", [])
         ],
         "topology_applied": data.get("topology_applied", False),
+        "topology_dir": data.get("topology_dir"),
         "prepare_state": data.get("prepare_state", "none"),
+        "prepare_errors": data.get("prepare_errors", []),
+        "output_gain_adjustments": data.get("output_gain_adjustments", {}),
         "base_transfer_manifest": [
             _ser_transfer_entry(e)
             for e in data.get("base_transfer_manifest", [])
@@ -415,14 +431,14 @@ def deserialize_session_state(raw: dict) -> dict:
     raw = _migrate(raw)
 
     source_dir = raw.get("source_dir", "")
-
+    track_dir = (raw.get("topology_dir") or source_dir) if raw.get("topology_applied") else source_dir
     tracks = [
-        _deserialize_track(fname, source_dir, tdata)
+        _deserialize_track(fname, os.path.join(track_dir, fname), tdata)
         for fname, tdata in raw.get("tracks", {}).items()
     ]
 
     output_tracks = [
-        _deserialize_output_track(fname, tdata)
+        _deserialize_track(fname, tdata.get("filepath", fname), tdata, output=True)
         for fname, tdata in raw.get("output_tracks", {}).items()
     ]
 
@@ -444,7 +460,10 @@ def deserialize_session_state(raw: dict) -> dict:
         "topology": topology,
         "transfer_manifest": transfer_manifest,
         "topology_applied": raw.get("topology_applied", False),
+        "topology_dir": raw.get("topology_dir"),
         "prepare_state": raw.get("prepare_state", "none"),
+        "prepare_errors": raw.get("prepare_errors", []),
+        "output_gain_adjustments": raw.get("output_gain_adjustments", {}),
         "base_transfer_manifest": [
             _deser_transfer_entry(e)
             for e in raw.get("base_transfer_manifest", [])

@@ -184,6 +184,10 @@ The output is organized into four categories:
 
 For details on every detector, see [REFERENCE.md](REFERENCE.md).
 
+### Correcting a finding
+
+In Phase 2, choose **Review repair** beside a DC, subsonic or ultrasonic finding, or open **Track repairs…** from the track's Processing menu. The selected preset suggests repairs by default. Choose **On** to apply one to the whole track or **Use preset** to follow its automatic selection. Switch between **Original** and **Corrected** in the preview to hear the difference before normalization. The waveform and spectrogram use the same time position for both sources.
+
 ### Processing: Bimodal normalization
 
 Most normalizers treat a kick drum and a synth pad the same. SessionPrep
@@ -213,6 +217,14 @@ uv run python sessionprep.py .
 ```bash
 uv run python sessionprep.py . -x
 ```
+
+### Apply repairs to matching tracks
+
+```bash
+uv run python sessionprep.py . --fix dc --fix subsonic --low-cut-hz 10 --execute
+```
+
+Omit `--execute` to review selections first. Add `--fix ultrasonic` for eligible high-rate files.
 
 ### Force classification overrides
 ```bash

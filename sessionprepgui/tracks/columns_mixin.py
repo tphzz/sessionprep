@@ -14,8 +14,6 @@ from PySide6.QtWidgets import (
     QToolButton,
 )
 
-from sessionpreplib.detector import TrackDetector
-from sessionpreplib.processors import default_processors
 from sessionpreplib.utils import protools_sort_key
 
 from ..helpers import track_analysis_label
@@ -29,7 +27,6 @@ from ..theme import (
     FILE_COLOR_SUSTAINED,
 )
 from ..widgets import BatchComboBox, BatchToolButton, TableCellDoubleSpinBox
-from ..analysis.worker import BatchReanalyzeWorker
 from .table_layout import (
     TRACK_TABLE_RIGHT_MIN_WIDTH,
     apply_track_table_layout,
@@ -190,17 +187,11 @@ class TrackColumnsMixin:  # pylint: disable=too-few-public-methods
 
                 # RMS Anchor combo (column 5)
                 self._create_anchor_combo(row, track)
-            elif track.status == "OK":
-                # OK track but no processor results (all processors disabled)
-                cls_item = _SortableItem("", "zzz")
-                self._track_table.setItem(row, 3, cls_item)
-                gain_item = _SortableItem("", 0.0)
-                self._track_table.setItem(row, 4, gain_item)
             else:
-                cls_item = _SortableItem("", "zzz")
-                self._track_table.setItem(row, 3, cls_item)
-                gain_item = _SortableItem("", 0.0)
-                self._track_table.setItem(row, 4, gain_item)
+                gain = track.manual_gain_db
+                self._track_table.setItem(row, 3, _SortableItem("", "zzz"))
+                self._track_table.setItem(row, 4, _SortableItem(
+                    f"{gain:+.1f} dB" if gain is not None else "", gain or 0.0))
 
             # Group combo, processing button, and row color for all OK tracks
             if track.status == "OK":
@@ -373,7 +364,6 @@ class TrackColumnsMixin:  # pylint: disable=too-few-public-methods
         if getattr(combo, 'batch_mode', False) or combo.property("_batch_mode"):
             combo.setProperty("_batch_mode", False)
             combo.batch_mode = False
-            track.classification_override = text
             def _prepare(t):
                 t.classification_override = text
             self._batch_apply_combo(combo, 3, text, _prepare,
@@ -383,7 +373,6 @@ class TrackColumnsMixin:  # pylint: disable=too-few-public-methods
             if track.classification_override == text:
                 return
             track.classification_override = text
-            # Single-track sync path
             self._recalculate_processor(track)
             row = self._find_table_row(fname)
             if row >= 0:
@@ -407,10 +396,14 @@ class TrackColumnsMixin:  # pylint: disable=too-few-public-methods
         if not track:
             return
 
-        # Write gain directly to the processor result
-        pr = next(iter(track.processor_results.values()), None)
+        track.manual_gain_db = float(value)
+        pr = track.processor_results.get("bimodal_normalize")
         if pr:
             pr.gain_db = value
+            pr.data["original_gain_db"] = value
+        self._apply_linked_group_levels()
+        if getattr(self, "_repair_plan_worker", None) is not None:
+            self._queue_repair_plan([track])
         self._mark_prepare_stale()
 
         # Update hidden sort item
@@ -477,7 +470,6 @@ class TrackColumnsMixin:  # pylint: disable=too-few-public-methods
         if combo.property("_batch_mode"):
             combo.setProperty("_batch_mode", False)
             combo.batch_mode = False
-            track.rms_anchor_override = new_override
             def _prepare(t):
                 t.rms_anchor_override = new_override
             self._batch_apply_combo(combo, 5, text, _prepare,
@@ -488,7 +480,7 @@ class TrackColumnsMixin:  # pylint: disable=too-few-public-methods
             if track.rms_anchor_override == new_override:
                 return
             track.rms_anchor_override = new_override
-            self._reanalyze_single_track(track)
+            self._queue_repair_plan([track], refresh_anchors=True)
         self._mark_prepare_stale()
 
     # ── Processing column (col 7) ──────────────────────────────────────
@@ -505,20 +497,20 @@ class TrackColumnsMixin:  # pylint: disable=too-few-public-methods
         btn = BatchToolButton()
         btn.setProperty("track_filename", track.filename)
 
+        btn.setPopupMode(QToolButton.InstantPopup)
+        menu = QMenu(btn)
+        for proc in processors:
+            action = menu.addAction(proc.name)
+            action.setCheckable(True)
+            action.setChecked(proc.id not in track.processor_skip)
+            action.setData(proc.id)
+            action.toggled.connect(
+                lambda checked, a=action: self._on_processing_toggled(checked, a))
         if processors:
-            btn.setPopupMode(QToolButton.InstantPopup)
-            menu = QMenu(btn)
-            for proc in processors:
-                action = menu.addAction(proc.name)
-                action.setCheckable(True)
-                checked = proc.id not in track.processor_skip
-                action.setChecked(checked)
-                action.setData(proc.id)
-                action.toggled.connect(
-                    lambda checked, a=action: self._on_processing_toggled(checked, a))
-            btn.setMenu(menu)
-        else:
-            btn.setEnabled(False)
+            menu.addSeparator()
+        repair_action = menu.addAction("Track repairs…")
+        repair_action.triggered.connect(lambda: self._open_track_repairs(track))
+        btn.setMenu(menu)
 
         self._update_processing_button_label(btn, track, processors)
 
@@ -529,9 +521,14 @@ class TrackColumnsMixin:  # pylint: disable=too-few-public-methods
 
     def _update_processing_button_label(self, btn, track, processors):
         """Set the button label based on current processor_skip state."""
+        if track.repair_recipe.active:
+            names = {"dc_remove": "DC removal", "low_cut": "Subsonic filter", "ultrasonic": "Ultrasonic filter"}
+            btn.setText("Repairs")
+            btn.setToolTip("Before normalization: " + ", ".join(names[key] for key in track.repair_recipe.applied_ids()))
+            return
         if not processors:
             btn.setText("None")
-            btn.setToolTip("No audio processors enabled")
+            btn.setToolTip("No audio processors enabled. Open Track repairs to review corrective processing.")
             return
         def _label(p):
             return p.shorthand if p.shorthand else p.name
@@ -610,6 +607,7 @@ class TrackColumnsMixin:  # pylint: disable=too-few-public-methods
                 track.processor_skip.add(proc_id)
             self._update_processing_button_label(btn, track, processors)
 
+        self._apply_linked_group_levels()
         self._mark_prepare_stale()
 
     # ── Batch combo helper ────────────────────────────────────────────────
@@ -621,17 +619,13 @@ class TrackColumnsMixin:  # pylint: disable=too-few-public-methods
 
         1. **Sync** — set overrides via *prepare_fn(track)* and update
            combo widgets instantly.
-        2. **Async** — start a ``BatchReanalyzeWorker`` that re-runs
-           detectors/processors in the background, updating table rows
-           as each track completes and restoring the multi-selection at
-           the end.
+        2. Queue the same background plan used for individual track edits,
+           then restore the multi-selection after publishing those results.
 
         *prepare_fn(track)* must only mutate the data model (e.g. set an
         override field).  It must **not** run analysis.
         """
         if not self._session:
-            return
-        if self._batch_worker and self._batch_worker.isRunning():
             return
         if self._worker and self._worker.isRunning():
             return
@@ -660,38 +654,25 @@ class TrackColumnsMixin:  # pylint: disable=too-few-public-methods
             return
 
         # Save filenames for selection restore after worker completes
-        self._batch_filenames = batch_keys
+        self._batch_filenames = set(batch_keys)
 
         self._progress_start("Re-analyzing\u2026")
         self._progress_value(0, len(tracks_to_reanalyze))
         self._analyze_action.setEnabled(False)
 
-        # Start async worker
-        self._batch_worker = BatchReanalyzeWorker(
-            tracks_to_reanalyze,
-            self._session.detectors,
-            self._session.processors,
-            run_detectors=run_detectors,
-        )
-        self._batch_worker.progress.connect(self._on_worker_progress)
-        self._batch_worker.progress_value.connect(self._on_worker_progress_value)
-        self._batch_worker.track_done.connect(self._on_batch_track_done)
-        self._batch_worker.batch_finished.connect(self._on_batch_done)
-        self._batch_worker.error.connect(self._on_batch_error)
-        self._batch_worker.start()
-
-    @Slot(str)
-    def _on_batch_track_done(self, filename: str):
-        """Update one table row after the worker finishes re-analyzing it."""
-        self._update_track_row(filename)
+        self._queue_repair_plan(tracks_to_reanalyze, refresh_anchors=run_detectors)
 
     @Slot()
     def _on_batch_done(self):
         """Finalize the batch: restore selection, switch back to tabs."""
-        self._batch_worker = None
         self._analyze_action.setEnabled(True)
         self._right_stack.setCurrentIndex(_PAGE_TABS)
-        self._progress_finish("Re-analysis complete")
+        failures = [t.filename for t in self._session.tracks
+                    if t.filename in self._batch_filenames and t._cache.get("repair_error")]
+        if failures:
+            self._progress_fail("Re-analysis failed for " + ", ".join(failures))
+        else:
+            self._progress_finish("Re-analysis complete")
 
         # Re-enable sorting (was disabled in _batch_apply_combo);
         # rows may reorder, so restore selection by key afterward.
@@ -704,52 +685,21 @@ class TrackColumnsMixin:  # pylint: disable=too-few-public-methods
         if self._current_track:
             self._refresh_file_tab(self._current_track)
 
-    @Slot(str)
-    def _on_batch_error(self, message: str):
-        """Handle fatal error from the batch worker."""
-        self._batch_worker = None
-        self._analyze_action.setEnabled(True)
-        self._track_table.setSortingEnabled(True)
-        self._track_table.restore_selection(self._batch_filenames)
-        self._batch_filenames = set()
-        self._right_stack.setCurrentIndex(_PAGE_TABS)
-        self._progress_fail(message)
-        self._status_bar.showMessage(f"Batch error: {message}")
-
     # ── Recalculation ────────────────────────────────────────────────────
 
     def _recalculate_processor(self, track):
         """Re-run the normalization processor for a single track."""
         if not self._session or not self._session.processors:
             return
+        if (track.repair_recipe.active or track.repair_overrides or track.manual_gain_db is not None
+                or self._repair_plan_worker is not None):
+            self._queue_repair_plan([track])
+            return
         for proc in self._session.processors:
             result = proc.process(track)
             result.data["original_gain_db"] = result.gain_db
             track.processor_results[proc.id] = result
-
-    def _reanalyze_single_track(self, track):
-        """Re-run all track detectors + processors for a single track (sync)."""
-        if not self._session:
-            return
-
-        # Re-run track-level detectors (already sorted by dependency)
-        for det in self._session.detectors:
-            if isinstance(det, TrackDetector):
-                try:
-                    result = det.analyze(track)
-                    track.detector_results[det.id] = result
-                except Exception:
-                    pass
-
-        # Re-run processors
-        self._recalculate_processor(track)
-
-        # Re-apply group levels for any gain-linked groups this track belongs to
         self._apply_linked_group_levels()
-
-        # Update UI
-        self._update_track_row(track.filename)
-        self._refresh_file_tab(track)
 
     # ── Track-row UI helpers ─────────────────────────────────────────────
 
@@ -757,9 +707,6 @@ class TrackColumnsMixin:  # pylint: disable=too-few-public-methods
         """Refresh analysis label, classification, gain, and sort items
         for the table row matching *filename*.
 
-        Called from:
-        - ``_reanalyze_single_track`` (sync single-track path)
-        - ``_on_batch_track_done`` (per-track signal from async worker)
         """
         if not self._session:
             return
@@ -781,7 +728,7 @@ class TrackColumnsMixin:  # pylint: disable=too-few-public-methods
 
         # Gain spin box + sort item + classification
         pr = next(iter(track.processor_results.values()), None)
-        new_gain = pr.gain_db if pr else 0.0
+        new_gain = pr.gain_db if pr else (track.manual_gain_db or 0.0)
         base_cls = None
         if track.classification_override:
             base_cls = track.classification_override
@@ -803,7 +750,10 @@ class TrackColumnsMixin:  # pylint: disable=too-few-public-methods
             spin.blockSignals(False)
         gain_sort = self._track_table.item(row, 4)
         if gain_sort:
-            gain_sort.setText(f"{new_gain:+.1f}")
+            if isinstance(spin, QDoubleSpinBox):
+                gain_sort.setText(f"{new_gain:+.1f}")
+            else:
+                gain_sort.setText(f"{new_gain:+.1f} dB" if pr or track.manual_gain_db is not None else "")
             gain_sort._sort_key = new_gain
 
         if base_cls is not None:

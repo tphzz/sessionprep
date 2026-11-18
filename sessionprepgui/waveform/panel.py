@@ -19,11 +19,15 @@ from PySide6.QtWidgets import (
     QToolButton,
     QVBoxLayout,
     QWidget,
+    QWidgetAction,
 )
 
+from ..controls import FormActionButton
 from ..icons import icon, icon_path
-from ..theme import CONTENT_INSET
+from ..theme import COLORS, CONTENT_INSET
+from .compute import SPECTROGRAM_COLORMAPS
 from .widget import WaveformWidget
+from .source_selector import AuditionSourceSelector
 
 
 _PREVIEW_CHEVRON_SIZE = 16
@@ -93,8 +97,8 @@ class _ViewControlRow(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._controls: list[QToolButton] = []
-        self._wanted: dict[QToolButton, bool] = {}
+        self._controls: list[QWidget] = []
+        self._wanted: dict[QWidget, bool] = {}
         layout = QHBoxLayout(self)
         layout.setContentsMargins(self.SPACING, 0, self.SPACING, 0)
         layout.setSpacing(self.SPACING)
@@ -118,26 +122,26 @@ class _ViewControlRow(QWidget):
         layout.addStretch(1)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
 
-    def add_control(self, control: QToolButton) -> None:
+    def add_control(self, control: QWidget) -> None:
         layout = self.layout()
         layout.insertWidget(layout.indexOf(self.more_button), control)
         self._controls.append(control)
         self._wanted[control] = True
 
     @property
-    def controls(self) -> list[QToolButton]:
+    def controls(self) -> list[QWidget]:
         return list(self._controls)
 
-    def set_wanted(self, control: QToolButton, wanted: bool) -> None:
+    def set_wanted(self, control: QWidget, wanted: bool) -> None:
         """Show or hide a control by panel logic (it may still overflow)."""
         self._wanted[control] = bool(wanted)
         self.updateGeometry()  # sizeHint depends on the wanted controls
         self._relayout()
 
-    def is_wanted(self, control: QToolButton) -> bool:
+    def is_wanted(self, control: QWidget) -> bool:
         return self._wanted.get(control, False)
 
-    def overflowed(self) -> list[QToolButton]:
+    def overflowed(self) -> list[QWidget]:
         """Wanted controls currently moved into the » menu."""
         return [c for c in self._controls if self._wanted[c] and c.isHidden()]
 
@@ -191,12 +195,40 @@ class _ViewControlRow(QWidget):
             visible = control in shown
             if control.isHidden() == visible:
                 control.setVisible(visible)
-        if overflow and focused in self._controls and focused.isHidden():
+        if overflow and focused and any(
+                c.isHidden() and (c is focused or c.isAncestorOf(focused)) for c in self._controls):
             self.more_button.setFocus(Qt.OtherFocusReason)
 
     def _fill_menu(self) -> None:
         self.more_menu.clear()
         for control in self.overflowed():
+            if isinstance(control, AuditionSourceSelector):
+                action = QWidgetAction(self.more_menu)
+                group = QWidget(self.more_menu)
+                layout = QVBoxLayout(group)
+                layout.setContentsMargins(12, 5, 12, 7)
+                layout.setSpacing(4)
+                layout.addWidget(QLabel("Audition source", group))
+                selector = AuditionSourceSelector(group)
+                layout.addWidget(selector, 0, Qt.AlignLeft)
+                selector.set_corrected(control.buttons[1].isChecked())
+                selector.buttons[1].setEnabled(control.buttons[1].isEnabled())
+                selector.buttons[1].setToolTip(control.buttons[1].toolTip())
+                selector.selected.connect(control.selected)
+                control.selected.connect(selector.set_corrected)
+                group.setFocusPolicy(Qt.StrongFocus)
+                group.setFocusProxy(selector)
+                action.setText("Audition source")
+                action.setDefaultWidget(group)
+                self.more_menu.addAction(action)
+                self.more_menu.addSeparator()
+                continue
+            if control.objectName() == "spectrogramRange":
+                self._menu_label("Spectrogram range")
+                self.more_menu.addActions(control.menu().actions())
+                self._menu_label(control.property("legendText"), secondary=True)
+                self.more_menu.addSeparator()
+                continue
             menu = control.menu()
             if menu is not None:
                 menu.setTitle(control.text())
@@ -208,6 +240,17 @@ class _ViewControlRow(QWidget):
                 action.triggered.connect(lambda _checked=False, c=control: c.click())
             action.setEnabled(control.isEnabled())
             action.setToolTip(control.toolTip())
+
+    def _menu_label(self, text, *, secondary=False):
+        action = QWidgetAction(self.more_menu)
+        action.setText(text)
+        label = QLabel(text)
+        label.setContentsMargins(12, 3, 12, 3)
+        if secondary:
+            label.setStyleSheet(f"color: {COLORS['metadata']};")
+        label.setAttribute(Qt.WA_TransparentForMouseEvents)
+        action.setDefaultWidget(label)
+        self.more_menu.addAction(action)
 
 
 class WaveformPanel(QWidget):
@@ -229,12 +272,18 @@ class WaveformPanel(QWidget):
     stop_clicked = Signal()
     position_clicked = Signal(int)
     display_mode_changed = Signal(str)
+    audition_source_changed = Signal(bool)
+    inspection_band_changed = Signal(str)
+    preview_retry = Signal()
 
     def __init__(self, analysis_mode: bool = True, parent=None):
         super().__init__(parent)
         self._analysis_mode = analysis_mode
         self._expanded = True
         self._content_available = False
+        self._show_audition_source = False
+        self.corrected = False
+        self.inspection_band = "full"
         self._expanded_splitter_sizes = None
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -250,7 +299,27 @@ class WaveformPanel(QWidget):
         self._view_toolbar = self._build_toolbar()
         self.preview_header.layout().insertWidget(1, self._view_toolbar, 1)
         self._set_header_tab_order()
+        if analysis_mode:
+            self.preview_notice = QWidget()
+            notice = QHBoxLayout(self.preview_notice)
+            notice.setContentsMargins(CONTENT_INSET, 1, CONTENT_INSET, 1)
+            self.preview_message = QLabel()
+            self.preview_message.setWordWrap(True)
+            notice.addWidget(self.preview_message, 1)
+            self.preview_retry_button = FormActionButton("Retry")
+            self.preview_retry_button.clicked.connect(self.preview_retry)
+            notice.addWidget(self.preview_retry_button)
+            self.preview_notice.hide()
+            body_layout.addWidget(self.preview_notice)
         body_layout.addWidget(self.waveform, 1)
+        if analysis_mode:
+            self.power_legend = QLabel()
+            self.power_legend.setContentsMargins(32, 0, CONTENT_INSET, 0)
+            self.power_legend.setStyleSheet(f"color: {COLORS['metadata']};")
+            body_layout.addWidget(self.power_legend)
+            for group in (self.cmap_group, self.floor_group, self.ceil_group):
+                group.triggered.connect(self._update_power_legend)
+            self._update_power_legend()
         body_layout.addWidget(self._build_transport())
         layout.addWidget(self._body, 1)
         self.disclosure_button.toggled.connect(self.set_expanded)
@@ -322,6 +391,62 @@ class WaveformPanel(QWidget):
     def is_expanded(self) -> bool:
         return self._expanded
 
+    def set_audition_available(self, available: bool, reason="", *, show=True):
+        self._show_audition_source = show
+        self._view_toolbar.set_wanted(self.source_selector, show and self._analysis_mode)
+        self.source_selector.buttons[1].setEnabled(available)
+        self.source_selector.buttons[1].setToolTip("" if available else reason)
+        if not available:
+            self.set_corrected(False)
+
+    def set_corrected(self, corrected: bool):
+        self.corrected = corrected
+        self.source_selector.set_corrected(corrected)
+
+    def _choose_source(self, corrected):
+        if self.corrected != corrected:
+            self.set_corrected(corrected)
+            self.audition_source_changed.emit(corrected)
+
+    def set_preview_notice(self, text="", *, retry=False):
+        self.preview_message.setText(text)
+        self.preview_retry_button.setVisible(retry)
+        self.preview_notice.setVisible(bool(text))
+
+    def _update_power_legend(self):
+        floor = self.floor_group.checkedAction().data()
+        ceil = self.ceil_group.checkedAction().data()
+        cmap = SPECTROGRAM_COLORMAPS[self.cmap_group.checkedAction().data()]
+        labels = []
+        for level in sorted({floor, ceil, *(db for db in (-60, -30) if floor < db < ceil)}):
+            idx = max(0, min(255, round(255 * (level - floor) / max(1, ceil - floor))))
+            r, g, b = cmap[idx][:3]
+            labels.append(f'<span style="color:#{r:02x}{g:02x}{b:02x}">■</span> {level:g}')
+        self.power_legend.setText("dBFS &nbsp; " + " &nbsp; ".join(labels))
+        description = f"dBFS  {floor:g} … {ceil:g} · both sources"
+        self.power_legend.setAccessibleName(description)
+        self.band_btn.setProperty("legendText", description)
+        self.power_legend.setVisible(self._analysis_mode and self.spec_action.isChecked() and self.width() > 400)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "power_legend"):
+            self.power_legend.setVisible(self._analysis_mode and self.spec_action.isChecked() and self.width() > 400)
+
+    def set_inspection_rate(self, samplerate):
+        high = self.band_actions["high"]
+        high.setEnabled(samplerate > 40000)
+        if self.inspection_band == "high" and not high.isEnabled():
+            self._choose_band("full")
+
+    def _choose_band(self, band):
+        self.inspection_band = band
+        self.band_actions[band].setChecked(True)
+        self.band_btn.setText(self.band_actions[band].text())
+        for menu in self._spec_transform_menus:
+            menu.setEnabled(band == "full")
+        self.inspection_band_changed.emit(band)
+
     def set_content_available(self, available: bool) -> None:
         """Update data availability without overriding the user's disclosure."""
         self._content_available = available
@@ -392,6 +517,12 @@ class WaveformPanel(QWidget):
             f" width: {_PREVIEW_CHEVRON_SIZE}px; height: {_PREVIEW_CHEVRON_SIZE}px;"
             f' image: url("{chevron}"); }}')
 
+        if self._analysis_mode:
+            self.source_selector = AuditionSourceSelector()
+            self.source_selector.selected.connect(self._choose_source)
+            toolbar.add_control(self.source_selector)
+            toolbar.set_wanted(self.source_selector, False)
+
         # Display mode dropdown
         self.display_mode_btn = QToolButton()
         self.display_mode_btn.setText("Waveform")
@@ -423,6 +554,30 @@ class WaveformPanel(QWidget):
         self.spec_settings_btn.setAutoRaise(True)
         self.spec_settings_btn.setStyleSheet(dropdown_style)
         spec_menu = QMenu(self.spec_settings_btn)
+        if self._analysis_mode:
+            self.band_btn = QToolButton()
+            self.band_btn.setObjectName("spectrogramRange")
+            self.band_btn.setText("Full range")
+            self.band_btn.setAccessibleName("Spectrogram range")
+            self.band_btn.setToolTip("Select the frequency range for both sources")
+            self.band_btn.setPopupMode(QToolButton.InstantPopup)
+            self.band_btn.setAutoRaise(True)
+            self.band_btn.setStyleSheet(dropdown_style)
+            band_menu = QMenu(self.band_btn)
+            self.band_btn.setMenu(band_menu)
+            toolbar.add_control(self.band_btn)
+            toolbar.set_wanted(self.band_btn, False)
+            group = QActionGroup(band_menu)
+            self.band_actions = {}
+            for key, label in (("full", "Full range"), ("low", "0–100 Hz"),
+                               ("high", "20 kHz–Nyquist")):
+                action = band_menu.addAction(label)
+                action.setCheckable(True)
+                action.setChecked(key == "full")
+                action.setData(key)
+                group.addAction(action)
+                self.band_actions[key] = action
+            group.triggered.connect(lambda action: self._choose_band(action.data()))
 
         # -- FFT Size submenu --
         fft_menu = spec_menu.addMenu("FFT Size")
@@ -437,6 +592,7 @@ class WaveformPanel(QWidget):
 
         # -- Window submenu --
         win_menu = spec_menu.addMenu("Window")
+        self._spec_transform_menus = [fft_menu, win_menu]
         self.win_group = QActionGroup(self)
         _WINDOW_MAP = [("Hann", "hann"), ("Hamming", "hamming"),
                        ("Blackman-Harris", "blackmanharris")]
@@ -466,9 +622,11 @@ class WaveformPanel(QWidget):
             act = floor_menu.addAction(f"{val} dB")
             act.setCheckable(True)
             act.setData(val)
-            if val == -80:
+            if val == (-100 if self._analysis_mode else -80):
                 act.setChecked(True)
             self.floor_group.addAction(act)
+        if self._analysis_mode:
+            self.waveform.set_spec_db_floor(-100)
 
         # -- dB Ceiling submenu --
         ceil_menu = spec_menu.addMenu("dB Ceiling")
@@ -779,6 +937,9 @@ class WaveformPanel(QWidget):
         # Hide waveform-only toolbar controls in spectrogram mode
         row = self._view_toolbar
         row.set_wanted(self.wf_settings_btn, is_waveform)
+        if hasattr(self, "band_btn"):
+            row.set_wanted(self.band_btn, self._analysis_mode and not is_waveform)
+            self._update_power_legend()
         if self._analysis_mode:
             row.set_wanted(self.markers_toggle, is_waveform)
             row.set_wanted(self.rms_lr_toggle, is_waveform)
@@ -795,6 +956,10 @@ class WaveformPanel(QWidget):
         """Show or hide analysis-specific toolbar controls."""
         self._analysis_mode = enabled
         waveform_mode = self.wf_action.isChecked()
+        if hasattr(self, "band_btn"):
+            self._view_toolbar.set_wanted(self.source_selector, enabled and self._show_audition_source)
+            self._view_toolbar.set_wanted(self.band_btn, enabled and not waveform_mode)
+            self._update_power_legend()
         for control in self._analysis_controls():
             # Waveform-only toggles stay hidden in spectrogram mode.
             wanted = enabled and (control is self.overlay_btn or waveform_mode)

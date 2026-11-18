@@ -3,8 +3,34 @@
 from __future__ import annotations
 
 import sounddevice as sd
+import numpy as np
 
-from PySide6.QtCore import QObject, QTimer, Signal, Slot
+from PySide6.QtCore import QObject, Qt, QTimer, Signal, Slot
+
+
+def _route(block, out, mode, channel):
+    """Write a block into the device buffer, using the same routing on both sides."""
+    data = block.reshape(len(block), -1)
+    channels = data.shape[1]
+    if channel is not None and 0 <= channel < channels:
+        if mode == "channel_mono":
+            out[:, 0] = data[:, channel]
+            return
+        if mode == "channel_as_is":
+            out.fill(0)
+            if channels <= 2:
+                out[:, channel] = data[:, channel]
+            else:
+                side = channel % 2
+                out[:, side] = data[:, channel] / data[:, side::2].shape[1]
+            return
+    if mode == "mono":
+        np.mean(data, axis=1, out=out[:, 0])
+    elif channels > 2:
+        np.mean(data[:, ::2], axis=1, out=out[:, 0])
+        np.mean(data[:, 1::2], axis=1, out=out[:, 1])
+    else:
+        out[:] = data
 
 
 class PlaybackController(QObject):
@@ -19,14 +45,16 @@ class PlaybackController(QObject):
     cursor_updated = Signal(int)
     playback_finished = Signal()
     error = Signal(str)
+    _stream_finished = Signal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._stream: sd.OutputStream | None = None
         self._play_start_sample: int = 0
         self._play_frame_count: list[int] = [0]
-        self._audio_data = None  # numpy array (samples, channels)
-        self._samplerate: int = 44100
+        self._generation = 0
+        self._corrected = False
+        self._stream_finished.connect(self._on_finished_main, Qt.QueuedConnection)
 
         self._timer = QTimer(self)
         self._timer.setInterval(30)
@@ -41,7 +69,8 @@ class PlaybackController(QObject):
         return self._play_start_sample
 
     def play(self, audio_data, samplerate: int, start_sample: int = 0,
-             mode: str = "as_is", channel: int | None = None):
+             mode: str = "as_is", channel: int | None = None, *, audition=None,
+             corrected: bool = False):
         # pylint: disable=too-many-positional-arguments
         """Start playback from the given sample position.
 
@@ -62,80 +91,73 @@ class PlaybackController(QObject):
         if audio_data is None or audio_data.size == 0:
             return
 
-        import numpy as np
         audio = audio_data
-        if audio.ndim == 1:
-            audio = audio.reshape(-1, 1)
-
-        n_ch = audio.shape[1]
-
-        if mode == "mono":
-            # Fold all channels to mono: sum / N
-            audio = np.mean(audio, axis=1, keepdims=True)
-        elif mode == "channel_as_is" and channel is not None and channel < n_ch:
-            # Solo channel in its original speaker position
-            out = np.zeros_like(audio)
-            out[:, channel] = audio[:, channel]
-            audio = out
-        elif mode == "channel_mono" and channel is not None and channel < n_ch:
-            # Extract single channel as mono (1-ch output)
-            audio = audio[:, channel:channel + 1].copy()
-
-        # Downmix to stereo if the device can't handle the channel count
-        if audio.shape[1] > 2:
-            n = audio.shape[1]
-            left = np.zeros(audio.shape[0], dtype=audio.dtype)
-            right = np.zeros(audio.shape[0], dtype=audio.dtype)
-            for ch in range(n):
-                if ch % 2 == 0:
-                    left += audio[:, ch]
-                else:
-                    right += audio[:, ch]
-            left /= max(1, (n + 1) // 2)
-            right /= max(1, n // 2)
-            audio = np.column_stack([left, right])
+        n_ch = audio.shape[1] if audio.ndim == 2 else 1
+        if channel is not None and not 0 <= channel < n_ch:
+            channel = None
+        mono = mode == "mono" or (mode == "channel_mono" and channel is not None)
+        output_channels = 1 if mono else min(n_ch, 2)
 
         if start_sample >= audio.shape[0]:
             start_sample = 0
 
-        self._audio_data = audio
-        self._samplerate = samplerate
         self._play_start_sample = start_sample
-        self._play_frame_count = [0]
-        play_data = audio[start_sample:]
-
-        frame_count = self._play_frame_count
+        frame_count = self._play_frame_count = [0]
+        generation = self._generation
+        self._corrected = corrected
+        target = corrected
+        fade_length = max(2, round(.01 * samplerate))
+        elapsed = fade_length
+        monitor_scale = 10 ** (audition.monitor_gain_db / 20) if audition else 1.
 
         def callback(outdata, frames, time_info, status):
-            pos = frame_count[0]
-            end = pos + frames
-            if end <= len(play_data):
-                outdata[:] = play_data[pos:end]
-                frame_count[0] = end
-            else:
-                remaining = len(play_data) - pos
-                if remaining > 0:
-                    outdata[:remaining] = play_data[pos:]
-                outdata[remaining:] = 0
-                frame_count[0] = len(play_data)
+            nonlocal target, elapsed
+            pos = start_sample + frame_count[0]
+            count = min(frames, len(audio) - pos)
+            if count:
+                selected = self._corrected
+                if audition and selected != target:
+                    # A reversal starts at the last blend heard, even mid-fade.
+                    elapsed = max(0, fade_length - elapsed)
+                    target = selected
+                if audition and elapsed < fade_length:
+                    block = audition.switch_samples(pos, not target, target, count, fade_offset=elapsed)
+                    elapsed = min(fade_length, elapsed + count)
+                    _route(block, outdata[:count], mode, channel)
+                else:
+                    source = audition.corrected if audition and target else audio
+                    block = source[pos:pos + count]
+                    if monitor_scale != 1.:
+                        block = np.multiply(block, monitor_scale, dtype=np.float64)
+                    _route(block, outdata[:count], mode, channel)
+                frame_count[0] += count
+            if count < frames:
+                outdata[count:] = 0
                 raise sd.CallbackStop()
+
+        def finished():
+            self._stream_finished.emit(generation)
 
         try:
             self._stream = sd.OutputStream(
                 samplerate=samplerate,
-                channels=audio.shape[1],
+                channels=output_channels,
                 callback=callback,
-                finished_callback=self._on_finished_sd,
+                finished_callback=finished,
             )
             self._stream.start()
             self._timer.start()
         except Exception as e:
-            self._stream = None
+            self.stop()
             self.error.emit(str(e))
+
+    def set_audition_source(self, corrected: bool):
+        self._corrected = corrected
 
     def stop(self):
         """Stop playback. Returns the start sample for cursor restoration."""
         self._timer.stop()
+        self._generation += 1
         if self._stream is not None:
             try:
                 self._stream.stop()
@@ -148,15 +170,12 @@ class PlaybackController(QObject):
         """Return the current playback sample position."""
         return self._play_start_sample + self._play_frame_count[0]
 
-    def _on_finished_sd(self):
-        """Called by sounddevice from the audio thread when playback ends."""
-        QTimer.singleShot(0, self._on_finished_main)
-
-    @Slot()
-    def _on_finished_main(self):
+    @Slot(int)
+    def _on_finished_main(self, generation):
         """Handle playback completion on the main thread."""
-        self._timer.stop()
-        self._stream = None
+        if generation != self._generation:
+            return
+        self.stop()
         self.playback_finished.emit()
 
     @Slot()

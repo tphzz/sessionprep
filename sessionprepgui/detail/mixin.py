@@ -49,6 +49,30 @@ class DetailMixin:  # pylint: disable=too-few-public-methods
                 track, self._session, show_clean=self._show_clean,
                 verbose=self._verbose)
 
+    def _open_track_repairs(self, track, detector_id=None):
+        if self._session is None or not any(current is track for current in self._session.tracks):
+            return
+        if track is not self._current_track or self._detail_tabs.currentIndex() != _TAB_FILE:
+            row = self._find_table_row(track.filename)
+            if row < 0:
+                return
+            with QSignalBlocker(self._track_table):
+                self._track_table.setCurrentCell(row, 7)
+            self._show_track_detail(track)
+        self._repair_editor.open_track(track, self._session, detector_id)
+
+    def _refresh_track_repair_editor(self, track=None):
+        track = self._current_track if track is None else track
+        if track is not None and self._session is not None:
+            self._repair_editor.refresh(track, self._session)
+
+    def _focus_processing_menu(self, filename):
+        row = self._find_table_row(filename)
+        button = self._track_table.cellWidget(row, 7) if row >= 0 else None
+        if button is not None:
+            self._track_table.scrollToItem(self._track_table.item(row, 0))
+            button.setFocus(Qt.OtherFocusReason)
+
     def _review_summary_file(self, filename):
         """Select the current file by identity, including after table sorting."""
         if self._session is None or self._summary_view.report_session is not self._session:
@@ -101,6 +125,10 @@ class DetailMixin:  # pylint: disable=too-few-public-methods
 
         # Guard: user may have clicked a different track while we were queued
         if self._current_track is not track:
+            return
+
+        if hasattr(self, "_repair_preview") and hasattr(track, "repair_recipe"):
+            self._repair_preview.select(track)
             return
 
         # Cancel any in-flight workers
@@ -187,6 +215,9 @@ class DetailMixin:  # pylint: disable=too-few-public-methods
 
     @Slot(str)
     def _on_display_mode_changed(self, mode: str):
+        if hasattr(self, "_repair_preview") and self._repair_preview.track is not None:
+            self._repair_preview.request()
+            return
         if mode == "spectrogram" and self._current_track:
             track = self._current_track
             if track.audio_data is not None and track.audio_data.size > 0:
@@ -195,7 +226,7 @@ class DetailMixin:  # pylint: disable=too-few-public-methods
                         self._start_wf_worker(track)
 
     @Slot(object, object)
-    def _on_waveform_loaded(self, result: dict, track, worker=None):
+    def _on_waveform_loaded(self, result: dict, track, worker=None, *, preserve_view=False):
         """Receive waveform data only from the currently owned worker."""
         if worker is not None and worker is not self._wf_worker:
             return
@@ -207,28 +238,40 @@ class DetailMixin:  # pylint: disable=too-few-public-methods
 
         if not self._visualization_context_is_current():
             return
-        self._waveform.set_precomputed(result)
+        if preserve_view:
+            self._waveform.set_precomputed(result, preserve_view=True)
+        else:
+            self._waveform.set_precomputed(result)
         self._waveform_unavailable_generation = None
         self._waveform_context_generation = self._file_report.context_generation
         # Apply cached peak data for mip-level rendering
         peak_cache = getattr(self, '_peak_cache', {})
         fn = getattr(track, 'filename', None)
-        if fn and fn in peak_cache:
-            self._waveform.set_peak_data(peak_cache[fn])
-        elif fn and hasattr(self, '_prioritize_peak'):
-            self._prioritize_peak(fn)
+        if fn and not result.get("corrected"):
+            if fn in peak_cache:
+                self._waveform.set_peak_data(peak_cache[fn])
+            elif hasattr(self, '_prioritize_peak'):
+                self._prioritize_peak(fn)
 
-        cmap = self._config.get("app", {}).get("spectrogram_colormap", "magma")
-        self._waveform.set_colormap(cmap)
-        # Sync colormap dropdown with preference
-        for act in self._cmap_group.actions():
-            if act.data() == cmap:
-                act.setChecked(True)
-                break
+        if not preserve_view:
+            cmap = self._config.get("app", {}).get("spectrogram_colormap", "magma")
+            self._waveform.set_colormap(cmap)
+            for act in self._cmap_group.actions():
+                if act.data() == cmap:
+                    act.setChecked(True)
+                    break
 
         self._refresh_waveform_issues()
         self._apply_pending_detector_visualization()
-        self._update_time_label(0)
+        self._update_time_label(self._waveform._cursor_sample if preserve_view else 0)
+
+    def _refresh_repair_preview(self, track):
+        if track is self._current_track and track is not None:
+            sample = self._playback.current_sample() if self._playback.is_playing else None
+            self._on_stop()
+            if sample is not None:
+                self._waveform.set_cursor(sample)
+            self._repair_preview.select(track, refresh=True)
 
     def _on_audio_loaded(self, track, orig_track, worker=None):
         """Audio data loaded from disk; proceed to waveform rendering."""
@@ -295,6 +338,14 @@ class DetailMixin:  # pylint: disable=too-few-public-methods
             self._pending_detector_visualization = None
             self._waveform_context_generation = None
             self._waveform_unavailable_generation = None
+            preview = getattr(self, "_repair_preview", None)
+            if preview and preview.track is not None:
+                preview.clear_material()
+                preview.track = None
+                preview.displayed = False
+                preview.panel.set_corrected(False)
+                preview.panel.set_audition_available(False, show=False)
+                preview.panel.set_preview_notice()
             return
         pending = self._pending_detector_visualization
         if pending is not None and (
@@ -438,10 +489,18 @@ class DetailMixin:  # pylint: disable=too-few-public-methods
 
     @Slot(QAction)
     def _on_spec_fft_changed(self, action):
+        if getattr(self, "_repair_preview", None) and self._repair_preview.track:
+            self._waveform._spec_renderer.set_n_fft(int(action.data()))
+            self._repair_preview.request()
+            return
         self._waveform.set_spec_fft(int(action.data()))
 
     @Slot(QAction)
     def _on_spec_window_changed(self, action):
+        if getattr(self, "_repair_preview", None) and self._repair_preview.track:
+            self._waveform._spec_renderer.set_window(action.data())
+            self._repair_preview.request()
+            return
         self._waveform.set_spec_window(action.data())
 
     @Slot(QAction)
@@ -481,24 +540,34 @@ class DetailMixin:  # pylint: disable=too-few-public-methods
     @Slot()
     def _on_play(self):
         track = self._current_track
-        if track is None or track.audio_data is None:
+        if track is None:
+            return
+        preview = getattr(self, "_repair_preview", None)
+        audition = preview.audition if preview and preview.track is track else None
+        if (preview and audition is None) or (audition is None and track.audio_data is None):
             return
         self._on_stop()
         start = self._waveform._cursor_sample
         mode, channel = self._wf_panel.play_mode
-        self._playback.play(track.audio_data, track.samplerate, start,
-                            mode=mode, channel=channel)
+        if audition is None:
+            self._playback.play(track.audio_data, track.samplerate, start,
+                                mode=mode, channel=channel)
+        else:
+            preview.play(start, mode, channel)
         if self._playback.is_playing:
             self._play_btn.setEnabled(False)
             self._stop_btn.setEnabled(True)
 
     @Slot()
     def _on_stop(self):
+        preview = getattr(self, "_repair_preview", None)
+        if preview:
+            preview.pending_play = None
         was_playing = self._playback.is_playing
         start_sample = self._playback.play_start_sample
         self._playback.stop()
         self._stop_btn.setEnabled(False)
-        if self._current_track is not None:
+        if self._current_track is not None and (not preview or preview.audition is not None):
             self._play_btn.setEnabled(True)
         if was_playing:
             self._waveform.set_cursor(start_sample)

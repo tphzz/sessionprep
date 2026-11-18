@@ -280,11 +280,12 @@ class AnalyzeWorker(QThread):
     finished = Signal(object, object)     # (session, diagnostic_summary)
     error = Signal(str)
 
-    def __init__(self, source_dir: str, config: dict, recursive: bool = False):
+    def __init__(self, source_dir: str, config: dict, recursive: bool = False, track_settings=None):
         super().__init__()
         self.source_dir = source_dir
         self.config = config
         self.recursive = recursive
+        self.track_settings = track_settings or {}
         self._event_bus = EventBus()
         self._is_cancelled = False
 
@@ -299,6 +300,9 @@ class AnalyzeWorker(QThread):
             self.progress.emit("Loading session\u2026")
             session = load_session(self.source_dir, self.config, event_bus=event_bus,
                                   recursive=self.recursive)
+            for track in session.tracks:
+                for key, value in self.track_settings.get(track.filename, {}).items():
+                    setattr(track, key, value)
 
             if not session.tracks:
                 self.error.emit("No audio files found in directory.")
@@ -378,7 +382,8 @@ class AnalyzeWorker(QThread):
 
             # Phase 2: Plan (per-track processors run in parallel)
             self.progress.emit("Planning\u2026")
-            session = pipeline.plan(session)
+            session = pipeline.plan(session, preserve_selections={
+                name for name, settings in self.track_settings.items() if "processor_skip" in settings})
 
             # Build summary
             with self._step_lock:
@@ -685,6 +690,49 @@ class TopoMultiAudioWorker(QThread):
             self.error.emit(str(exc))
 
 
+class RepairPlanWorker(QThread):
+    """Plan edited repairs from immutable choices without changing a live session."""
+
+    completed = Signal(object)
+    progress_value = Signal(int, int)
+
+    def __init__(self, session, tracks, config, parent=None, *, refresh_anchors=()):
+        super().__init__(parent)
+        self.session = session
+        self.config = dict(config)
+        self.refresh_anchors = frozenset(refresh_anchors)
+        self.tracks = [
+            replace(t, repair_overrides=dict(t.repair_overrides), processor_skip=set(t.processor_skip),
+                    _cache=dict(t._cache), detector_results=dict(t.detector_results), processor_results={})
+            for t in tracks
+        ]
+        self.failure = ""
+        self._events = EventBus()
+        self._progress_lock = threading.Lock()
+        self._done = 0
+        self._events.subscribe("track.plan_complete", self._on_planned)
+
+    def _on_planned(self, **_):
+        with self._progress_lock:
+            self._done += 1
+            self.progress_value.emit(self._done, len(self.tracks))
+
+    def cancel(self):
+        self._events.cancel()
+
+    def run(self):
+        try:
+            from sessionpreplib.models import SessionContext
+            detectors = default_detectors() if self.refresh_anchors else []
+            pipeline = Pipeline(detectors, default_processors(), self.config, self._events)
+            snapshot = SessionContext(self.tracks, self.config)
+            pipeline.plan(snapshot, preserve_selections={t.filename for t in self.tracks},
+                          refresh_anchors=self.refresh_anchors)
+        except Exception as exc:
+            self.failure = str(exc)
+        self.completed.emit(self)
+
+
 class PrepareWorker(QThread):
     """Runs Pipeline.prepare() off the main thread with progress."""
 
@@ -693,14 +741,48 @@ class PrepareWorker(QThread):
     track_prepared = Signal(str)        # filename
     prepare_finished = Signal()         # renamed: avoid shadowing QThread.finished
     error = Signal(str)
+    completed = Signal(object)
 
     def __init__(self, session, processors, output_dir: str):
         super().__init__()
-        self._session = session
-        self._processors = processors
+        self.owner = session
+        self.outdated = False
+        self.failure = ""
+        # Share read-only sample buffers. Freeze all choices used for the bytes
+        # and fader receipt together before the GUI accepts another edit.
+        tracks = [replace(t, processor_results=deepcopy(t.processor_results),
+                          repair_overrides=dict(t.repair_overrides),
+                          processor_skip=set(t.processor_skip), _cache=dict(t._cache))
+                  for t in session.tracks]
+        self._session = replace(session, tracks=tracks, config=dict(session.config),
+                                topology=deepcopy(session.topology),
+                                transfer_manifest=deepcopy(session.transfer_manifest),
+                                output_tracks=list(session.output_tracks))
+        self._processors = [deepcopy(proc) for proc in processors]
         self._output_dir = output_dir
 
+    def publish(self):
+        """Publish committed output receipts without replacing later edits to the tracks."""
+        result, session = self._session, self.owner
+        if session.topology is None:
+            session.topology = result.topology
+        session.output_tracks = result.output_tracks
+        session.transfer_manifest = result.transfer_manifest
+        session.base_transfer_manifest = result.base_transfer_manifest
+        session.prepare_state = "stale" if self.outdated else result.prepare_state
+        for key in ("_prepared_files", "_prepare_errors", "_output_gain_adjustments"):
+            session.config[key] = result.config[key]
+        if self.outdated:
+            session.config["_output_gain_adjustments"] = {}
+        for current, frozen in zip(session.tracks, result.tracks, strict=True):
+            current.processed_filepath = frozen.processed_filepath
+            current.applied_processors = frozen.applied_processors
+            current.prepared_file_signature = frozen.prepared_file_signature
+            current.prepared_fader_db = frozen.prepared_fader_db
+
     def _on_progress(self, current: int, total: int, message: str):
+        if self.isInterruptionRequested():
+            raise InterruptedError("Prepare cancelled")
         self.progress.emit(message)
         self.progress_value.emit(current, total)
 
@@ -721,7 +803,10 @@ class PrepareWorker(QThread):
             )
             self.prepare_finished.emit()
         except Exception as e:
-            self.error.emit(str(e))
+            self.failure = str(e)
+            self.error.emit(self.failure)
+        finally:
+            self.completed.emit(self)
 
 
 class TopologyApplyWorker(QThread):

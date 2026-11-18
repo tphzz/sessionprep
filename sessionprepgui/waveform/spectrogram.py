@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QImage, QPainter, QPen
 
 from ..theme import COLORS
 from .compute import (
@@ -50,6 +50,10 @@ class SpectrogramRenderer:
         self._mel_view_min: float = _hz_to_mel(_SPEC_F_MIN)
         self._mel_view_max: float = _hz_to_mel(_SPEC_F_MAX)
         self._on_done_callback = None
+        self.band = "full"
+        self._native_range = False
+        self._frequencies = None
+        self._column_times = None
 
     # ── Public API ──────────────────────────────────────────────────────────
 
@@ -63,6 +67,10 @@ class SpectrogramRenderer:
         self._spec_image = None
         self._spec_image_data = None
         self._spec_cache_key = ()
+        self.band = "full"
+        self._native_range = False
+        self._frequencies = None
+        self._column_times = None
         self._mel_view_min = _hz_to_mel(_SPEC_F_MIN)
         self._mel_view_max = _hz_to_mel(min(_SPEC_F_MAX, samplerate / 2.0))
 
@@ -72,6 +80,36 @@ class SpectrogramRenderer:
         self._spec_image = None
         self._spec_image_data = None
         self._spec_cache_key = ()
+
+    def set_inspection(self, result, preserve=False):
+        band = result.get("inspection_band", "full")
+        same = preserve and self.band == band and self._native_range
+        self.band = band
+        self._native_range = True
+        self._frequencies = result.get("spec_freq")
+        self._column_times = result.get("spec_times")
+        if not same:
+            self.reset_freq_view(result["samplerate"])
+        self.set_spec_data(result.get("spec_db"))
+
+    def _axis_bounds(self, samplerate):
+        if self.band != "full" and self._frequencies is not None:
+            return float(self._frequencies[0]), float(self._frequencies[-1])
+        upper = samplerate / 2 if self._native_range else min(_SPEC_F_MAX, samplerate / 2)
+        return _hz_to_mel(_SPEC_F_MIN), _hz_to_mel(upper)
+
+    def hz_for_axis(self, value):
+        return _mel_to_hz(value) if self.band == "full" else value
+
+    def _band_label(self, frequency):
+        return f"{frequency / 1000:.4g} kHz" if self.band == "high" else f"{frequency:.3g} Hz"
+
+    def axis_margin(self):
+        if self.band == "full":
+            return 0
+        fm = QFontMetrics(QFont("Consolas", 7))
+        return max(fm.horizontalAdvance(self._band_label(hz)) for hz in
+                   (self._mel_view_min, self._mel_view_max, (self._mel_view_min + self._mel_view_max) / 2)) + 7
 
     def invalidate(self):
         """Force image rebuild on next paint (e.g. resize)."""
@@ -105,7 +143,7 @@ class SpectrogramRenderer:
         if mel_range <= 0:
             return
         frac = max(0.0, min(1.0 - my / ctx.draw_h, 1.0))
-        freq = _mel_to_hz(self._mel_view_min + frac * mel_range)
+        freq = self.hz_for_axis(self._mel_view_min + frac * mel_range)
         freq_label = f"{freq / 1000:.1f} kHz" if freq >= 1000 else f"{freq:.0f} Hz"
         painter.setFont(QFont("Consolas", 7))
         label_color = QColor(180, 180, 180, 120)
@@ -120,15 +158,15 @@ class SpectrogramRenderer:
                   samplerate: int = 44100):
         """Zoom the mel frequency range by factor around anchor_mel."""
         mel_range = self._mel_view_max - self._mel_view_min
-        mel_full_min = _hz_to_mel(_SPEC_F_MIN)
-        mel_full_max = _hz_to_mel(min(_SPEC_F_MAX, samplerate / 2.0))
+        mel_full_min, mel_full_max = self._axis_bounds(samplerate)
         if anchor_mel is not None:
             anchor = max(self._mel_view_min, min(anchor_mel, self._mel_view_max))
             frac = (anchor - self._mel_view_min) / mel_range if mel_range > 0 else 0.5
         else:
             anchor = (self._mel_view_min + self._mel_view_max) / 2.0
             frac = 0.5
-        new_range = max(min(mel_range * factor, mel_full_max - mel_full_min), 50.0)
+        minimum = 1. if self.band == "low" else 50.
+        new_range = min(mel_full_max - mel_full_min, max(mel_range * factor, minimum))
         new_min = anchor - frac * new_range
         new_max = anchor + (1.0 - frac) * new_range
         if new_min < mel_full_min:
@@ -144,8 +182,7 @@ class SpectrogramRenderer:
 
     def scroll_freq(self, delta_mel: float, samplerate: int = 44100):
         """Pan the frequency view by delta_mel mels."""
-        mel_full_min = _hz_to_mel(_SPEC_F_MIN)
-        mel_full_max = _hz_to_mel(min(_SPEC_F_MAX, samplerate / 2.0))
+        mel_full_min, mel_full_max = self._axis_bounds(samplerate)
         mel_range = self._mel_view_max - self._mel_view_min
         new_min = self._mel_view_min + delta_mel
         new_max = self._mel_view_max + delta_mel
@@ -162,8 +199,7 @@ class SpectrogramRenderer:
 
     def reset_freq_view(self, samplerate: int):
         """Reset mel frequency view to full range (used by zoom_fit)."""
-        self._mel_view_min = _hz_to_mel(_SPEC_F_MIN)
-        self._mel_view_max = _hz_to_mel(min(_SPEC_F_MAX, samplerate / 2.0))
+        self._mel_view_min, self._mel_view_max = self._axis_bounds(samplerate)
         self._spec_image = None
         self._spec_cache_key = ()
 
@@ -246,8 +282,7 @@ class SpectrogramRenderer:
         frame_end = min(n_frames, ctx.view_end * n_frames // ctx.total_samples)
         if frame_end <= frame_start:
             frame_end = min(frame_start + 1, n_frames)
-        mel_full_min = _hz_to_mel(_SPEC_F_MIN)
-        mel_full_max = _hz_to_mel(min(_SPEC_F_MAX, ctx.samplerate / 2.0))
+        mel_full_min, mel_full_max = self._axis_bounds(ctx.samplerate)
         mel_full_range = mel_full_max - mel_full_min
         if mel_full_range <= 0:
             self._spec_image = None
@@ -256,7 +291,15 @@ class SpectrogramRenderer:
         row_hi = int(np.ceil((self._mel_view_max - mel_full_min) / mel_full_range * (n_mels - 1)))
         row_lo = max(0, min(row_lo, n_mels - 1))
         row_hi = max(row_lo + 1, min(row_hi + 1, n_mels))
-        view_spec = spec[row_lo:row_hi, frame_start:frame_end]
+        if self._column_times is None:
+            view_spec = spec[row_lo:row_hi, frame_start:frame_end]
+        else:
+            # Edge windows and the final partial group are not evenly spaced.
+            centers = self._column_times
+            boundaries = (centers[:-1] + centers[1:]) / 2
+            pixels = np.linspace(ctx.view_start, ctx.view_end, ctx.draw_w, endpoint=False)
+            columns = np.searchsorted(boundaries, pixels / ctx.samplerate)
+            view_spec = spec[row_lo:row_hi, columns]
         db_floor = self._spec_db_floor
         db_ceil = self._spec_db_ceil
         norm = np.clip((view_spec - db_floor) / max(db_ceil - db_floor, 1.0), 0.0, 1.0)
@@ -276,7 +319,7 @@ class SpectrogramRenderer:
         """Draw frequency scale on left/right margins for spectrogram mode."""
         if self._spec_db is None or ctx.draw_h <= 0:
             return
-        _FREQ_TICKS = [50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000]
+        ticks = [50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 40000, 80000]
         _MIN_TICK_SPACING = 20
         mel_min = self._mel_view_min
         mel_max = self._mel_view_max
@@ -293,18 +336,25 @@ class SpectrogramRenderer:
         grid_color.setAlpha(35)
         grid_pen = QPen(grid_color, 1, Qt.DotLine)
         used_ys: list[int] = []
-        for freq in _FREQ_TICKS:
-            mel = _hz_to_mel(freq)
+        if self.band != "full":
+            ticks = np.linspace(mel_min, mel_max, 3)
+        for freq in ticks:
+            mel = _hz_to_mel(freq) if self.band == "full" else freq
             if mel < mel_min or mel > mel_max:
                 continue
             frac = (mel - mel_min) / mel_range
             y = int(ctx.draw_h * (1.0 - frac))
-            if y < text_h or y > ctx.draw_h - text_h:
+            if self.band != "full":
+                y = max(text_h // 2 + 1, min(y, ctx.draw_h - text_h // 2 - 1))
+            elif y < text_h or y > ctx.draw_h - text_h:
                 continue
             if any(abs(uy - y) < _MIN_TICK_SPACING for uy in used_ys):
                 continue
             used_ys.append(y)
-            label = f"{freq // 1000}k" if freq >= 1000 else str(freq)
+            if self.band == "full":
+                label = f"{freq / 1000:g}k" if freq >= 1000 else f"{freq:g}"
+            else:
+                label = self._band_label(freq)
             painter.setPen(grid_pen)
             painter.drawLine(ctx.x0, y, ctx.x0 + ctx.draw_w, y)
             painter.setPen(tick_pen)

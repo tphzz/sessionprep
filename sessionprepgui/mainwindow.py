@@ -51,6 +51,7 @@ from .prefs import PreferencesDialog
 from .detail import PlaybackController, DetailMixin
 from .change_marker import install_tab_marker, use_marker_tab_bar
 from .detail.help_panel import FileReportPane
+from .detail.repair_editor import TrackRepairEditor
 from .detail.report_style import wrap_report_html
 from .waveform import WaveformPanel, WaveformLoadWorker
 from .widgets import ProgressPanel
@@ -61,7 +62,7 @@ from .window_geometry import (
 )
 from .analysis import (
     AnalysisMixin,
-    AudioLoadWorker, BatchReanalyzeWorker, DawCheckWorker,
+    AudioLoadWorker, DawCheckWorker,
     DawFetchWorker, DawTransferWorker, PrepareWorker,
 )
 from .tracks import (
@@ -146,7 +147,6 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
         self._topo_source_tracks = []  # original source tracks for Phase 1 input table
         self._topo_topology = None  # Phase 1 topology (separate from session.topology)
         self._worker = None
-        self._batch_worker: BatchReanalyzeWorker | None = None
         self._batch_filenames: set[str] = set()
         self._wf_worker: WaveformLoadWorker | None = None
         self._audio_load_worker: AudioLoadWorker | None = None
@@ -156,7 +156,6 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
         self._waveform_context_generation: int | None = None
         self._waveform_unavailable_generation: int | None = None
         self._session_groups: list[dict] = []
-        self._prev_group_assignments: dict[str, str | None] = {}
         self._active_session_preset: str = "Default"
         self._recursive_scan: bool = False
         self._session_overrides: dict[str, Any] = {}
@@ -174,6 +173,9 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
         self._daw_fetch_worker: DawFetchWorker | None = None
         self._daw_transfer_worker: DawTransferWorker | None = None
         self._prepare_worker: PrepareWorker | None = None
+        self._repair_plan_worker = None
+        self._repair_plan_pending = set()
+        self._repair_plan_anchors = set()
 
         self._batch_manager = BatchManager(self)
         self._close_after_batch = False
@@ -816,6 +818,11 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
         self._file_splitter = content_splitter(Qt.Vertical)
 
         self._file_report = self._make_report_browser()
+        self._repair_editor = TrackRepairEditor(self._file_report)
+        self._file_report.repairRequested.connect(lambda key: self._open_track_repairs(self._current_track, key))
+        self._repair_editor.choiceChanged.connect(self._set_track_repair_choice)
+        self._repair_editor.adjustGainRequested.connect(self._adjust_failed_output_gain)
+        self._repair_editor.processingFocusRequested.connect(self._focus_processing_menu)
         self._file_report.visualizeRequested.connect(self._visualize_detector)
         self._file_report.reportChanged.connect(self._on_file_report_context_changed)
         self._file_report_pane = FileReportPane(self._file_report)
@@ -847,6 +854,8 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
         self._play_btn = self._wf_panel.play_btn
         self._stop_btn = self._wf_panel.stop_btn
         self._time_label = self._wf_panel.time_label
+        from .detail.repair_preview import RepairPreview
+        self._repair_preview = RepairPreview(self)
 
         # Connect spectrogram action groups to DetailMixin slots
         self._wf_panel.fft_group.triggered.connect(self._on_spec_fft_changed)
@@ -1007,6 +1016,8 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
             self._refresh_enabled_processors()
         if impact.requires_phase1 or impact.requires_phase2:
             self._mark_prepare_stale()
+        if impact.repair_keys and self._session and self._phase_tabs.isTabEnabled(_PHASE_ANALYSIS):
+            self._queue_repair_plan(self._session.tracks)
         if impact.presentation_keys and self._session:
             self._refresh_presentation()
 
@@ -1175,14 +1186,24 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
 
         self._playback.stop()
         self._pending_after_check = None
+        self._repair_preview.close()
+        # Qt destroys child threads along with their window. A long filter can
+        # finish its current track after cancellation, including on a closed project.
+        from .analysis.worker import RepairPlanWorker
+        for worker in self.findChildren(RepairPlanWorker):
+            worker.cancel()
+            worker.wait()
+        self._repair_plan_worker = None
+        for worker in self.findChildren(PrepareWorker):
+            worker.requestInterruption()
+            worker.wait()
+        self._prepare_worker = None
 
         # Stop active background tasks cleanly so ThreadPoolExecutor can terminate
         from PySide6.QtCore import QThread
         for worker_attr in (
             "_p1_worker",
             "_worker",
-            "_batch_worker",
-            "_prepare_worker",
             "_peak_build_worker",
             "_topo_apply_worker",
             "_daw_check_worker",

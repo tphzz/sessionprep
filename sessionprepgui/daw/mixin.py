@@ -455,7 +455,8 @@ class DawMixin:  # pylint: disable=too-few-public-methods
         has_assignments = bool(dp_state.get("assignments"))
         self._auto_assign_action.setEnabled(has_folders)
         self._unassign_all_action.setEnabled(has_assignments)
-        self._transfer_action.setEnabled(has_processor and has_assignments)
+        self._transfer_action.setEnabled(has_processor and has_assignments
+                                         and getattr(self, "_prepare_worker", None) is None)
 
         batch_mode = getattr(self, "_batch_mode_action", None)
         if batch_mode and batch_mode.isChecked():
@@ -651,7 +652,7 @@ class DawMixin:  # pylint: disable=too-few-public-methods
     @Slot()
     def _on_daw_transfer(self):
         processor, source = self._active_daw_processor, self._session
-        if not processor or not source or self._daw_operation_running():
+        if not processor or not source or self._daw_operation_running() or getattr(self, "_prepare_worker", None):
             return
         log.info("DAW transfer: %s (%d tracks)", processor.name, len(source.transfer_manifest))
 
@@ -736,6 +737,7 @@ class DawMixin:  # pylint: disable=too-few-public-methods
             "colors": deepcopy(self._config.get("colors", PT_DEFAULT_COLORS)),
         }
         config["_source_dir"] = self._source_dir
+        config["_use_processed"] = self._use_processed_cb.isChecked()
         config["_output_folder"] = self._config.get("app", {}).get(
             "phase2_output_folder", "sp_02_prepared")
         return config

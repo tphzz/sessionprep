@@ -40,6 +40,7 @@ class WaveformWidget(QWidget):
         self._issues: list = []
         self._view_start: int = 0
         self._view_end: int = 0
+        self._fit_vscale: float = 1.0
         self._vscale: float = 1.0
         # RMS / overlay / marker toggles
         self._rms_window_samples: int = 0
@@ -81,6 +82,9 @@ class WaveformWidget(QWidget):
 
     def set_audio(self, audio_data: np.ndarray | None, samplerate: int):
         """Load raw audio data.  Peak finding is deferred to first paint."""
+        self._corrected = False
+        self._loading = False
+        self._fit_vscale = 1.
         if audio_data is None or audio_data.size == 0:
             self._channels = []
             self._num_channels = 0
@@ -140,7 +144,7 @@ class WaveformWidget(QWidget):
         downsampling raw samples on each paint.  Returns ``False`` if
         metadata shows the peak cache belongs to a different waveform.
         """
-        if not self._peak_data_matches_current_waveform(peak_data):
+        if getattr(self, "_corrected", False) or not self._peak_data_matches_current_waveform(peak_data):
             self._wf_renderer.set_peak_data(None)
             self._invalidate_bg()
             return False
@@ -148,14 +152,23 @@ class WaveformWidget(QWidget):
         self._invalidate_bg()
         return True
 
-    def set_loading(self, loading: bool):
+    def set_loading(self, loading: bool, *, preserve_view=False):
         """Show or hide a 'Loading waveform…' placeholder."""
         self._loading = loading
-        if loading:
+        if loading and not preserve_view:
             self._channels = []
             self._num_channels = 0
             self._total_samples = 0
             self._wf_renderer.reset()
+        self._invalidate_bg()
+
+    def set_unavailable(self):
+        """Remove stale samples and peaks, retaining the viewport for a retry."""
+        self._loading = False
+        self._channels = []
+        self._num_channels = self._total_samples = 0
+        self._wf_renderer.reset()
+        self._spec_renderer.set_spec_data(None)
         self._invalidate_bg()
 
     def set_preview_mode(self, channels_count: int, total_samples: int,
@@ -166,6 +179,8 @@ class WaveformWidget(QWidget):
         log = logging.getLogger(__name__)
 
         channels_count = max(1, channels_count)
+        self._corrected = False
+        self._fit_vscale = 1.
         self._channels = [np.array([], dtype=np.float32) for _ in range(channels_count)]
         self._num_channels = channels_count
         self._total_samples = total_samples
@@ -198,7 +213,7 @@ class WaveformWidget(QWidget):
         log.debug("[Trace] WaveformWidget.set_preview_mode finished in %.2f ms", (time.perf_counter() - t0) * 1000)
         return True
 
-    def set_precomputed(self, result: dict):
+    def set_precomputed(self, result: dict, *, preserve_view=False):
         """Apply pre-computed waveform data from a WaveformLoadWorker."""
         import time, logging
         t0 = time.perf_counter()
@@ -208,11 +223,15 @@ class WaveformWidget(QWidget):
         self._num_channels = len(self._channels)
         self._total_samples = result["total_samples"]
         self._samplerate = result["samplerate"]
-        self._cursor_sample = 0
-        self._cursor_y_value = None
-        self._view_start = 0
-        self._view_end = self._total_samples
-        self._vscale = 1.0
+        self._corrected = result.get("corrected", False)
+        audition = result.get("audition")
+        self._fit_vscale = 10 ** (audition.monitor_gain_db / 20) if audition is not None else 1.
+        if not preserve_view:
+            self._cursor_sample = 0
+            self._cursor_y_value = None
+            self._view_start = 0
+            self._view_end = self._total_samples
+            self._vscale = self._fit_vscale
         self._rms_window_samples = result["rms_window_samples"]
         self._wf_renderer.set_track_data(
             self._channels,
@@ -226,8 +245,11 @@ class WaveformWidget(QWidget):
             rms_max_db=result["rms_max_db"],
             rms_max_amplitude=result["rms_max_amplitude"],
         )
-        self._spec_renderer.reset(result["samplerate"])
-        self._spec_renderer.set_spec_data(result.get("spec_db"))
+        if audition is not None:
+            self._spec_renderer.set_inspection(result, preserve_view)
+        else:
+            self._spec_renderer.reset(result["samplerate"])
+            self._spec_renderer.set_spec_data(result.get("spec_db"))
         self._loading = False
         self._invalidate_bg()
         log.debug("[Trace] WaveformWidget.set_precomputed finished in %.2f ms", (time.perf_counter() - t0) * 1000)
@@ -256,8 +278,10 @@ class WaveformWidget(QWidget):
 
     def _draw_area(self) -> tuple[int, int]:
         """Return (x0, draw_w) for the waveform drawing area."""
-        draw_w = max(1, self.width() - self._MARGIN_LEFT - self._MARGIN_RIGHT)
-        return self._MARGIN_LEFT, draw_w
+        margin = self._spec_renderer.axis_margin() if self._display_mode == "spectrogram" else 0
+        left = max(margin, self._MARGIN_LEFT)
+        right = max(margin, self._MARGIN_RIGHT)
+        return left, max(1, self.width() - left - right)
 
     def _sample_to_x(self, sample: int, w: int) -> int:
         view_len = self._view_end - self._view_start
@@ -335,6 +359,7 @@ class WaveformWidget(QWidget):
             self._issues, self._enabled_overlays,
             self._display_mode, self._num_channels,
             self._spec_renderer.mel_view_min, self._spec_renderer.mel_view_max,
+            self._spec_renderer.band != "full",
         )
         draw_time_scale(bg_painter, x0, draw_w, draw_h,
                         self._view_start, self._view_end, self._samplerate)
@@ -357,7 +382,8 @@ class WaveformWidget(QWidget):
             painter.end()
             return
 
-        if not self._is_resizing and (self._bg_pixmap is None or getattr(self._bg_pixmap, "_logical_size", None) != sz):
+        if (not self._is_resizing or self._stale_pixmap is None) and (
+                self._bg_pixmap is None or getattr(self._bg_pixmap, "_logical_size", None) != sz):
             self._update_bg_pixmap(w, h)
 
         painter = QPainter(self)
@@ -394,7 +420,7 @@ class WaveformWidget(QWidget):
                         if mel_range > 0 and draw_h > 0:
                             frac = (self._cursor_y_value - mel_min) / mel_range
                             cursor_y = int(draw_h * (1.0 - frac))
-                            freq = _mel_to_hz(self._cursor_y_value)
+                            freq = self._spec_renderer.hz_for_axis(self._cursor_y_value)
                             cursor_label = (f"{freq / 1000:.1f} kHz" if freq >= 1000
                                             else f"{freq:.0f} Hz")
                     else:
@@ -703,7 +729,7 @@ class WaveformWidget(QWidget):
         """Reset horizontal zoom and vertical scale to show the entire file."""
         self._view_start = 0
         self._view_end = self._total_samples
-        self._vscale = 1.0
+        self._vscale = self._fit_vscale
         self._spec_renderer.reset_freq_view(self._samplerate)
         self._wf_renderer.invalidate()
         self._invalidate_bg()

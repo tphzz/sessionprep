@@ -17,6 +17,9 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
+    QDialog,
+    QDialogButtonBox,
+    QFormLayout,
     QFileDialog,
     QHeaderView,
     QHBoxLayout,
@@ -34,6 +37,7 @@ from sessionpreplib.audio import AUDIO_EXTENSIONS, discover_audio_files, discove
 from sessionpreplib.config import (
     classify_structured_config_change,
     default_config,
+    REPAIR_PARAMS,
     infer_session_overrides,
     resolve_session_config,
 )
@@ -47,7 +51,9 @@ from ..helpers import track_analysis_label
 from ..prefs.config_pages import _config_section_values
 from ..prefs.param_form import ConfigResetButton, _read_widget, _set_widget_value
 from ..prefs.param_widgets import build_config_pages, load_config_widgets
-from ..session.io import save_session as _save_session_file, load_session as _load_session_file
+from ..session.io import (
+    load_session as _load_session_file, restore_layout_sources, save_session as _save_session_file,
+)
 from ..settings import build_defaults
 from ..tracks.table_widgets import (
     DETAIL_TAB_INSET,
@@ -59,10 +65,10 @@ from ..tracks.table_widgets import (
 )
 from ..change_marker import MARKER_COLUMN_WIDTH, set_item_marker, set_tab_marker
 from ..controls import (
-    content_splitter, fit_navigation_pane, inset_pane, set_action_busy, settings_scroll_area,
+    FormDoubleSpinBox, content_splitter, fit_navigation_pane, inset_pane, set_action_busy, settings_scroll_area,
 )
 from ..theme import COLORS, FILE_COLOR_OK, FILE_COLOR_ERROR
-from .worker import AnalyzeWorker, PrepareWorker, Phase1AnalyzeWorker
+from .worker import AnalyzeWorker, PrepareWorker, Phase1AnalyzeWorker, RepairPlanWorker
 
 
 class AnalysisMixin:  # pylint: disable=too-few-public-methods
@@ -343,11 +349,22 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
     def _cancel_worker(self, worker_attr: str) -> None:
         """Safely detach and cancel a background worker to avoid QThread GC destruction."""
         worker = getattr(self, worker_attr, None)
+        if isinstance(worker, (RepairPlanWorker, PrepareWorker)):
+            setattr(self, worker_attr, None)
+            worker.disconnect(self)
+            if isinstance(worker, RepairPlanWorker):
+                worker.cancel()
+            else:
+                worker.requestInterruption()
+            worker.finished.connect(worker.deleteLater)
+            if worker.isFinished():
+                worker.deleteLater()
+            return
         if worker is not None:
             if hasattr(worker, "isRunning") and worker.isRunning():
                 # Disconnect all signals so it stops updating UI
                 try:
-                    worker.disconnect()
+                    worker.disconnect(self)
                 except RuntimeError:
                     pass
                 if hasattr(worker, "cancel"):
@@ -375,8 +392,12 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         self._on_stop()
         self._cancel_worker("_p1_worker")
         self._cancel_worker("_worker")
-        self._cancel_worker("_batch_worker")
         self._cancel_worker("_prepare_worker")
+        self._cancel_worker("_repair_plan_worker")
+        self._repair_plan_pending = set()
+        self._repair_plan_anchors = set()
+        self._batch_filenames = set()
+        self._track_table.setSortingEnabled(True)
         for attr in ("_prepare_action", "_topo_apply_action", "_transfer_action"):
             action = getattr(self, attr, None)
             if action is not None:
@@ -384,6 +405,8 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         self._cancel_worker("_peak_build_worker")
         self._peak_cache = {}
         self._session = None
+        self._use_processed_cb.setChecked(False)
+        self._update_use_processed_action()
         self._summary = None
         self._current_track = None
         self._selected_detector_overlays = set()
@@ -564,6 +587,8 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         """Save the current session state to a .spsession file."""
         if not self._session or not self._source_dir:
             return
+        if self._prepare_worker is not None or self._repair_plan_worker is not None:
+            return
         log.info("Save session")
         default_path = os.path.join(self._source_dir, "session.spsession")
         path, _ = QFileDialog.getSaveFileName(
@@ -605,7 +630,10 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
             "topology": self._topo_topology,
             "transfer_manifest": self._session.transfer_manifest if self._session else [],
             "topology_applied": self._topology_dir is not None,
+            "topology_dir": self._topology_dir,
             "prepare_state": self._session.prepare_state if self._session else "none",
+            "prepare_errors": self._session.config.get("_prepare_errors", []) if self._session else [],
+            "output_gain_adjustments": self._session.config.get("_output_gain_adjustments", {}) if self._session else {},
             "base_transfer_manifest": self._session.base_transfer_manifest if self._session else [],
             "use_processed": self._use_processed_cb.isChecked(),
             "recursive_scan": self._recursive_scan,
@@ -702,19 +730,7 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
 
         tracks = data["tracks"]
 
-        # Phase 2 tracks live in sp_01_tracklayout/, not source_dir.
-        # _deserialize_track resolves against source_dir — correct that here.
-        if data.get("topology_applied", False):
-            topo_folder = self._config.get("app", {}).get(
-                "phase1_output_folder", "sp_01_tracklayout")
-            topo_dir = os.path.join(source_dir, topo_folder)
-            for track in tracks:
-                track.filepath = os.path.join(topo_dir, track.filename)
-                if not os.path.isfile(track.filepath):
-                    track.status = "Error"
-                elif track.status == "Error":
-                    # Was marked Error only because source_dir lookup failed
-                    track.status = "OK"
+        layout_dir = restore_layout_sources(data, app_cfg.get("phase1_output_folder", "sp_01_tracklayout"))
 
         flat = self._flat_config()
 
@@ -732,13 +748,19 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         session_config_flat = dict(default_config())
         session_config_flat.update(flat)
         session_config_flat["_source_dir"] = source_dir
+        session_config_flat["_prepare_errors"] = data.get("prepare_errors", [])
+        session_config_flat["_output_gain_adjustments"] = data.get("output_gain_adjustments", {})
 
         prepare_state = data.get("prepare_state", "none")
+        saved_repairs = _config_section_values(data.get("session_config") or {}, "processors.corrective")
+        current_repairs = _config_section_values(effective, "processors.corrective")
+        repair_defaults_changed = any(saved_repairs.get(p.key, p.default) !=
+                                      current_repairs.get(p.key, p.default) for p in REPAIR_PARAMS)
         if prepare_state == "ready":
             since_saved = infer_session_overrides(effective, data.get("session_config"))
             saved = resolve_session_config(effective, since_saved)
             impact = classify_structured_config_change(saved, effective)
-            if impact.requires_phase1 or impact.requires_phase2:
+            if impact.requires_phase1 or impact.requires_phase2 or repair_defaults_changed:
                 prepare_state = "stale"
 
         session = SessionContext(
@@ -783,12 +805,8 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         self._render_summary()
 
         # ── Restore topology_dir if topology was applied ─────────────────────
-        if data.get("topology_applied", False):
-            output_folder = self._config.get("app", {}).get(
-                "phase1_output_folder", "sp_01_tracklayout")
-            topo_dir = os.path.join(source_dir, output_folder)
-            if os.path.isdir(topo_dir):
-                self._topology_dir = topo_dir
+        if layout_dir and os.path.isdir(layout_dir):
+            self._topology_dir = layout_dir
 
         # ── Restore or reconstruct output_tracks ───────────────
         if data.get("output_tracks"):
@@ -849,9 +867,8 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         self._update_prepare_button()
         # Restore "Use Processed" checkbox state
         use_processed = data.get("use_processed", False)
-        if use_processed and session.prepare_state in ("ready", "stale"):
-            session.config["_use_processed"] = True
-            self._use_processed_cb.setChecked(True)
+        session.config["_use_processed"] = use_processed
+        self._use_processed_cb.setChecked(use_processed)
         self._update_use_processed_action()
 
         self._update_daw_lifecycle_buttons()
@@ -880,35 +897,47 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         # And for analysis tracks (Phase 2 waveforms) if topology was applied
         if self._topology_dir and tracks:
             self._start_peak_build(tracks, self._topology_dir)
+        if repair_defaults_changed:
+            self._queue_repair_plan(tracks)
 
     # ── Analyze ──────────────────────────────────────────────────────────
 
     @Slot()
     def _on_analyze(self):
+        if self._prepare_worker is not None:
+            return
         if not self._source_dir:
             return
 
         # Phase 2 analysis reads from sp_01_tracklayout/ if available
         analyze_dir = self._topology_dir or self._source_dir
         log.info("Analyze: %s", analyze_dir)
+        self._cancel_worker("_repair_plan_worker")
+        self._repair_plan_pending = set()
+        self._repair_plan_anchors = set()
+        self._batch_filenames = set()
+        self._track_table.setSortingEnabled(True)
 
         # Snapshot existing group assignments and user overrides so we can
         # restore them after re-analysis (filenames that survive are matched).
-        self._prev_group_assignments = {}
-        self._prev_track_overrides = {}
+        track_settings = {}
         if self._session:
-            self._prev_group_assignments = {
-                t.filename: t.group for t in self._session.tracks if t.group}
             for t in self._session.tracks:
                 overrides = {}
                 if t.classification_override:
                     overrides["classification_override"] = t.classification_override
                 if t.rms_anchor_override:
                     overrides["rms_anchor_override"] = t.rms_anchor_override
-                if t.processor_skip:
+                if t.processor_skip or "audio_classifier" in t.detector_results:
                     overrides["processor_skip"] = set(t.processor_skip)
+                if t.repair_overrides:
+                    overrides["repair_overrides"] = dict(t.repair_overrides)
+                if t.manual_gain_db is not None:
+                    overrides["manual_gain_db"] = t.manual_gain_db
+                if t.group is not None:
+                    overrides["group"] = t.group
                 if overrides:
-                    self._prev_track_overrides[t.filename] = overrides
+                    track_settings[t.filename] = overrides
 
         self._analyze_action.setEnabled(False)
         self._current_track = None
@@ -927,7 +956,7 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
             config["_fader_ceiling_db"] = self._active_daw_processor.fader_ceiling_db
 
         self._worker = AnalyzeWorker(analyze_dir, config,
-                                     recursive=self._recursive_scan)
+                                     recursive=self._recursive_scan, track_settings=track_settings)
         self._worker.progress.connect(self._on_worker_progress)
         self._worker.progress_value.connect(self._on_worker_progress_value)
         self._worker.track_analyzed.connect(self._on_track_analyzed)
@@ -1070,6 +1099,12 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         current_project_name = self._project_name_edit.text().strip()
         session.project_name = current_project_name
 
+        if self._session and self._session.output_tracks:
+            session.output_tracks = self._session.output_tracks
+            session.prepare_state = "stale"
+            session.transfer_manifest = self._session.transfer_manifest
+            session.base_transfer_manifest = self._session.base_transfer_manifest
+            session.daw_state = self._session.daw_state
         self._session = session
         self._summary = summary
         self._analyze_action.setEnabled(True)
@@ -1084,20 +1119,7 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
             self._merge_groups_from_preset()
             self._populate_group_preset_combo()
         else:
-            # Re-analysis — restore previous group assignments and
-            # user overrides by filename match.
-            prev = self._prev_group_assignments
-            prev_ov = self._prev_track_overrides
-            for track in session.tracks:
-                track.group = prev.get(track.filename)
-                ov = prev_ov.get(track.filename)
-                if ov:
-                    track.classification_override = ov.get(
-                        "classification_override")
-                    track.rms_anchor_override = ov.get(
-                        "rms_anchor_override")
-                    track.processor_skip = ov.get(
-                        "processor_skip", set())
+            # AnalyzeWorker applied the saved choices before planning gain.
             self._populate_groups_tab()
             self._refresh_group_combos()
 
@@ -1248,6 +1270,10 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         cur_track = getattr(self, "_current_track", None)
         if cur_track and cur_track.filename == filename:
             wf = getattr(self, "_waveform", None)
+            preview = getattr(self, "_repair_preview", None)
+            if preview and preview.track is cur_track and (
+                    preview.panel.corrected or not preview.displayed or preview.worker is not None):
+                return
             if wf:
                 wf.set_peak_data(peak_data)
                 if getattr(wf, "_loading", False):
@@ -1282,6 +1308,93 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         self._status_bar.showMessage(f"Error: {message}")
         self._progress_fail(message)
 
+    def _set_track_repair_choice(self, track, key, value):
+        if self._session is None or not any(t is track for t in self._session.tracks):
+            return
+        if value is None:
+            track.repair_overrides.pop(key, None)
+        else:
+            track.repair_overrides[key] = value
+        self._queue_repair_plan([track])
+
+    def _queue_repair_plan(self, tracks, *, refresh_anchors=False):
+        """Coalesce edits while DSP is running and publish only the newest choice for each file."""
+        if self._session is None:
+            return
+        pending = getattr(self, "_repair_plan_pending", set())
+        changed = {t.filename for t in tracks if t.status == "OK"}
+        pending.update(changed)
+        preview = getattr(self, "_repair_preview", None)
+        if preview and preview.track is not None and preview.track.filename in changed:
+            preview.planning()
+        if refresh_anchors:
+            self._repair_plan_anchors.update(changed)
+        self._repair_plan_pending = pending
+        if not pending:
+            return
+        self._mark_prepare_stale()
+        self._save_session_action.setEnabled(False)
+        self._prepare_action.setEnabled(False)
+        if getattr(self, "_repair_plan_worker", None) is not None or self._prepare_worker is not None:
+            return
+        tracks = [t for t in self._session.tracks if t.filename in pending]
+        pending.clear()
+        config = {**self._session.config, **self._flat_config()}
+        self._repair_plan_worker = RepairPlanWorker(
+            self._session, tracks, config, self, refresh_anchors=self._repair_plan_anchors)
+        if self._batch_filenames:
+            self._repair_plan_worker.progress_value.connect(self._on_worker_progress_value)
+        self._repair_plan_worker.completed.connect(self._repair_plan_finished, Qt.QueuedConnection)
+        self._repair_plan_worker.start()
+
+    @Slot(object)
+    def _repair_plan_finished(self, worker):
+        if self._repair_plan_worker is not worker or self._session is not worker.session:
+            return
+        worker.wait()
+        self._repair_plan_worker = None
+        worker.deleteLater()
+        current = {t.filename: t for t in self._session.tracks}
+        committed = []
+        for planned in worker.tracks:
+            t = current.get(planned.filename)
+            if t is None or planned.filename in self._repair_plan_pending:
+                continue
+            problem = worker.failure or planned._cache.get("repair_error")
+            if problem:
+                t._cache["repair_error"] = problem
+                self._status_bar.showMessage(f"{t.filename}: {problem}")
+            else:
+                t._cache.pop("repair_error", None)
+            t.repair_recipe = planned.repair_recipe
+            t.repair_measurements = planned.repair_measurements
+            t.processor_results = planned.processor_results
+            if planned.filename in worker.refresh_anchors:
+                t.detector_results.update(planned.detector_results)
+                self._repair_plan_anchors.discard(planned.filename)
+            elif "ultrasonic" in planned.detector_results:
+                t.detector_results["ultrasonic"] = planned.detector_results["ultrasonic"]
+            committed.append(t)
+        self._session.config.update(self._flat_config())
+        self._apply_linked_group_levels()
+        for t in committed:
+            self._update_track_row(t.filename)
+            row = self._find_table_row(t.filename)
+            button = self._track_table.cellWidget(row, 7) if row >= 0 else None
+            if button:
+                self._update_processing_button_label(button, t, self._session.processors)
+            if t is self._current_track:
+                self._refresh_file_tab(t)
+                self._refresh_track_repair_editor(t)
+                self._refresh_repair_preview(t)
+        if self._repair_plan_pending:
+            self._queue_repair_plan([])
+        else:
+            self._save_session_action.setEnabled(True)
+            self._update_prepare_button()
+            if self._batch_filenames:
+                self._on_batch_done()
+
     # ── Prepare handlers ─────────────────────────────────────────────────
 
     @Slot()
@@ -1289,7 +1402,7 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         """Run the Prepare pipeline to generate processed audio files."""
         if not self._session or not self._source_dir:
             return
-        if self._prepare_worker is not None:
+        if self._prepare_worker is not None or getattr(self, "_repair_plan_worker", None) is not None:
             return  # already running
         log.info("Prepare: %s", self._source_dir)
 
@@ -1303,21 +1416,20 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
 
         # Use the session's configured processors
         processors = list(self._session.processors) if self._session.processors else []
-        if not processors:
-            self._status_bar.showMessage("No audio processors enabled.")
-            return
-
         set_action_busy(self._prepare_action, True, "Preparing…")
         self._prepare_action.setEnabled(False)
         self._progress_start("Preparing\u2026")
 
         self._prepare_worker = PrepareWorker(
             self._session, processors, output_dir)
+        self._prepare_worker.setParent(self)
+        self._save_session_action.setEnabled(False)
+        self._analyze_action.setEnabled(False)
+        self._update_daw_lifecycle_buttons()
         self._prepare_worker.progress.connect(self._on_prepare_progress)
         self._prepare_worker.progress_value.connect(
             self._on_prepare_progress_value)
-        self._prepare_worker.prepare_finished.connect(self._on_prepare_done)
-        self._prepare_worker.error.connect(self._on_prepare_error)
+        self._prepare_worker.completed.connect(self._on_prepare_done, Qt.QueuedConnection)
         self._prepare_worker.start()
 
     @Slot(str)
@@ -1328,43 +1440,99 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
     def _on_prepare_progress_value(self, current: int, total: int):
         self._progress_value(current, total)
 
-    @Slot()
-    def _on_prepare_done(self):
+    @Slot(object)
+    def _on_prepare_done(self, worker):
+        if self._prepare_worker is not worker or worker.owner is not self._session:
+            return
+        worker.wait()
+        if worker.failure:
+            self._on_prepare_error(worker.failure)
+            return
+        worker.publish()
+        outdated = worker.outdated
+        self._prepare_worker = None
+        worker.deleteLater()
         set_action_busy(self._prepare_action, False)
-        if self._prepare_worker is not None:
-            self._prepare_worker.deleteLater()
-            self._prepare_worker = None
+        self._analyze_action.setEnabled(not self._batch_filenames)
+        self._save_session_action.setEnabled(not self._repair_plan_pending)
+        self._update_daw_lifecycle_buttons()
         self._update_prepare_button()
         self._update_use_processed_action()
 
-        # Enable Session Setup now that transfer_manifest is populated
-        if self._session and self._session.transfer_manifest:
-            self._phase_tabs.setTabEnabled(_PHASE_SETUP, True)
-            self._phase_tabs.setCurrentIndex(_PHASE_SETUP)
-
-        prepared = sum(
-            1 for t in self._session.tracks
-            if t.processed_filepath is not None
-        )
+        prepared = len(self._session.config.get("_prepared_files", []))
         errors = self._session.config.get("_prepare_errors", [])
-        if errors:
-            msg = f"Prepare complete: {prepared} file(s) written, {len(errors)} error(s)"
+        if self._session.transfer_manifest:
+            self._phase_tabs.setTabEnabled(_PHASE_SETUP, True)
+        if self._current_track:
+            self._refresh_track_repair_editor(self._current_track)
+        if outdated:
+            msg = "Settings changed during Prepare. Run Prepare again for the current settings."
             self._progress_finish(msg)
             self._status_bar.showMessage(msg)
+        elif errors:
+            msg = f"Prepare incomplete: {prepared} file(s) written, {len(errors)} error(s)"
+            self._progress_fail(msg)
+            self._status_bar.showMessage(msg)
             detail = "\n".join(f"• {fn}: {err}" for fn, err in errors)
-            QMessageBox.warning(
-                self, "Prepare — errors",
-                f"{len(errors)} file(s) could not be written:\n\n{detail}\n\n"
-                "This is usually caused by a file being open in another "
-                "application (e.g. the waveform player). Close the file "
-                "and try again.",
-            )
+            adjustments = self._session.config.get("_output_gain_adjustments", {})
+            track = next((t for t in self._session.tracks if t.filename in adjustments), None)
+            if track is None:
+                QMessageBox.warning(self, "Prepare — errors", detail)
+            else:
+                box = QMessageBox(QMessageBox.Warning, "Output gain needs adjustment",
+                                  detail, QMessageBox.Close, self)
+                adjust = box.addButton("Adjust Gain", QMessageBox.ActionRole)
+                box.exec()
+                if box.clickedButton() is adjust:
+                    self._adjust_failed_output_gain(track)
         else:
             msg = f"Prepare complete: {prepared} file(s) written"
             log.info("Prepare complete: %d file(s)", prepared)
             self._progress_finish(msg)
             self._status_bar.showMessage(msg)
+            if self._session.transfer_manifest and not self._repair_plan_pending:
+                self._phase_tabs.setCurrentIndex(_PHASE_SETUP)
         self._populate_setup_table()
+        if self._repair_plan_pending:
+            self._queue_repair_plan([])
+
+    def _adjust_failed_output_gain(self, track):
+        """Offer the measured safe trim. Only Apply changes the track's gain."""
+        adjustment = self._session.config.get("_output_gain_adjustments", {}).get(track.filename)
+        if not adjustment:
+            return
+        norm = track.processor_results.get("bimodal_normalize")
+        normalizing = (norm is not None and "bimodal_normalize" not in track.processor_skip
+                       and norm.classification not in ("Skip", "Silent"))
+        current = norm.gain_db if normalizing else float(track.manual_gain_db or 0)
+        previous = adjustment.get("gain_db", current)
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Adjust Gain" if normalizing else "Manual output gain")
+        form = QFormLayout(dialog)
+        form.addRow(QLabel(track.filename))
+        gain = FormDoubleSpinBox()
+        gain.setRange(-160, 60)
+        gain.setDecimals(1)
+        gain.setSingleStep(0.1)
+        gain.setValue(previous - adjustment["reduction_db"])
+        form.addRow("Output gain (dB)", gain)
+        forecast = QLabel()
+        def show_peak():
+            peak = adjustment["peak_db"] + gain.value() - previous
+            forecast.setText(f"At this gain, the prepared peak is {peak:+.2f} dBFS.")
+        show_peak()
+        gain.valueChanged.connect(show_peak)
+        form.addRow(forecast)
+        form.addRow(QLabel("Original and Corrected audition both stay at unity before output gain."))
+        buttons = QDialogButtonBox(QDialogButtonBox.Cancel)
+        apply = buttons.addButton("Apply gain", QDialogButtonBox.AcceptRole)
+        apply.setDefault(True)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        form.addRow(buttons)
+        if dialog.exec() == QDialog.Accepted:
+            track.manual_gain_db = gain.value()
+            self._queue_repair_plan([track])
 
     @Slot(str)
     def _on_prepare_error(self, message: str):
@@ -1374,12 +1542,17 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
             self._prepare_worker.deleteLater()
             self._prepare_worker = None
         self._prepare_action.setEnabled(True)
+        self._analyze_action.setEnabled(not self._batch_filenames)
+        self._save_session_action.setEnabled(not self._repair_plan_pending)
+        self._update_daw_lifecycle_buttons()
         self._progress_fail(message)
         self._status_bar.showMessage(f"Prepare failed: {message}")
+        if self._repair_plan_pending:
+            self._queue_repair_plan([])
 
     def _update_prepare_button(self):
         """Update the Prepare button text and enabled state based on prepare_state."""
-        if getattr(self, "_prepare_worker", None) is not None:
+        if getattr(self, "_prepare_worker", None) is not None or getattr(self, "_repair_plan_worker", None) is not None:
             return
         if not self._session:
             self._prepare_action.setEnabled(False)
@@ -1399,6 +1572,8 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
 
     def _mark_prepare_stale(self):
         """Mark prepared files as stale if they were previously ready."""
+        if getattr(self, "_prepare_worker", None) is not None:
+            self._prepare_worker.outdated = True
         if self._session and self._session.prepare_state == "ready":
             self._session.prepare_state = "stale"
             self._update_prepare_button()
