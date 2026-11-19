@@ -365,3 +365,128 @@ def test_double_monitor_pad_precedes_device_narrowing_on_both_sources(app, strea
             np.testing.assert_allclose(block, np.tile(expected, (frames, 1)), rtol=1.e-6, atol=1.e-7)
     finally:
         player.stop()
+
+
+def _worker_spectra(track, band):
+    from sessionprepgui.waveform.compute import WaveformLoadWorker
+
+    pair = None
+    for corrected in (False, True):
+        worker = WaveformLoadWorker(None, track.samplerate, track.samplerate // 4,
+                                    preview_track=track, audition=pair, corrected=corrected,
+                                    band=band, spec_n_fft=512)
+        results, errors = [], []
+        worker.finished.connect(results.append)
+        worker.failed.connect(errors.append)
+        worker.run()
+        assert not errors and len(results) == 1, errors
+        pair = worker.audition
+        yield results[0], pair.corrected if corrected else pair.original
+
+
+@pytest.mark.parametrize("rate,hz,db,band,recipe", [
+    (48000, 23997.5, -40, "high", RepairRecipe(low_cut_hz=40)),
+    (48000, 23990., -60, "high", RepairRecipe(low_cut_hz=40)),
+    (48000, 23997.5, -40, "full", RepairRecipe(low_cut_hz=40)),
+    (48000, 41.2034446, -40, "full", RepairRecipe(low_cut_hz=40)),
+    (48000, 23990., -40, "high", RepairRecipe(dc_remove=True)),
+    (96000, .75, -40, "low", RepairRecipe(ultrasonic=True)),
+])
+def test_corrected_worker_calibrates_the_line_present_in_each_render(
+        app, tmp_path, rate, hz, db, band, recipe):
+    import soundfile as sf
+    from sessionpreplib.audio import load_track
+    from sessionprepgui.waveform.spectrogram import SpectrogramRenderer, SpecRenderCtx
+
+    t = np.arange(4 * rate) / rate
+    phase = 2 * np.pi * hz * t + .923
+    path = tmp_path / "calibration.wav"
+    sf.write(path, 10 ** (db / 20) * np.cos(phase), rate, subtype="PCM_16")
+    track = load_track(str(path))
+    track.repair_recipe, track.audio_data = recipe, None
+    measured = (t >= 1.) & (t < 3.)
+    basis = np.column_stack((np.cos(phase[measured]), np.sin(phase[measured]), np.ones(measured.sum())))
+    for result, audio in _worker_spectra(track, band):
+        a, b, _ = np.linalg.lstsq(basis, audio[measured], rcond=None)[0]
+        target = 20 * np.log10(np.hypot(a, b))
+        times = result["spec_times"]
+        settled = np.flatnonzero((times >= 1.) & (times < 3.))
+        peaks = result["spec_db"][:, settled].max(axis=0)
+        np.testing.assert_allclose(peaks, target, atol=.3)
+        renderer = SpectrogramRenderer()
+        renderer.set_colormap("grayscale")
+        renderer.set_inspection(result)
+        for j in (settled[np.argmin(peaks)], settled[np.argmax(peaks)]):
+            center = round(times[j] * rate)
+            ctx = SpecRenderCtx(0, 30, 50, center - 1, center + 1, len(audio), rate)
+            renderer._build_spec_image(ctx)
+            brightest = max(renderer._spec_image.pixelColor(x, y).red() for x in range(30) for y in range(50))
+            expected = 255 * (target - renderer._spec_db_floor) / (renderer._spec_db_ceil - renderer._spec_db_floor)
+            assert abs(brightest - expected) <= 2
+
+
+@pytest.mark.parametrize("rate,hz,band,recipe,reduction", [
+    (48000, 0., "low", RepairRecipe(dc_remove=True), 100.),
+    (48000, 1., "low", RepairRecipe(low_cut_hz=40), 55.),
+    (96000, 47997.5, "high", RepairRecipe(ultrasonic=True), 70.),
+    (96000, 47997.5, "full", RepairRecipe(ultrasonic=True), 70.),
+])
+def test_corrected_worker_only_reports_audio_left_by_the_filter(app, tmp_path, rate, hz, band, recipe, reduction):
+    import soundfile as sf
+    from sessionpreplib.audio import load_track
+
+    t = np.arange(4 * rate) / rate
+    wave = .1 * np.cos(2 * np.pi * hz * t)
+    path = tmp_path / "filter.wav"
+    sf.write(path, wave, rate, subtype="PCM_16")
+    track = load_track(str(path))
+    track.repair_recipe, track.audio_data = recipe, None
+    levels = []
+    for result, _ in _worker_spectra(track, band):
+        times = result["spec_times"]
+        settled = (times >= 1.5) & (times < 3.)
+        carrier_row = np.argmin(abs(result["spec_freq"] - hz))
+        levels.append(result["spec_db"][carrier_row, settled].max())
+    assert levels[0] == pytest.approx(-20., abs=.3)
+    assert levels[1] <= levels[0] - reduction
+
+
+def test_float_worker_resolves_a_quiet_line_with_a_measured_noise_floor(app, tmp_path):
+    import soundfile as sf
+    from sessionpreplib.audio import load_track
+
+    rate = 48000
+    t = np.arange(4 * rate) / rate
+    carrier = np.cos(2 * np.pi * 23997.5 * t + .923)
+    # A floating-point export of a noisy oscillator need not lie on a PCM grid.
+    noise = np.random.default_rng(43219).normal(0., 8e-6, len(t))
+    path = tmp_path / "floating.wav"
+    sf.write(path, .01 * carrier + noise, rate, subtype="FLOAT")
+    track = load_track(str(path))
+    track.repair_recipe, track.audio_data = RepairRecipe(low_cut_hz=40), None
+    for result, audio in _worker_spectra(track, "high"):
+        selected = (t >= 1.) & (t < 3.)
+        expected = 20 * np.log10(np.dot(audio[selected], carrier[selected]) /
+                                 np.dot(carrier[selected], carrier[selected]))
+        selected = (result["spec_times"] >= 1.) & (result["spec_times"] < 3.)
+        np.testing.assert_allclose(result["spec_db"][:, selected].max(axis=0), expected, atol=.3)
+
+
+def test_corrected_worker_keeps_the_high_band_dark_during_the_lowpass_tail_of_a_cut(app, tmp_path):
+    import soundfile as sf
+    from sessionpreplib.audio import load_track
+
+    rate = 48000
+    t = np.arange(6 * rate) / rate
+    wave = .3 * np.cos(2 * np.pi * 23999.875 * t + np.pi / 2)
+    wave[t >= 4.] = 0.
+    path = tmp_path / "cut.wav"
+    sf.write(path, wave, rate, subtype="PCM_U8")
+    track = load_track(str(path))
+    track.repair_recipe, track.audio_data = RepairRecipe(low_cut_hz=40), None
+    for result, audio in _worker_spectra(track, "high"):
+        if result["corrected"]:
+            # The high-pass retains a low-frequency state after the cut.
+            assert np.max(np.abs(audio[4 * rate:4 * rate + 480])) > 1e-4
+        after_cut = result["spec_times"] >= 4.01
+        assert np.max(result["spec_db"][:, after_cut]) == -200.

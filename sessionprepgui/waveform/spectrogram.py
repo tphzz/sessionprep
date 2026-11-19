@@ -300,7 +300,8 @@ class SpectrogramRenderer:
             centers = (np.arange(columns) + 0.5) * ctx.total_samples / (columns * ctx.samplerate)
         time_edges = np.linspace(ctx.view_start, ctx.view_end, ctx.draw_w + 1) / ctx.samplerate
         view_spec = _peak_pixels(spec, centers, time_edges, axis=1)
-        freq_centers = np.linspace(full_min, full_max, rows)
+        freq_centers = (self._frequencies if self.band != "full" and self._frequencies is not None
+                        else np.linspace(full_min, full_max, rows))
         freq_edges = np.linspace(self._mel_view_min, self._mel_view_max, ctx.draw_h + 1)
         view_spec = _peak_pixels(view_spec, freq_centers, freq_edges, axis=0)
         db_floor = self._spec_db_floor

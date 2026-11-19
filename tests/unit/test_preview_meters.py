@@ -8,6 +8,7 @@ from sessionprepgui.waveform.renderer import WaveformRenderer, WaveformRenderCtx
 from sessionprepgui.waveform.spectrogram import SpectrogramRenderer, SpecRenderCtx
 from sessionpreplib.audition import inspection_spectrogram
 from sessionpreplib.models import TrackContext
+from sessionpreplib.spectrum import full_spectrogram
 
 
 @pytest.mark.parametrize("rate", [44100, 48000, 96000, 192000])
@@ -129,3 +130,46 @@ def test_rms_curve_and_marker_share_the_same_sample_axis(start, end, width):
     marker_x = (33600 - start) * width // (end - start)
     assert np.argmax(renderer._rms_envelope[0]) == marker_x
     assert renderer._rms_combined[marker_x] == pytest.approx(0.5)
+
+
+@pytest.mark.parametrize("rate", [40001, 40026, 40049, 47952, 48048, 96096])
+def test_high_worker_measures_both_physical_band_edges_at_pulled_rates(rate):
+    t = np.arange(2 * rate) / rate
+    for frequency in (20000., rate / 2 - min(4., (rate / 2 - 20000) / 2)):
+        samples = .25 * np.cos(2 * np.pi * frequency * t + .33)
+        worker = WaveformLoadWorker(samples, rate, 256, band="high")
+        results, errors = [], []
+        worker.finished.connect(results.append)
+        worker.failed.connect(errors.append)
+        worker.run()
+        assert not errors
+        measured, = results
+        frequency_rows = measured["spec_freq"]
+        assert frequency_rows[0] == 20000. and frequency_rows[-1] == rate / 2
+        assert np.all(np.diff(frequency_rows) > 0)
+        interior = (measured["spec_times"] > .4) & (measured["spec_times"] < 1.6)
+        np.testing.assert_allclose(measured["spec_db"][:, interior].max(axis=0),
+                                   20 * np.log10(.25), atol=.3)
+
+
+def test_full_measures_the_lower_cutoff_when_it_lies_below_the_first_fft_bin():
+    rate = 384000
+    t = np.arange(rate) / rate
+    samples = .25 * np.cos(2 * np.pi * 20 * t + .42)
+    times, _, levels = full_spectrogram([samples], rate, width=512, window="hamming",
+                                        frequency_max=rate / 2, rows=256)
+    interior = (times > .1) & (times < .9)
+    np.testing.assert_allclose(levels[0, interior], 20 * np.log10(.25), atol=.3)
+
+
+def test_high_painter_uses_the_actual_frequency_of_the_partial_edge_rows():
+    renderer = SpectrogramRenderer()
+    renderer.set_colormap("grayscale")
+    renderer.set_inspection(dict(spec_times=np.array([.5]), samplerate=40200,
+                                 spec_freq=np.array([20000., 20001., 20051., 20100.]),
+                                 spec_db=np.array([[-200.], [0.], [-200.], [-200.]]),
+                                 inspection_band="high"))
+    renderer._build_spec_image(SpecRenderCtx(0, 8, 100, 0, 40200, 40200, 40200))
+    # The second cell extends to the midpoint at 20,026 Hz.
+    assert renderer._spec_image.pixelColor(4, 89).red() == 255  # 20,010 Hz
+    assert renderer._spec_image.pixelColor(4, 54).red() == 0    # 20,045 Hz

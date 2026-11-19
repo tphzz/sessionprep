@@ -62,6 +62,23 @@ def _pcm_step(channel):
     return 0.
 
 
+def source_sample_steps(audio, subtype=None):
+    """Per-channel rounding steps inherited by a floating-point repair render.
+
+    A linear PCM header gives the exact digital step. For floating-point or
+    in-memory originals, recognize an existing sample grid when available.
+    The spectrum still measures frequency, phase and level on the selected audio.
+    """
+    data = np.asarray(audio)
+    count = 1 if data.ndim == 1 else data.shape[1]
+    bits = {"PCM_U8": 8, "PCM_S8": 8, "PCM_16": 16, "PCM_24": 24, "PCM_32": 32}.get(subtype)
+    if bits is not None:
+        return (2. ** (1 - bits),) * count
+    if not data.size:
+        return (0.,) * count
+    return tuple(_pcm_step(channel) for channel in data.reshape(len(data), count).T)
+
+
 @dataclass
 class _EdgeLine:
     """A resolved oscillator on a measured time interval, in absolute sample phase."""
@@ -74,6 +91,7 @@ class _EdgeLine:
     b: float
     high: bool
     residual_limit: float
+    rms_limit: float = np.inf
 
     def local_components(self, frame, start):
         phase = self.omega * (np.arange(len(frame)) + (start - self.origin))
@@ -85,6 +103,8 @@ class _EdgeLine:
         # The reference supplies quadrature only when its real samples agree
         # with this entire window, allowing for integer-code rounding.
         if np.max(np.abs(residual)) > self.residual_limit:
+            return None
+        if np.isfinite(self.rms_limit) and np.mean(residual ** 2) > self.rms_limit ** 2:
             return None
         quadrature = self.a * sn - self.b * cs
         if self.high:
@@ -145,17 +165,33 @@ def _measure_edge_line(channel, start, stop, high, quantum):
     # small residual around a coherent line. Require a low RMS error and
     # independently bound the largest deviation before supplying quadrature.
     rms_error = np.sqrt(np.mean(residual ** 2))
-    if (angle < required_angle or amplitude > 1.45 or abs(dc) > tolerance + .001 * amplitude or
-            rms_error > .75 * tolerance + .0005 * amplitude or
-            np.max(np.abs(residual)) > 2 * tolerance + .002 * amplitude):
+    if angle < required_angle or amplitude > 1.45:
         return None
+    peak_error = np.max(np.abs(residual))
+    rms_limit = np.inf
+    residual_limit = max(2.5 * quantum, 2e-4 * amplitude * scale, 5 * rms_error * scale)
+    if (abs(dc) > tolerance + .001 * amplitude or rms_error > .75 * tolerance + .0005 * amplitude or
+            peak_error > 2 * tolerance + .002 * amplitude):
+        # A float recording may have no grid and still contain a coherent
+        # oscillator plus light noise. Before using its measured residual,
+        # require a whole cycle with the same amplitude and phase on both halves.
+        if (quantum or angle < 2 * np.pi or rms_error > .012 * amplitude or
+                peak_error > 6 * rms_error or abs(dc) > 4 * rms_error):
+            return None
+        for part in (slice(None, len(y) // 2), slice(len(y) // 2, None)):
+            aa, bb, _ = np.linalg.lstsq(basis[part], y[part], rcond=None)[0]
+            if np.hypot(aa - a, bb - b) > .02 * amplitude:
+                return None
+        # The paired reference samples average two noise contributions. The
+        # selected raw window must agree within both peak and RMS bounds.
+        rms_limit = scale * (abs(dc) + 2.5 * rms_error)
+        residual_limit = scale * (abs(dc) + 9 * rms_error)
     omega = angle / (indices[-1] - indices[0])
     # Undo the adjacent-pair average's cosine response. Its timestamp is
     # halfway between the two samples.
     gain = scale / np.cos(omega / 2)
     origin = (indices[0] + indices[-1] + 1) / 2
-    residual_limit = max(2.5 * quantum, 2e-4 * amplitude * scale, 5 * rms_error * scale)
-    return _EdgeLine(start, stop, origin, omega, a * gain, b * gain, high, residual_limit)
+    return _EdgeLine(start, stop, origin, omega, a * gain, b * gain, high, residual_limit, rms_limit)
 
 
 def _endpoint_model(channel, start, stop, rate, quantum, previous):
@@ -182,11 +218,20 @@ def _endpoint_model(channel, start, stop, rate, quantum, previous):
     noise = quantum / max(quantum, scale)
     expected_variation = energy * (8 * np.pi / n) ** 2 + n * (2 * noise) ** 2
     if scale > 4 * quantum and np.einsum("i,i->", variation, variation) > expected_variation:
-        return None, None
+        # Near a beat null, broadband noise can dominate single-sample
+        # differences. Test its block-averaged trend before rejecting the fit.
+        stride = max(1, n // 48)
+        if quantum or stride == 1:
+            return None, None
+        groups = x[:(n // stride) * stride].reshape(-1, stride).mean(axis=1)
+        if np.mean(np.diff(groups) ** 2) > np.mean(groups ** 2) * (8 * np.pi / len(groups)) ** 2:
+            return None, None
     # Very low-level quantized samples can alternate between zero and a
     # single code; adjacent products then cannot distinguish the two endpoints.
     orientations = (high, not high) if scale <= 4 * quantum else (high,)
-    span = min(len(channel), n * 4)
+    # Begin with the selected window. A filter transient elsewhere in a
+    # short recording must not invalidate an already settled local oscillator.
+    span = n
     limit = min(len(channel), max(n * 4, rate * 8))
     while True:
         origins = ((start + stop - span) // 2, start, stop - span)
@@ -207,24 +252,31 @@ def _endpoint_model(channel, start, stop, rate, quantum, previous):
     return None, None
 
 
-def _window_amplitudes(channel, start, stop, rate, weights, n_fft, quantum, previous):
+def _window_amplitudes(channel, start, stop, rate, weights, n_fft, quantum, previous, cutoffs):
     model, line = _endpoint_model(channel, start, stop, rate, quantum, previous)
     residual = channel[start:stop] if model is None else model[1]
     # A real windowed Fourier transform keeps edits, noise and multiple
     # components inside the nominated time window. DC and Nyquist have no
     # negative-frequency counterpart. Resolved endpoint tones contribute
     # their isolated positive-frequency lobe, without doubling its image.
-    amplitudes = np.abs(fft.rfft(residual * weights, n=n_fft))
+    weighted = residual * weights
+    amplitudes = np.abs(fft.rfft(weighted, n=n_fft))
     amplitudes[1:-1] *= 2
+    # An off-grid cutoff is always between DC and Nyquist. Measure its actual
+    # Fourier coefficient with the same window and one-sided normalization.
+    edge_levels = [2 * abs(np.einsum("i,i->", kernel[:len(weights)], weighted)) for kernel in cutoffs]
     if model is not None:
         # Report the strongest measured component. Adding the quantizer's
         # DC bias coherently to the fitted line would modulate its readout.
-        carrier = fft.fft(model[0] * weights, n=n_fft)[:len(amplitudes)]
+        weighted_line = model[0] * weights
+        carrier = fft.fft(weighted_line, n=n_fft)[:len(amplitudes)]
         np.maximum(amplitudes, np.abs(carrier), out=amplitudes)
-    return amplitudes, line
+        for i, kernel in enumerate(cutoffs):
+            edge_levels[i] = max(edge_levels[i], abs(np.einsum("i,i->", kernel[:len(weights)], weighted_line)))
+    return amplitudes, edge_levels, line
 
 
-def _peak_spectrogram(channels, rate, width, hop, window, frequencies, max_columns, cancelled):
+def _peak_spectrogram(channels, rate, width, hop, window, frequencies, max_columns, cancelled, source_steps):
     """Measure each window, holding channel, frequency-cell and time-column maxima."""
     frames = len(channels[0])
     if not frames:
@@ -250,12 +302,30 @@ def _peak_spectrogram(channels, rate, width, hop, window, frequencies, max_colum
     # Four samples across each native FFT interval limit worst-case scalloping
     # to 0.11 dB for every selectable window. Resolution still comes from width.
     n_fft = 4 * width
-    hz_per_bin = rate / n_fft
-    midpoints = (frequencies[:-1] + frequencies[1:]) / 2
-    first = int(np.ceil(frequencies[0] / hz_per_bin))
-    last = min(n_fft // 2, int(np.floor(frequencies[-1] / hz_per_bin)))
-    edges = np.clip(np.ceil(np.r_[frequencies[0], midpoints] / hz_per_bin).astype(int), first, last)
-    quanta = [_pcm_step(channel) for channel in channels]
+    # A physical band edge can fall between FFT samples, particularly at
+    # pulled sample rates or with a short Full window at a high sample rate.
+    limits = frequencies[[0, -1]] * n_fft / rate
+    nearest = np.rint(limits)
+    off_grid = np.abs(limits - nearest) > 8 * np.spacing(np.maximum(1., limits))
+    lower, upper = np.where(off_grid, limits, nearest)
+    first, last = int(np.ceil(lower)), int(np.floor(upper))
+    extra_bins = limits[off_grid]
+    lower_count = int(off_grid[0])
+    sample_bins = np.concatenate((extra_bins[:lower_count], np.arange(first, last + 1),
+                                  extra_bins[lower_count:]))
+    cutoffs = [np.exp(-2j * np.pi * pos * np.arange(width) / n_fft) for pos in extra_bins]
+    row_bins = frequencies * n_fft / rate
+    midpoints = (row_bins[:-1] + row_bins[1:]) / 2
+    edges = np.r_[0, np.searchsorted(sample_bins, midpoints), len(sample_bins)]
+    # More display rows than Fourier samples is common at the low end of
+    # Full. Extend the nearest measured level into otherwise empty cells.
+    empty_rows = np.flatnonzero(np.diff(edges) == 0)
+    right = np.clip(edges[empty_rows], 1, len(sample_bins) - 1)
+    nearest_empty = np.where(row_bins[empty_rows] * 2 <= sample_bins[right - 1] + sample_bins[right],
+                             right - 1, right)
+    quanta = [_pcm_step(channel) for channel in channels] if source_steps is None else source_steps
+    if len(quanta) != len(channels) or not all(np.isfinite(q) and q >= 0 for q in quanta):
+        raise ValueError("Expected one finite, nonnegative sample step per channel")
     previous = [None] * len(channels)
     for i, center in enumerate(centers):
         if cancelled is not None and cancelled():
@@ -267,10 +337,13 @@ def _peak_spectrogram(channels, rate, width, hop, window, frequencies, max_colum
             frame = np.asarray(channel[lo:hi], dtype=np.float64)
             if not frame.any():
                 continue
-            spectrum, previous[ch] = _window_amplitudes(
-                channel, lo, hi, rate, weights, n_fft, quanta[ch], previous[ch])
+            spectrum, boundaries, previous[ch] = _window_amplitudes(
+                channel, lo, hi, rate, weights, n_fft, quanta[ch], previous[ch], cutoffs)
             amplitude = spectrum[first:last + 1]
-            cells = np.maximum.reduceat(amplitude, edges - first)
+            if cutoffs:
+                amplitude = np.concatenate((boundaries[:lower_count], amplitude, boundaries[lower_count:]))
+            cells = np.maximum.reduceat(amplitude, edges[:-1])
+            cells[empty_rows] = amplitude[nearest_empty]
             db = 20 * np.log10(np.maximum(cells / weights.sum(), 1e-10))
             dest = levels[:, column[i]]
             np.maximum(dest, db, out=dest)
@@ -278,7 +351,7 @@ def _peak_spectrogram(channels, rate, width, hop, window, frequencies, max_colum
 
 
 def full_spectrogram(channels, rate, *, width, window, frequency_max, rows,
-                     hop=None, cancelled=None):
+                     hop=None, cancelled=None, source_steps=None):
     """Full overview on the mel axis, in the same peak dBFS as focused inspection."""
     if rate <= 0 or width < 4 or rows < 2 or (hop is not None and hop < 1):
         raise ValueError("Invalid full spectrogram dimensions")
@@ -289,11 +362,11 @@ def full_spectrogram(channels, rate, *, width, window, frequency_max, rows,
     requested_hop = width if hop is None else hop
     max_columns = 1 + (len(channels[0]) + requested_hop - 1) // requested_hop
     return _peak_spectrogram(channels, rate, width, min(requested_hop, width // 2),
-                             window, frequencies, max_columns, cancelled)
+                             window, frequencies, max_columns, cancelled, source_steps)
 
 
 def inspection_spectrogram(audio: np.ndarray, sample_rate: int, band: str, *,
-                           max_columns: int = 512, cancelled=None):
+                           max_columns: int = 512, cancelled=None, source_steps=None):
     """Time, native frequency labels and maximum per-channel sine-peak dBFS.
 
     Low windows span one second (1 Hz bins). High windows span 20 ms
@@ -307,8 +380,9 @@ def inspection_spectrogram(audio: np.ndarray, sample_rate: int, band: str, *,
     if data.ndim not in (1, 2) or (data.ndim == 2 and not data.shape[1]):
         raise ValueError("Expected finite mono or multichannel audio")
     width = max(4, round(sample_rate * (1 if band == "low" else .02)))
-    bins = fft.rfftfreq(width, 1 / sample_rate)
-    freq = bins[bins <= 100] if band == "low" else bins[bins >= 20000]
+    bins = np.arange(width // 2 + 1) * float(sample_rate) / width
+    lower, upper = (0., min(100., sample_rate / 2)) if band == "low" else (20000., sample_rate / 2)
+    freq = np.r_[lower, bins[(bins > lower) & (bins < upper)], upper]
     channels = [data] if data.ndim == 1 else data.T
     return _peak_spectrogram(channels, sample_rate, width, width // 2,
-                             "hann", freq, max_columns, cancelled)
+                             "hann", freq, max_columns, cancelled, source_steps)

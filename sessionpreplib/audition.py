@@ -5,16 +5,17 @@ import numpy as np
 
 from .monitor import MonitorPad, monitor_fade
 from .repairs import RepairRecipe, render_corrected
-from .spectrum import inspection_spectrogram as inspection_spectrogram
+from .spectrum import inspection_spectrogram as inspection_spectrogram, source_sample_steps
 
 
 class RepairAudition:
     """The original and corrected share one time base and one monitor gain."""
 
-    def __init__(self, original: np.ndarray, sample_rate: int, recipe: RepairRecipe):
+    def __init__(self, original: np.ndarray, sample_rate: int, recipe: RepairRecipe, *, source_subtype=None):
         self.original = np.asarray(original)
         self.corrected = render_corrected(self.original, sample_rate, recipe)
         self.sample_rate = sample_rate
+        self.source_steps = source_sample_steps(self.original, source_subtype)
         self.monitor_pad = MonitorPad(self.original, self.corrected)
 
     @property

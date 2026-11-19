@@ -155,7 +155,8 @@ class WaveformLoadWorker(QThread):
                 if self.audition is None:
                     if source.audio_data is None or not source.audio_data.size:
                         raise ValueError("Source audio is empty.")
-                    self.audition = RepairAudition(source.audio_data, source.samplerate, self.recipe)
+                    self.audition = RepairAudition(source.audio_data, source.samplerate, self.recipe,
+                                                  source_subtype=source.subtype)
                 validate_analysis_level(self.audition.monitor_pad.peak, len(self.audition.original))
                 if not self._cancelled.is_set():
                     self.source_ready.emit()
@@ -252,17 +253,19 @@ class WaveformLoadWorker(QThread):
         spec_times = None
         if self._compute_spectrogram:
             t0 = time.perf_counter()
+            source_steps = self.audition.source_steps if self.audition is not None else None
             if self.band == "full" and self.track is not None:
                 spec_times, spec_freq, spec_db = full_spectrogram(
                     channels, sr, width=self._spec_n_fft, window=self._spec_window,
-                    frequency_max=sr / 2, rows=_SPEC_N_MELS, cancelled=self._cancelled.is_set)
+                    frequency_max=sr / 2, rows=_SPEC_N_MELS, cancelled=self._cancelled.is_set,
+                    source_steps=source_steps)
             elif self.band == "full":
                 spec_db = compute_mel_spectrogram(
                     channels, sr, n_fft=self._spec_n_fft, window=self._spec_window,
                     cancelled=self._cancelled.is_set)
             else:
                 spec_times, spec_freq, spec_db = inspection_spectrogram(
-                    data, sr, self.band, cancelled=self._cancelled.is_set)
+                    data, sr, self.band, cancelled=self._cancelled.is_set, source_steps=source_steps)
             log.debug("[Trace] WaveformLoadWorker STFT: %.2f ms", (time.perf_counter() - t0) * 1000)
 
             if self._cancelled.is_set():
