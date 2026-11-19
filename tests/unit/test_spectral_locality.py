@@ -177,3 +177,34 @@ def test_dithered_pcm_line_survives_a_common_floating_point_gain(
             times, _, levels = inspection_spectrogram(source, rate, "high")
         settled = (times > .5) & (times < 3.5)
         np.testing.assert_allclose(levels[:, settled].max(axis=0), expected, atol=.3)
+
+
+@pytest.mark.parametrize("fixture", ["white noise", "pink noise", "two tones"])
+def test_high_cells_keep_observed_noise_and_two_separate_tones(fixture):
+    rate, width = 48000, 960
+    n = np.arange(rate)
+    if fixture == "two tones":
+        source = (.22 * np.cos(2 * np.pi * 22000 * n / rate + .37)
+                  + .18 * np.cos(2 * np.pi * 22200 * n / rate - .81))
+    else:
+        source = np.random.default_rng(527).normal(0., .08, rate)
+        if fixture == "pink noise":
+            f = np.fft.rfftfreq(len(source), 1 / rate)
+            source = np.fft.irfft(np.fft.rfft(source) / np.sqrt(np.maximum(f, 1.)), n=len(source))
+    times, frequencies, levels = inspection_spectrogram(source, rate, "high")
+    index = np.arange(width)
+    window = .5 - .5 * np.cos(2 * np.pi * index / width)
+    # An independent Fourier sum at each quarter-bin gives the expected
+    # maximum for the actual samples and taper, including the valley between
+    # the two tones. Nyquist has no negative-frequency image to double.
+    for frequency in (22000., 22050., 22100., 22150., 22200., rate / 2):
+        bins = np.arange(frequency - 25., min(frequency + 25., rate / 2 + 1.), 12.5)
+        factors = np.where(bins == rate / 2, 1., 2.)
+        transform = np.exp(-2j * np.pi * bins[:, None] * index / rate)
+        row = np.flatnonzero(frequencies == frequency).item()
+        for seconds in (.25, .5, .75):
+            column = np.flatnonzero(times == seconds).item()
+            start = round(seconds * rate) - width // 2
+            sums = transform @ (source[start:start + width] * window)
+            peak = np.max(factors * np.abs(sums)) / window.sum()
+            assert levels[row, column] == pytest.approx(20 * np.log10(max(1e-10, peak)), abs=1e-4)

@@ -324,4 +324,3 @@ def test_device_failure_after_deferred_seek_releases_transport_controls(devices,
     app.processEvents()
     assert errors == ["Device disconnected"]
     assert finished and not player.is_playing
-
