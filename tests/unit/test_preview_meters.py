@@ -112,3 +112,20 @@ def test_unmeasurable_double_reaches_neither_preview_ready_nor_waveform_meters(c
     worker.run()
     assert errors and "finite range" in errors[0]
     assert not ready and not results
+
+
+@pytest.mark.parametrize(("start", "end", "width"), [(0, 48000, 600), (12000, 45600, 607)])
+def test_rms_curve_and_marker_share_the_same_sample_axis(start, end, width):
+    rate, window = 48000, 19200
+    samples = np.zeros(rate)
+    samples[24000:43200] = 0.5
+    renderer = WaveformRenderer()
+    renderer.set_track_data([samples], rms_window=window, rms_max_dirty=True)
+    renderer._ensure_rms_max_computed()
+    assert renderer._rms_max_sample == 33600
+    ctx = WaveformRenderCtx(0, width, 400, 0, start, end, 1., [samples], 1,
+                            True, False, False, False, 1)
+    renderer._build_rms_envelope(ctx)
+    marker_x = (33600 - start) * width // (end - start)
+    assert np.argmax(renderer._rms_envelope[0]) == marker_x
+    assert renderer._rms_combined[marker_x] == pytest.approx(0.5)

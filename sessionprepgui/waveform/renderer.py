@@ -648,25 +648,11 @@ class WaveformRenderer:
                 return np.zeros(width)
             pixel_edges = np.arange(width + 1)
             s_edges = vs + pixel_edges * view_len // width
-            global_wm = np.clip(s_edges - half_win, 0, offset + n_wm)
-            local_wm = np.clip(global_wm - offset, 0, n_wm)
-            first = min(int(local_wm[0]), n_wm - 1)
-            last = max(int(local_wm[-1]), first + 1)
-            last = min(last, n_wm)
-            wm_slice = wm[first:last]
-            n_slice = len(wm_slice)
-            if n_slice >= width:
-                spb = n_slice // width
-                n_use = spb * width
-                reshaped = wm_slice[:n_use].reshape(width, spb)
-                result = np.sqrt(np.maximum(reshaped.max(axis=1), 0.0))
-                if n_use < n_slice:
-                    tail_max = float(wm_slice[n_use:].max())
-                    result[-1] = np.sqrt(max(float(result[-1]) ** 2, tail_max))
-                return result
-            local = np.clip(local_wm[:-1] - first, 0,
-                            max(n_slice - 1, 0)).astype(np.intp)
-            return np.sqrt(np.maximum(wm_slice[local], 0.0))
+            local_edges = np.clip(s_edges - half_win - offset, 0, n_wm)
+            starts = np.minimum(local_edges[:-1], n_wm - 1)
+            stop = max(int(local_edges[-1]), int(starts[-1]) + 1)
+            peaks = np.maximum.reduceat(wm[:stop], starts)
+            return np.sqrt(np.maximum(peaks, 0.0))
 
         self._rms_envelope = [_downsample(wm, wm_offset) for wm in ch_wms]
         self._rms_combined = _downsample(combined_wm, wm_offset)

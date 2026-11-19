@@ -29,6 +29,7 @@ def devices(app, monkeypatch):
         def __init__(self, **kwargs):
             self.__dict__.update(kwargs)
             self.active = False
+            self.closed = False
             streams.append(self)
 
         def start(self):
@@ -36,6 +37,7 @@ def devices(app, monkeypatch):
 
         def close(self):
             self.active = False
+            self.closed = True
 
         def stop(self):
             self.active = False
@@ -51,7 +53,15 @@ def devices(app, monkeypatch):
             return result
 
     monkeypatch.setattr("sessionprepgui.detail.playback.sd.OutputStream", Output)
-    return streams
+    yield streams
+    # Real PortAudio completes a stopped stream and queues the controller's
+    # close on the GUI thread. The in-memory driver has no background clock.
+    for stream in streams:
+        if stream.active:
+            stream.active = False
+            stream.finished_callback()
+    app.processEvents()
+    assert all(stream.closed for stream in streams)
 
 
 def _click_db(samples, frequency=100, rate=48000):
