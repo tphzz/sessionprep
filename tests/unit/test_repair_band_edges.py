@@ -1,6 +1,9 @@
 """Band decisions through the track planner, calibrated against known source RMS."""
+import io
+
 import numpy as np
 import pytest
+import soundfile as sf
 
 from sessionpreplib.models import TrackContext
 from sessionpreplib.repair_plan import plan_repairs
@@ -216,3 +219,99 @@ def test_default_band_keeps_tapered_ac_at_dc_in_a_separated_mixture(hz, program_
     expected = np.max(10 * np.log10(np.sum((frame_ac * window) ** 2, axis=1) / np.sum(window ** 2)))
     assert evidence["band_dbfs"] == pytest.approx(expected, abs=0.1)
     assert track.repair_recipe.low_cut_hz == 10
+
+
+def decoded(samples, rate, subtype):
+    stream = io.BytesIO()
+    sf.write(stream, samples, rate, format="WAV", subtype=subtype)
+    stream.seek(0)
+    return sf.read(stream)[0]
+
+
+@pytest.mark.parametrize("subtype", ["PCM_16", "PCM_24", "FLOAT"])
+@pytest.mark.parametrize(("cutoff", "hz", "inside"), [
+    (1, 1, True), (1, 1.1, False), (20, 19.98, True), (20, 20.02, False),
+])
+def test_decoded_infrasonic_gate_and_windowed_level(subtype, cutoff, hz, inside):
+    rate = 48000
+    t = np.arange(4 * rate) / rate
+    phase = 0.0 if hz == 1 else 0.37
+    source = decoded(0.004720304381429618 * np.cos(2 * np.pi * hz * t + phase), rate, subtype)
+    track = track_for(source, rate)
+    plan_repairs(track, {"subsonic_hz": cutoff, "repair_auto_low_cut": True})
+    evidence = track.repair_measurements["original"]["low_band"]
+    assert bool(track.repair_recipe.low_cut_hz) is inside
+    assert bool(evidence["regions"]) is inside
+    if inside:
+        window = np.sin(np.pi * np.arange(rate) / rate) ** 2
+        frames = np.lib.stride_tricks.sliding_window_view(source, rate)[::rate // 2]
+        ac = frames - frames.mean(axis=1, keepdims=True)
+        expected = np.max(10 * np.log10(np.sum((window * ac) ** 2, axis=1) / np.sum(window ** 2)))
+        assert evidence["band_dbfs"] == pytest.approx(expected, abs=0.1)
+
+
+@pytest.mark.parametrize(("rate", "hz", "program_hz", "relative"), [
+    (48000, 19.94, 26.37, -15), (48000, 19.94, 31.113, -15),
+    (48000, 19.94, 82.413, -15), (48000, 19.94, 187.37, -15),
+    (96000, 24100.6, 22003.4, -28), (96000, 24100.6, 22897.31, -28),
+    (96000, 24100.6, 24001.17, -28),
+])
+@pytest.mark.parametrize("subtype", ["PCM_16", "DOUBLE"])
+def test_separated_musical_program_cannot_veto_a_sustained_carrier(rate, hz, program_hz, relative, subtype):
+    high = rate == 96000
+    t = np.arange(round((0.45 if high else 3.5) * rate)) / rate
+    q = 10 ** (relative / 10)
+    carrier = 0.4 * np.sqrt(q / (1 - q)) * np.cos(2 * np.pi * hz * t + 0.17)
+    source = decoded(0.4 * np.cos(2 * np.pi * program_hz * t + 0.3) + carrier, rate, subtype)
+    track = track_for(source, rate)
+    plan_repairs(track, {"repair_auto_ultrasonic": high, "repair_auto_low_cut": not high})
+    evidence = track.repair_measurements["original"]["ultrasonic" if high else "low_band"]
+    assert evidence["regions"] == [[0, len(t) - 1, 0]]
+    assert (track.repair_recipe.ultrasonic if high else bool(track.repair_recipe.low_cut_hz))
+    assert evidence["ratio_db"] == pytest.approx(relative, abs=0.1)
+
+
+@pytest.mark.parametrize(("rate", "hz", "relative", "subtype"), [
+    (88200, 24100.2, -33., "PCM_16"), (192000, 24100.1, -34.7, "PCM_16"),
+    (96000, 24100.6, -34.7, "DOUBLE"),
+])
+def test_quiet_band_edge_still_resolves_six_bins_from_a_louder_neighbor(rate, hz, relative, subtype):
+    t = np.arange(round(0.45 * rate)) / rate
+    q = 10 ** (relative / 10)
+    source = 0.3 * (np.cos(2 * np.pi * 24037 * t + 0.3) +
+                    np.sqrt(q / (1 - q)) * np.cos(2 * np.pi * hz * t + 0.15))
+    track = track_for(decoded(source, rate, subtype), rate)
+    plan_repairs(track, {"repair_auto_ultrasonic": True})
+    assert track.repair_recipe.ultrasonic
+    assert track.detector_results["ultrasonic"].data["regions"] == [[0, len(t) - 1, 0]]
+
+
+@pytest.mark.parametrize("high", [False, True])
+def test_several_separated_partials_in_the_program_preserve_an_edge_decision(high):
+    rate, edge, spacing = (96000, 24100, 10) if high else (48000, 20, 1)
+    t = np.arange(round(rate * (0.45 if high else 3.5))) / rate
+    direction = -1 if high else 1
+    offsets = [12.73, 21.02, 28.71, 39.34, 47.1, 56.7]
+    program = sum(0.09 * np.cos(2 * np.pi * (edge + direction * spacing * delta) * t + 0.7 * i)
+                  for i, delta in enumerate(offsets))
+    carrier = (0.008 if high else 0.035) * np.cos(2 * np.pi * (edge - direction * .06 * spacing) * t)
+    track = track_for(program + carrier, rate)
+    plan_repairs(track, {"repair_auto_ultrasonic": high, "repair_auto_low_cut": not high})
+    evidence = track.repair_measurements["original"]["ultrasonic" if high else "low_band"]
+    assert evidence["regions"] == [[0, len(t) - 1, 0]]
+
+
+@pytest.mark.parametrize("high", [False, True])
+def test_out_of_band_modulation_and_low_noise_do_not_trigger_an_automatic_repair(high):
+    rate, edge, spacing = (96000, 24100, 10) if high else (48000, 20, 1)
+    t = np.arange(round(rate * (0.45 if high else 3.5))) / rate
+    direction = -1 if high else 1
+    # Modulation creates two sidebands, each still outside the repair band.
+    a = 0.32 + 0.18 * np.cos(2 * np.pi * 0.14 * spacing * t)
+    near = a * np.cos(2 * np.pi * (edge + direction * 0.2 * spacing) * t + 0.31)
+    program = 0.12 * np.cos(2 * np.pi * (edge + direction * 6.3 * spacing) * t)
+    quiet_noise = np.random.default_rng(4619).normal(scale=3e-5, size=len(t))
+    track = track_for(decoded(near + program + quiet_noise, rate, "PCM_16"), rate)
+    plan_repairs(track, {"repair_auto_ultrasonic": high, "repair_auto_low_cut": not high})
+    evidence = track.repair_measurements["original"]["ultrasonic" if high else "low_band"]
+    assert evidence["regions"] == [] and not track.repair_recipe.active

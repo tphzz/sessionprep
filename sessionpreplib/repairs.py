@@ -144,18 +144,27 @@ def check_output_headroom(audio: np.ndarray, subtype: str) -> None:
 class _BoundaryPartial:
     """Resolve one stationary partial in the Hann main lobe at a decision edge."""
 
-    def __init__(self, hz, bin_hz, freqs, window):
-        self.width = len(window)
-        self.edge = hz / bin_hz
-        self.bins = np.flatnonzero(np.abs(freqs - hz) <= 3 * bin_hz)
+    def __init__(self, cycles, width, window_dc):
+        self.width = width
+        self.edge = float(cycles)
+        self.bins = np.arange(max(0, math.ceil(cycles - 3)),
+                              min(len(window_dc), math.floor(cycles + 3) + 1))
         self.extended_bins = np.arange(self.bins[0] - 1, self.bins[-1] + 2)
-        self.window_dc = np.fft.rfft(window)[self.bins] / self.width
+        self.window_dc = window_dc[self.bins]
         self.dc_axis = None
         if self.bins[0] <= 1:
             # A separate non-coherent program tone can contribute to the
             # frame mean. Fit the bass partial independently of that constant.
             dc = np.concatenate((self.window_dc.real, self.window_dc.imag))
             self.dc_axis = dc / np.linalg.norm(dc)
+        self.background = None
+        if self.bins[0] > 1 and self.bins[-1] < len(window_dc) - 1:
+            # Distant Hann sidelobes vary smoothly across this narrow lobe.
+            # Fit the same quadratic background to the measured coefficients
+            # and sinusoidal basis so several unrelated partials can coexist.
+            positions = np.linspace(-1, 1, len(self.bins))
+            columns = np.polynomial.polynomial.polyvander(positions, 2)
+            self.background = np.eye(len(self.bins)) - columns @ np.linalg.pinv(columns)
         self.grid = np.unique(np.clip(self.edge + np.arange(-2, 2.25, 0.5),
                                       1e-8, self.width / 2))
         self.bases = np.stack([self._basis(f) for f in self.grid])
@@ -177,20 +186,25 @@ class _BoundaryPartial:
         cosine = (tones[0] + tones[1]) / 2
         sine = (tones[0] - tones[1]) / (2j)
         basis = np.column_stack((cosine, sine))
+        if self.background is not None:
+            basis = self.background @ basis
         basis = np.concatenate((basis.real, basis.imag))
         if self.dc_axis is not None:
             basis -= np.outer(self.dc_axis, self.dc_axis @ basis)
         return basis
 
-    def fit(self, spectrum):
-        if len(self.bins) < 3:
-            return None
+    def observe(self, spectrum):
         local = spectrum[self.bins] / self.width
+        if self.background is not None:
+            local = self.background @ local
         vector = np.concatenate((local.real, local.imag))
         if self.dc_axis is not None:
             vector -= self.dc_axis * (self.dc_axis @ vector)
+        return vector
+
+    def fit(self, vector, noise_power):
         power = vector @ vector
-        if not power:
+        if not power or len(self.bins) < 3:
             return None
         coeffs = self.inverses @ vector
         residuals = (self.bases @ coeffs[..., None])[..., 0] - vector
@@ -199,11 +213,11 @@ class _BoundaryPartial:
         if errors[best] > 0.25 * power:
             return None
         centre = self.grid[best]
-        # The grid brackets the frequency. Refine it only when a single line
-        # can account for the local coefficients to near measurement precision.
-        tolerance = 1e-12 * power
-        if errors[best] <= tolerance:
-            return centre, coeffs[best]
+        # The residual of a real line includes the source's spectral noise
+        # floor. Cap its allowance so a noisy or blended lobe cannot qualify.
+        tolerance = max(1e-12 * power, min(1e-5 * power, 12 * len(self.bins) * noise_power))
+        if errors[best] <= 1e-12 * power or (centre == self.edge and errors[best] <= tolerance):
+            return centre, coeffs[best], True
 
         def fit_at(offset):
             basis = self._basis(centre + offset)
@@ -216,9 +230,9 @@ class _BoundaryPartial:
         optimum = optimize.minimize_scalar(lambda offset: fit_at(offset)[0], method="bounded",
                                           bounds=(lower, upper), options={"xatol": 1e-10})
         error, cs = fit_at(optimum.x)
-        if error <= tolerance:
-            return centre + optimum.x, cs
-        return None
+        if error > 0.02 * power:
+            return None
+        return centre + optimum.x, cs, error <= tolerance
 
 
 class _BandWindow:
@@ -232,19 +246,80 @@ class _BandWindow:
         self.phase = 2 * np.pi * np.arange(width) / width
         self.window = signal.windows.hann(width, sym=False)
         self.window_energy = np.sum(self.window ** 2)
+        self.window_dc = np.fft.rfft(self.window) / width
         self.weights = np.full(len(self.freqs), 2.0 / (width * self.window_energy))
         # The signal's DC was removed before windowing. Tapering a real AC
         # component can put legitimate energy in the DC bin (and at Nyquist).
         self.weights[0] *= 0.5
         if width % 2 == 0:
             self.weights[-1] *= 0.5
-        self.edges = [(hz, side, _BoundaryPartial(hz, self.bin_hz, self.freqs, self.window))
+        self.edges = [(hz, side, self._partial(hz / self.bin_hz))
                       for hz, side in ((low, 1), (high, -1)) if 0 < hz < self.nyquist]
         self.partials = [partial for _, _, partial in self.edges]
         if low == 0 and high > 2 * self.bin_hz:
             # The real signal's positive- and negative-frequency lobes meet
             # here even when the upper decision edge is many bins away.
-            self.partials.append(_BoundaryPartial(0, self.bin_hz, self.freqs, self.window))
+            self.partials.append(self._partial(0))
+
+    def _partial(self, cycles):
+        return _BoundaryPartial(cycles, len(self.window), self.window_dc)
+
+    def _resolve(self, partial, spectrum):
+        powers = np.abs(spectrum) ** 2
+        # Median power across broad frequency bands estimates the recording
+        # noise even for quantized periodic signals with a sparse noise floor.
+        bands = min(32, len(powers) // 16)
+        noise = 0.0
+        if bands:
+            bins = (len(powers) - 1) // bands
+            noise = np.median(powers[1:1 + bins * bands].reshape(bands, bins).mean(axis=1))
+            noise /= len(self.window) ** 2
+        vector = partial.observe(spectrum)
+        fit = partial.fit(vector, noise)
+        if not np.any(vector):
+            return None
+        cycles, cs = partial.edge, np.zeros(2)
+        if fit is not None:
+            cycles, cs, resolved = fit
+            if resolved:
+                return cycles, cs
+
+        # A separated program partial can leak into a quiet band-edge lobe.
+        # Identify it at its own peak, subtract its predicted leakage only
+        # from the coefficients being fitted, then check the edge fit again.
+        peaks = signal.find_peaks(powers)[0]
+        distance = np.abs(peaks - partial.edge)
+        local_peak = powers[partial.bins].max()
+        eligible = (distance >= 4) & (powers[peaks] >= 0.01 * local_peak)
+        peaks, distance = peaks[eligible], distance[eligible]
+        # The Hann sidelobe amplitude decays as inverse frequency cubed.
+        influence = powers[peaks] / (distance - 3) ** 6
+        order = np.argsort(influence)[-3:][::-1]
+        for index in order:
+            if fit is None and influence[index] < 1e-5 * local_peak:
+                break
+            k = peaks[index]
+            remote = self._partial(k)
+            measured = remote.observe(spectrum)
+            corrected = vector
+            # Each initially fitted tone contains a little of the other's
+            # sidelobe. Refine both estimates before trying another neighbor.
+            for _ in range(3):
+                background = remote.fit(measured - remote._basis(cycles) @ cs, noise)
+                if background is None:
+                    break
+                f, gains, _ = background
+                if abs(f - cycles) < 4:
+                    break  # overlapping Hann main lobes
+                corrected = vector - partial._basis(f) @ gains
+                candidate = partial.fit(corrected, noise)
+                if candidate is None:
+                    break
+                cycles, cs, resolved = candidate
+                if resolved:
+                    return cycles, cs
+            vector = corrected
+        return None
 
     def _spectrum(self, ac):
         raw = np.fft.rfft(ac)
@@ -269,7 +344,7 @@ class _BandWindow:
         tol = 1e-7 * self.bin_hz
         partial_power = 0.0
         for partial in self.partials:
-            fit = partial.fit(spectrum)
+            fit = self._resolve(partial, spectrum)
             if fit is None:
                 continue
             cycles, (cosine, sine) = fit
