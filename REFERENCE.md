@@ -215,6 +215,8 @@ visible issue.
 
 Sources at 50 kHz or higher are eligible. Five consecutive 100 ms windows with 50% overlap must exceed both −60 dBFS RMS and −35 dB relative to program energy in the band from 24.1 kHz to Nyquist. Each channel is evaluated separately.
 
+The local meter uses the available samples on clips shorter than 100 ms. Only full windows count toward a suggestion. Reported spans cover the qualifying windows. Manually enabling the filter provides both the original and corrected readings.
+
 ## 3. Analysis Metrics (Stage B)
 
 Stage B is where SessionPrep extracts level and dynamic information from each
@@ -400,9 +402,15 @@ insert on each channel.
 
 **DC removal** uses a first-order 2 Hz high-pass. **Subsonic filter** uses a second-order high-pass with a 10 Hz default and a 5–40 Hz range. Selecting both applies the stronger high-pass once. Automatic low-cut selection looks for sustained infrasonic energy on individual channels after any selected DC removal. The broader subsonic advisory can also describe intentional bass. **Ultrasonic filter** preserves the band through 20 kHz and attenuates frequencies from 24 kHz by at least 80 dB on eligible sources. Its FIR delay is compensated. All three preserve the sample count and channel layout.
 
+Automatic low-cut selection uses three consecutive 1 s windows at 50% overlap and considers AC energy up to the smaller of 20 Hz and the configured subsonic frequency. Both the low-cut and ultrasonic meters use frequency reassignment so a sustained tone at the inclusive band edge counts at its full windowed RMS level. When components overlap at the edge and their frequency estimates disagree, only confidently in-band energy can qualify an automatic repair.
+
 Use **Preferences → Config Presets → Processors → Corrective processing** for automatic selection defaults. Phase 2 Config can override these for one project. **Review repair** in File and **Track repairs…** in Processing open the same per-track choices and measurements. **Use preset** releases a track override. Stereo compatibility remains a review finding.
 
 Corrections run before gain calculation. **Prepare** checks the final, routed samples against the destination encoding. If the level is too high, **Adjust Gain** offers the minimum safe reduction rounded up to 0.1 dB. Confirm the change and retry. Files are replaced after a successful render. A failed retry retains the previous file and marks it stale.
+
+Check the repair measurements for **Boundary settling** when a filter rings into an edit gap. For each channel with at least 100 ms of exact source silence, SessionPrep reports the first and last affected sample and the peak if it exceeds −120 dBFS before gain. The text and JSON delivery reports include the same measurements.
+
+When several normalized sources share an output, they must share a DAW fader offset. If Prepare reports different offsets, link the source gains or route them to separate outputs and retry.
 
 ---
 
@@ -461,7 +469,9 @@ In JSON schema `2.0`, use only tracks with `processing.status == "written"` for 
 
 ### 6.3 Preview Header and View Settings
 
-In Phase 2, **Original** and **Corrected** select the routed source or its repaired audio before normalization and output gain. The filled segment identifies the active source. Left and Right switch at the current sample, and Space activates the focused choice. Playback uses a 10 ms crossfade. A common monitor pad protects both choices when either would overload playback. Inspect low frequencies from 0–100 Hz or high frequencies from 20 kHz to the source's Nyquist frequency using the same axes and dBFS scale.
+In Phase 2, **Original** and **Corrected** select the routed source or its repaired audio before normalization and output gain. The filled segment identifies the active source. Left and Right switch at the current sample, and Space activates the focused choice. A 10 ms crossfade follows each selection, including a reversal during a fade. Starting, stopping and seeking also use short fades. The common monitor pad keeps device samples within full scale for both choices. Direct playback in Phase 1 also attenuates over-range samples.
+
+Full, Low (0–100 Hz) and High (20 kHz to Nyquist) share a sine-peak dBFS color scale. The display keeps the strongest measured event in each screen cell as you resize or zoom. For clips shorter than the RMS window, the waveform reports the RMS of the available samples.
 
 **Waveform preview** is a local disclosure in both Track Layout and File detail.
 Track Layout starts collapsed. The header stays visible while the preview is

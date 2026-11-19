@@ -418,7 +418,7 @@ contains the runner-image package list and image-build validation command.
 |---------------|----------------|------------------------------------------------------------------------------------------------------------|
 | `numpy`       | Runtime        | `sessionpreplib` (DSP, array ops)                                                                          |
 | `soundfile`   | Runtime        | `sessionpreplib/audio.py` (WAV I/O, bundles libsndfile)                                                    |
-| `scipy`       | Runtime        | `sessionpreplib/audio.py` (subsonic STFT analysis), `sessionprepgui/waveform/compute.py` (mel spectrogram) |
+| `scipy`       | Runtime        | `sessionpreplib/audio.py` (subsonic STFT analysis), `sessionpreplib/spectrum.py` (preview spectra) |
 | `rich`        | Runtime        | `sessionprep.py` (CLI rendering: tables, panels, progress)                                                 |
 | `PySide6`     | Optional (gui) | `sessionprepgui` (Qt widgets, main window, waveform)                                                       |
 | `sounddevice` | Optional (gui) | `sessionprepgui/detail/playback.py` (audio playback via PortAudio)                                         |
@@ -530,7 +530,7 @@ sessionprepgui/                  # GUI package (PySide6)
         table_widgets.py         # Track table widget classes
     waveform/
         __init__.py              # Re-exports WaveformWidget, WaveformLoadWorker, SPECTROGRAM_COLORMAPS
-        compute.py               # Colormaps, mel math, spectrogram computation, QThread workers
+        compute.py               # Colormaps, spectral view preparation, QThread workers
                                  #   (WaveformLoadWorker, SpectrogramWorker, PeakBuildWorker)
         peakcache.py             # Pre-computed peak mipmap cache: build, save, load, query
                                  #   Binary .peaks format for fast waveform rendering
@@ -1043,7 +1043,9 @@ def default_detectors() -> list[TrackDetector | SessionDetector]:
 
 Whole-track repairs form a pre-normalization stage. `repair_plan.plan_repairs` combines numeric evidence with preset defaults and sparse per-track choices. The immutable `RepairRecipe` and `repairs.render_corrected` are shared by planning, print and audition. Preserve source detector results when recalculating the classifier and normalization on repaired samples. A change to a repair setting requires replanning. It does not require rerunning the source detectors.
 
-`audition.RepairAudition` holds sample-aligned unity signals, computes one monitor gain and renders callback-sized crossfades. `inspection_spectrogram` returns the same native frequency bins for both choices. The GUI owns requests, cancellation, playback position and view state.
+`audition.RepairAudition` holds the sample-aligned source and correction. `monitor.MonitorPlayback` applies their common pad, channel routing and 10 ms fades using buffers allocated before the device opens. Device callbacks advance their own cursor. The GUI requests source changes and releases, and closes or reopens the device after the release drains. The same monitor handles direct file playback.
+
+`spectrum.full_spectrogram` and `inspection_spectrogram` measure peak amplitude in overlapping windows. Full uses a mel display grid. Low and High expose the native frequency labels for the inspection window. Both sources share the same axes and reference. The widget retains measured peaks when more than one time or frequency cell maps to a display pixel.
 
 `Pipeline.prepare` validates routed output samples and replaces each file atomically. The prepared track records its actual fader offset, routed source path and file signatures. DAW adapters resolve the media and fader together through `resolve_transfer_audio`. CLI text and JSON reports derive delivered gain from the current execution's successful write receipts.
 
@@ -1946,10 +1948,10 @@ separator.
 | `tracks/groups_mixin.py`  | `GroupsMixin` — group assignment UI, color rendering in track table                                                                                                                                                                                                                                                                                                                           |
 | `tracks/table_widgets.py` | Track table widget classes (custom cell widgets, batch-edit base classes)                                                                                                                                                                                                                                                                                                                     |
 | `waveform/__init__.py`    | Re-exports `WaveformWidget`, `WaveformLoadWorker`, `SPECTROGRAM_COLORMAPS`                                                                                                                                                                                                                                                                                                                    |
-| `waveform/compute.py`     | Colormaps (magma/viridis/grayscale LUTs), mel math, spectrogram computation, `WaveformLoadWorker` QThread, `PeakBuildWorker` (batch peak cache builder using thread pool)                                                                                                                                                                                                                      |
+| `waveform/compute.py`     | Colormaps (magma/viridis/grayscale LUTs), spectral view preparation, `WaveformLoadWorker` QThread, `PeakBuildWorker` (batch peak cache builder using thread pool)                                                                                                                                                                                                                      |
 | `waveform/peakcache.py`   | Pre-computed peak mipmap cache: `PeakData`, `MipLevel`, `build_peaks()`, `save_peaks()`, `load_peaks()`, `query_peaks_fast()`. Binary `.peaks` file format (`SPK1`) with staleness detection via source file mtime                                                                                                                                                                            |
 | `waveform/renderer.py`    | `WaveformRenderer` — vectorised NumPy peak/RMS downsampling, waveform drawing, RMS L/R and AVG envelopes, dB scale, peak/RMS markers. Uses mip-level peak queries when `PeakData` is available for near-instant rendering                                                                                                                                                                      |
-| `waveform/spectrogram.py` | `SpectrogramRenderer` — mel spectrogram QImage (256 mel bins via `scipy.signal.stft`), frequency scale, freq zoom/pan, background recompute worker                                                                                                                                                                                                                                            |
+| `waveform/spectrogram.py` | `SpectrogramRenderer` — peak-preserving spectrogram QImage, frequency scale, freq zoom/pan, background recompute worker                                                                                                                                                                                                                                            |
 | `waveform/overlay.py`     | Stateless overlay drawing functions — detector issue overlays (with optional frequency bounds), horizontal time scale                                                                                                                                                                                                                                                                         |
 | `waveform/panel.py`       | `WaveformPanel` — composite widget: persistent preview header + view settings + `WaveformWidget` + transport bar. Reused in Phase 1 (topology preview) and Phase 2 (file detail)                                                                                                                                                                                                                                       |
 | `waveform/widget.py`      | `WaveformWidget` — thin orchestrator coordinating `WaveformRenderer` and `SpectrogramRenderer`; paintEvent, mouse/keyboard event handlers, zoom/pan API, public setters                                                                                                                                                                                                                       |
@@ -2033,7 +2035,7 @@ leaves. `prefs/` reads `ParamSpec` metadata from detectors and processors.
     (e.g. "Detector Overlays (2)"). Menu is rebuilt on track selection and
     on classification override changes.
   - **Spectrogram mode** — mel spectrogram (256 mel bins) computed via
-    `scipy.signal.stft` in a background thread (`WaveformLoadWorker`).
+    `sessionpreplib.spectrum` in a background thread (`WaveformLoadWorker`).
     Configurable FFT size, window type, dB floor/ceiling, and colormap.
     Colormap registry (`SPECTROGRAM_COLORMAPS`): magma, viridis, grayscale
     (256-entry RGBA LUTs). Frequency axis with mel-spaced ticks at 50, 100,
@@ -2433,7 +2435,7 @@ aggressively pushes the new peak cache to instantly resolve the loading state.
 |---------------|---------------------------------------------------------------------------------------------------------------------|
 | `numpy`       | `sessionpreplib` (core dependency)                                                                                  |
 | `soundfile`   | `sessionpreplib/audio.py` (audio I/O)                                                                               |
-| `scipy`       | `sessionpreplib/audio.py` (subsonic STFT), `sessionprepgui/waveform/compute.py` (mel spectrogram) — core dependency |
+| `scipy`       | `sessionpreplib/audio.py` (subsonic STFT), `sessionpreplib/spectrum.py` (preview spectra) — core dependency |
 | `rich`        | `sessionprep.py` only — **not** a library dependency                                                                |
 | `PySide6`     | `sessionprepgui` only — optional GUI dependency                                                                     |
 | `sounddevice` | `sessionprepgui/detail/playback.py` only — optional GUI dependency                                                  |
