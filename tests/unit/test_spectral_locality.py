@@ -102,3 +102,78 @@ def test_midrange_tones_do_not_create_a_false_ultrasonic_line_at_frame_seams():
     # The real, local 20 ms Hann spectrum's sidelobes in 20–24 kHz are
     # below -145 dBFS. A periodic analytic extension adds spurious energy.
     assert levels[:, interior].max() < -140
+
+
+@pytest.mark.parametrize("codec,db", [("PCM_U8", -12), ("PCM_16", -6), ("PCM_16", -18),
+                                       ("PCM_16", -24), ("PCM_24", -20), ("PCM_24", -24),
+                                       ("FLOAT", -24)])
+@pytest.mark.parametrize("rate,frequency,band,seconds", [
+    (48000, 41.2034446, "full", 1.6), (192000, 41.2034446, "full", 1.6),
+    (48000, .25, "low", 8), (48000, 23999.875, "high", 8.37),
+    (96000, 47999.75, "high", 6.15),
+])
+def test_decoded_edge_levels_match_measured_line_through_nulls(
+        tmp_path, codec, db, rate, frequency, band, seconds):
+    import soundfile as sf
+    phase = 2 * np.pi * frequency * (np.arange(round(seconds * rate)) / rate) + .923
+    path = tmp_path / "stationary.wav"
+    sf.write(path, 10 ** (db / 20) * np.cos(phase), rate, subtype=codec)
+    decoded, _ = sf.read(path)
+    # Measure the recorded line independently; eight-bit files can carry
+    # a measurable DC bias and amplitude quantization error.
+    basis = np.column_stack((np.cos(phase), np.sin(phase), np.ones(len(phase))))
+    a, b, _ = np.linalg.lstsq(basis, decoded, rcond=None)[0]
+    expected = 20 * np.log10(np.hypot(a, b))
+    if band == "full":
+        times, _, levels = full_spectrogram([decoded], rate, width=512, window="hann",
+                                            frequency_max=rate / 2, rows=128)
+    else:
+        times, _, levels = inspection_spectrogram(decoded, rate, band, max_columns=4096)
+    settled = (times >= .2 * seconds) & (times <= .8 * seconds)
+    np.testing.assert_allclose(levels[:, settled].max(axis=0), expected, atol=.3)
+
+
+@pytest.mark.parametrize("codec", ["PCM_U8", "PCM_16", "PCM_24", "FLOAT"])
+def test_decoded_stationary_sections_remeasure_the_local_level_across_edits(tmp_path, codec):
+    import soundfile as sf
+    rate = 48000
+    t = np.arange(12 * rate) / rate
+    carrier = np.cos(2 * np.pi * 23999.75 * t + .13)
+    level = np.select([(t >= 1) & (t < 6), (t >= 6) & (t < 11)], [.6, .15])
+    path = tmp_path / "edited.wav"
+    sf.write(path, level * carrier, rate, subtype=codec)
+    decoded, _ = sf.read(path)
+    times, _, spectrum = inspection_spectrogram(decoded, rate, "high", max_columns=2000)
+    peaks = spectrum.max(axis=0)
+    assert (peaks[(times < .98) | (times > 11.02)] == -200).all()
+    for start, end in [(1, 6), (6, 11)]:
+        samples = (t >= start) & (t < end)
+        amplitude = np.dot(carrier[samples], decoded[samples]) / np.dot(carrier[samples], carrier[samples])
+        interior = (times > start + .03) & (times < end - .03)
+        np.testing.assert_allclose(peaks[interior], 20 * np.log10(amplitude), atol=.3)
+
+
+@pytest.mark.parametrize("codec,amplitude,step", [("PCM_U8", .3, 2. ** -7),
+                                                ("PCM_16", .063, 2. ** -15)])
+@pytest.mark.parametrize("frequency", [41.2, 23999.75])
+def test_dithered_pcm_line_survives_a_common_floating_point_gain(
+        tmp_path, codec, amplitude, step, frequency):
+    import soundfile as sf
+    rate = 48000
+    t = np.arange(4 * rate) / rate
+    rng = np.random.default_rng(420)
+    dither = step * (rng.random(len(t)) - rng.random(len(t)))
+    carrier = np.cos(2 * np.pi * frequency * t + .456)
+    path = tmp_path / "dithered.wav"
+    sf.write(path, amplitude * carrier + dither, rate, subtype=codec)
+    decoded, _ = sf.read(path)
+    for gain in (1., .37):
+        source = decoded * gain
+        expected = 20 * np.log10(np.dot(source, carrier) / np.dot(carrier, carrier))
+        if frequency < 50:
+            times, _, levels = full_spectrogram([source], rate, width=512, window="hann",
+                                                frequency_max=rate / 2, rows=128)
+        else:
+            times, _, levels = inspection_spectrogram(source, rate, "high")
+        settled = (times > .5) & (times < 3.5)
+        np.testing.assert_allclose(levels[:, settled].max(axis=0), expected, atol=.3)

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from concurrent.futures import CancelledError
+from dataclasses import dataclass
 
 import numpy as np
 from scipy import fft, signal
@@ -32,122 +33,195 @@ def _edge_frequency(samples):
     return 2 * np.arcsin(.5 * np.sqrt(coefficient)) / lag
 
 
-def _fit_sinusoid(values, omega):
-    phase = omega * (np.arange(len(values)) - (len(values) - 1) / 2)
-    cs, sn = np.cos(phase), np.sin(phase)
-    # Centering makes the even cosine and odd sine bases orthogonal.
-    a = np.einsum("i,i->", values, cs) / np.einsum("i,i->", cs, cs)
-    b = np.einsum("i,i->", values, sn) / np.einsum("i,i->", sn, sn)
-    residual = values - (a * cs + b * sn)
-    if np.einsum("i,i->", residual, residual) > 1e-8 * np.einsum("i,i->", values, values):
+def _pcm_step(channel):
+    """Measure integer sample spacing, including after a floating-point gain."""
+    distributed = channel[np.linspace(0, len(channel) - 1, min(len(channel), 513), dtype=int)]
+    # Adjacent samples help reveal a single code step in short, quiet material.
+    observations = np.r_[distributed, channel[len(channel) // 2:len(channel) // 2 + 256]]
+    peak = np.max(np.abs(observations))
+    if not peak or np.all(np.abs(observations) == abs(observations[0])):
+        return 0.
+    if peak <= 1.:
+        for bits in (7, 15, 23):
+            codes = np.ldexp(observations, bits)
+            if np.array_equal(codes, np.rint(codes)):
+                return 2. ** -bits
+    values = np.unique(np.abs(observations / peak))
+    if len(values) < 8:
+        return 0.
+    spacing = min(np.diff(values))
+    # The smallest observed difference can span several actual codes. Accept
+    # a candidate only when every observed value fits the same lattice.
+    for divisor in range(1, 9):
+        step = spacing / divisor
+        if step < 2. ** -24:
+            break
+        codes = values / step
+        if np.max(np.abs(codes - np.rint(codes))) <= 1e-5:
+            return step * peak
+    return 0.
+
+
+@dataclass
+class _EdgeLine:
+    """A resolved oscillator on a measured time interval, in absolute sample phase."""
+
+    start: int
+    end: int
+    origin: float
+    omega: float
+    a: float
+    b: float
+    high: bool
+    residual_limit: float
+
+    def local_components(self, frame, start):
+        phase = self.omega * (np.arange(len(frame)) + (start - self.origin))
+        cs, sn = np.cos(phase), np.sin(phase)
+        real = self.a * cs + self.b * sn
+        if self.high:
+            real[1 - start % 2::2] *= -1
+        residual = frame - real
+        # The reference supplies quadrature only when its real samples agree
+        # with this entire window, allowing for integer-code rounding.
+        if np.max(np.abs(residual)) > self.residual_limit:
+            return None
+        quadrature = self.a * sn - self.b * cs
+        if self.high:
+            quadrature[start % 2::2] *= -1
+        return real + 1j * quadrature, residual
+
+
+def _measure_edge_line(channel, start, stop, high, quantum):
+    """Fit frequency, phase and amplitude to observations spanning a real swing."""
+    # Average adjacent samples after folding. Paired samples cancel the DC
+    # bias of integer PCM near Nyquist, even when the observation stride is even.
+    stride = max(1, (stop - start - 1) // 192)
+    indices = np.arange(start, stop - 1, stride)
+    if len(indices) < 8:
         return None
-    return np.hypot(a, b), a * sn - b * cs, residual
-
-
-def _corroborated_edge(channel, start, stop, high, omega, rate):
-    """Confirm a sub-cycle frequency on adjacent audio that exhibits its swing.
-
-    A short ramp can fit the tip of an arbitrarily large hypothetical sine.
-    Require measured support for the line, in either time direction so that
-    an edit on one side doesn't invalidate the other. Only frequency and a
-    consistency bound cross the window: no outside samples supply its level.
-    """
-    n = stop - start
-    span = max(4 * n, int(np.ceil(np.pi / omega)) if omega else 4 * rate)
-    span = min(len(channel), span)
-    center = (start + stop) // 2
-    # Limit work to 96 observations even when the beat period is many seconds.
-    step = max(1, span // 96)
-    count = min(96, span // step)
-    if count < 8:
+    first = np.asarray(channel[indices], dtype=np.float64)
+    second = np.asarray(channel[indices + 1], dtype=np.float64)
+    if high:
+        y = (first - second) * .5
+        y[indices % 2 != 0] *= -1
+    else:
+        y = (first + second) * .5
+    scale = np.max(np.abs(y))
+    if not scale or scale < 4 * quantum:
         return None
-    tried = set()
-    for origin in (center - span // 2, stop - span, start):
-        origin = min(len(channel) - span, max(0, origin))
-        if origin in tried:
-            continue
-        tried.add(origin)
-        indices = origin + np.arange(count) * step
-        values = np.asarray(channel[indices], dtype=np.float64)
-        if high:
-            values[(indices - start) % 2 != 0] *= -1
-        peak = np.max(np.abs(values))
-        if not peak:
-            continue
-        values /= peak
-        angular = _edge_frequency(values)
-        if angular is None:
-            continue
-        fit = _fit_sinusoid(values, angular)
-        # A quarter-cycle observation reaches at least 1/sqrt(2) of a
-        # sinusoid's peak at some point, including around a beat null.
-        if fit is not None and fit[0] <= 1.43:
-            return angular / step, fit[0] * peak
-    return None
+    y /= scale
+    angular = _edge_frequency(y)
+    if angular is None:
+        return None
+    # Fit over a meaningful fraction of a cycle. A short linear fade alone
+    # cannot establish a sinusoid's amplitude on the other side of a zero.
+    angle = angular * (len(y) - 1)
+    # Coarse samples need at least half a cycle to distinguish the peak
+    # amplitude from quantization bias on the curved flank of a wave.
+    tolerance = quantum / scale
+    required_angle = np.pi if tolerance > .005 else np.pi / 2
+    if angle < required_angle:
+        return None
+    t = np.linspace(-.5, .5, len(y))
+    for _ in range(5):
+        cs, sn = np.cos(angle * t), np.sin(angle * t)
+        basis = np.column_stack((cs, sn, np.ones(len(y))))
+        a, b, dc = np.linalg.lstsq(basis, y, rcond=None)[0]
+        residual = y - (a * cs + b * sn + dc)
+        # Refine the recurrence estimate by projecting the phase derivative
+        # alongside the linear coefficients (frequency is the only nonlinear parameter).
+        derivative = (b * cs - a * sn) * t
+        delta = np.linalg.lstsq(np.column_stack((basis, derivative)), residual, rcond=None)[0][-1]
+        if abs(delta) < 1e-9:
+            break
+        if abs(delta) > angle / 3:
+            return None
+        angle += delta
+    else:
+        return None
+    amplitude = np.hypot(a, b)
+    # Rounding, triangular dither or an earlier gain change can leave a
+    # small residual around a coherent line. Require a low RMS error and
+    # independently bound the largest deviation before supplying quadrature.
+    rms_error = np.sqrt(np.mean(residual ** 2))
+    if (angle < required_angle or amplitude > 1.45 or abs(dc) > tolerance + .001 * amplitude or
+            rms_error > .75 * tolerance + .0005 * amplitude or
+            np.max(np.abs(residual)) > 2 * tolerance + .002 * amplitude):
+        return None
+    omega = angle / (indices[-1] - indices[0])
+    # Undo the adjacent-pair average's cosine response. Its timestamp is
+    # halfway between the two samples.
+    gain = scale / np.cos(omega / 2)
+    origin = (indices[0] + indices[-1] + 1) / 2
+    residual_limit = max(2.5 * quantum, 2e-4 * amplitude * scale, 5 * rms_error * scale)
+    return _EdgeLine(start, stop, origin, omega, a * gain, b * gain, high, residual_limit)
 
 
-def _endpoint_model(channel, start, stop, rate):
-    """Return a supported near-endpoint analytic line and its real local residual."""
+def _endpoint_model(channel, start, stop, rate, quantum, previous):
     frame = np.asarray(channel[start:stop], dtype=np.float64)
     n = len(frame)
+    if previous is not None and previous.start <= start and stop <= previous.end:
+        components = previous.local_components(frame, start)
+        if components is not None:
+            return components, previous
     scale = np.max(np.abs(frame))
-    x = frame / scale
+    x = frame / max(scale, quantum)
     high = np.einsum("i,i->", x[1:], x[:-1]) < 0
     if high:
         x[1::2] *= -1
-    if np.ptp(x) < 1e-10:
-        return frame, np.zeros_like(frame)
+    constant = np.ptp(x) < 1e-10
+    if constant and (not quantum or n < 12):
+        return (frame, np.zeros_like(frame)), None
     if n < 12:
-        return None
+        return None, None
     variation = np.diff(x)
     energy = np.einsum("i,i->", x, x)
-    # Only unresolved positive/negative lobes at DC or Nyquist need a fit.
-    if np.einsum("i,i->", variation, variation) > energy * (8 * np.pi / n) ** 2:
-        return None
-    # Equal block averages share the oscillator frequency and suppress
-    # rounding noise in curvature estimates for FLOAT and integer PCM.
-    stride = max(1, n // 48)
-    count = n // stride
-    means = x[:count * stride].reshape(count, stride).mean(axis=1)
-    angular = _edge_frequency(means)
-    omega = angular / stride if angular is not None else None
-    reference_peak = None
-    if omega is None or omega * n < np.pi / 2:
-        line = _corroborated_edge(channel, start, stop, high, omega, rate)
-        if line is not None:
-            omega, reference_peak = line
-    if omega is None:
-        return None
-    fit = _fit_sinusoid(x, omega)
-    if fit is None:
-        return None
-    amplitude, quadrature, residual = fit
-    if reference_peak is not None:
-        if abs(amplitude * scale - reference_peak) > .03 * reference_peak:
-            return None
-    elif omega * n < np.pi / 2 and amplitude > 1.035:
-        # An uncorroborated sub-cycle fit must not invent an unseen peak.
-        return None
-    if high:
-        # Mirroring the baseband frequency at Nyquist conjugates quadrature.
-        residual[1::2] *= -1
-        quadrature[::2] *= -1
-    residual *= scale
-    return (frame - residual) + 1j * (scale * quadrature), residual
+    # Only unresolved real-spectrum images at DC or Nyquist need separation.
+    # Finite precision contributes to the adjacent difference on both samples.
+    noise = quantum / max(quantum, scale)
+    expected_variation = energy * (8 * np.pi / n) ** 2 + n * (2 * noise) ** 2
+    if scale > 4 * quantum and np.einsum("i,i->", variation, variation) > expected_variation:
+        return None, None
+    # Very low-level quantized samples can alternate between zero and a
+    # single code; adjacent products then cannot distinguish the two endpoints.
+    orientations = (high, not high) if scale <= 4 * quantum else (high,)
+    span = min(len(channel), n * 4)
+    limit = min(len(channel), max(n * 4, rate * 8))
+    while True:
+        origins = ((start + stop - span) // 2, start, stop - span)
+        origins = dict.fromkeys(max(0, min(len(channel) - span, lo)) for lo in origins)
+        for lo in origins:
+            for orientation in orientations:
+                line = _measure_edge_line(channel, lo, lo + span, orientation, quantum)
+                if line is None:
+                    continue
+                components = line.local_components(frame, start)
+                if components is not None:
+                    return components, line
+        if span == limit:
+            break
+        span = min(span * 2, limit)
+    if constant:
+        return (frame, np.zeros_like(frame)), None
+    return None, None
 
 
-def _window_spectrum(channel, start, stop, rate, weights, n_fft):
-    model = _endpoint_model(channel, start, stop, rate)
+def _window_amplitudes(channel, start, stop, rate, weights, n_fft, quantum, previous):
+    model, line = _endpoint_model(channel, start, stop, rate, quantum, previous)
     residual = channel[start:stop] if model is None else model[1]
     # A real windowed Fourier transform keeps edits, noise and multiple
     # components inside the nominated time window. DC and Nyquist have no
     # negative-frequency counterpart. Resolved endpoint tones contribute
     # their isolated positive-frequency lobe, without doubling its image.
-    spectrum = fft.rfft(residual * weights, n=n_fft)
-    spectrum[1:-1] *= 2
+    amplitudes = np.abs(fft.rfft(residual * weights, n=n_fft))
+    amplitudes[1:-1] *= 2
     if model is not None:
-        spectrum += fft.fft(model[0] * weights, n=n_fft)[:len(spectrum)]
-    return spectrum
+        # Report the strongest measured component. Adding the quantizer's
+        # DC bias coherently to the fitted line would modulate its readout.
+        carrier = fft.fft(model[0] * weights, n=n_fft)[:len(amplitudes)]
+        np.maximum(amplitudes, np.abs(carrier), out=amplitudes)
+    return amplitudes, line
 
 
 def _peak_spectrogram(channels, rate, width, hop, window, frequencies, max_columns, cancelled):
@@ -181,18 +255,21 @@ def _peak_spectrogram(channels, rate, width, hop, window, frequencies, max_colum
     first = int(np.ceil(frequencies[0] / hz_per_bin))
     last = min(n_fft // 2, int(np.floor(frequencies[-1] / hz_per_bin)))
     edges = np.clip(np.ceil(np.r_[frequencies[0], midpoints] / hz_per_bin).astype(int), first, last)
+    quanta = [_pcm_step(channel) for channel in channels]
+    previous = [None] * len(channels)
     for i, center in enumerate(centers):
         if cancelled is not None and cancelled():
             raise CancelledError()
         start = center - width // 2
         lo, hi = max(start, 0), min(start + width, frames)
         weights = taper[lo - start:hi - start]
-        for channel in channels:
+        for ch, channel in enumerate(channels):
             frame = np.asarray(channel[lo:hi], dtype=np.float64)
             if not frame.any():
                 continue
-            spectrum = _window_spectrum(channel, lo, hi, rate, weights, n_fft)
-            amplitude = np.abs(spectrum[first:last + 1])
+            spectrum, previous[ch] = _window_amplitudes(
+                channel, lo, hi, rate, weights, n_fft, quanta[ch], previous[ch])
+            amplitude = spectrum[first:last + 1]
             cells = np.maximum.reduceat(amplitude, edges - first)
             db = 20 * np.log10(np.maximum(cells / weights.sum(), 1e-10))
             dest = levels[:, column[i]]
