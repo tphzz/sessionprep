@@ -12,10 +12,11 @@ import threading
 import numpy as np
 
 from PySide6.QtCore import QThread, Signal
-from scipy.signal import stft as scipy_stft
 
+from sessionpreplib.audio import max_momentary_rms, squared_sample_prefix, validate_analysis_level
 from sessionpreplib.audition import RepairAudition, inspection_spectrogram
 from sessionpreplib.repair_plan import source_for_render
+from sessionpreplib.spectrum import full_spectrogram, hz_to_mel as _hz_to_mel, mel_to_hz as _mel_to_hz
 
 
 # ---------------------------------------------------------------------------
@@ -64,46 +65,6 @@ _register_colormap("grayscale", [
 
 
 # ---------------------------------------------------------------------------
-# Mel filterbank
-# ---------------------------------------------------------------------------
-
-def _hz_to_mel(f: float) -> float:
-    return 2595.0 * np.log10(1.0 + f / 700.0)
-
-
-def _mel_to_hz(m: float) -> float:
-    return 700.0 * (10.0 ** (m / 2595.0) - 1.0)
-
-
-def _mel_filterbank(sr: int, n_fft: int, n_mels: int = 128,
-                    f_min: float = 20.0, f_max: float = 22050.0
-                    ) -> np.ndarray:
-    """Build a Mel filterbank matrix (n_mels, n_fft // 2 + 1)."""
-    f_max = min(f_max, sr / 2.0)
-    n_freqs = n_fft // 2 + 1
-    mel_min = _hz_to_mel(f_min)
-    mel_max = _hz_to_mel(f_max)
-    mel_points = np.linspace(mel_min, mel_max, n_mels + 2)
-    hz_points = 700.0 * (10.0 ** (mel_points / 2595.0) - 1.0)
-    bin_points = np.floor((n_fft + 1) * hz_points / sr).astype(np.intp)
-
-    fb = np.zeros((n_mels, n_freqs), dtype=np.float64)
-    for i in range(n_mels):
-        left, center, right = bin_points[i], bin_points[i + 1], bin_points[i + 2]
-        if center == left:
-            center = left + 1
-        if right == center:
-            right = center + 1
-        for j in range(int(left), int(center)):
-            if j < n_freqs:
-                fb[i, j] = (j - left) / (center - left)
-        for j in range(int(center), int(right)):
-            if j < n_freqs:
-                fb[i, j] = (right - j) / (right - center)
-    return fb
-
-
-# ---------------------------------------------------------------------------
 # Spectrogram computation (used by background workers)
 # ---------------------------------------------------------------------------
 
@@ -122,42 +83,17 @@ def compute_mel_spectrogram(channels: list[np.ndarray], sr: int, *,
                             compare_channels: bool = False,
                             cancelled=None,
                             ) -> np.ndarray | None:
-    """Compute a full-file mel spectrogram from channel data.
-
-    Returns a float32 array of shape (n_mels, n_frames) in dB, or None
-    if the audio is too short.
-    """
-    if not channels:
+    """Return the full-band preview's calibrated peak dBFS on its mel axis."""
+    if not channels or not len(channels[0]):
         return None
-    if hop is None:
-        hop = n_fft  # optimized for UI speed (4x faster than n_fft // 4)
-    # Mix to mono in-place to avoid massive memory allocations
-    if len(channels) == 1 or compare_channels:
-        mono = channels[0]
-    else:
-        mono = channels[0].copy()
-        for ch in channels[1:]:
-            mono += ch
-        mono /= len(channels)
-    if len(mono) < n_fft:
-        return None
-    # STFT
-    f_max = sr / 2 if compare_channels else min(_SPEC_F_MAX, sr / 2.0)
-    fb = _mel_filterbank(sr, n_fft, _SPEC_N_MELS, _SPEC_F_MIN, f_max)
-    mel_spec = None
-    for channel in channels if compare_channels else (mono,):
-        if cancelled is not None and cancelled():
-            raise CancelledError()
-        _, _, spectrum = scipy_stft(channel, fs=sr, nperseg=n_fft,
-                                    noverlap=n_fft - hop, window=window, boundary=None)
-        channel_spec = fb @ (np.abs(spectrum) ** 2)
-        if mel_spec is None:
-            mel_spec = channel_spec
-        else:
-            np.maximum(mel_spec, channel_spec, out=mel_spec)
-    # To dB
-    mel_spec = 10.0 * np.log10(np.maximum(mel_spec, 1e-10))
-    return mel_spec.astype(np.float32)
+    if not compare_channels and len(channels) > 1:
+        mono = channels[0].astype(np.float64, copy=True)
+        for channel in channels[1:]:
+            mono += channel
+        channels = [mono / len(channels)]
+    f_max = sr / 2 if compare_channels else min(_SPEC_F_MAX, sr / 2)
+    return full_spectrogram(channels, sr, width=n_fft, window=window, frequency_max=f_max,
+                            rows=_SPEC_N_MELS, hop=hop, cancelled=cancelled)[2]
 
 
 # ---------------------------------------------------------------------------
@@ -220,6 +156,7 @@ class WaveformLoadWorker(QThread):
                     if source.audio_data is None or not source.audio_data.size:
                         raise ValueError("Source audio is empty.")
                     self.audition = RepairAudition(source.audio_data, source.samplerate, self.recipe)
+                validate_analysis_level(self.audition.monitor_pad.peak, len(self.audition.original))
                 if not self._cancelled.is_set():
                     self.source_ready.emit()
                 if self._cached is not None:
@@ -284,6 +221,7 @@ class WaveformLoadWorker(QThread):
             peak_channel = int(np.argmax(max_vals))
             peak_sample = peaks_per_ch[peak_channel]
         peak_lin = abs(float(channels[peak_channel][peak_sample]))
+        validate_analysis_level(peak_lin, total)
         peak_db = 20.0 * np.log10(peak_lin) if peak_lin > 0 else float('-inf')
         peak_amplitude = float(channels[peak_channel][peak_sample])
 
@@ -294,36 +232,14 @@ class WaveformLoadWorker(QThread):
 
         # --- RMS cumsum (computed once, reused for envelope drawing) ---
         t0 = time.perf_counter()
-        rms_max_sample = -1
-        rms_max_db = float('-inf')
-        rms_max_amplitude = 0.0
-        rms_cumsums: list[np.ndarray] = []
+        win = min(win, total)
+        rms_cumsums = []
         if win > 0:
-            ch_wms: list[np.ndarray] = []
-            for ch_data in channels:
+            for channel in channels:
                 if self._cancelled.is_set():
                     return
-                n = len(ch_data)
-                if n <= win:
-                    rms_cumsums.append(np.zeros(2, dtype=np.float64))
-                    ch_wms.append(np.zeros(1, dtype=np.float64))
-                    continue
-                sq = ch_data.astype(np.float64) ** 2
-                cs = np.empty(n + 1, dtype=np.float64)
-                cs[0] = 0.0
-                np.cumsum(sq, out=cs[1:])
-                rms_cumsums.append(cs)
-                ch_wms.append((cs[win:] - cs[:n - win + 1]) / win)
-            min_len = min(len(wm) for wm in ch_wms)
-            if min_len > 0:
-                combined = np.mean(
-                    np.column_stack([wm[:min_len] for wm in ch_wms]), axis=1
-                )
-                max_idx = int(np.argmax(combined))
-                rms_max_sample = max_idx + win // 2
-                rms_lin = float(np.sqrt(combined[max_idx]))
-                rms_max_db = 20.0 * np.log10(rms_lin) if rms_lin > 0 else float('-inf')
-                rms_max_amplitude = rms_lin
+                rms_cumsums.append(squared_sample_prefix(channel))
+        rms_max_sample, rms_max_db, rms_max_amplitude = max_momentary_rms(rms_cumsums, win)
 
         log.debug("[Trace] WaveformLoadWorker RMS: %.2f ms", (time.perf_counter() - t0) * 1000)
 
@@ -336,10 +252,14 @@ class WaveformLoadWorker(QThread):
         spec_times = None
         if self._compute_spectrogram:
             t0 = time.perf_counter()
-            if self.band == "full":
+            if self.band == "full" and self.track is not None:
+                spec_times, spec_freq, spec_db = full_spectrogram(
+                    channels, sr, width=self._spec_n_fft, window=self._spec_window,
+                    frequency_max=sr / 2, rows=_SPEC_N_MELS, cancelled=self._cancelled.is_set)
+            elif self.band == "full":
                 spec_db = compute_mel_spectrogram(
                     channels, sr, n_fft=self._spec_n_fft, window=self._spec_window,
-                    compare_channels=self.track is not None, cancelled=self._cancelled.is_set)
+                    cancelled=self._cancelled.is_set)
             else:
                 spec_times, spec_freq, spec_db = inspection_spectrogram(
                     data, sr, self.band, cancelled=self._cancelled.is_set)

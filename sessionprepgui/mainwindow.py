@@ -1184,7 +1184,7 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
             return
         self._close_after_batch = False
 
-        self._playback.stop()
+        self._playback.close()
         self._pending_after_check = None
         self._repair_preview.close()
         # Qt destroys child threads along with their window. A long filter can

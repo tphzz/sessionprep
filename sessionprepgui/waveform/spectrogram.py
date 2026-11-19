@@ -29,6 +29,19 @@ class SpecRenderCtx:
     samplerate: int
 
 
+def _peak_pixels(values, centers, edges, axis):
+    """Hold the maximum of every source cell intersecting each pixel interval."""
+    boundaries = (centers[:-1] + centers[1:]) / 2
+    first = np.searchsorted(boundaries, edges[:-1], side="right")
+    last = np.searchsorted(boundaries, edges[1:], side="left")
+    values = np.moveaxis(values, axis, 0)
+    # A pixel edge can bisect a cell. Include that cell on both sides;
+    # repeated start indices naturally extend a cell when zooming in.
+    reduced = np.maximum.reduceat(values[:last[-1] + 1], first, axis=0)
+    np.maximum(reduced, values[last], out=reduced)
+    return np.moveaxis(reduced, 0, axis)
+
+
 class SpectrogramRenderer:
     """Renders the mel spectrogram image, frequency scale, and frequency guide.
 
@@ -277,29 +290,19 @@ class SpectrogramRenderer:
         if spec is None or ctx.draw_w <= 0 or ctx.draw_h <= 0:
             self._spec_image = None
             return
-        n_mels, n_frames = spec.shape
-        frame_start = max(0, ctx.view_start * n_frames // ctx.total_samples)
-        frame_end = min(n_frames, ctx.view_end * n_frames // ctx.total_samples)
-        if frame_end <= frame_start:
-            frame_end = min(frame_start + 1, n_frames)
-        mel_full_min, mel_full_max = self._axis_bounds(ctx.samplerate)
-        mel_full_range = mel_full_max - mel_full_min
-        if mel_full_range <= 0:
+        rows, columns = spec.shape
+        if not rows or not columns:
             self._spec_image = None
             return
-        row_lo = int((self._mel_view_min - mel_full_min) / mel_full_range * (n_mels - 1))
-        row_hi = int(np.ceil((self._mel_view_max - mel_full_min) / mel_full_range * (n_mels - 1)))
-        row_lo = max(0, min(row_lo, n_mels - 1))
-        row_hi = max(row_lo + 1, min(row_hi + 1, n_mels))
-        if self._column_times is None:
-            view_spec = spec[row_lo:row_hi, frame_start:frame_end]
-        else:
-            # Edge windows and the final partial group are not evenly spaced.
-            centers = self._column_times
-            boundaries = (centers[:-1] + centers[1:]) / 2
-            pixels = np.linspace(ctx.view_start, ctx.view_end, ctx.draw_w, endpoint=False)
-            columns = np.searchsorted(boundaries, pixels / ctx.samplerate)
-            view_spec = spec[row_lo:row_hi, columns]
+        full_min, full_max = self._axis_bounds(ctx.samplerate)
+        centers = self._column_times
+        if centers is None:
+            centers = (np.arange(columns) + 0.5) * ctx.total_samples / (columns * ctx.samplerate)
+        time_edges = np.linspace(ctx.view_start, ctx.view_end, ctx.draw_w + 1) / ctx.samplerate
+        view_spec = _peak_pixels(spec, centers, time_edges, axis=1)
+        freq_centers = np.linspace(full_min, full_max, rows)
+        freq_edges = np.linspace(self._mel_view_min, self._mel_view_max, ctx.draw_h + 1)
+        view_spec = _peak_pixels(view_spec, freq_centers, freq_edges, axis=0)
         db_floor = self._spec_db_floor
         db_ceil = self._spec_db_ceil
         norm = np.clip((view_spec - db_floor) / max(db_ceil - db_floor, 1.0), 0.0, 1.0)
@@ -308,12 +311,10 @@ class SpectrogramRenderer:
         if lut is None:
             lut = SPECTROGRAM_COLORMAPS.get("magma", np.zeros((256, 4), np.uint8))
         indices = (norm * 255).astype(np.uint8)
-        rgba = lut[indices]
-        nat_h, nat_w = rgba.shape[:2]
-        rgba_c = np.ascontiguousarray(rgba)
-        self._spec_image_data = rgba_c
-        native_img = QImage(rgba_c.data, nat_w, nat_h, nat_w * 4, QImage.Format.Format_RGBA8888)
-        self._spec_image = native_img.scaled(ctx.draw_w, ctx.draw_h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+        rgba = np.ascontiguousarray(lut[indices])
+        self._spec_image_data = rgba
+        self._spec_image = QImage(rgba.data, ctx.draw_w, ctx.draw_h, rgba.strides[0],
+                                  QImage.Format.Format_RGBA8888)
 
     def _draw_freq_scale(self, painter: QPainter, ctx: SpecRenderCtx):
         """Draw frequency scale on left/right margins for spectrogram mode."""

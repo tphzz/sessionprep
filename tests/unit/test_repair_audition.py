@@ -1,9 +1,17 @@
 """Sample-aligned A/B playback and calibrated frequency inspection."""
 import numpy as np
 import pytest
+from scipy.integrate import cumulative_trapezoid
 
 from sessionpreplib.audition import RepairAudition, inspection_spectrogram
 from sessionpreplib.repairs import RepairRecipe, render_corrected
+
+
+def _expected_switch(length):
+    # Numerically integrate the symmetric Blackman kernel independently of
+    # the analytic step used by the monitor.
+    cumulative = cumulative_trapezoid(np.blackman(length), initial=0.)
+    return cumulative / cumulative[-1]
 
 
 def test_audition_keeps_unclipped_unity_sources_and_applies_one_common_monitor_gain():
@@ -92,11 +100,9 @@ def test_switch_crossfades_ten_ms_at_the_same_nonzero_cursor_and_keeps_playback_
     actual = audition.switch_samples(cursor, from_corrected, not from_corrected, frames)
 
     assert actual.shape == old.shape
-    weight = np.linspace(0.0, 1.0, length)[:, None]
+    weight = _expected_switch(length)[:, None]
     expected = old[:length] * (1 - weight) + new[:length] * weight
-    # Inclusive and exclusive ramp endpoints differ by one blend-weight increment.
-    tolerance = np.max(np.abs(old - new)) / length + 1e-7
-    np.testing.assert_allclose(actual[:length], expected, atol=tolerance, rtol=0)
+    np.testing.assert_allclose(actual[:length], expected, atol=2e-5, rtol=0)
     np.testing.assert_allclose(actual[length:], new[length:], atol=1e-7)
 
 
@@ -108,13 +114,13 @@ def test_switch_near_end_returns_the_remaining_frames_of_the_original_ten_ms_ram
     old = pair.playback_samples(False)[cursor:]
     new = pair.playback_samples(True)[cursor:]
     fade_frames = round(0.010 * rate)
-    weight = np.arange(len(old)) / (fade_frames - 1)
+    weight = _expected_switch(fade_frames)[:len(old)]
 
     switched = pair.switch_samples(cursor, False, True, 1024)
 
     assert switched.shape == (64,)
     np.testing.assert_allclose(switched, old * (1 - weight) + new * weight,
-                               atol=np.max(np.abs(old - new)) / fade_frames + 1e-7)
+                               atol=2e-5, rtol=0)
 
 
 def test_switch_spans_multiple_audio_callbacks_without_restarting_the_ramp():

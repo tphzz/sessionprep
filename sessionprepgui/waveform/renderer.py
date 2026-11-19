@@ -7,6 +7,8 @@ import logging
 
 import numpy as np
 
+from sessionpreplib.audio import max_momentary_rms, squared_sample_prefix
+
 from PySide6.QtCore import QPointF, Qt
 from PySide6.QtGui import (QColor, QFont, QLinearGradient, QPainter,
                            QPen, QPolygonF)
@@ -546,35 +548,11 @@ class WaveformRenderer:
 
     def _compute_rms_max_sample(self):
         """Find the sample position of the maximum momentary RMS window."""
-        win = self._rms_window_samples
-        if not self._channels or win <= 0:
-            self._rms_max_sample = -1
-            return
-        ch_wms: list[np.ndarray] = []
-        have_cumsums = len(self._rms_cumsums) == len(self._channels)
-        for ch_idx, ch_data in enumerate(self._channels):
-            n = len(ch_data)
-            if n <= win:
-                ch_wms.append(np.zeros(1, dtype=np.float64))
-                continue
-            if have_cumsums:
-                cs = self._rms_cumsums[ch_idx]
-            else:
-                sq = ch_data.astype(np.float64) ** 2
-                cs = np.empty(n + 1, dtype=np.float64)
-                cs[0] = 0.0
-                np.cumsum(sq, out=cs[1:])
-            ch_wms.append((cs[win:] - cs[:n - win + 1]) / win)
-        min_len = min(len(wm) for wm in ch_wms)
-        if min_len == 0:
-            self._rms_max_sample = -1
-            return
-        combined = np.mean(np.column_stack([wm[:min_len] for wm in ch_wms]), axis=1)
-        max_idx = int(np.argmax(combined))
-        self._rms_max_sample = max_idx + win // 2
-        max_rms_lin = float(np.sqrt(combined[max_idx]))
-        self._rms_max_db = 20.0 * np.log10(max_rms_lin) if max_rms_lin > 0 else float('-inf')
-        self._rms_max_amplitude = max_rms_lin
+        prefixes = self._rms_cumsums
+        if len(prefixes) != len(self._channels):
+            prefixes = [squared_sample_prefix(channel) for channel in self._channels]
+        self._rms_max_sample, self._rms_max_db, self._rms_max_amplitude = (
+            max_momentary_rms(prefixes, self._rms_window_samples))
 
     def _draw_markers(self, painter: QPainter, ctx: WaveformRenderCtx,
                       nch: int, lane_h: float):
@@ -628,6 +606,9 @@ class WaveformRenderer:
             self._rms_envelope = []
             self._rms_combined = []
             return
+        win = min(win, len(ctx.channels[0]))
+        if not win:
+            return
         cache_key = (width, ctx.view_start, ctx.view_end)
         if self._rms_cache_key == cache_key and self._rms_envelope:
             return
@@ -644,22 +625,16 @@ class WaveformRenderer:
         for ch_idx, ch_data in enumerate(ctx.channels):
             n = len(ch_data)
             n_wm_total = n - win + 1
-            if n <= win:
-                ch_wms.append(np.zeros(1, dtype=np.float64))
-                continue
             if have_cumsums:
                 cs = self._rms_cumsums[ch_idx]
             else:
-                sq = ch_data.astype(np.float64) ** 2
-                cs = np.empty(n + 1, dtype=np.float64)
-                cs[0] = 0.0
-                np.cumsum(sq, out=cs[1:])
+                cs = squared_sample_prefix(ch_data)
             wm_lo = max(0, vs - half_win - win)
             wm_hi = min(n_wm_total, ve + half_win + win)
             wm_offset = wm_lo
             ch_wms.append((cs[wm_lo + win: wm_hi + win] - cs[wm_lo: wm_hi]) / win)
         min_len = min(len(wm) for wm in ch_wms)
-        if min_len > 1 and len(ch_wms) > 1:
+        if len(ch_wms) > 1:
             combined_wm = np.mean(
                 np.column_stack([wm[:min_len] for wm in ch_wms]), axis=1)
         elif ch_wms:
@@ -675,7 +650,7 @@ class WaveformRenderer:
             s_edges = vs + pixel_edges * view_len // width
             global_wm = np.clip(s_edges - half_win, 0, offset + n_wm)
             local_wm = np.clip(global_wm - offset, 0, n_wm)
-            first = int(local_wm[0])
+            first = min(int(local_wm[0]), n_wm - 1)
             last = max(int(local_wm[-1]), first + 1)
             last = min(last, n_wm)
             wm_slice = wm[first:last]

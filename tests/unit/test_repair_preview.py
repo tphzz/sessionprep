@@ -179,10 +179,10 @@ def test_playing_source_switch_does_not_wait_for_waveform_computation(app, windo
     try:
         window._wf_panel.source_selector.buttons[1].click()
         until = time.monotonic() + 1.5
-        while not window._playback._corrected and time.monotonic() < until:
+        while not window._playback._monitor.selected and time.monotonic() < until:
             app.processEvents()
             time.sleep(.005)
-        assert window._playback._corrected and window._repair_preview.worker is not None
+        assert window._playback._monitor.selected and window._repair_preview.worker is not None
         assert len(streams) == 1
     finally:
         resume.set()
@@ -312,15 +312,16 @@ def test_source_change_preserves_cursor_and_crossfades_across_callbacks(app, str
     player.play(audition.original, 1000, 5, mode="channel_mono", channel=0,
                 audition=audition, corrected=False)
     try:
+        streams[0].callback(np.empty((10, 1), dtype=np.float32), 10, None, None)
         player.set_audition_source(True)
         blocks = []
         for frames in (3, 4, 5):
             block = np.empty((frames, 1), dtype=np.float32)
             streams[0].callback(block, frames, None, None)
             blocks.append(block)
-        expected = audition.switch_samples(5, False, True, 12)[:, 0]
+        expected = audition.switch_samples(15, False, True, 12)[:, 0]
         np.testing.assert_allclose(np.concatenate(blocks)[:, 0], expected, rtol=1e-6)
-        assert len(streams) == 1 and player.current_sample() == 17
+        assert len(streams) == 1 and player.current_sample() == 27
     finally:
         player.stop()
 
@@ -353,7 +354,9 @@ def test_double_monitor_pad_precedes_device_narrowing_on_both_sources(app, strea
     player = PlaybackController()
     player.play(audio, 1000, mode=mode, channel=channel, audition=pair)
     try:
-        expected = np.asarray(expected) * pair.playback_samples(False)[0, 0]
+        # The fixture's 776.657388 dBFS peak owes precisely 776.7 dB of pad.
+        expected = np.asarray(expected) * (amplitude * 10 ** (-776.7 / 20))
+        streams[0].callback(np.empty((10, len(expected)), dtype=np.float32), 10, None, None)
         for switching, frames in ((False, 3), (True, 4), (True, 8), (True, 5)):
             player.set_audition_source(switching)
             block = np.empty((frames, len(expected)), dtype=np.float32)
