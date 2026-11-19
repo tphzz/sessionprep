@@ -27,7 +27,7 @@ from .models import (
 )
 from .detector import TrackDetector, SessionDetector
 from .processor import AudioProcessor
-from .repair_plan import plan_repairs, source_for_render
+from .repair_plan import boundary_settling, plan_repairs, repair_levels, source_for_render
 from .repairs import OutputHeadroomError, check_output_headroom, render_corrected
 from .events import EventBus
 from .audio import load_track, format_duration, linear_to_db, AUDIO_EXTENSIONS
@@ -440,12 +440,10 @@ class Pipeline:
     # Prepare (apply processors, write processed files)
     # ------------------------------------------------------------------
 
-    def _render_track(self, track: TrackContext) -> tuple[np.ndarray, list[str]]:
-        """Render from the routed original without mutating its samples or analysis cache."""
-        if "repair_error" in track._cache:
-            raise ValueError(track._cache["repair_error"])
-        source = source_for_render(track)
-        audio = render_corrected(source.audio_data, source.samplerate, track.repair_recipe)
+    def _render_track(self, track: TrackContext) -> tuple[np.ndarray, np.ndarray, list[str]]:
+        """Render a verified source, retaining the signal just before output gain."""
+        corrected = render_corrected(track.audio_data, track.samplerate, track.repair_recipe)
+        audio = corrected
         applied = track.repair_recipe.applied_ids()
         for proc in self.audio_processors:
             pr = track.processor_results.get(proc.id)
@@ -461,7 +459,7 @@ class Pipeline:
                 applied.append(proc.id)
         if track.manual_gain_db is not None and "bimodal_normalize" not in applied:
             audio = audio * (10.0 ** (track.manual_gain_db / 20))
-        return audio, applied
+        return corrected, audio, applied
 
     def prepare(
         self,
@@ -470,7 +468,7 @@ class Pipeline:
         progress_cb: Callable[[int, int, str], None] | None = None,
     ) -> SessionContext:
         """Render each output atomically. A failed retry retains its last successful render."""
-        from .topology import build_default_topology, build_transfer_manifest, passthrough_routes, resolve_entry_audio
+        from .topology import build_default_topology, build_transfer_manifest, resolve_entry_audio
 
         root = Path(output_dir).resolve()
         root.mkdir(parents=True, exist_ok=True)
@@ -478,7 +476,11 @@ class Pipeline:
         session.topology = topology
         sources = {t.filename: t for t in session.tracks if t.status == "OK"}
         needed = dict.fromkeys(s.input_filename for e in topology.entries for s in e.sources)
+        rerouted = {i for i, entry in enumerate(topology.entries) if not _passthrough_entry(entry, sources)}
+        routed_names = {s.input_filename for i in rerouted for s in topology.entries[i].sources}
+        direct_names = {e.sources[0].input_filename for i, e in enumerate(topology.entries) if i not in rerouted}
         rendered, original, applied, source_errors = {}, {}, {}, {}
+        unity, source_gaps = {}, {}
         expected = len(needed) + len(topology.entries)
         destinations = Counter((root / e.output_filename).resolve() for e in topology.entries)
         for step, name in enumerate(needed):
@@ -486,9 +488,13 @@ class Pipeline:
                 progress_cb(step, expected, f"Processing {name}")
             try:
                 track = source_for_render(sources[name])
-                audio, applied[name] = self._render_track(track)
+                corrected, audio, applied[name] = self._render_track(track)
                 original[name] = (track.audio_data, track.samplerate)
                 rendered[name] = (audio, track.samplerate)
+                if name in routed_names:
+                    unity[name] = (corrected, track.samplerate)
+                if name in direct_names and track.repair_recipe.active:
+                    source_gaps[name] = boundary_settling(track.audio_data, corrected, track.samplerate)
             except Exception as exc:
                 source_errors[name] = str(exc)
 
@@ -515,10 +521,32 @@ class Pipeline:
                 if not dest.is_relative_to(root) or dest in input_paths or dest.is_relative_to(root / ".routed"):
                     raise ValueError("Prepared output must be separate from its source")
                 audio = resolve_entry_audio(entry, rendered)
-                check_output_headroom(audio, src.subtype)
+                try:
+                    check_output_headroom(audio, src.subtype)
+                except OutputHeadroomError as overload:
+                    if len(set(names)) != 1:
+                        raise
+                    gain, reduction = self._retry_trim(src, entry, original[src.filename][0],
+                                                       applied[src.filename], overload)
+                    previous = gain_adjustments.get(src.filename)
+                    if previous is None or (reduction, overload.peak_db) > (
+                            previous["reduction_db"], previous["peak_db"]):
+                        gain_adjustments[src.filename] = {
+                            "peak_db": overload.peak_db, "reduction_db": reduction, "gain_db": gain,
+                        }
+                    if reduction != overload.reduction_db:
+                        raise OutputHeadroomError(overload.peak_db, reduction, src.subtype) from overload
+                    raise
                 fader = _routed_fader(entry, sources, rendered, applied)
-                identity = (len(names) == 1 and entry.output_channels == src.channels and
-                            entry.sources[0].routes == passthrough_routes(src.channels))
+                identity = index not in rerouted
+                measurements = deepcopy(src.repair_measurements) if identity else {}
+                if identity and src.filename in source_gaps:
+                    measurements["boundary_settling"] = source_gaps[src.filename]
+                elif identity and "boundary_settling" in measurements:
+                    # A direct library render can bypass a previously planned repair.
+                    for key in ("boundary_settling", "low_cut_resolved", "subsonic_resolved"):
+                        measurements.pop(key, None)
+                    measurements["corrected"] = deepcopy(measurements.get("original", {}))
                 dry_path = src.filepath
                 dry_signature = src.source_file_signature
                 if not identity:
@@ -534,6 +562,13 @@ class Pipeline:
                             "The routed original cannot be encoded as finite FLOAT audio. "
                             "Check the source levels and routing gains."
                         ) from exc
+                    if any(sources[n].repair_recipe.active for n in names):
+                        corrected_route = resolve_entry_audio(entry, unity)
+                        measurements = {
+                            "original": repair_levels(dry_audio),
+                            "corrected": repair_levels(corrected_route),
+                            "boundary_settling": boundary_settling(dry_audio, corrected_route, src.samplerate),
+                        }
                     digest = hashlib.blake2b(dry_audio, digest_size=16).hexdigest()
                     dry = root / ".routed" / str(src.samplerate) / digest / (Path(name).name + ".wav")
                     old = prior.get(name)
@@ -555,7 +590,7 @@ class Pipeline:
                     source_file_signature=dry_signature,
                     processor_results=deepcopy(src.processor_results), _cache={},
                     repair_overrides=dict(src.repair_overrides),
-                    repair_measurements=deepcopy(src.repair_measurements),
+                    repair_measurements=measurements,
                 )
                 out.prepared_file_signature = _write_atomic(dest, audio, src.samplerate, src.subtype)
                 output_tracks.append(out)
@@ -568,15 +603,6 @@ class Pipeline:
                 self._emit("track.prepared", filename=name, index=index, total=len(topology.entries))
             except Exception as exc:
                 errors.append((name, str(exc)))
-                if isinstance(exc, OutputHeadroomError) and len(set(names)) == 1 and names[0] in sources:
-                    failed = sources[names[0]]
-                    norm = failed.processor_results.get("bimodal_normalize")
-                    gain = norm.gain_db if norm and "bimodal_normalize" in applied[names[0]] else failed.manual_gain_db
-                    previous = gain_adjustments.get(failed.filename)
-                    if previous is None or exc.peak_db > previous["peak_db"]:
-                        gain_adjustments[failed.filename] = {
-                            "peak_db": exc.peak_db, "reduction_db": exc.reduction_db, "gain_db": gain or 0.0,
-                        }
                 if name in prior:
                     output_tracks.append(prior[name])
                 self._emit("prepare.error", filename=name, error=str(exc))
@@ -613,6 +639,28 @@ class Pipeline:
         session.base_transfer_manifest = deepcopy(manifest)
         session.prepare_state = ("stale" if output_tracks else "none") if errors else "ready"
         return session
+
+    def _retry_trim(self, track, entry, source_audio, applied, overload):
+        """Check a borderline decimal step using the same operations as a retry."""
+        from .topology import resolve_entry_audio
+
+        norm = track.processor_results.get("bimodal_normalize")
+        normalizing = norm is not None and "bimodal_normalize" in applied
+        gain = norm.gain_db if normalizing else (track.manual_gain_db or 0.0)
+        candidate = overload.boundary_db
+        if candidate is None:
+            return gain, overload.reduction_db
+        retry = replace(track, audio_data=source_audio, manual_gain_db=gain - candidate,
+                        processor_results=deepcopy(track.processor_results), _cache={})
+        if normalizing:
+            retry.processor_results["bimodal_normalize"].gain_db = retry.manual_gain_db
+        _, audio, _ = self._render_track(retry)
+        routed = resolve_entry_audio(entry, {track.filename: (audio, track.samplerate)})
+        try:
+            check_output_headroom(routed, track.subtype)
+        except OutputHeadroomError:
+            candidate = (round(candidate * 10) + 1) / 10
+        return gain, candidate
 
     # ------------------------------------------------------------------
     # Phase 3: Execute (apply gains, write files)
@@ -659,8 +707,11 @@ class Pipeline:
                     if not os.path.exists(backup_path):
                         shutil.copy2(src_filepath, backup_path)
 
-                audio, applied = self._render_track(track)
+                source = source_for_render(track)
+                corrected, audio, applied = self._render_track(source)
                 check_output_headroom(audio, track.subtype)
+                settling = (boundary_settling(source.audio_data, corrected, source.samplerate)
+                            if source.repair_recipe.active else [])
                 norm = track.processor_results.get("bimodal_normalize")
                 gain, fader = float(track.manual_gain_db or 0), 0.0
                 if norm and "bimodal_normalize" in applied:
@@ -673,8 +724,8 @@ class Pipeline:
                 for result in track.processor_results.values():
                     result.data["out_peak"] = peak
                 receipt = {"gain_db": gain, "fader_db": fader, "applied_processors": applied}
-                if track.repair_measurements.get("boundary_settling"):
-                    receipt["boundary_settling"] = deepcopy(track.repair_measurements["boundary_settling"])
+                if settling:
+                    receipt["boundary_settling"] = settling
                 receipts[track.filename] = receipt
                 track.processed_filepath = str(dst_filepath)
                 track.applied_processors = applied
@@ -695,6 +746,17 @@ class Pipeline:
 # --------------------------------------------------------------------------
 # Helpers
 # --------------------------------------------------------------------------
+
+def _passthrough_entry(entry, sources) -> bool:
+    from .topology import passthrough_routes
+
+    if len(entry.sources) != 1:
+        return False
+    source = entry.sources[0]
+    track = sources.get(source.input_filename)
+    return (track is not None and track.channels == entry.output_channels
+            and source.routes == passthrough_routes(track.channels))
+
 
 def _routed_fader(entry, sources, rendered, applied) -> float:
     """Return the single fader that can compensate all contributing channels."""

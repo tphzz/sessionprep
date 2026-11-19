@@ -20,7 +20,8 @@ def _analyze(kind, track, config):
     return detector.analyze(track)
 
 
-def _levels(data):
+def repair_levels(data):
+    """Per-channel signed DC and overall sample peak at unity gain."""
     if not data.size:
         return {"signed_dc": [], "peak_dbfs": -math.inf}
     peak = float(np.max(np.abs(data)))
@@ -28,9 +29,11 @@ def _levels(data):
             "peak_dbfs": 20 * math.log10(peak) if peak else -math.inf}
 
 
-def _boundary_settling(source, corrected, rate):
+def boundary_settling(source, corrected, rate):
     """Locate audible filter tails in channel-local runs of digital silence."""
     regions = []
+    if not source.size:
+        return regions
     minimum = math.ceil(rate / 10)  # 100 ms excludes ordinary zero crossings.
     for channel, (before, after) in enumerate(zip(source.reshape(len(source), -1).T,
                                                   corrected.reshape(len(corrected), -1).T)):
@@ -137,7 +140,7 @@ def plan_repairs(track, config):
         "suggested": {"dc_remove": dc_suggested, "low_cut": low_match, "ultrasonic": high_match},
         "inherited": {"dc_remove": dc_auto, "low_cut": bool(config.get("repair_auto_low_cut") and low_match),
                       "ultrasonic": bool(config.get("repair_auto_ultrasonic") and high_match)},
-        "original": _levels(data), "low_band": low,
+        "original": repair_levels(data), "low_band": low,
     }
     if measure_low:
         measurements["original"]["low_band"] = original_low
@@ -151,9 +154,8 @@ def plan_repairs(track, config):
         gain_track = replace(source, audio_data=audio, _cache={}, detector_results=dict(source.detector_results))
         for detector in (SilenceDetector, AudioClassifierDetector):
             gain_track.detector_results[detector.id] = _analyze(detector, gain_track, config)
-        most_recent = _levels(audio)
-        if data.size:
-            measurements["boundary_settling"] = _boundary_settling(data, audio, rate)
+        most_recent = repair_levels(audio)
+        measurements["boundary_settling"] = boundary_settling(data, audio, rate)
         if measure_low:
             corrected_low = low if audio is dc_audio else _low_cut_evidence(audio, rate, config)
             most_recent["low_band"] = corrected_low

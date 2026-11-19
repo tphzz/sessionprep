@@ -112,6 +112,19 @@ def open_editor(window, track):
     return window._repair_editor
 
 
+def test_adjust_gain_suggests_a_representable_value_with_the_full_reduction(project, monkeypatch):
+    track = project._session.tracks[0]
+    adjustments = {track.filename: {"gain_db": 4.79, "peak_db": 0.1, "reduction_db": 0.1}}
+    project._session.config["_output_gain_adjustments"] = adjustments
+
+    def cancel(dialog):
+        assert dialog.findChild(QDoubleSpinBox).value() == 4.6
+        return QDialog.Rejected
+
+    monkeypatch.setattr(QDialog, "exec", cancel)
+    project._adjust_failed_output_gain(track)
+
+
 def test_project_and_track_inherit_explicit_values_and_reopen(project, tmp_path, monkeypatch):
     window = project
     first, second = window._session.tracks

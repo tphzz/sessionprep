@@ -342,6 +342,59 @@ def test_repeat_prepare_restores_a_replaced_routed_original(tmp_path):
     np.testing.assert_array_equal(sf.read(current.filepath)[0], original)
 
 
+def test_prepare_freezes_settling_on_the_actual_routed_channels_before_gain(tmp_path):
+    from sessionpreplib.repair_plan import plan_repairs
+
+    rate = 48000
+    silence = np.zeros(rate)
+    pulse = silence.copy()
+    pulse[23998:24000] = 0.5
+    a = source_track(tmp_path, "Silence.wav", silence, rate)
+    b = source_track(tmp_path, "Pulse.wav", pulse, rate)
+    stereo = source_track(tmp_path, "Stereo.wav", np.column_stack((silence, pulse)), rate)
+    for track in (b, stereo):
+        track.repair_overrides = {"low_cut": True, "low_cut_hz": 40}
+        track.manual_gain_db = -6.0
+        plan_repairs(track, {})
+    routes = TopologyMapping([
+        TopologyEntry("Merged.wav", 2, [TopologySource(a.filename, [ChannelRoute(0, 0)]),
+                                        TopologySource(b.filename, [ChannelRoute(0, 1)])]),
+        TopologyEntry("Right.wav", 1, [TopologySource(stereo.filename, [ChannelRoute(1, 0)])]),
+        TopologyEntry("Left.wav", 1, [TopologySource(stereo.filename, [ChannelRoute(0, 0)])]),
+        TopologyEntry("Swapped.wav", 2, [TopologySource(stereo.filename,
+                                                       [ChannelRoute(1, 0), ChannelRoute(0, 1)])]),
+        TopologyEntry("Cancel.wav", 1, [TopologySource(stereo.filename, [ChannelRoute(1, 0)]),
+                                        TopologySource(b.filename, [ChannelRoute(0, 0, -1.0)])]),
+    ])
+    session = SessionContext([a, b, stereo], {}, topology=routes)
+    Pipeline([]).prepare(session, str(tmp_path / "out"))
+    assert session.prepare_state == "ready", session.config["_prepare_errors"]
+    for track, ch in zip(session.output_tracks, [1, 0, None, 0, None], strict=True):
+        gaps = track.repair_measurements.get("boundary_settling", [])
+        if ch is None:
+            assert not gaps
+            continue
+        gap, = gaps
+        samples, _ = sf.read(track.processed_filepath, always_2d=True)
+        untrimmed = samples[24000:, ch] * 10 ** (6 / 20)
+        audible = np.flatnonzero(np.abs(untrimmed) > 1e-6)
+        assert (gap["channel"], gap["start_sample"], gap["end_sample"]) == (
+            ch, 24000 + audible[0], 24000 + audible[-1])
+        assert gap["peak_dbfs"] == pytest.approx(20 * np.log10(np.abs(untrimmed).max()), abs=1e-5)
+    assert stereo.repair_measurements["boundary_settling"][0]["channel"] == 1
+
+    # A library caller can bypass a repair while retaining its earlier analysis.
+    # The success receipt must describe the new write for a direct output too.
+    stereo.repair_recipe = RepairRecipe()
+    session.topology = TopologyMapping([TopologyEntry("Direct.wav", 2, [TopologySource(
+        stereo.filename, [ChannelRoute(0, 0), ChannelRoute(1, 1)])])])
+    Pipeline([]).prepare(session, str(tmp_path / "direct"))
+    assert session.prepare_state == "ready"
+    direct = session.output_tracks[0].repair_measurements
+    assert not direct.get("boundary_settling")
+    assert direct["corrected"] == direct["original"]
+
+
 def test_multi_source_prepare_only_publishes_a_representable_fader(tmp_path):
     rate = 48000
     time = np.arange(rate) / rate

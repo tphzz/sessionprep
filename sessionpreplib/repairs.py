@@ -7,7 +7,7 @@ import math
 from numbers import Real
 
 import numpy as np
-from scipy import signal
+from scipy import optimize, signal
 
 
 @dataclass(frozen=True)
@@ -93,9 +93,10 @@ def render_corrected(audio: np.ndarray, sample_rate: int, recipe: RepairRecipe) 
 
 
 class OutputHeadroomError(ValueError):
-    def __init__(self, peak_db: float, reduction_db: float, subtype: str):
+    def __init__(self, peak_db: float, reduction_db: float, subtype: str, *, boundary_db=None):
         self.peak_db = peak_db
         self.reduction_db = reduction_db
+        self.boundary_db = boundary_db
         super().__init__(f"Output peak {peak_db:+.2f} dBFS exceeds {subtype}. "
                          f"Reduce the output gain by at least {reduction_db:.1f} dB and retry.")
 
@@ -123,16 +124,102 @@ def check_output_headroom(audio: np.ndarray, subtype: str) -> None:
     negative_over = math.log10(-low) - math.log10(negative_range) if low < -negative_range else 0.0
     # Check the nearest tenth in sample units. A log round-trip can turn
     # exactly 0.1 dB into 0.1000000000000001 and recommend an extra step.
-    tenths = round(200 * max(positive_over, negative_over))
+    exact_tenths = 200 * max(positive_over, negative_over)
+    tenths = round(exact_tenths)
+    candidate_db = tenths / 10
     if tenths < 60000:
-        factor = 10 ** (tenths / 200)
+        # Use the same dB-to-linear conversion as the actual gain stage.
+        factor = 10 ** (candidate_db / 20)
         fits = high <= positive_range * factor and -low <= negative_range * factor
     else:
-        attenuation = 10 ** (-tenths / 200)
+        attenuation = 10 ** (-candidate_db / 20)
         fits = high * attenuation <= positive_range and -low * attenuation <= negative_range
     reduction = (tenths if fits else tenths + 1) / 10
     peak_db = 20 * math.log10(max(-low, high))
-    raise OutputHeadroomError(peak_db, reduction, subtype)
+    # A retry at a decimal boundary can round differently when source gain is
+    # applied before the channel routes. The writer can test that exact path.
+    boundary = candidate_db if tenths > 0 and abs(exact_tenths - tenths) < 1e-8 else None
+    raise OutputHeadroomError(peak_db, reduction, subtype, boundary_db=boundary)
+
+
+class _BoundaryPartial:
+    """Resolve one stationary partial in the Hann main lobe at a decision edge."""
+
+    def __init__(self, hz, bin_hz, freqs, window):
+        self.width = len(window)
+        self.edge = hz / bin_hz
+        self.bins = np.flatnonzero(np.abs(freqs - hz) <= 3 * bin_hz)
+        self.extended_bins = np.arange(self.bins[0] - 1, self.bins[-1] + 2)
+        self.window_dc = np.fft.rfft(window)[self.bins] / self.width
+        self.dc_axis = None
+        if self.bins[0] <= 1:
+            # A separate non-coherent program tone can contribute to the
+            # frame mean. Fit the bass partial independently of that constant.
+            dc = np.concatenate((self.window_dc.real, self.window_dc.imag))
+            self.dc_axis = dc / np.linalg.norm(dc)
+        self.grid = np.unique(np.clip(self.edge + np.arange(-2, 2.25, 0.5),
+                                      1e-8, self.width / 2))
+        self.bases = np.stack([self._basis(f) for f in self.grid])
+        self.inverses = np.linalg.pinv(self.bases)
+
+    def _rect(self, offsets):
+        # Exact normalized finite geometric sum, periodic in DFT-bin units.
+        # Wrapping also covers the negative-frequency image near Nyquist.
+        d = np.remainder(offsets + self.width / 2, self.width) - self.width / 2
+        return np.exp(1j * np.pi * d * (1 - 1 / self.width)) * np.sinc(d) / np.sinc(d / self.width)
+
+    def _basis(self, f):
+        # The measured frame has its arithmetic mean removed before windowing.
+        # Fit both images of a real sinusoid, including the windowed mean.
+        cycles = np.array([f, -f])[:, None]
+        rect = self._rect(cycles - self.extended_bins)
+        tones = 0.5 * rect[:, 1:-1] - 0.25 * (rect[:, :-2] + rect[:, 2:])
+        tones -= self._rect(cycles) * self.window_dc
+        cosine = (tones[0] + tones[1]) / 2
+        sine = (tones[0] - tones[1]) / (2j)
+        basis = np.column_stack((cosine, sine))
+        basis = np.concatenate((basis.real, basis.imag))
+        if self.dc_axis is not None:
+            basis -= np.outer(self.dc_axis, self.dc_axis @ basis)
+        return basis
+
+    def fit(self, spectrum):
+        if len(self.bins) < 3:
+            return None
+        local = spectrum[self.bins] / self.width
+        vector = np.concatenate((local.real, local.imag))
+        if self.dc_axis is not None:
+            vector -= self.dc_axis * (self.dc_axis @ vector)
+        power = vector @ vector
+        if not power:
+            return None
+        coeffs = self.inverses @ vector
+        residuals = (self.bases @ coeffs[..., None])[..., 0] - vector
+        errors = np.sum(residuals ** 2, axis=1)
+        best = int(errors.argmin())
+        if errors[best] > 0.25 * power:
+            return None
+        centre = self.grid[best]
+        # The grid brackets the frequency. Refine it only when a single line
+        # can account for the local coefficients to near measurement precision.
+        tolerance = 1e-12 * power
+        if errors[best] <= tolerance:
+            return centre, coeffs[best]
+
+        def fit_at(offset):
+            basis = self._basis(centre + offset)
+            cs = np.linalg.lstsq(basis, vector, rcond=None)[0]
+            residual = vector - basis @ cs
+            return residual @ residual, cs
+
+        lower = self.grid[max(0, best - 1)] - centre
+        upper = self.grid[min(len(self.grid) - 1, best + 1)] - centre
+        optimum = optimize.minimize_scalar(lambda offset: fit_at(offset)[0], method="bounded",
+                                          bounds=(lower, upper), options={"xatol": 1e-10})
+        error, cs = fit_at(optimum.x)
+        if error <= tolerance:
+            return centre + optimum.x, cs
+        return None
 
 
 class _BandWindow:
@@ -143,26 +230,32 @@ class _BandWindow:
         self.bin_hz = rate / width
         self.nyquist = rate / 2
         self.freqs = np.fft.rfftfreq(width, 1 / rate)
-        window = signal.windows.hann(width, sym=False)
-        self.weights = np.full(len(self.freqs), 2.0 / (width * np.sum(window ** 2)))
-        self.weights[0] = 0
+        self.phase = 2 * np.pi * np.arange(width) / width
+        self.window = signal.windows.hann(width, sym=False)
+        self.window_energy = np.sum(self.window ** 2)
+        self.weights = np.full(len(self.freqs), 2.0 / (width * self.window_energy))
+        # The signal's DC was removed before windowing. Tapering a real AC
+        # component can put legitimate energy in the DC bin (and at Nyquist).
+        self.weights[0] *= 0.5
         if width % 2 == 0:
             self.weights[-1] *= 0.5
+        self.edges = [(hz, side, _BoundaryPartial(hz, self.bin_hz, self.freqs, self.window))
+                      for hz, side in ((low, 1), (high, -1)) if 0 < hz < self.nyquist]
+        self.partials = [partial for _, _, partial in self.edges]
+        if low == 0 and high > 2 * self.bin_hz:
+            # The real signal's positive- and negative-frequency lobes meet
+            # here even when the upper decision edge is many bins away.
+            self.partials.append(_BoundaryPartial(0, self.bin_hz, self.freqs, self.window))
 
-        self.edges = []
-        for hz, side in ((low, 1), (high, -1)):
-            if not 0 < hz < self.nyquist:
-                continue
-            # Two bins on either side span the Hann main lobe. The measured
-            # sine/cosine basis also represents an edge between native bins.
-            bins = np.flatnonzero(np.abs(self.freqs - hz) <= 2 * self.bin_hz)
-            phase = 2 * np.pi * hz * np.arange(width) / rate
-            basis = np.column_stack((np.cos(phase), np.sin(phase)))
-            basis -= basis.mean(axis=0)
-            tones = np.fft.rfft(window[:, None] * basis, axis=0)[bins]
-            components = np.concatenate((tones.real, tones.imag))
-            projection = components @ np.linalg.pinv(components)
-            self.edges.append((hz, side, bins, projection))
+    def _spectrum(self, ac):
+        raw = np.fft.rfft(ac)
+        # Multiplication by a periodic Hann or its derivative is a three-bin
+        # convolution. Reflect the one-sided real FFT at DC and Nyquist.
+        last = -2 if len(ac) % 2 == 0 else -1
+        padded = np.concatenate((raw[1:2].conj(), raw, [raw[last].conj()]))
+        left, right = padded[:-2], padded[2:]
+        sides = (left + right) * 0.25
+        return 0.5 * raw - sides, self.bin_hz / (4j) * (left - right), sides
 
     def levels(self, block):
         scale = np.max(np.abs(block))
@@ -170,52 +263,46 @@ class _BandWindow:
             return -math.inf, -math.inf, -math.inf
         ac = np.asarray(block, dtype=np.float64) / scale
         ac -= ac.mean()
-        raw = np.fft.rfft(ac)
-        # Multiplication by the periodic Hann (and its two time derivatives)
-        # is a three-bin convolution. Reflect the real FFT at DC and Nyquist.
-        last = -2 if len(block) % 2 == 0 else -1
-        padded = np.concatenate((raw[1:2].conj(), raw, [raw[last].conj()]))
-        left, right = padded[:-2], padded[2:]
-        sides = (left + right) * 0.25
-        spectrum = 0.5 * raw - sides
-        powers = np.abs(spectrum) ** 2 * self.weights
-        total = powers.sum()
+        spectrum, derivative, sides = self._spectrum(ac)
+        total = np.sum(np.abs(spectrum) ** 2 * self.weights)
         if not total:
             return -math.inf, -math.inf, -math.inf
+        tol = 1e-7 * self.bin_hz
+        partial_power = 0.0
+        for partial in self.partials:
+            fit = partial.fit(spectrum)
+            if fit is None:
+                continue
+            cycles, (cosine, sine) = fit
+            phase = cycles * self.phase
+            line = cosine * np.cos(phase) + sine * np.sin(phase)
+            line -= line.mean()
+            if self.low - tol <= cycles * self.bin_hz <= self.high + tol:
+                partial_power += np.sum((line * self.window) ** 2) / self.window_energy
+            ac -= line
+            spectrum, derivative, sides = self._spectrum(ac)
 
-        # Local frequency from the phase derivative (Flandrin et al.,
-        # Time-frequency reassignment, eq. 5.20). A single tone carries its
-        # main-lobe energy to its own frequency, also at the inclusive edge.
-        derivative = self.bin_hz / (4j) * (left - right)
+        # Diffuse energy and overlapping lines use the local phase derivative
+        # (Flandrin et al., Time-frequency reassignment, eq. 5.20).
+        powers = np.abs(spectrum) ** 2 * self.weights
         shift = np.divide(derivative, spectrum, out=derivative, where=spectrum != 0)
         frequency = np.clip(self.freqs - shift.imag, 0, self.nyquist)
-        tolerance = 1e-7 * self.bin_hz
-        inside = (frequency > 0) & (frequency >= self.low - tolerance) & (frequency <= self.high + tolerance)
+        inside = (frequency > 0) & (frequency >= self.low - tol) & (frequency <= self.high + tol)
         confirmed = inside.copy()
-        for hz, direction, bins, projection in self.edges:
+        for hz, direction, partial in self.edges:
+            bins = partial.bins
             local = spectrum[bins]
-            vector = np.concatenate((local.real, local.imag))
-            residual = vector - projection @ vector
-            local_energy = vector @ vector
-            if local_energy and residual @ residual <= 1e-12 * local_energy:
-                # One edge tone fits the measured complex coefficients to
-                # within one part per million in amplitude, at any phase.
-                inside[bins] = confirmed[bins] = True
-                continue
-            # Two unresolved tones can beat at an apparent frequency outside
-            # both. For two lines the magnitude of the second central moment
-            # is the product of their distances from the complex mean.
-            # Keep the reading, but require its uncertainty to clear the edge
-            # before using those bins to select a whole-track filter.
+            # For two unresolved lines, the magnitude of the second central
+            # frequency moment is the product of their distances from the mean.
             second = self.bin_hz ** 2 * sides[bins]
             np.divide(second, local, out=second, where=local != 0)
             spread = np.sqrt(np.abs(shift[bins] ** 2 - second))
-            confirmed[bins] &= direction * (frequency[bins] - hz) >= spread - tolerance
+            confirmed[bins] &= direction * (frequency[bins] - hz) >= spread - tol
 
-        power = powers[inside].sum()
+        power = powers[inside].sum() + partial_power
         if not power:
             return -math.inf, -math.inf, -math.inf
-        confident = powers[confirmed].sum()
+        confident = powers[confirmed].sum() + partial_power
         level = 10 * math.log10(power) + 20 * math.log10(scale)
         ratio = min(0.0, 10 * math.log10(power / total))
         confidence_db = 10 * math.log10(confident / power) if confident else -math.inf

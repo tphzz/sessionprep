@@ -144,3 +144,75 @@ def test_unmeasurable_ac_and_measured_silence_have_distinct_readings():
     for samples in (np.empty(0), np.array([0.8])):
         assert band_evidence(samples, **kwargs)["band_dbfs"] is None
     assert band_evidence(np.zeros(4800), **kwargs)["band_dbfs"] == -np.inf
+
+
+@pytest.mark.parametrize(("hz", "ratio", "selected"), [
+    (24099.4, -28.0, False), (24100, -34.9, True), (24100.01, -34.9, True),
+    (24100.6, -35.1, False), (24100.6, -34.9, True), (24100.6, -28.0, True),
+])
+def test_widely_separated_off_bin_program_and_carrier_use_the_relative_gate(hz, ratio, selected):
+    rate = 96000
+    t = np.arange(round(0.4 * rate)) / rate
+    fraction = 10 ** (ratio / 10)
+    carrier_peak = 0.4 * np.sqrt(fraction / (1 - fraction))
+    source = (0.4 * np.cos(2 * np.pi * 997 * t + 0.3) +
+              carrier_peak * np.cos(2 * np.pi * hz * t + 0.17))
+    track = track_for(source, rate)
+    plan_repairs(track, {"repair_auto_ultrasonic": True})
+    measured = track.repair_measurements["original"]["ultrasonic"]
+    assert track.repair_recipe.ultrasonic is selected
+    assert measured["regions"] == ([[0, len(t) - 1, 0]] if selected else [])
+    if hz >= 24100:
+        assert measured["ratio_db"] == pytest.approx(ratio, abs=0.1)
+        assert measured["band_dbfs"] == pytest.approx(20 * np.log10(carrier_peak / np.sqrt(2)), abs=0.1)
+
+
+@pytest.mark.parametrize(("edge", "hz", "phase", "selected"), [
+    (1, 1, 0, True), (1, 1, 0.73, True), (1, 1, np.pi / 2, True),
+    (1, 0.98, 0.37, True), (1, 1.02, 0.37, False), (0.7, 0.7, 0.37, True),
+    (2.5, 2.48, 0.37, True), (2.5, 2.52, 0.37, False), (20, 19.98, 0.37, True),
+])
+def test_infrasonic_edge_preserves_the_full_windowed_ac_at_each_phase(edge, hz, phase, selected):
+    rate = 8000
+    t = np.arange(4 * rate) / rate
+    samples = 0.5 * np.cos(2 * np.pi * hz * t + phase) + 0.07
+    track = track_for(samples, rate)
+    plan_repairs(track, {"repair_auto_low_cut": True, "subsonic_hz": edge})
+    measured = track.repair_measurements["original"]["low_band"]
+    assert bool(track.repair_recipe.low_cut_hz) is selected
+    if selected:
+        window = np.sin(np.pi * np.arange(rate) / rate) ** 2
+        frames = np.lib.stride_tricks.sliding_window_view(samples, rate)[::rate // 2]
+        ac = frames - frames.mean(axis=1, keepdims=True)
+        direct = 10 * np.log10(np.sum((window * ac) ** 2, axis=1) / np.sum(window ** 2))
+        assert measured["band_dbfs"] == pytest.approx(max(direct), abs=0.1)
+        assert measured["ratio_db"] == pytest.approx(0, abs=0.1)
+    else:
+        assert measured["band_dbfs"] < -50
+
+
+def test_infrasonic_windowed_level_reaches_the_planner_at_the_absolute_gate():
+    rate = 48000
+    t = np.arange(4 * rate) / rate
+    track = track_for(0.004720304381429618 * np.cos(2 * np.pi * t), rate)
+    plan_repairs(track, {"repair_auto_low_cut": True, "subsonic_hz": 1})
+    evidence = track.repair_measurements["original"]["low_band"]
+    assert evidence["band_dbfs"] == pytest.approx(-48.861432, abs=0.01)
+    assert evidence["regions"] == [[0, len(t) - 1, 0]] and track.repair_recipe.low_cut_hz == 10
+
+
+@pytest.mark.parametrize(("hz", "program_peak"), [(0.8, 0), (1, 0), (1, 0.01), (1.5, 0.02)])
+def test_default_band_keeps_tapered_ac_at_dc_in_a_separated_mixture(hz, program_peak):
+    rate = 8000
+    t = np.arange(4 * rate) / rate
+    infrasonic = 0.009 * np.cos(2 * np.pi * hz * t + 0.37)
+    source = infrasonic + program_peak * np.cos(2 * np.pi * 997.3 * t)
+    track = track_for(source, rate)
+    plan_repairs(track, {"repair_auto_low_cut": True})
+    evidence = track.repair_measurements["original"]["low_band"]
+    window = np.sin(np.pi * np.arange(rate) / rate) ** 2
+    frames = np.lib.stride_tricks.sliding_window_view(infrasonic, rate)[::rate // 2]
+    frame_ac = frames - frames.mean(axis=1, keepdims=True)
+    expected = np.max(10 * np.log10(np.sum((frame_ac * window) ** 2, axis=1) / np.sum(window ** 2)))
+    assert evidence["band_dbfs"] == pytest.approx(expected, abs=0.1)
+    assert track.repair_recipe.low_cut_hz == 10

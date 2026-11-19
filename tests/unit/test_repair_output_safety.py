@@ -110,6 +110,42 @@ def test_peak_at_negative_full_scale_recovers_with_one_tenth_db_on_disk(tmp_path
     np.testing.assert_array_equal(sf.read(target / track.filename)[0], [-1.0, 0.0])
 
 
+def test_minimum_trim_matches_the_rendered_gain_at_every_tenth():
+    for step in range(1, 241):
+        gain = step / 10
+        for limit in (-1.0, 1 - 2 ** -15):
+            sample = limit * 10 ** (gain / 20)
+            with pytest.raises(OutputHeadroomError) as exact:
+                check_output_headroom(np.array([sample]), "PCM_16")
+            assert exact.value.reduction_db == gain
+            with pytest.raises(OutputHeadroomError) as above:
+                check_output_headroom(np.array([np.nextafter(sample, 2 * sample)]), "PCM_16")
+            assert above.value.reduction_db == (step + 1) / 10
+
+
+@pytest.mark.parametrize(("subtype", "bits"), [("PCM_16", 16), ("PCM_24", 24)])
+def test_adjust_gain_recovers_positive_full_scale_through_a_routing_gain(tmp_path, subtype, bits):
+    path = tmp_path / "Positive.wav"
+    limit = 1 - 2 ** (1 - bits)
+    sf.write(path, np.full(64, limit), 48000, subtype=subtype)
+    track = load_track(str(path))
+    topology = build_default_topology([track])
+    topology.entries[0].sources[0].routes[0].gain = 10 ** (0.1 / 20)
+    session = SessionContext([track], {}, topology=topology)
+    pipeline = Pipeline([])
+    target = tmp_path / "prepared"
+    pipeline.prepare(session, str(target))
+    adjustment = session.config["_output_gain_adjustments"][track.filename]
+    # Applying gain before route summing rounds a -0.1 dB retry one ULP above
+    # positive full scale. The actual encoder must accept the offered retry.
+    assert adjustment["reduction_db"] == 0.2
+    assert "0.2 dB" in session.config["_prepare_errors"][0][1]
+    track.manual_gain_db = adjustment["gain_db"] - adjustment["reduction_db"]
+    pipeline.prepare(session, str(target))
+    assert session.prepare_state == "ready"
+    assert sf.read(target / path.name)[0].max() <= limit
+
+
 def test_routed_dry_float_overload_is_rejected_before_publishing(tmp_path):
     path = tmp_path / "Source.wav"
     largest_float = float(np.finfo(np.float32).max)

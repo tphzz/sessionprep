@@ -8,6 +8,7 @@ import logging
 log = logging.getLogger(__name__)
 
 import copy
+from decimal import Decimal, ROUND_FLOOR
 import os
 from typing import Any
 
@@ -1514,7 +1515,8 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         gain.setRange(-160, 60)
         gain.setDecimals(1)
         gain.setSingleStep(0.1)
-        gain.setValue(previous - adjustment["reduction_db"])
+        safe = Decimal(str(previous)) - Decimal(str(adjustment["reduction_db"]))
+        gain.setValue(float(safe.quantize(Decimal("0.1"), rounding=ROUND_FLOOR)))
         form.addRow("Output gain (dB)", gain)
         forecast = QLabel()
         def show_peak():
