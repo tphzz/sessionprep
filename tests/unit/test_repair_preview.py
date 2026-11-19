@@ -479,6 +479,40 @@ def test_float_worker_resolves_a_quiet_line_with_a_measured_noise_floor(
         np.testing.assert_allclose(result["spec_db"][:, selected].max(axis=0), expected, atol=.3)
 
 
+@pytest.mark.parametrize("rate,level,offset", [(96000, .41, 350.), (95904, -.21, 314.)])
+def test_filtered_nyquist_level_survives_a_louder_program_and_noise(app, tmp_path, rate, level, offset):
+    import soundfile as sf
+    from sessionpreplib.audio import load_track
+    from sessionprepgui.waveform.spectrogram import SpectrogramRenderer, SpecRenderCtx
+
+    index = np.arange(4 * rate)
+    t = index / rate
+    alternating = 1 - 2 * (index % 2)
+    source = (level * alternating + .4 * abs(level) * np.cos(2 * np.pi * (rate / 2 - offset) * t + .61)
+              + .12 * np.cos(2 * np.pi * 997 * t + .37))
+    source += np.random.default_rng(22670).normal(0., abs(level) * 10 ** (-42 / 20), len(t))
+    path = tmp_path / "nyquist.wav"
+    sf.write(path, source, rate, subtype="PCM_16")
+    track = load_track(str(path))
+    track.repair_recipe, track.audio_data = RepairRecipe(ultrasonic=True), None
+    for result, audio in _worker_spectra(track, "high"):
+        settled = slice(rate, 3 * rate)
+        reference = np.average(audio[settled] * alternating[settled], weights=np.hanning(2 * rate))
+        expected = 20 * np.log10(abs(reference))
+        columns = np.flatnonzero((result["spec_times"] >= 1.) & (result["spec_times"] < 3.))
+        readings = result["spec_db"][-1, columns]
+        np.testing.assert_allclose(readings, expected, atol=.3)
+        renderer = SpectrogramRenderer()
+        renderer.set_colormap("grayscale")
+        renderer.set_inspection(result)
+        renderer.set_db_floor(-120.)
+        renderer.set_db_ceil(-30.)
+        center = round(result["spec_times"][columns[np.argmax(readings)]] * rate)
+        renderer._build_spec_image(SpecRenderCtx(0, 6, 2048, center - 1, center + 1, len(t), rate))
+        gray = renderer._spec_image.pixelColor(3, 0).red()
+        assert abs(gray - np.clip(255 * (expected + 120.) / 90., 0., 255.)) <= 2
+
+
 @pytest.mark.parametrize("rate,hz,amplitude,band,recipe,expected_db", [
     (96000, 47990., 10 ** (-6 / 20), "high", RepairRecipe(ultrasonic=True), -109.77),
     (96000, 47999.75, 10 ** (-6 / 20), "high", RepairRecipe(ultrasonic=True), -109.76),

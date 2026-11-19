@@ -122,11 +122,8 @@ class _EndpointBand:
     def local_bias(self, frame, start):
         # Use the whole local support: the FIR observations lose one radius
         # on each side, widening their taper enough to admit a resolved line.
-        if self.high:
-            pairs = len(frame) // 2
-            difference = np.subtract(frame[:2 * pairs:2], frame[1:2 * pairs:2], dtype=np.float64)
-            return (.5 if start % 2 == 0 else -.5) * _bias_level(difference)
-        return _bias_level(frame)
+        level = _bias_level(frame, alternating=self.high)
+        return -level if self.high and start % 2 else level
 
 
 @dataclass
@@ -168,21 +165,20 @@ class _EdgeLine:
         return real + 1j * quadrature
 
 
-@lru_cache(maxsize=64)
-def _bias_weights(count):
-    """Unit DC response with strong rejection of other spectral lines."""
+@lru_cache(maxsize=32)
+def _bias_weights(count, alternating):
+    """Unit response at DC or Nyquist, evaluated at the observation rate."""
     taper = signal.windows.blackmanharris(count)
-    return taper / taper.sum()
+    taper /= taper.sum()
+    if alternating:
+        taper[1::2] *= -1
+    return taper
 
 
-def _bias_level(samples):
-    # Reduce long contexts by integration so their window storage is bounded.
-    # Plain subsampling could alias a distant tone to the endpoint.
-    stride = max(1, len(samples) // 128)
-    if stride > 1:
-        count = len(samples) // stride
-        samples = samples[:count * stride].reshape(count, stride).mean(axis=1, dtype=np.float64)
-    return np.einsum("i,i->", samples, _bias_weights(len(samples)))
+def _bias_level(samples, *, alternating=False):
+    # Decimating a block average here folds unrelated program into the
+    # endpoint. Project every sample onto the tapered DC or alternating basis.
+    return np.einsum("i,i->", samples, _bias_weights(len(samples), alternating))
 
 
 def _consistent_bias(samples, level):

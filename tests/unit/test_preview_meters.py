@@ -177,7 +177,8 @@ def test_high_painter_uses_the_actual_frequency_of_the_partial_edge_rows():
 
 @pytest.mark.parametrize("band", ["low", "high"])
 @pytest.mark.parametrize(("companion", "bins"), [
-    ("distant tone", None), ("resolved tone", 4), ("resolved tone", 8), ("noise", None),
+    ("distant tone", None), ("out-of-band program", None), ("resolved tone", 4),
+    ("resolved tone", 8), ("noise", None),
 ])
 def test_exact_dc_and_nyquist_keep_their_one_sided_level_with_other_audio(band, companion, bins):
     rate = 48000
@@ -185,9 +186,13 @@ def test_exact_dc_and_nyquist_keep_their_one_sided_level_with_other_audio(band, 
     endpoint = np.ones(len(index))
     if band == "high":
         endpoint[1::2] = -1
-    source = .05 * endpoint
+    level = -.025 if band == "high" and companion == "out-of-band program" else .05
+    source = level * endpoint
     if companion == "distant tone":
         source += .24 * np.sin(2 * np.pi * (1000 / rate) * index)
+    elif companion == "out-of-band program":
+        frequency = 129. if band == "low" else 15950.
+        source += .24 * np.cos(2 * np.pi * (frequency / rate) * index + .37)
     elif companion == "resolved tone":
         frequency = bins if band == "low" else rate / 2 - 50 * bins
         source += .24 * np.sin(2 * np.pi * (frequency / rate) * index + .48)
