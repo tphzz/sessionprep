@@ -338,7 +338,7 @@ class PeakBuildWorker(QThread):
     progress = Signal(str)                 # status message
     progress_value = Signal(int, int)      # (current, total)
     file_done = Signal(str, object)        # (filename, PeakData)
-    all_done = Signal()
+    all_done = Signal(int)
 
     def __init__(self, items: list[tuple[str, str, str]],
                  parent=None):
@@ -456,4 +456,4 @@ class PeakBuildWorker(QThread):
         if not self._cancelled.is_set():
             self.progress.emit("Peak cache creation finished.")
             log.info("Peak cache background batch finished (%d files)", self._total)
-            self.all_done.emit()
+            self.all_done.emit(completed)

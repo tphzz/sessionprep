@@ -1233,21 +1233,38 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         self._cancel_worker("_peak_build_worker")
         self._progress_start(f"Building peak cache: 0/{len(items)}")
         worker = PeakBuildWorker(items)
-        worker.file_done.connect(self._on_peak_file_done)
-        worker.progress.connect(self._progress_message)
-        worker.progress_value.connect(self._progress_value)
-        worker.all_done.connect(
-            lambda: self._on_peak_build_done(len(items)))
+        worker.file_done.connect(self._on_peak_file_done, Qt.QueuedConnection)
+        worker.progress.connect(self._on_peak_progress, Qt.QueuedConnection)
+        worker.progress_value.connect(self._on_peak_progress_value, Qt.QueuedConnection)
+        worker.all_done.connect(self._on_peak_build_done, Qt.QueuedConnection)
         self._peak_build_worker = worker
         worker.start()
 
+    def _from_current_peak_worker(self):
+        # Disconnecting a worker does not retract events already in Qt's queue.
+        return self._peak_build_worker is not None and self.sender() is self._peak_build_worker
+
+    @Slot(str)
+    def _on_peak_progress(self, message):
+        if self._from_current_peak_worker():
+            self._progress_message(message)
+
+    @Slot(int, int)
+    def _on_peak_progress_value(self, current, total):
+        if self._from_current_peak_worker():
+            self._progress_value(current, total)
+
+    @Slot(int)
     def _on_peak_build_done(self, count: int) -> None:
-        log.info("Peak cache build complete (%d files)", count)
-        self._progress_finish(f"Peak cache built for {count} file(s)")
+        if self._from_current_peak_worker():
+            log.info("Peak cache build complete (%d files)", count)
+            self._progress_finish(f"Peak cache built for {count} file(s)")
 
     @Slot(str, object)
     def _on_peak_file_done(self, filename: str, peak_data):
         """Cache a newly built PeakData in memory, and push to UI if active."""
+        if not self._from_current_peak_worker():
+            return
         if not hasattr(self, "_peak_cache"):
             self._peak_cache = {}
         self._peak_cache[filename] = peak_data

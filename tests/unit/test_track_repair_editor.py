@@ -122,6 +122,26 @@ def test_settling_in_a_previously_silent_gap_is_visible_in_the_editor(editor_pan
     assert editor.error.isHidden()
 
 
+def test_peak_layout_releases_moved_native_items_on_reflow(editor_pane, app):
+    from shiboken6 import isValid
+
+    pane, editor, track, session = editor_pane
+    grid = editor.peak_layout
+    label = grid.itemAtPosition(0, 0)
+    editor.open_track(track, session)
+    app.processEvents()
+    for width, position in [(450, (1, 0)), (1010, (0, 1))]:
+        old_item = grid.itemAt(grid.indexOf(editor.peak))
+        pane.resize(width, 520)
+        app.processEvents()
+        editor.reflow()
+        # An implicit Qt layout move can leave a Python wrapper registered
+        # for deleted native memory, which a newly created worker can reuse.
+        assert not isValid(old_item)
+        assert grid.itemAtPosition(0, 0) is label
+        assert grid.itemAtPosition(*position).widget() is editor.peak
+
+
 def test_processing_menu_opens_same_editor_and_restores_focus_without_normalization(app, editor_pane):
     pane, editor, track, session = editor_pane
     class Table(TrackColumnsMixin, DetailMixin):

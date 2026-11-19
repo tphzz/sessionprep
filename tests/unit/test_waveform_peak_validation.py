@@ -2,14 +2,18 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+import soundfile as sf
 
 pytest.importorskip("PySide6")
 
+from PySide6.QtCore import QObject
 from PySide6.QtWidgets import QApplication
 
+from sessionprepgui.analysis.mixin import AnalysisMixin
 from sessionprepgui.topology.mixin import TopologyMixin
 from sessionprepgui.waveform.peakcache import build_peaks
 from sessionprepgui.waveform.widget import WaveformWidget
+from sessionpreplib.audio import load_track
 
 
 @pytest.fixture(scope="module")
@@ -18,6 +22,52 @@ def qapp():
     if app is None:
         app = QApplication([])
     return app
+
+
+@pytest.mark.parametrize("dispatch_before_replacement", [False, True])
+def test_new_project_ignores_queued_peaks_and_progress_for_the_same_filename(
+        qapp, tmp_path, dispatch_before_replacement):
+    class Host(AnalysisMixin, QObject):
+        def __init__(self):
+            super().__init__()
+            self._config = {}
+            self.events = []
+
+        def _progress_start(self, message):
+            self.events.append(message)
+
+        _progress_message = _progress_finish = _progress_start
+
+        def _progress_value(self, current, total):
+            self.events.append((current, total))
+
+    host = Host()
+    def start(folder_name, peak):
+        folder = tmp_path / folder_name
+        folder.mkdir()
+        path = folder / "shared.wav"
+        sf.write(path, np.full(4096, peak), 48000, subtype="FLOAT")
+        host._start_peak_build([load_track(str(path))], str(folder))
+        return host._peak_build_worker
+
+    old_worker = start("first", .75)
+    # Finish the real worker while its GUI callbacks are still queued.
+    assert old_worker.wait(5000)
+    host._cancel_worker("_peak_build_worker")
+    host._peak_cache.clear()
+    host.events.clear()
+    if dispatch_before_replacement:
+        qapp.processEvents()
+        assert host._peak_cache == {} and host.events == []
+
+    current_worker = start("second", .125)
+    assert current_worker.wait(5000)
+    # A second lookup in the same project may have no missing routed peaks.
+    host._start_peak_build([], str(tmp_path / "second"))
+    assert host._peak_build_worker is current_worker
+    qapp.processEvents()
+    assert host.events.count("Peak cache built for 1 file(s)") == 1
+    np.testing.assert_allclose(host._peak_cache["shared.wav"].levels[0].data, .125)
 
 
 def test_waveform_widget_rejects_mismatched_peak_data(qapp, caplog):

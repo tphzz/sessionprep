@@ -410,7 +410,9 @@ class TrackRepairEditor(QFrame):
                     for key, row in self.rows.items():
                         row.arrange(narrow)
                         row.setVisible(not narrow or self.detector is None or _DETECTORS.get(self.detector) == key)
-                    self.peak_layout.addWidget(self.peak_name, 0, 0)
+                    # Explicit removal invalidates the old PySide layout item
+                    # before Qt can reuse its address for another object.
+                    self.peak_layout.removeWidget(self.peak)
                     self.peak_layout.addWidget(self.peak, int(narrow), int(not narrow))
                     self.peak_layout.setColumnMinimumWidth(0, 0 if narrow else 164)
                     self.peak_layout.setColumnStretch(1, int(not narrow))
