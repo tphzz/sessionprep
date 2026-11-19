@@ -421,6 +421,7 @@ class PeakBuildWorker(QThread):
 
         max_workers = min(os.cpu_count() or 4, 6)
         completed = 0
+        built = 0
 
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             # Process items in small batches to keep the queue reorderable
@@ -445,6 +446,7 @@ class PeakBuildWorker(QThread):
                     filename, peak_data = future.result()
                     completed += 1
                     if filename and peak_data:
+                        built += 1
                         self.progress.emit(
                             f"Building peak cache: {filename}"
                             f"  ({completed}/{self._total})")
@@ -455,5 +457,5 @@ class PeakBuildWorker(QThread):
 
         if not self._cancelled.is_set():
             self.progress.emit("Peak cache creation finished.")
-            log.info("Peak cache background batch finished (%d files)", self._total)
-            self.all_done.emit(completed)
+            log.info("Peak cache background batch finished (%d of %d files available)", built, self._total)
+            self.all_done.emit(built)

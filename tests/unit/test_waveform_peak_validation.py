@@ -11,6 +11,7 @@ from PySide6.QtWidgets import QApplication
 
 from sessionprepgui.analysis.mixin import AnalysisMixin
 from sessionprepgui.topology.mixin import TopologyMixin
+from sessionprepgui.waveform.compute import PeakBuildWorker
 from sessionprepgui.waveform.peakcache import build_peaks
 from sessionprepgui.waveform.widget import WaveformWidget
 from sessionpreplib.audio import load_track
@@ -68,6 +69,22 @@ def test_new_project_ignores_queued_peaks_and_progress_for_the_same_filename(
     qapp.processEvents()
     assert host.events.count("Peak cache built for 1 file(s)") == 1
     np.testing.assert_allclose(host._peak_cache["shared.wav"].levels[0].data, .125)
+
+
+def test_peak_completion_counts_only_readable_files(qapp, tmp_path):
+    good = tmp_path / "good.wav"
+    bad = tmp_path / "bad.wav"
+    sf.write(good, np.zeros(4096), 48000)
+    bad.write_bytes(b"unreadable audio")
+    worker = PeakBuildWorker([(str(p), p.name, str(p.with_suffix(".peaks"))) for p in (good, bad)])
+    published, progress, done = [], [], []
+    worker.file_done.connect(lambda filename, data: published.append(filename))
+    worker.progress_value.connect(lambda current, total: progress.append((current, total)))
+    worker.all_done.connect(done.append)
+    worker.run()
+    assert published == [good.name]
+    assert progress == [(1, 2), (2, 2)]
+    assert done == [1]
 
 
 def test_waveform_widget_rejects_mismatched_peak_data(qapp, caplog):
