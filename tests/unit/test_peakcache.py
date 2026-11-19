@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
+import pytest
 
 from sessionprepgui.waveform.renderer import WaveformRenderer, WaveformRenderCtx
 from sessionprepgui.waveform.peakcache import (
@@ -30,6 +33,24 @@ def test_peakcache_round_trip(tmp_path):
     assert loaded.total_samples == 4096
     assert loaded.source_mtime == 123
     assert [level.samples_per_bin for level in loaded.levels] == [256, 1024, 4096]
+
+
+@pytest.mark.parametrize("samples", [1, 255, 257, 4097, 16385, 32897])
+def test_all_waveform_cache_levels_retain_the_final_sample(tmp_path, samples):
+    audio = np.zeros((samples, 2))
+    audio[-1] = [.75, -.625]
+    path = str(tmp_path / "track.peaks")
+    save_peaks(build_peaks(audio, 48000), path)
+    cached = load_peaks(path)
+    assert cached.levels
+    for level in cached.levels:
+        assert len(level.data) == (samples + level.samples_per_bin - 1) // level.samples_per_bin
+        assert level.data[-1, 0, 1] == .75
+        assert level.data[-1, 1, 0] == -.625
+    for query in (query_peaks, query_peaks_fast):
+        left, right = query(cached, 0, samples, min(64, samples))
+        assert left[1][-1] == .75
+        assert right[0][-1] == -.625
 
 
 def test_peakcache_stale_mtime_returns_none(tmp_path):
@@ -147,10 +168,23 @@ def test_waveform_renderer_prefers_raw_audio_when_view_is_finer_than_peak_cache(
     assert np.all(maxs < 2.0)
 
 
-def test_peaks_path_uses_basename_stem(tmp_path):
-    path = peaks_path_for(str(tmp_path), "nested/source file.wav")
+def test_disk_cache_distinguishes_source_folders_and_extensions(tmp_path):
+    names = ["source.wav", "source.aiff", "left/source.wav", "right/source.wav"]
+    paths = {Path(peaks_path_for(str(tmp_path), name)) for name in names}
+    assert len(paths) == len(names)
+    assert all(path.is_relative_to(tmp_path) for path in paths)
+    assert Path(peaks_path_for(str(tmp_path), "../outside.wav")).is_relative_to(tmp_path)
 
-    assert path == str(tmp_path / "source file.peaks")
+
+def test_physical_disk_cache_identity_supports_shared_cache_and_project_moves(tmp_path):
+    source = tmp_path / "project"
+    common = str(tmp_path / "common" / "peaks")
+    assert peaks_path_for(common, str(source / "Bass.wav")) != peaks_path_for(
+        common, str(source / "layout" / "Bass.wav"))
+    moved = tmp_path / "moved"
+    first = peaks_path_for(str(source / "peaks"), str(source / "Bass.wav"))
+    assert Path(first).name == Path(peaks_path_for(str(moved / "peaks"), str(moved / "Bass.wav"))).name
+    assert first == peaks_path_for(str(source / "peaks"), "Bass.wav")
 
 
 def test_waveform_renderer_ignores_stale_peak_cache_channel_count(caplog):

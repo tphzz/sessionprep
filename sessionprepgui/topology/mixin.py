@@ -34,6 +34,7 @@ from ..controls import bind_primary_action, content_splitter, set_action_busy
 from ..theme import COLORS, CONTENT_INSET, tune_toolbar_checkbox
 from ..tracks.table_widgets import _PHASE_TOPOLOGY, _PHASE_ANALYSIS, _PHASE_SETUP
 from ..waveform import WaveformPanel
+from ..waveform.peakcache import peak_source_key
 
 from .input_tree import InputTree
 from .output_tree import OutputTree
@@ -730,7 +731,7 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
         self,
         kind: str,
         *,
-        peak_filename: str | None = None,
+        peak_path: str | None = None,
         file_count: int = 0,
         channel_count: int = 0,
         labels_count: int = 0,
@@ -742,14 +743,12 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
         request_id = getattr(self, "_topo_wf_request_id", 0) + 1
         self._topo_wf_request_id = request_id
         self._topo_wf_request_kind = kind
-        self._topo_wf_peak_filename = peak_filename
+        self._topo_wf_peak_path = peak_source_key(peak_path)
         self._topo_wf_request_description = description
-        # Keep the legacy attribute in sync for peak-cache completion callbacks.
-        self._topo_wf_filename = peak_filename
         logging.getLogger(__name__).debug(
             "Phase 1 waveform request #%d: kind=%s peak=%r files=%d "
             "channels=%d labels=%d %s",
-            request_id, kind, peak_filename, file_count, channel_count,
+            request_id, kind, peak_path, file_count, channel_count,
             labels_count, description,
         )
         return request_id
@@ -792,7 +791,7 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
 
         request_id = self._topo_begin_waveform_request(
             "input-file",
-            peak_filename=filename,
+            peak_path=track.filepath,
             file_count=1,
             channel_count=track.channels,
             description=filename,
@@ -807,14 +806,15 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
             self._topo_wf_panel.setVisible(True)
 
         peak_cache = getattr(self, '_peak_cache', {})
-        if filename in peak_cache:
+        key = self._topo_wf_peak_path
+        if key in peak_cache:
             self._topo_wf_panel.waveform.set_preview_mode(
-                track.channels, track.total_samples, track.samplerate, peak_cache[filename]
+                track.channels, track.total_samples, track.samplerate, peak_cache[key]
             )
         else:
             self._topo_wf_panel.waveform.set_loading(True)
             if hasattr(self, '_prioritize_peak'):
-                self._prioritize_peak(filename)
+                self._prioritize_peak(key)
 
         self._topo_wf_panel.play_btn.setEnabled(False)
         log.debug("[Trace] _topo_load_input_waveform setup for '%s': %.2f ms", filename, (time.perf_counter() - t0) * 1000)
@@ -1118,12 +1118,12 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
         self._topo_wf_panel.waveform.set_precomputed(result)
         # Apply cached peak data for mip-level rendering
         peak_cache = getattr(self, '_peak_cache', {})
-        wf_fn = getattr(self, '_topo_wf_peak_filename', None)
+        key = getattr(self, '_topo_wf_peak_path', None)
         peak_applied = False
-        if wf_fn and wf_fn in peak_cache:
-            peak_applied = self._topo_wf_panel.waveform.set_peak_data(peak_cache[wf_fn])
-        elif wf_fn and hasattr(self, '_prioritize_peak'):
-            self._prioritize_peak(wf_fn)
+        if key in peak_cache:
+            peak_applied = self._topo_wf_panel.waveform.set_peak_data(peak_cache[key])
+        elif key and hasattr(self, '_prioritize_peak'):
+            self._prioritize_peak(key)
         n_ch = len(result["channels"])
         labels = getattr(self, '_topo_pending_labels', None)
         self._topo_wf_panel.update_play_mode_channels(n_ch, labels=labels)
@@ -1133,7 +1133,7 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
             "[Trace] _on_topo_wf_loaded applied request=%s kind=%s channels=%d "
             "samples=%s sr=%s peak=%r peak_applied=%s in %.2f ms",
             request_id, getattr(self, "_topo_wf_request_kind", None), n_ch,
-            result.get("total_samples"), result.get("samplerate"), wf_fn,
+            result.get("total_samples"), result.get("samplerate"), key,
             peak_applied, (time.perf_counter() - t0) * 1000,
         )
 

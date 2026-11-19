@@ -2340,7 +2340,9 @@ The CLI is **not** affected by this file — it continues to use its own
 Waveform rendering uses a **pre-computed peak mipmap cache** (similar to
 Cubase/Reaper `.peaks` files) to avoid expensive raw-sample downsampling on
 every paint. The cache is built eagerly in the background and persisted to disk
-as binary `.peaks` files in the `sp_peaks/` directory.
+as binary `.peaks` files in `sp_peaks/by-source/`. A digest of the relative
+audio path, including its extension, distinguishes equal basenames while
+allowing a project folder to move. Older stem-only entries are rebuilt on demand.
 
 **Architecture:**
 
@@ -2348,7 +2350,7 @@ as binary `.peaks` files in the `sp_peaks/` directory.
 graph LR
     A[Folder Open] --> B["_on_phase1_done()"]
     B --> C["PeakBuildWorker (bg thread pool)"]
-    C --> D["sp_peaks/*.peaks files"]
+    C --> D["sp_peaks/by-source/*.peaks files"]
     C --> E["In-memory _peak_cache dict"]
     E --> F["WaveformRenderer.set_peak_data()"]
     F --> G["query_peaks_fast() → instant paint"]
@@ -2379,7 +2381,9 @@ Four mip levels at 256, 1024, 4096, and 16384 samples/bin. A 5-minute stereo
   `skip_folders` so the cache directory is not scanned as audio content.
 - `analysis/mixin.py` — `_start_peak_build()` triggered from
   `_on_phase1_done()` and `_on_analyze_done()`. Maintains `_peak_cache` dict
-  (filename → `PeakData`). Worker cleanup in `_clear_workspace()`.
+  (normalized absolute source path → `PeakData`). Reopening queues original
+  inputs and routed files in one job. Queued deliveries identify their job
+  explicitly. Worker cleanup runs in `_clear_workspace()`.
 - `topology/mixin.py` — injects `PeakData` into the Phase 1 waveform display
   via `set_peak_data()` after `set_precomputed()`. Passes `peaks_dir` to
   `TopologyApplyWorker` so output files get cached during Apply.

@@ -372,11 +372,7 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
         self._init_menus()
         self._phase_progress_layouts = {}
         self._phase_progress_panels = {}
-        self._progress_active_phase: int | None = None
-        self._progress_running = False
-        self._progress_text = ""
-        self._progress_current = 0
-        self._progress_total = 1
+        self._clear_progress()
 
         # ── Top-level phase tabs ──────────────────────────────────────────
         self._phase_tabs = _CurrentPageTabWidget()
@@ -444,7 +440,18 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
         panel.set_progress(self._progress_current, self._progress_total)
         self._progress_active_phase = phase_index
 
-    def _progress_start(self, text: str) -> None:
+    def _clear_progress(self) -> None:
+        for panel in self._phase_progress_panels.values():
+            panel.hide()
+        self._progress_active_phase = None
+        self._progress_owner = None
+        self._progress_running = False
+        self._progress_text = ""
+        self._progress_current = 0
+        self._progress_total = 1
+
+    def _progress_start(self, text: str, *, owner=None) -> None:
+        self._progress_owner = owner
         self._progress_running = True
         self._progress_text = text
         self._progress_current = 0
@@ -462,11 +469,13 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
             self._progress_active_phase).set_progress(current, total)
 
     def _progress_finish(self, text: str) -> None:
+        self._progress_owner = None
         self._progress_running = False
         self._progress_text = text
         self._progress_panel_for_phase(self._progress_active_phase).finish(text)
 
     def _progress_fail(self, text: str) -> None:
+        self._progress_owner = None
         self._progress_running = False
         self._progress_text = text
         self._progress_panel_for_phase(self._progress_active_phase).fail(text)

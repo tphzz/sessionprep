@@ -992,7 +992,7 @@ class TopologyApplyWorker(QThread):
             # Phase C: Build peak caches (re-reading from just-written files)
             if self._peaks_dir:
                 from ..waveform.peakcache import (
-                    build_peaks, save_peaks, load_peaks,
+                    build_peaks, save_peaks,
                     peaks_path_for, get_source_mtime,
                 )
                 peak_base_step = n_sources + n_entries
@@ -1006,18 +1006,8 @@ class TopologyApplyWorker(QThread):
                     self.progress_value.emit(step, total)
 
                     try:
-                        pp = peaks_path_for(self._peaks_dir, out_fn)
+                        pp = peaks_path_for(self._peaks_dir, os.path.abspath(dst))
                         mtime = get_source_mtime(dst)
-                        # Check shape: if total_samples and channels match,
-                        # the content is unchanged and we can skip.
-                        info = sf.info(dst)
-                        existing = load_peaks(pp)
-                        if (existing is not None
-                                and existing.total_samples == info.frames
-                                and existing.channels == info.channels):
-                            log.debug("Peak cache for '%s' is up-to-date, skipping rebuild -> %s", out_fn, pp)
-                            continue
-
                         import time as _time
                         _t0 = _time.perf_counter()
                         data, file_sr = sf.read(dst, dtype="float64")

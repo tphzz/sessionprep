@@ -1,20 +1,29 @@
 from __future__ import annotations
 
+from pathlib import Path
+from time import monotonic, sleep
+
 import numpy as np
 import pytest
 import soundfile as sf
 
 pytest.importorskip("PySide6")
 
-from PySide6.QtCore import QObject
+from PySide6.QtCore import QEvent
 from PySide6.QtWidgets import QApplication
 
-from sessionprepgui.analysis.mixin import AnalysisMixin
+from sessionprepgui.analysis.worker import TopologyApplyWorker
+from sessionprepgui import settings
+from sessionprepgui.mainwindow import SessionPrepWindow
+from sessionprepgui.session.io import load_session, save_session
 from sessionprepgui.topology.mixin import TopologyMixin
 from sessionprepgui.waveform.compute import PeakBuildWorker
-from sessionprepgui.waveform.peakcache import build_peaks
+from sessionprepgui.waveform.peakcache import build_peaks, get_source_mtime, load_peaks, peaks_path_for, save_peaks
+from sessionprepgui.waveform.renderer import WaveformRenderCtx
 from sessionprepgui.waveform.widget import WaveformWidget
 from sessionpreplib.audio import load_track
+from sessionpreplib.models import SessionContext
+from sessionpreplib.topology import ChannelRoute, TopologyEntry, TopologyMapping, TopologySource
 
 
 @pytest.fixture(scope="module")
@@ -25,50 +34,190 @@ def qapp():
     return app
 
 
+@pytest.fixture
+def window(qapp, tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "get_app_dir", lambda: str(tmp_path / "settings"))
+    win = SessionPrepWindow()
+    yield win
+    assert win.close()
+    qapp.processEvents()
+    win.deleteLater()
+    qapp.sendPostedEvents(win, QEvent.DeferredDelete)
+
+
+def wait_until(qapp, condition):
+    until = monotonic() + 8
+    while not condition() and monotonic() < until:
+        qapp.processEvents()
+        sleep(.005)
+    assert condition()
+
+
+@pytest.mark.parametrize("unreadable", [0, 1, 2])
+def test_window_finishes_peak_build_and_publishes_only_readable_files(qapp, window, tmp_path, unreadable):
+    tracks = []
+    for i in range(2):
+        path = tmp_path / f"{i}.wav"
+        sf.write(path, np.full(4096, (i + 1) / 4), 48000, subtype="FLOAT")
+        tracks.append(load_track(str(path)))
+        if i < unreadable:
+            path.write_bytes(b"invalid waveform")
+
+    window._start_peak_build(tracks, str(tmp_path))
+    assert window._peak_build_worker.wait(5000)
+    qapp.processEvents()
+    assert not window._progress_running
+    assert (window._progress_current, window._progress_total) == (2, 2)
+    assert window._progress_text == f"Peak cache built for {2 - unreadable} file(s)"
+    assert sorted(float(p.levels[0].data.max()) for p in window._peak_cache.values()) == [
+        (i + 1) / 4 for i in range(unreadable, 2)]
+
+
+def test_window_keeps_readable_peaks_when_cache_folder_cannot_be_created(qapp, window, tmp_path):
+    path = tmp_path / "Bass.wav"
+    sf.write(path, np.full(4096, .5), 48000, subtype="FLOAT")
+    (tmp_path / "sp_peaks").write_text("existing file")
+    window._start_peak_build([load_track(str(path))], str(tmp_path))
+    assert window._peak_build_worker.wait(5000)
+    qapp.processEvents()
+    assert window._progress_text == "Peak cache built for 1 file(s)"
+    assert next(iter(window._peak_cache.values())).levels[0].data.max() == .5
+
+
+def test_queued_peaks_cannot_finish_a_newer_foreground_operation(qapp, window, tmp_path):
+    path = tmp_path / "Bass.wav"
+    sf.write(path, np.full(4096, .5), 48000, subtype="FLOAT")
+    window._start_peak_build([load_track(str(path))], str(tmp_path))
+    assert window._peak_build_worker.wait(5000)
+    window._progress_start("Preparing…")
+    window._progress_value(1, 3)
+    qapp.processEvents()
+    assert window._progress_running and window._progress_text == "Preparing…"
+    assert (window._progress_current, window._progress_total) == (1, 3)
+    assert next(iter(window._peak_cache.values())).levels[0].data.max() == .5
+
+
+def test_replacing_a_project_with_disk_caches_clears_its_unfinished_progress(qapp, window, tmp_path):
+    path = tmp_path / "Bass.wav"
+    sf.write(path, np.full(4096, .25), 48000, subtype="FLOAT")
+    track = load_track(str(path))
+    window._start_peak_build([track], str(tmp_path))
+    assert window._peak_build_worker.wait(5000)
+    state = window._capture_session_state()
+    state.update(source_dir=str(tmp_path), tracks=[track])
+    window._restore_session_state(state)
+    qapp.processEvents()
+    assert not window._progress_running
+    assert next(iter(window._peak_cache.values())).levels[0].data.max() == .25
+
+
+@pytest.mark.parametrize(("source_cached", "routed_cached"), [
+    (False, False), (False, True), (True, False), (True, True),
+])
+def test_reopened_project_displays_its_own_source_and_routed_peaks(
+        qapp, window, tmp_path, source_cached, routed_cached):
+    source = tmp_path / "audio"
+    routed = source / "sp_01_tracklayout"
+    routed.mkdir(parents=True)
+    name, rate, frames = "Bass.wav", 48000, 96000
+    tone = np.cos(2 * np.pi * 375 * np.arange(frames) / rate)
+    for folder, level, cached in ((source, .8, source_cached), (routed, .1, routed_cached)):
+        path = folder / name
+        sf.write(path, level * tone, rate, subtype="FLOAT")
+        if cached:
+            audio, _ = sf.read(path)
+            save_peaks(build_peaks(audio, rate, get_source_mtime(str(path))),
+                       peaks_path_for(str(folder / "sp_peaks"), name))
+
+    state = window._capture_session_state()
+    state.update(source_dir=str(source), topology_dir=str(routed), topology_applied=True,
+                 tracks=[load_track(str(routed / name))], topology=TopologyMapping([
+                     TopologyEntry(name, 1, [TopologySource(name, [ChannelRoute(0, 0, .125)])])]))
+    project = str(tmp_path / "routing.spsession")
+    save_session(project, state)
+    window._restore_session_state(load_session(project))
+    worker = getattr(window, "_peak_build_worker", None)
+    if worker is not None:
+        assert worker.wait(5000)
+        qapp.processEvents()
+    assert len(window._peak_cache) == 2
+
+    def check_envelope(wave, expected):
+        renderer = wave._wf_renderer
+        assert renderer._peak_data is not None
+        ctx = WaveformRenderCtx(0, 192, 128, 0, 0, frames, 1., wave._channels, 1,
+                                False, False, False, False, 1)
+        renderer._build_peaks(ctx)
+        assert np.max(np.abs(wave._channels[0])) == pytest.approx(expected)
+        assert np.max(renderer._peaks_cache[0][1]) == pytest.approx(expected)
+
+    window._show_track_detail(window._session.tracks[0])
+    wait_until(qapp, lambda: window._repair_preview.displayed and window._repair_preview.worker is None)
+    check_envelope(window._waveform, .1)
+    window._phase_tabs.setCurrentIndex(0)
+    window._topo_load_input_waveform(name)
+    wave = window._topo_wf_panel.waveform
+    wait_until(qapp, lambda: bool(wave._channels) and len(wave._channels[0]) == frames
+               and window._topo_audio_worker is None and window._topo_wf_worker is None)
+    check_envelope(wave, .8)
+
+
+def test_reapplying_same_length_route_rebuilds_peaks_from_new_audio(qapp, tmp_path):
+    source = tmp_path / "Bass.wav"
+    layout = tmp_path / "layout"
+    cache = layout / "sp_peaks"
+    sf.write(source, np.full(4096, .8), 48000, subtype="FLOAT")
+    track = load_track(str(source))
+    session = SessionContext([track], {})
+    for gain in (1., .125):
+        session.topology = TopologyMapping([TopologyEntry(source.name, 1, [
+            TopologySource(source.name, [ChannelRoute(0, 0, gain)])])])
+        worker = TopologyApplyWorker(session, str(layout), str(tmp_path), str(cache))
+        worker.run()
+        audio, _ = sf.read(layout / source.name)
+        peaks = load_peaks(peaks_path_for(str(cache), source.name))
+        assert peaks.levels[0].data.max() == pytest.approx(audio.max())
+        assert audio.max() == pytest.approx(.8 * gain)
+
+
 @pytest.mark.parametrize("dispatch_before_replacement", [False, True])
 def test_new_project_ignores_queued_peaks_and_progress_for_the_same_filename(
-        qapp, tmp_path, dispatch_before_replacement):
-    class Host(AnalysisMixin, QObject):
-        def __init__(self):
-            super().__init__()
-            self._config = {}
-            self.events = []
+        qapp, window, tmp_path, dispatch_before_replacement, monkeypatch):
+    finished = []
+    finish = window._progress_finish
 
-        def _progress_start(self, message):
-            self.events.append(message)
+    def record_finish(message):
+        finished.append(message)
+        finish(message)
 
-        _progress_message = _progress_finish = _progress_start
+    monkeypatch.setattr(window, "_progress_finish", record_finish)
 
-        def _progress_value(self, current, total):
-            self.events.append((current, total))
-
-    host = Host()
     def start(folder_name, peak):
         folder = tmp_path / folder_name
         folder.mkdir()
         path = folder / "shared.wav"
         sf.write(path, np.full(4096, peak), 48000, subtype="FLOAT")
-        host._start_peak_build([load_track(str(path))], str(folder))
-        return host._peak_build_worker
+        window._start_peak_build([load_track(str(path))], str(folder))
+        return window._peak_build_worker
 
     old_worker = start("first", .75)
     # Finish the real worker while its GUI callbacks are still queued.
     assert old_worker.wait(5000)
-    host._cancel_worker("_peak_build_worker")
-    host._peak_cache.clear()
-    host.events.clear()
+    window._clear_workspace()
     if dispatch_before_replacement:
         qapp.processEvents()
-        assert host._peak_cache == {} and host.events == []
+        assert window._peak_cache == {} and finished == [] and not window._progress_running
 
     current_worker = start("second", .125)
     assert current_worker.wait(5000)
     # A second lookup in the same project may have no missing routed peaks.
-    host._start_peak_build([], str(tmp_path / "second"))
-    assert host._peak_build_worker is current_worker
+    window._start_peak_build([], str(tmp_path / "second"))
+    assert window._peak_build_worker is current_worker
     qapp.processEvents()
-    assert host.events.count("Peak cache built for 1 file(s)") == 1
-    np.testing.assert_allclose(host._peak_cache["shared.wav"].levels[0].data, .125)
+    assert finished == ["Peak cache built for 1 file(s)"]
+    assert len(window._peak_cache) == 1
+    assert Path(next(iter(window._peak_cache))) == tmp_path / "second" / "shared.wav"
+    np.testing.assert_allclose(next(iter(window._peak_cache.values())).levels[0].data, .125)
 
 
 def test_peak_completion_counts_only_readable_files(qapp, tmp_path):
@@ -78,11 +227,11 @@ def test_peak_completion_counts_only_readable_files(qapp, tmp_path):
     bad.write_bytes(b"unreadable audio")
     worker = PeakBuildWorker([(str(p), p.name, str(p.with_suffix(".peaks"))) for p in (good, bad)])
     published, progress, done = [], [], []
-    worker.file_done.connect(lambda filename, data: published.append(filename))
-    worker.progress_value.connect(lambda current, total: progress.append((current, total)))
-    worker.all_done.connect(done.append)
+    worker.file_done.connect(lambda job, filepath, data: published.append(Path(filepath)))
+    worker.progress_value.connect(lambda job, current, total: progress.append((current, total)))
+    worker.all_done.connect(lambda job, count: done.append(count))
     worker.run()
-    assert published == [good.name]
+    assert published == [good]
     assert progress == [(1, 2), (2, 2)]
     assert done == [1]
 
@@ -102,19 +251,18 @@ def test_waveform_widget_rejects_mismatched_peak_data(qapp, caplog):
     assert "Rejected waveform peak cache metadata mismatch" in caplog.text
 
 
-def test_phase1_waveform_request_clears_peak_filename_for_multi_selection():
+def test_phase1_waveform_request_clears_peak_path_for_multi_selection():
     class DummyTopology(TopologyMixin):
         pass
 
     topology = DummyTopology()
     first_request = topology._topo_begin_waveform_request(
-        "input-file", peak_filename="17_ElecGtr6.wav", file_count=1)
+        "input-file", peak_path="17_ElecGtr6.wav", file_count=1)
     second_request = topology._topo_begin_waveform_request(
         "input-multi", file_count=4)
 
     assert second_request == first_request + 1
-    assert topology._topo_wf_filename is None
-    assert topology._topo_wf_peak_filename is None
+    assert topology._topo_wf_peak_path is None
     assert not topology._topo_is_current_waveform_request(first_request)
     assert topology._topo_is_current_waveform_request(second_request)
 
@@ -125,7 +273,7 @@ def test_phase1_stale_multi_result_is_ignored():
 
     topology = DummyTopology()
     stale_request = topology._topo_begin_waveform_request(
-        "input-file", peak_filename="old.wav")
+        "input-file", peak_path="old.wav")
     topology._topo_begin_waveform_request("input-multi", file_count=2)
     topology._topo_multi_worker = object()
 

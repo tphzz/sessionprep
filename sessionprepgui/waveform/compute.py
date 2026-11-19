@@ -17,6 +17,7 @@ from sessionpreplib.audio import max_momentary_rms, squared_sample_prefix, valid
 from sessionpreplib.audition import RepairAudition, inspection_spectrogram
 from sessionpreplib.repair_plan import source_for_render
 from sessionpreplib.spectrum import full_spectrogram, hz_to_mel as _hz_to_mel, mel_to_hz as _mel_to_hz
+from .peakcache import peak_source_key
 
 
 # ---------------------------------------------------------------------------
@@ -328,17 +329,17 @@ class PeakBuildWorker(QThread):
     """Eagerly build and save ``.peaks`` files for a batch of audio files.
 
     Runs in the background with a thread pool — does not block the UI.
-    Emits ``file_done(filename, PeakData)`` for each completed file so the
-    caller can cache the result in memory.
+    Each queued delivery carries its job. Successful files also carry their
+    source path so projects and routed outputs can reuse the same track name.
 
-    The work queue is mutable: call ``prioritize(filename)`` to move a file
+    The work queue is mutable: call ``prioritize(filepath)`` to move a file
     to the front of the pending queue so it is processed next.
     """
 
-    progress = Signal(str)                 # status message
-    progress_value = Signal(int, int)      # (current, total)
-    file_done = Signal(str, object)        # (filename, PeakData)
-    all_done = Signal(int)
+    progress = Signal(object, str)
+    progress_value = Signal(object, int, int)
+    file_done = Signal(object, str, object)
+    all_done = Signal(object, int)
 
     def __init__(self, items: list[tuple[str, str, str]],
                  parent=None):
@@ -347,32 +348,28 @@ class PeakBuildWorker(QThread):
         ----------
         items : list of (filepath, filename, peaks_path)
             *filepath*: absolute path to the audio file on disk.
-            *filename*: canonical filename (used as cache key).
+            *filename*: user-facing track name.
             *peaks_path*: absolute path for the ``.peaks`` output file.
         """
         super().__init__(parent)
-        self._items_map: dict[str, tuple[str, str, str]] = {
-            fn: (fp, fn, pp) for fp, fn, pp in items
-        }
-        self._queue: collections.deque[str] = collections.deque(
-            fn for _, fn, _ in items
-        )
+        self._items_map = {peak_source_key(item[0]): item for item in items}
+        self._queue = collections.deque(self._items_map)
         self._lock = threading.Lock()
         self._cancelled = threading.Event()
-        self._total = len(items)
+        self._total = len(self._items_map)
 
     def cancel(self):
         self._cancelled.set()
 
-    def prioritize(self, filename: str):
-        """Move *filename* to the front of the pending queue (if still pending)."""
+    def prioritize(self, source_key: str):
+        """Move this physical source to the front if it is still pending."""
         with self._lock:
             try:
-                self._queue.remove(filename)
+                self._queue.remove(source_key)
             except ValueError:
                 return  # already processed or not in queue
-            self._queue.appendleft(filename)
-            log.debug("Prioritized peak build for '%s'", filename)
+            self._queue.appendleft(source_key)
+            log.debug("Prioritized peak build for '%s'", source_key)
 
     def _next_item(self) -> tuple[str, str, str] | None:
         """Pop the next item from the queue under lock."""
@@ -392,32 +389,32 @@ class PeakBuildWorker(QThread):
             build_peaks, save_peaks, load_peaks, get_source_mtime,
         )
 
-        def _process(filepath, filename, peaks_path):
+        def _process(filepath, peaks_path):
             if self._cancelled.is_set():
-                return None, None
+                return None
             mtime = get_source_mtime(filepath)
             # Check if existing peaks are still valid
             existing = load_peaks(peaks_path, expected_mtime=mtime)
             if existing is not None:
-                return filename, existing
+                return existing
             # Build from audio
             import time as _time
             _t0 = _time.perf_counter()
             try:
                 data, sr = sf.read(filepath, dtype="float64")
             except Exception as e:
-                log.debug("Failed to read '%s' for peak cache: %s", filename, e)
-                return None, None
+                log.debug("Failed to read '%s' for peak cache: %s", filepath, e)
+                return None
             if self._cancelled.is_set():
-                return None, None
+                return None
             peak_data = build_peaks(data, sr, source_mtime=mtime)
             try:
                 save_peaks(peak_data, peaks_path)
                 _elapsed = (_time.perf_counter() - _t0) * 1000
-                log.debug("Built peak cache for '%s' -> %s (%d levels, %.1f ms)", filename, peaks_path, len(peak_data.levels), _elapsed)
+                log.debug("Built peak cache for '%s' -> %s (%d levels, %.1f ms)", filepath, peaks_path, len(peak_data.levels), _elapsed)
             except OSError as e:
-                log.debug("Failed to save peak cache for '%s' -> %s: %s", filename, peaks_path, e)
-            return filename, peak_data
+                log.debug("Failed to save peak cache for '%s' -> %s: %s", filepath, peaks_path, e)
+            return peak_data
 
         max_workers = min(os.cpu_count() or 4, 6)
         completed = 0
@@ -437,25 +434,24 @@ class PeakBuildWorker(QThread):
                     break  # queue exhausted
 
                 futures = {
-                    pool.submit(_process, fp, fn, pp): fn
+                    pool.submit(_process, fp, pp): (fp, fn)
                     for fp, fn, pp in batch
                 }
                 for future in as_completed(futures):
                     if self._cancelled.is_set():
                         return
-                    filename, peak_data = future.result()
+                    filepath, filename = futures[future]
+                    peak_data = future.result()
                     completed += 1
-                    if filename and peak_data:
+                    if peak_data is not None:
                         built += 1
-                        self.progress.emit(
+                        self.progress.emit(self,
                             f"Building peak cache: {filename}"
                             f"  ({completed}/{self._total})")
-                        self.progress_value.emit(completed, self._total)
-                        self.file_done.emit(filename, peak_data)
-                    else:
-                        self.progress_value.emit(completed, self._total)
+                        self.file_done.emit(self, filepath, peak_data)
+                    self.progress_value.emit(self, completed, self._total)
 
         if not self._cancelled.is_set():
-            self.progress.emit("Peak cache creation finished.")
+            self.progress.emit(self, "Peak cache creation finished.")
             log.info("Peak cache background batch finished (%d of %d files available)", built, self._total)
-            self.all_done.emit(built)
+            self.all_done.emit(self, built)

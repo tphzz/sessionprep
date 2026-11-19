@@ -27,6 +27,7 @@ Binary ``.peaks`` format
 
 from __future__ import annotations
 
+import hashlib
 import os
 import struct
 from dataclasses import dataclass, field
@@ -86,24 +87,18 @@ def build_peaks(
     n_samples, n_channels = audio_data.shape
     levels: list[MipLevel] = []
 
-    # Force contiguous memory per channel once to avoid slow strided reductions.
-    # Taking .min(axis=1) on a (bins, spb, channels) array is catastrophically
-    # slow for stereo files because it traverses the non-contiguous spb axis.
+    # Reduce contiguous channels and include the last, possibly short, bin.
     channel_arrays = [np.ascontiguousarray(audio_data[:, c]) for c in range(n_channels)]
 
     for spb in MIP_BINS:
-        n_bins = n_samples // spb
-        if n_bins < 1:
-            continue
-        usable = n_bins * spb
+        if not n_samples or (spb > n_samples and spb != MIP_BINS[0]):
+            break
+        starts = np.arange(0, n_samples, spb)
 
         ch_data = []
         for c_array in channel_arrays:
-            # Reshape contiguous 1D channel array to (n_bins, spb)
-            c_reshaped = c_array[:usable].reshape(n_bins, spb)
-            # Reductions over the contiguous inner axis are massively faster
-            c_mins = c_reshaped.min(axis=1)
-            c_maxs = c_reshaped.max(axis=1)
+            c_mins = np.minimum.reduceat(c_array, starts)
+            c_maxs = np.maximum.reduceat(c_array, starts)
             ch_data.append(np.stack([c_mins, c_maxs], axis=-1))
 
         # Stack into (n_bins, channels, 2)
@@ -355,7 +350,19 @@ def get_source_mtime(filepath: str) -> int:
         return 0
 
 
-def peaks_path_for(peaks_dir: str, filename: str) -> str:
-    """Return the ``.peaks`` file path for a given audio filename."""
-    stem = os.path.splitext(os.path.basename(filename))[0]
-    return os.path.join(peaks_dir, f"{stem}.peaks")
+def peak_source_key(filepath: str | None) -> str | None:
+    """Identify the actual audio file shared by cache producers and previews."""
+    return os.path.normcase(os.path.abspath(filepath)) if filepath else None
+
+
+def peaks_path_for(peaks_dir: str, filepath: str) -> str:
+    """Use a relocatable source identity and keep the derived file inside the cache."""
+    identity = os.path.normpath(filepath)
+    if os.path.isabs(identity):
+        try:
+            identity = os.path.relpath(identity, os.path.dirname(peaks_dir))
+        except ValueError:
+            pass  # A shared cache on another Windows drive needs the absolute path.
+    digest = hashlib.sha256(os.fsencode(os.path.normcase(identity))).hexdigest()
+    # Older stem-only entries can refer to another file with the same mtime.
+    return os.path.join(peaks_dir, "by-source", f"{digest}.peaks")

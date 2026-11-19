@@ -15,6 +15,7 @@ from ..tracks.table_widgets import _TAB_FILE, _TAB_SUMMARY, _PHASE_TOPOLOGY
 from ..theme import COLORS
 from ..analysis.worker import AudioLoadWorker
 from ..waveform.compute import WaveformLoadWorker
+from ..waveform.peakcache import peak_source_key
 from .report import visualizable_issues
 
 
@@ -144,18 +145,19 @@ class DetailMixin:  # pylint: disable=too-few-public-methods
         # 1. Handle instant preview or loading state
         peak_cache = getattr(self, '_peak_cache', {})
         fn = getattr(track, 'filename', None)
+        key = peak_source_key(getattr(track, "filepath", None))
         self._waveform_unavailable_generation = None
         self._waveform_context_generation = None
-        if fn and fn in peak_cache:
+        if key in peak_cache:
             ready = self._waveform.set_preview_mode(
-                track.channels, track.total_samples, track.samplerate, peak_cache[fn]
+                track.channels, track.total_samples, track.samplerate, peak_cache[key]
             )
             if ready:
                 self._waveform_context_generation = self._file_report.context_generation
         else:
             self._waveform.set_loading(True)
-            if fn and hasattr(self, '_prioritize_peak'):
-                self._prioritize_peak(fn)
+            if key and hasattr(self, '_prioritize_peak'):
+                self._prioritize_peak(key)
 
         self._refresh_waveform_issues()
         self._apply_pending_detector_visualization()
@@ -246,12 +248,12 @@ class DetailMixin:  # pylint: disable=too-few-public-methods
         self._waveform_context_generation = self._file_report.context_generation
         # Apply cached peak data for mip-level rendering
         peak_cache = getattr(self, '_peak_cache', {})
-        fn = getattr(track, 'filename', None)
-        if fn and not result.get("corrected"):
-            if fn in peak_cache:
-                self._waveform.set_peak_data(peak_cache[fn])
+        key = peak_source_key(getattr(track, "filepath", None))
+        if key and not result.get("corrected"):
+            if key in peak_cache:
+                self._waveform.set_peak_data(peak_cache[key])
             elif hasattr(self, '_prioritize_peak'):
-                self._prioritize_peak(fn)
+                self._prioritize_peak(key)
 
         if not preserve_view:
             cmap = self._config.get("app", {}).get("spectrogram_colormap", "magma")

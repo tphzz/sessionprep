@@ -69,6 +69,7 @@ from ..controls import (
     FormDoubleSpinBox, content_splitter, fit_navigation_pane, inset_pane, set_action_busy, settings_scroll_area,
 )
 from ..theme import COLORS, FILE_COLOR_OK, FILE_COLOR_ERROR
+from ..waveform.peakcache import peak_source_key
 from .worker import AnalyzeWorker, PrepareWorker, Phase1AnalyzeWorker, RepairPlanWorker
 
 
@@ -405,6 +406,12 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
                 set_action_busy(action, False)
         self._cancel_worker("_peak_build_worker")
         self._peak_cache = {}
+        self._clear_progress()
+        self._topo_begin_waveform_request("none")
+        self._topo_cancel_workers()
+        self._topo_cached_audio = None
+        self._topo_wf_panel.waveform.set_audio(None, 44100)
+        self._topo_wf_panel.play_btn.setEnabled(False)
         self._session = None
         self._use_processed_cb.setChecked(False)
         self._update_use_processed_action()
@@ -892,12 +899,8 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         )
         self.setWindowTitle("SessionPrep")
 
-        # Eagerly build peak cache for source tracks (Phase 1 waveforms)
-        if source_dir and source_tracks:
-            self._start_peak_build(source_tracks, source_dir)
-        # And for analysis tracks (Phase 2 waveforms) if topology was applied
-        if self._topology_dir and tracks:
-            self._start_peak_build(tracks, self._topology_dir)
+        # Queue both phases together, including same-named files in different folders.
+        self._start_peak_build(source_tracks, source_dir, (tracks, self._topology_dir))
         if repair_defaults_changed:
             self._queue_repair_plan(tracks)
 
@@ -1180,19 +1183,16 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
             f"Analysis complete: {ok_count}/{len(session.tracks)} tracks OK")
 
         # Eagerly build peak cache for Phase 2 tracks
-        analyze_dir = self._topology_dir or self._source_dir
-        if analyze_dir:
-            self._start_peak_build(session.tracks, analyze_dir)
+        if self._topology_dir:
+            self._start_peak_build(session.tracks, self._topology_dir,
+                                   (self._topo_source_tracks, self._source_dir))
+        elif self._source_dir:
+            self._start_peak_build(session.tracks, self._source_dir)
 
     # ── Peak cache ────────────────────────────────────────────────────────
 
-    def _start_peak_build(self, tracks, base_dir: str):
-        """Launch a background PeakBuildWorker for all tracks under *base_dir*.
-
-        Before launching, scan existing ``sp_peaks/`` for valid ``.peaks``
-        files and load them into the in-memory cache — only stale or missing
-        files are queued for background building.
-        """
+    def _start_peak_build(self, tracks, base_dir, *additional_groups):
+        """Load valid peaks from each track directory and build all misses in one job."""
         from ..waveform.compute import PeakBuildWorker
         from ..waveform.peakcache import (
             peaks_path_for, load_peaks, get_source_mtime,
@@ -1200,39 +1200,44 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
 
         app_cfg = self._config.get("app", {})
         peaks_folder = app_cfg.get("peak_cache_folder", "sp_peaks")
-        peaks_dir = os.path.join(base_dir, peaks_folder)
 
         if not hasattr(self, "_peak_cache"):
             self._peak_cache = {}
 
         items = []
-        for track in tracks:
-            filepath = getattr(track, "filepath", None)
-            if not filepath:
-                filepath = os.path.join(base_dir, track.filename)
-            if not os.path.isfile(filepath):
+        seen = set()
+        for group, directory in ((tracks, base_dir), *additional_groups):
+            if not directory:
                 continue
-            pp = peaks_path_for(peaks_dir, track.filename)
-            # Try to reuse existing .peaks from disk
-            mtime = get_source_mtime(filepath)
-            existing = load_peaks(pp, expected_mtime=mtime)
-            if existing is not None:
-                self._peak_cache[track.filename] = existing
-            else:
-                items.append((filepath, track.filename, pp))
-
-        if not items:
-            log.info("Peak cache: all %d files already cached", len(tracks))
+            peaks_dir = os.path.join(directory, peaks_folder)
+            for track in group:
+                filepath = track.filepath or os.path.join(directory, track.filename)
+                key = peak_source_key(filepath)
+                if key in seen:
+                    continue
+                seen.add(key)
+                if not os.path.isfile(filepath):
+                    self._peak_cache.pop(key, None)
+                    continue
+                pp = peaks_path_for(peaks_dir, os.path.abspath(filepath))
+                existing = load_peaks(pp, expected_mtime=get_source_mtime(filepath))
+                if existing is not None:
+                    self._peak_cache[key] = existing
+                else:
+                    self._peak_cache.pop(key, None)
+                    items.append((filepath, track.filename, pp))
+        if not seen:
             return
 
-        log.info(
-            "Peak cache: %d cached from disk, %d to build",
-            len(tracks) - len(items), len(items),
-        )
-
+        previous = getattr(self, "_peak_build_worker", None)
         self._cancel_worker("_peak_build_worker")
-        self._progress_start(f"Building peak cache: 0/{len(items)}")
+        if not items:
+            if previous is not None and previous is self._progress_owner:
+                count = sum(key in self._peak_cache for key in seen)
+                self._progress_finish(f"Peak cache built for {count} file(s)")
+            return
         worker = PeakBuildWorker(items)
+        self._progress_start(f"Building peak cache: 0/{len(items)}", owner=worker)
         worker.file_done.connect(self._on_peak_file_done, Qt.QueuedConnection)
         worker.progress.connect(self._on_peak_progress, Qt.QueuedConnection)
         worker.progress_value.connect(self._on_peak_progress_value, Qt.QueuedConnection)
@@ -1240,53 +1245,42 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         self._peak_build_worker = worker
         worker.start()
 
-    def _from_current_peak_worker(self):
-        # Disconnecting a worker does not retract events already in Qt's queue.
-        return self._peak_build_worker is not None and self.sender() is self._peak_build_worker
-
-    @Slot(str)
-    def _on_peak_progress(self, message):
-        if self._from_current_peak_worker():
+    @Slot(object, str)
+    def _on_peak_progress(self, worker, message):
+        if worker is self._peak_build_worker and worker is self._progress_owner:
             self._progress_message(message)
 
-    @Slot(int, int)
-    def _on_peak_progress_value(self, current, total):
-        if self._from_current_peak_worker():
+    @Slot(object, int, int)
+    def _on_peak_progress_value(self, worker, current, total):
+        if worker is self._peak_build_worker and worker is self._progress_owner:
             self._progress_value(current, total)
 
-    @Slot(int)
-    def _on_peak_build_done(self, count: int) -> None:
-        if self._from_current_peak_worker():
+    @Slot(object, int)
+    def _on_peak_build_done(self, worker, count: int) -> None:
+        if worker is self._peak_build_worker and worker is self._progress_owner:
             log.info("Peak cache build complete (%d files)", count)
             self._progress_finish(f"Peak cache built for {count} file(s)")
 
-    @Slot(str, object)
-    def _on_peak_file_done(self, filename: str, peak_data):
+    @Slot(object, str, object)
+    def _on_peak_file_done(self, worker, filepath: str, peak_data):
         """Cache a newly built PeakData in memory, and push to UI if active."""
-        if not self._from_current_peak_worker():
+        if worker is not self._peak_build_worker:
             return
-        if not hasattr(self, "_peak_cache"):
-            self._peak_cache = {}
-        self._peak_cache[filename] = peak_data
+        key = peak_source_key(filepath)
+        self._peak_cache[key] = peak_data
 
         # Push to Phase 1 topology preview if active
-        if getattr(self, "_topo_wf_filename", None) == filename:
+        if getattr(self, "_topo_wf_peak_path", None) == key:
             wf = getattr(self, "_topo_wf_panel", None)
             if wf and hasattr(wf, "waveform"):
                 wf.waveform.set_peak_data(peak_data)
                 if getattr(wf.waveform, "_loading", False):
-                    track = None
-                    if hasattr(self, "_topo_track_map"):
-                        track = self._topo_track_map().get(filename)
-                    if track:
-                        wf.waveform.set_preview_mode(
-                            track.channels, track.total_samples,
-                            track.samplerate, peak_data
-                        )
+                    wf.waveform.set_preview_mode(
+                        peak_data.channels, peak_data.total_samples, peak_data.samplerate, peak_data)
 
         # Push to Phase 2 analysis preview if active
         cur_track = getattr(self, "_current_track", None)
-        if cur_track and cur_track.filename == filename:
+        if cur_track and peak_source_key(cur_track.filepath) == key:
             wf = getattr(self, "_waveform", None)
             preview = getattr(self, "_repair_preview", None)
             if preview and preview.track is cur_track and (
@@ -1300,11 +1294,11 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
                         cur_track.samplerate, peak_data
                     )
 
-    def _prioritize_peak(self, filename: str):
-        """If a peak build is in progress, move *filename* to the front."""
+    def _prioritize_peak(self, source_key: str):
+        """If a peak build is in progress, move this source to the front."""
         worker = getattr(self, "_peak_build_worker", None)
         if worker is not None and worker.isRunning():
-            worker.prioritize(filename)
+            worker.prioritize(source_key)
 
     @Slot(str)
     def _on_analyze_error(self, message: str):
