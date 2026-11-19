@@ -108,6 +108,20 @@ def test_narrow_editor_and_help_share_width_and_scroll_independently(editor_pane
     assert editor.isHidden()
 
 
+def test_settling_in_a_previously_silent_gap_is_visible_in_the_editor(editor_pane):
+    pane, editor, track, session = editor_pane
+    track.repair_measurements["boundary_settling"] = [
+        {"channel": 1, "start_sample": 48000, "end_sample": 70000, "peak_dbfs": -19.97}]
+    pane.report.activate_report_link(QUrl("report-repair:subsonic"))
+    assert editor.error.isVisible()
+    message = editor.error.text()
+    assert "Boundary settling" in message and "Ch 2" in message
+    assert "48000" in message and "70000" in message and "20.0 dBFS" in message
+    track.repair_measurements.pop("boundary_settling")
+    editor.refresh(track, session)
+    assert editor.error.isHidden()
+
+
 def test_processing_menu_opens_same_editor_and_restores_focus_without_normalization(app, editor_pane):
     pane, editor, track, session = editor_pane
     class Table(TrackColumnsMixin, DetailMixin):
@@ -177,7 +191,7 @@ def test_high_rate_evidence_and_headroom_recovery_use_the_selected_track(editor_
     session.config["_output_gain_adjustments"] = {track.filename: {"peak_db": 0.58, "gain_db": 0, "reduction_db": 0.6}}
     editor.open_track(track, session)
     high = editor.rows["ultrasonic"]
-    assert high.choice.isVisible() and "0.65 s" in high.description.text()
+    assert high.choice.isVisible() and "Qualifying windows span 0.65 s" in high.description.text()
     assert "−33.5" in high.evidence.text() and "dBFS RMS" in high.evidence.text()
     requested = []
     editor.adjustGainRequested.connect(requested.append)

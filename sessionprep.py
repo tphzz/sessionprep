@@ -23,7 +23,7 @@ from sessionpreplib.detectors import default_detectors
 from sessionpreplib.processors import default_processors
 from sessionpreplib.config import default_config, merge_configs
 from sessionpreplib.rendering import build_diagnostic_summary, render_diagnostic_summary_text
-from sessionpreplib.reports import generate_report, save_json, build_warnings
+from sessionpreplib.reports import build_warnings, format_boundary_settling, generate_report, save_json
 from sessionpreplib.utils import protools_sort_key
 from sessionpreplib.audio import AUDIO_EXTENSIONS, discover_audio_files
 from sessionpreplib.events import EventBus
@@ -440,6 +440,8 @@ def process_files():
         if track.repair_recipe.active:
             console.print("Repairs", track.filename, "·", ", ".join(track.repair_recipe.applied_ids()),
                           markup=False)
+            for warning in format_boundary_settling(track.repair_measurements.get("boundary_settling", [])):
+                console.print(warning, style="yellow", markup=False)
         suggestions = track.repair_measurements.get("suggested", {})
         flags = {"dc_remove": "dc", "low_cut": "subsonic", "ultrasonic": "ultrasonic"}
         available = [f"--fix {flag}" for key, flag in flags.items()

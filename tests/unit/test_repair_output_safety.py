@@ -10,7 +10,7 @@ from sessionpreplib import repair_plan
 from sessionpreplib.audio import load_track
 from sessionpreplib.models import SessionContext
 from sessionpreplib.pipeline import Pipeline
-from sessionpreplib.repairs import RepairRecipe, check_output_headroom
+from sessionpreplib.repairs import OutputHeadroomError, RepairRecipe, check_output_headroom
 from sessionpreplib.topology import ChannelRoute, TopologyEntry, TopologySource, build_default_topology
 
 
@@ -82,6 +82,32 @@ def test_float_subtypes_accept_overrange_only_within_their_own_finite_range():
     for sign in (-1, 1):
         with pytest.raises(ValueError, match="FLOAT"):
             check_output_headroom(np.array([sign * 2 * largest_float]), "FLOAT")
+
+
+@pytest.mark.parametrize("limit", [-1.0, 1 - 2 ** -15])
+def test_minimum_trim_at_and_one_ulp_above_a_tenth_db(limit):
+    boundary = limit * 10 ** (0.1 / 20)
+    for sample, expected in [(boundary, 0.1), (np.nextafter(boundary, 2 * limit), 0.2)]:
+        with pytest.raises(OutputHeadroomError) as error:
+            check_output_headroom(np.array([sample]), "PCM_16")
+        assert error.value.reduction_db == expected
+
+
+def test_peak_at_negative_full_scale_recovers_with_one_tenth_db_on_disk(tmp_path):
+    path = tmp_path / "Negative.wav"
+    sf.write(path, [-1.0, 0.0], 48000, subtype="PCM_16")
+    track = load_track(str(path))
+    track.manual_gain_db = 0.1
+    session = SessionContext([track], {})
+    pipeline = Pipeline([])
+    target = tmp_path / "prepared"
+    pipeline.prepare(session, str(target))
+    adjustment = session.config["_output_gain_adjustments"][track.filename]
+    assert adjustment["reduction_db"] == 0.1
+    track.manual_gain_db -= adjustment["reduction_db"]
+    pipeline.prepare(session, str(target))
+    assert session.prepare_state == "ready"
+    np.testing.assert_array_equal(sf.read(target / track.filename)[0], [-1.0, 0.0])
 
 
 def test_routed_dry_float_overload_is_rejected_before_publishing(tmp_path):

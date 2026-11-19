@@ -342,6 +342,61 @@ def test_repeat_prepare_restores_a_replaced_routed_original(tmp_path):
     np.testing.assert_array_equal(sf.read(current.filepath)[0], original)
 
 
+def test_multi_source_prepare_only_publishes_a_representable_fader(tmp_path):
+    rate = 48000
+    time = np.arange(rate) / rate
+    tracks = [source_track(tmp_path, f"Stem{i}.wav", 0.05 * np.sin(2 * np.pi * hz * time), rate)
+              for i, hz in enumerate([330, 550])]
+    pipeline, session = analyze(tracks, fader_headroom_db=0)
+    routes = [TopologySource(track.filename, [ChannelRoute(0, 0)]) for track in tracks]
+    session.topology = TopologyMapping([TopologyEntry("Mix.wav", 1, routes)])
+    target = tmp_path / "prepared"
+    for track, gain in zip(tracks, [6.0, 12.0]):
+        track.manual_gain_db = gain
+    pipeline.plan(session)
+    pipeline.prepare(session, str(target))
+    assert session.prepare_state == "none" and not session.output_tracks
+    assert "fader" in dict(session.config["_prepare_errors"])["Mix.wav"].lower()
+    assert not list(target.rglob("*.wav"))
+
+    tracks[1].manual_gain_db = 6.0
+    pipeline.plan(session)
+    pipeline.prepare(session, str(target))
+    assert session.prepare_state == "ready"
+    previous = session.output_tracks[0]
+    transfer = resolve_transfer_audio(session, previous)
+    assert transfer.fader_db == -6.0
+    recovered = sf.read(transfer.filepath)[0] * 10 ** (transfer.fader_db / 20)
+    np.testing.assert_allclose(recovered, tracks[0].audio_data + tracks[1].audio_data, atol=1e-7)
+    saved = Path(transfer.filepath).read_bytes()
+
+    tracks[1].manual_gain_db = 12.0
+    pipeline.plan(session)
+    pipeline.prepare(session, str(target))
+    assert session.prepare_state == "stale"
+    assert session.output_tracks == [previous] and not session.config["_prepared_files"]
+    assert Path(transfer.filepath).read_bytes() == saved
+    with pytest.raises(ValueError, match="out of date"):
+        resolve_transfer_audio(session, previous)
+
+    routes[1].routes[0].gain = 0.0
+    pipeline.prepare(session, str(target))
+    assert session.prepare_state == "ready"
+    assert resolve_transfer_audio(session, session.output_tracks[0]).fader_db == -6.0
+
+    # The silence may be confined to the particular channel that is routed.
+    partial = source_track(tmp_path, "Stereo.wav", np.column_stack([time / 8, np.zeros(rate)]), rate)
+    partial.manual_gain_db = 12.0
+    session.tracks.append(partial)
+    routes[1] = TopologySource(partial.filename, [ChannelRoute(1, 0)])
+    pipeline.analyze_phase1(session)
+    pipeline.analyze_phase2(session)
+    pipeline.plan(session)
+    pipeline.prepare(session, str(target))
+    assert session.prepare_state == "ready", session.config["_prepare_errors"]
+    assert resolve_transfer_audio(session, session.output_tracks[0]).fader_db == -6.0
+
+
 @pytest.mark.parametrize("bad_fader", [float("nan"), float("inf")])
 def test_prepare_rejects_nonfinite_fader_before_replacing_media(tmp_path, bad_fader):
     rate = 48000

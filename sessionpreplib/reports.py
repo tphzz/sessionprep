@@ -44,6 +44,15 @@ def _report_db(value) -> float | None:
     return round(value, 2) if isinstance(value, (int, float)) and math.isfinite(value) else None
 
 
+def format_boundary_settling(regions):
+    """Present each affected channel and inclusive sample range at unity gain."""
+    return [
+        f"Boundary settling in previously silent audio · Ch {r['channel'] + 1} · "
+        f"samples {r['start_sample']}–{r['end_sample']} · peak {r['peak_dbfs']:.1f} dBFS before gain"
+        for r in regions
+    ]
+
+
 def _processing_outcomes(session: SessionContext) -> dict[str, dict[str, Any]]:
     """Report the last execution receipt separately from the current plan."""
     receipts = session.config.get("_executed_files", {})
@@ -60,12 +69,14 @@ def _processing_outcomes(session: SessionContext) -> dict[str, dict[str, Any]]:
         if normalizing and result.error:
             error = error or result.error
         receipt = None if error else receipts.get(track.filename)
+        evidence = receipt if receipt is not None else track.repair_measurements
         planned_gain = result.gain_db if normalizing else (track.manual_gain_db or 0.0)
         outcomes[track.filename] = {
             "status": "failed" if error else "written" if receipt is not None else "planned",
             "error": error,
             "classification": result.classification if result else "Unknown",
             "planned_repairs": track.repair_recipe.applied_ids(),
+            "boundary_settling": evidence.get("boundary_settling", []),
             "applied_repairs": [p for p in receipt["applied_processors"]
                                 if p in ("dc_remove", "low_cut", "ultrasonic")] if receipt else [],
             "planned_gain_db": _report_db(planned_gain),
@@ -152,6 +163,7 @@ def generate_report(
         repairs = outcome["applied_repairs"] if outcome["status"] == "written" else outcome["planned_repairs"]
         detail = ", ".join([outcome["classification"], *repairs])
         lines.append(f"{t.filename:<32} {outcome['status']:<8} {gain_str:>12} {fader_str:>12}  {detail}")
+        lines.extend(f"  {warning}" for warning in format_boundary_settling(outcome["boundary_settling"]))
 
     # Tail report
     rms_anchor = config.get("rms_anchor", "percentile")

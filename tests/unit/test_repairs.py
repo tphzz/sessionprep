@@ -198,3 +198,26 @@ def test_invalid_sample_rate_fails_even_in_bypass(sample_rate):
 def test_invalid_low_cut_cannot_be_applied(cutoff):
     with pytest.raises(ValueError):
         render_corrected(np.zeros(8), 48000, RepairRecipe(low_cut_hz=cutoff))
+
+
+@pytest.mark.parametrize(("recipe", "seconds"), [
+    (RepairRecipe(dc_remove=True), 75), (RepairRecipe(low_cut_hz=40), 8),
+])
+def test_highpass_settles_to_zero_without_subnormal_samples(recipe, seconds):
+    rate = 48000
+    source = np.zeros((seconds * rate, 2))
+    source[0, 0] = 1.0
+    source[-2:, 1] = [1e-12, -1e-12]
+    output = render_corrected(source, rate, recipe)
+    assert output[0, 0] > 0.9
+    assert not ((np.abs(output) < np.finfo(output.dtype).tiny) & (output != 0)).any()
+    assert not output[-rate:, 0].any()
+    assert not output[:-2, 1].any()
+    assert abs(output[-2, 1]) > 0.9e-12
+
+
+def test_corrector_surfaces_nonfinite_filter_output_from_finite_double():
+    maximum = np.finfo(np.float64).max
+    source = np.tile([maximum, -maximum, -maximum, maximum], 16)
+    with pytest.raises(ValueError, match="finite|range"):
+        render_corrected(source, 48000, RepairRecipe(dc_remove=True))

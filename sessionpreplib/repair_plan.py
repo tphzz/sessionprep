@@ -5,7 +5,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .audio import load_track
+from .audio import load_track, validate_analysis_level
 from .detectors.audio_classifier import AudioClassifierDetector
 from .detectors.dc_offset import DCOffsetDetector
 from .detectors.silence import SilenceDetector
@@ -26,6 +26,25 @@ def _levels(data):
     peak = float(np.max(np.abs(data)))
     return {"signed_dc": np.atleast_1d(np.mean(data, axis=0, dtype=np.float64)).tolist(),
             "peak_dbfs": 20 * math.log10(peak) if peak else -math.inf}
+
+
+def _boundary_settling(source, corrected, rate):
+    """Locate audible filter tails in channel-local runs of digital silence."""
+    regions = []
+    minimum = math.ceil(rate / 10)  # 100 ms excludes ordinary zero crossings.
+    for channel, (before, after) in enumerate(zip(source.reshape(len(source), -1).T,
+                                                  corrected.reshape(len(corrected), -1).T)):
+        edges = np.flatnonzero(np.diff(before == 0, prepend=False, append=False))
+        runs = edges.reshape(-1, 2)
+        for start, stop in runs[runs[:, 1] - runs[:, 0] >= minimum]:
+            magnitude = np.abs(after[start:stop])
+            peak = float(np.max(magnitude))
+            if peak > 1e-6:  # -120 dBFS sample peak, before any gain.
+                above = magnitude > 1e-6
+                regions.append({"channel": channel, "start_sample": int(start + above.argmax()),
+                                "end_sample": int(stop - 1 - above[::-1].argmax()),
+                                "peak_dbfs": 20 * math.log10(peak)})
+    return regions
 
 
 def _persistent_bias(data, rate, threshold):
@@ -84,8 +103,7 @@ def plan_repairs(track, config):
         return track
     source = source_for_render(track)
     data = source.audio_data
-    if not np.isfinite(data).all():
-        raise ValueError("Source contains non-finite samples")
+    validate_analysis_level(np.max(np.abs(data), initial=0.), len(data))
     rate = source.samplerate
     if consider_dc and dc is None:
         dc = _analyze(DCOffsetDetector, source, config)
@@ -106,10 +124,12 @@ def plan_repairs(track, config):
     low_match = bool(consider_low and low.get("regions"))
     low_on = choices.get("low_cut", bool(config.get("repair_auto_low_cut") and low_match))
     high = source.detector_results.get("ultrasonic")
-    if high is None and high_rate and config.get("ultrasonic_enabled", True):
+    high_enabled = high_rate and config.get("ultrasonic_enabled", True)
+    if high is None and high_rate and (high_enabled or choices.get("ultrasonic")):
         high = _analyze(UltrasonicDetector, source, config)
-        track.detector_results["ultrasonic"] = high
-    high_match = bool(high and high.data.get("regions") and config.get("ultrasonic_enabled", True))
+        if high_enabled:
+            track.detector_results["ultrasonic"] = high
+    high_match = bool(high_enabled and high and high.data.get("regions"))
     high_on = choices.get("ultrasonic", bool(config.get("repair_auto_ultrasonic") and high_match))
     recipe = RepairRecipe(dc_on, choices.get("low_cut_hz", config.get("repair_low_cut_hz", 10))
                           if low_on else None, high_on)
@@ -132,6 +152,8 @@ def plan_repairs(track, config):
         for detector in (SilenceDetector, AudioClassifierDetector):
             gain_track.detector_results[detector.id] = _analyze(detector, gain_track, config)
         most_recent = _levels(audio)
+        if data.size:
+            measurements["boundary_settling"] = _boundary_settling(data, audio, rate)
         if measure_low:
             corrected_low = low if audio is dc_audio else _low_cut_evidence(audio, rate, config)
             most_recent["low_band"] = corrected_low
@@ -142,7 +164,7 @@ def plan_repairs(track, config):
             most_recent["subsonic_ratio_db"] = result.data["subsonic_ratio_db"]
             if sub.data.get("subsonic_warn"):
                 measurements["subsonic_resolved"] = not result.data["subsonic_warn"]
-        if high_match:
+        if high and high_rate:
             most_recent["ultrasonic"] = _analyze(UltrasonicDetector, gain_track, config).data
         measurements["corrected"] = most_recent
     else:

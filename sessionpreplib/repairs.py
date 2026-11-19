@@ -43,6 +43,19 @@ def _ultrasonic_taps(sample_rate: int) -> np.ndarray:
     return signal.firwin(count | 1, 22000, fs=sample_rate, window=("kaiser", beta))
 
 
+def _apply_highpass(data, sos):
+    """Carry the IIR history across blocks and retire inaudibly small delay states."""
+    state = np.zeros((len(sos), 2, *data.shape[1:]), dtype=np.float64)
+    output = np.empty_like(data)
+    for start in range(0, len(data), 4096):
+        block = slice(start, start + 4096)
+        output[block], state = signal.sosfilt(sos, data[block], axis=0, zi=state)
+        # -2000 dBFS leaves the representable tail well clear of the subnormal
+        # range between checks at audio sample rates, independently per channel.
+        state[np.abs(state) < 1e-100] = 0.0
+    return output
+
+
 def render_corrected(audio: np.ndarray, sample_rate: int, recipe: RepairRecipe) -> np.ndarray:
     """Return corrected samples at their original time origin and length.
 
@@ -67,12 +80,15 @@ def render_corrected(audio: np.ndarray, sample_rate: int, recipe: RepairRecipe) 
     if recipe.low_cut_hz is not None or recipe.dc_remove:
         order = 2 if recipe.low_cut_hz is not None else 1
         sos = signal.butter(order, cutoff, btype="highpass", fs=sample_rate, output="sos")
-        result = signal.sosfilt(sos, result, axis=0)
+        result = _apply_highpass(result, sos)
     if recipe.ultrasonic:
         taps = _ultrasonic_taps(sample_rate)
         delay = (len(taps) - 1) // 2
         full = signal.upfirdn(taps, result, axis=0)
         result = full[delay:delay + len(result)]
+    if not np.isfinite(result).all():
+        raise ValueError("Corrected audio exceeds the finite sample range. Lower the source level.")
+    result[np.abs(result) < np.finfo(result.dtype).tiny] = 0.0
     return result
 
 
@@ -105,45 +121,132 @@ def check_output_headroom(audio: np.ndarray, subtype: str) -> None:
     # Subtract logs to keep a finite gain recommendation even at float64 max.
     positive_over = math.log10(high) - math.log10(positive_range) if high > positive_range else 0.0
     negative_over = math.log10(-low) - math.log10(negative_range) if low < -negative_range else 0.0
-    reduction = max(0.1, math.ceil(200 * max(positive_over, negative_over)) / 10)
+    # Check the nearest tenth in sample units. A log round-trip can turn
+    # exactly 0.1 dB into 0.1000000000000001 and recommend an extra step.
+    tenths = round(200 * max(positive_over, negative_over))
+    if tenths < 60000:
+        factor = 10 ** (tenths / 200)
+        fits = high <= positive_range * factor and -low <= negative_range * factor
+    else:
+        attenuation = 10 ** (-tenths / 200)
+        fits = high * attenuation <= positive_range and -low * attenuation <= negative_range
+    reduction = (tenths if fits else tenths + 1) / 10
     peak_db = 20 * math.log10(max(-low, high))
     raise OutputHeadroomError(peak_db, reduction, subtype)
+
+
+class _BandWindow:
+    """One calibrated Hann window reused for every channel and hop."""
+
+    def __init__(self, width, rate, low, high):
+        self.low, self.high = low, high
+        self.bin_hz = rate / width
+        self.nyquist = rate / 2
+        self.freqs = np.fft.rfftfreq(width, 1 / rate)
+        window = signal.windows.hann(width, sym=False)
+        self.weights = np.full(len(self.freqs), 2.0 / (width * np.sum(window ** 2)))
+        self.weights[0] = 0
+        if width % 2 == 0:
+            self.weights[-1] *= 0.5
+
+        self.edges = []
+        for hz, side in ((low, 1), (high, -1)):
+            if not 0 < hz < self.nyquist:
+                continue
+            # Two bins on either side span the Hann main lobe. The measured
+            # sine/cosine basis also represents an edge between native bins.
+            bins = np.flatnonzero(np.abs(self.freqs - hz) <= 2 * self.bin_hz)
+            phase = 2 * np.pi * hz * np.arange(width) / rate
+            basis = np.column_stack((np.cos(phase), np.sin(phase)))
+            basis -= basis.mean(axis=0)
+            tones = np.fft.rfft(window[:, None] * basis, axis=0)[bins]
+            components = np.concatenate((tones.real, tones.imag))
+            projection = components @ np.linalg.pinv(components)
+            self.edges.append((hz, side, bins, projection))
+
+    def levels(self, block):
+        scale = np.max(np.abs(block))
+        if not scale:
+            return -math.inf, -math.inf, -math.inf
+        ac = np.asarray(block, dtype=np.float64) / scale
+        ac -= ac.mean()
+        raw = np.fft.rfft(ac)
+        # Multiplication by the periodic Hann (and its two time derivatives)
+        # is a three-bin convolution. Reflect the real FFT at DC and Nyquist.
+        last = -2 if len(block) % 2 == 0 else -1
+        padded = np.concatenate((raw[1:2].conj(), raw, [raw[last].conj()]))
+        left, right = padded[:-2], padded[2:]
+        sides = (left + right) * 0.25
+        spectrum = 0.5 * raw - sides
+        powers = np.abs(spectrum) ** 2 * self.weights
+        total = powers.sum()
+        if not total:
+            return -math.inf, -math.inf, -math.inf
+
+        # Local frequency from the phase derivative (Flandrin et al.,
+        # Time-frequency reassignment, eq. 5.20). A single tone carries its
+        # main-lobe energy to its own frequency, also at the inclusive edge.
+        derivative = self.bin_hz / (4j) * (left - right)
+        shift = np.divide(derivative, spectrum, out=derivative, where=spectrum != 0)
+        frequency = np.clip(self.freqs - shift.imag, 0, self.nyquist)
+        tolerance = 1e-7 * self.bin_hz
+        inside = (frequency > 0) & (frequency >= self.low - tolerance) & (frequency <= self.high + tolerance)
+        confirmed = inside.copy()
+        for hz, direction, bins, projection in self.edges:
+            local = spectrum[bins]
+            vector = np.concatenate((local.real, local.imag))
+            residual = vector - projection @ vector
+            local_energy = vector @ vector
+            if local_energy and residual @ residual <= 1e-12 * local_energy:
+                # One edge tone fits the measured complex coefficients to
+                # within one part per million in amplitude, at any phase.
+                inside[bins] = confirmed[bins] = True
+                continue
+            # Two unresolved tones can beat at an apparent frequency outside
+            # both. For two lines the magnitude of the second central moment
+            # is the product of their distances from the complex mean.
+            # Keep the reading, but require its uncertainty to clear the edge
+            # before using those bins to select a whole-track filter.
+            second = self.bin_hz ** 2 * sides[bins]
+            np.divide(second, local, out=second, where=local != 0)
+            spread = np.sqrt(np.abs(shift[bins] ** 2 - second))
+            confirmed[bins] &= direction * (frequency[bins] - hz) >= spread - tolerance
+
+        power = powers[inside].sum()
+        if not power:
+            return -math.inf, -math.inf, -math.inf
+        confident = powers[confirmed].sum()
+        level = 10 * math.log10(power) + 20 * math.log10(scale)
+        ratio = min(0.0, 10 * math.log10(power / total))
+        confidence_db = 10 * math.log10(confident / power) if confident else -math.inf
+        return level, ratio, confidence_db
 
 
 def band_evidence(audio, sample_rate, *, low_hz, high_hz, window_sec,
                   level_db, ratio_db, consecutive):
     """Measure sustained AC band energy per channel, with absolute and relative gates.
 
-    Report inclusive frame spans. A run belongs to one channel; alternating
-    bursts on different channels cannot satisfy the persistence requirement.
+    Spans are inclusive and refer to full windows on a single channel.
+    Short clips supply a meter reading but cannot qualify a repair.
     """
     data = np.asarray(audio)
-    channels = data.reshape(len(data), -1) if data.size else None
-    width = max(2, round(window_sec * sample_rate))
-    hop = max(1, width // 2)
-    freqs = np.fft.rfftfreq(width, 1 / sample_rate)
-    band = (freqs > 0) & (freqs >= low_hz) & (freqs <= high_hz)
+    full_width = max(2, round(window_sec * sample_rate))
+    width = min(len(data), full_width)
     spans = []
     peak_level = peak_ratio = -math.inf
-    if channels is None or len(data) < width or not band.any():
-        return {"regions": spans, "band_dbfs": peak_level, "ratio_db": peak_ratio}
-    window = signal.windows.hann(width, sym=False)
-    weights = np.full(len(freqs), 2.0 / (width * np.dot(window, window)))
-    weights[0] = 0
-    if width % 2 == 0:
-        weights[-1] *= 0.5
+    if width < 2 or not data.size:
+        return {"regions": spans, "band_dbfs": None, "ratio_db": None}
+    channels = data.reshape(len(data), -1)
+    hop = max(1, width // 2)
+    meter = _BandWindow(width, sample_rate, low_hz, high_hz)
     for ch, channel in enumerate(channels.T):
         count = 0
         for start in range(0, len(channel) - width + 1, hop):
             block = channel[start:start + width]
-            spectrum = np.fft.rfft((block - np.mean(block, dtype=np.float64)) * window)
-            powers = np.abs(spectrum) ** 2 * weights
-            energy, total = float(powers[band].sum()), float(powers.sum())
-            level = 10 * math.log10(energy) if energy > 0 else -math.inf
-            ratio = 10 * math.log10(energy / total) if energy > 0 and total > 0 else -math.inf
+            level, ratio, confidence_db = meter.levels(block)
             if level > peak_level:
                 peak_level, peak_ratio = level, ratio
-            if level < level_db or ratio < ratio_db:
+            if width < full_width or level + confidence_db < level_db or ratio + confidence_db < ratio_db:
                 count = 0
                 continue
             count += 1

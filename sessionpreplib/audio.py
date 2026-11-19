@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 from typing import Any
 
@@ -186,6 +187,36 @@ def get_peak_db(track: TrackContext) -> float:
 def is_silent(track: TrackContext) -> bool:
     """True if the file is absolute silence (peak == 0)."""
     return get_peak(track) == 0.0
+
+
+def validate_analysis_level(peak: float, samples: int) -> None:
+    """Require finite samples and room to square windowed spectral sums in DOUBLE."""
+    if not math.isfinite(peak):
+        raise ValueError("Source contains non-finite samples")
+    if samples and peak > math.sqrt(np.finfo(np.float64).max) / samples:
+        raise ValueError("Source level exceeds the finite range for analysis. Lower the source level.")
+
+
+def squared_sample_prefix(samples: np.ndarray) -> np.ndarray:
+    """Cumulative channel energy with a zero prefix for arbitrary RMS windows."""
+    prefix = np.empty(len(samples) + 1, dtype=np.float64)
+    prefix[0] = 0
+    np.square(samples, dtype=np.float64, out=prefix[1:])
+    np.cumsum(prefix[1:], out=prefix[1:])
+    return prefix
+
+
+def max_momentary_rms(prefixes: list[np.ndarray], window: int) -> tuple[int, float, float]:
+    """Center sample, dBFS and linear maximum of the channel-averaged RMS."""
+    if not prefixes or window <= 0 or len(prefixes[0]) < 2:
+        return -1, float("-inf"), 0.0
+    window = min(window, len(prefixes[0]) - 1)
+    energy = (prefixes[0][window:] - prefixes[0][:-window]) / len(prefixes)
+    for prefix in prefixes[1:]:
+        energy += (prefix[window:] - prefix[:-window]) / len(prefixes)
+    start = int(np.argmax(energy))
+    rms = float(np.sqrt(energy[start] / window))
+    return start + window // 2, 20 * np.log10(rms) if rms else float("-inf"), rms
 
 
 def get_rms_window_means(

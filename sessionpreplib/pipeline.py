@@ -516,6 +516,7 @@ class Pipeline:
                     raise ValueError("Prepared output must be separate from its source")
                 audio = resolve_entry_audio(entry, rendered)
                 check_output_headroom(audio, src.subtype)
+                fader = _routed_fader(entry, sources, rendered, applied)
                 identity = (len(names) == 1 and entry.output_channels == src.channels and
                             entry.sources[0].routes == passthrough_routes(src.channels))
                 dry_path = src.filepath
@@ -545,19 +546,12 @@ class Pipeline:
                         current_signature = _write_atomic(dry, dry_audio, src.samplerate, "FLOAT")
                     dry_path = str(dry)
                     dry_signature = current_signature
-                faders = set()
-                for n in names:
-                    norm = sources[n].processor_results.get("bimodal_normalize")
-                    faders.add(float(norm.data.get("fader_offset", -norm.gain_db))
-                               if norm and "bimodal_normalize" in applied[n] else 0.0)
-                if not all(np.isfinite(fader) for fader in faders):
-                    raise ValueError("Prepared fader offsets must be finite")
                 ids = list(dict.fromkeys(pid for n in names for pid in applied[n]))
                 out = replace(
                     src, filename=name, filepath=dry_path, processed_filepath=str(dest),
                     audio_data=None, total_samples=len(audio), channels=entry.output_channels,
                     duration_sec=len(audio) / src.samplerate, applied_processors=ids,
-                    prepared_fader_db=faders.pop() if len(faders) == 1 else 0.0,
+                    prepared_fader_db=fader,
                     source_file_signature=dry_signature,
                     processor_results=deepcopy(src.processor_results), _cache={},
                     repair_overrides=dict(src.repair_overrides),
@@ -678,7 +672,10 @@ class Pipeline:
                 signature = _write_atomic(dst_filepath, audio, track.samplerate, track.subtype)
                 for result in track.processor_results.values():
                     result.data["out_peak"] = peak
-                receipts[track.filename] = {"gain_db": gain, "fader_db": fader, "applied_processors": applied}
+                receipt = {"gain_db": gain, "fader_db": fader, "applied_processors": applied}
+                if track.repair_measurements.get("boundary_settling"):
+                    receipt["boundary_settling"] = deepcopy(track.repair_measurements["boundary_settling"])
+                receipts[track.filename] = receipt
                 track.processed_filepath = str(dst_filepath)
                 track.applied_processors = applied
                 track.prepared_file_signature = signature
@@ -698,6 +695,38 @@ class Pipeline:
 # --------------------------------------------------------------------------
 # Helpers
 # --------------------------------------------------------------------------
+
+def _routed_fader(entry, sources, rendered, applied) -> float:
+    """Return the single fader that can compensate all contributing channels."""
+    by_offset = {}
+    for source in entry.sources:
+        name = source.input_filename
+        track = sources[name]
+        norm = track.processor_results.get("bimodal_normalize")
+        offset = (float(norm.data.get("fader_offset", -norm.gain_db))
+                  if norm and "bimodal_normalize" in applied[name] else 0.0)
+        for route in source.routes:
+            if route.gain and 0 <= route.source_channel < track.channels:
+                by_offset.setdefault(offset, set()).add((name, route.source_channel))
+    if not all(np.isfinite(offset) for offset in by_offset):
+        raise ValueError("Prepared fader offsets must be finite")
+    if len(by_offset) <= 1:
+        return next(iter(by_offset), 0.0)
+
+    # Distinct offsets only conflict when both routes carry signal. Inspect
+    # precisely the selected channels, including a silent side of a stereo file.
+    audible = []
+    for offset, channels in by_offset.items():
+        for name, channel in channels:
+            samples = rendered[name][0]
+            if np.any(samples if samples.ndim == 1 else samples[:, channel]):
+                audible.append(offset)
+                break
+    if len(audible) > 1:
+        raise ValueError("One output fader cannot restore these sources' different normalization "
+                         "gains. Link their gains or route them to separate outputs, then Prepare again.")
+    return audible[0] if audible else 0.0
+
 
 def _write_atomic(destination: Path, audio: np.ndarray, sample_rate: int,
                   subtype: str) -> tuple[int, int]:

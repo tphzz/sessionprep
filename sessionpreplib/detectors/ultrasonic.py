@@ -10,7 +10,7 @@ class UltrasonicDetector(TrackDetector):
 
     @classmethod
     def html_help(cls):
-        return ("Checks for sustained ultrasonic energy above 24.1 kHz on each channel. "
+        return ("Checks for sustained ultrasonic energy from 24.1 kHz to Nyquist on each channel. "
                 "Five consecutive 100 ms windows must exceed both −60 dBFS RMS and "
                 "−35 dB relative to program energy. The source must be at least 50 kHz.")
 

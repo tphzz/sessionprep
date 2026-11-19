@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
 )
 
 from sessionpreplib.config import REPAIR_PARAMS
+from sessionpreplib.reports import format_boundary_settling
 from ..controls import FormActionButton, FormDoubleSpinBox
 from ..prefs.param_form import _FieldResetButton, _spin_decimals
 from ..theme import COLORS, REPORT_INSET
@@ -54,7 +55,7 @@ def _number(value, places, *, sign=False):
     return format(value, f"{'+' if sign else ''}.{places}f").replace("-", "−")
 
 
-def _above_threshold_seconds(regions, rate):
+def _qualifying_window_seconds(regions, rate):
     """Display elapsed time once when channels report overlapping locations."""
     end = -1
     samples = 0
@@ -332,11 +333,11 @@ class TrackRepairEditor(QFrame):
         if track.samplerate < 50000:
             high.description.setText(f"Requires at least 50 kHz · source is {track.samplerate / 1000:g} kHz")
         elif suggested.get("ultrasonic"):
-            duration = _above_threshold_seconds(original_high.get("regions", []), track.samplerate)
-            high.description.setText(f"Suggested · {duration:.2f} s above threshold")
+            duration = _qualifying_window_seconds(original_high.get("regions", []), track.samplerate)
+            high.description.setText(f"Suggested · Qualifying windows span {duration:.2f} s")
         else:
             high.description.setText("Audible passband through 20 kHz")
-        high.evidence_title.setText("Energy above 24.1 kHz")
+        high.evidence_title.setText("Energy ≥24.1 kHz")
         high.evidence.setText(f"{_number(original_high.get('band_dbfs'), 1)} → "
                               f"{_number(after.get('ultrasonic', {}).get('band_dbfs'), 1)} dBFS RMS")
         for row, visible in ((low, bool(low_evidence)), (dc, bool(dc_values)),
@@ -373,8 +374,9 @@ class TrackRepairEditor(QFrame):
                 details.append("The previous prepared output is marked stale.")
         self.recovery_detail.setText(" ".join(details))
         self.recovery_detail.setVisible(bool(details))
-        self.error.setText("\n".join(errors))
-        self.error.setVisible(bool(errors))
+        messages = errors + format_boundary_settling(measures.get("boundary_settling", []))
+        self.error.setText("\n".join(messages))
+        self.error.setVisible(bool(messages))
         self.recovery.setVisible(bool(adjustment))
         self.adjust_gain.setVisible(bool(adjustment))
         self.reflow()
