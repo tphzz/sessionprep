@@ -85,8 +85,10 @@ def _cell_colors(tree, item, column=0):
             for y in range(image.height()) for x in range(image.width())}
 
 
-def _has_green(colors):
-    return any(g > r + 32 and g > b + 32 for r, g, b in colors)
+def _has_status_ink(colors):
+    # A Windows subpixel fringe on amber warning text can also be green.
+    # Only the status label paints solid #44cc44.
+    return (68, 204, 68) in colors
 
 
 def test_release_and_reassignment_follow_the_last_route(layout_window):
@@ -128,13 +130,13 @@ def test_collapsed_count_and_warning_paint_together(form_font, layout_window):
     assert piano.data(0, Qt.AccessibleTextRole).endswith("2 unassigned")
     assert "clipping detected" in piano.toolTip(0)
     assert piano.foreground(0).color().name() == "#ffaa00"
-    assert _has_green(_cell_colors(inputs, piano))
+    assert _has_status_ink(_cell_colors(inputs, piano))
 
     piano.setExpanded(True)
     QApplication.processEvents()
-    assert not _has_green(_cell_colors(inputs, piano))
-    assert _has_green(_cell_colors(inputs, piano.child(0)))
-    assert _has_green(_cell_colors(inputs, piano.child(1)))
+    assert not _has_status_ink(_cell_colors(inputs, piano))
+    assert _has_status_ink(_cell_colors(inputs, piano.child(0)))
+    assert _has_status_ink(_cell_colors(inputs, piano.child(1)))
 
 
 def test_selected_and_narrow_rows_keep_the_unassigned_status(form_font, layout_window):
@@ -144,9 +146,9 @@ def test_selected_and_narrow_rows_keep_the_unassigned_status(form_font, layout_w
     inputs.setColumnWidth(0, 190)
     QApplication.processEvents()
     colors = _cell_colors(inputs, channel)
-    assert _has_green(colors)
+    assert _has_status_ink(colors)
     assert any(r == g == b and r > 214 for r, g, b in colors)
-    assert not _has_green(_cell_colors(inputs, channel, 1))
+    assert not _has_status_ink(_cell_colors(inputs, channel, 1))
 
     inputs.setCurrentItem(channel)
     inputs.setFocus()
@@ -154,13 +156,13 @@ def test_selected_and_narrow_rows_keep_the_unassigned_status(form_font, layout_w
     selected = _cell_colors(inputs, channel)
     assert (42, 109, 181) in selected
     assert any(r == g == b and r > 247 for r, g, b in selected)
-    assert not _has_green(selected)
+    assert not _has_status_ink(selected)
 
     inputs.clearSelection()
     inputs.setColumnWidth(0, 52)
     QApplication.processEvents()
-    assert not _has_green(_cell_colors(inputs, channel))
-    assert not _has_green(_cell_colors(inputs, channel, 1))
+    assert not _has_status_ink(_cell_colors(inputs, channel))
+    assert not _has_status_ink(_cell_colors(inputs, channel, 1))
     assert PIANO in channel.toolTip(1)
     assert "Unassigned" in channel.toolTip(1)
     assert channel.data(0, Qt.AccessibleTextRole).endswith("Unassigned")

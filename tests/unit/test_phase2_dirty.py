@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 import copy
-from types import SimpleNamespace
 
 import pytest
 
 pytest.importorskip("PySide6")
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QEvent, Qt
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -17,6 +16,7 @@ from PySide6.QtWidgets import (
     QSpinBox,
 )
 
+from sessionpreplib.models import SessionContext
 from sessionprepgui.settings import build_defaults
 from sessionprepgui.mainwindow import SessionPrepWindow
 from sessionprepgui.tracks.table_widgets import _TAB_GROUPS, _TAB_SESSION
@@ -31,17 +31,17 @@ def qapp():
     return app
 
 
+def _close_window(window):
+    # Let queued setup and close callbacks run while their widgets still exist.
+    assert window.close()
+    QApplication.processEvents()
+    window.deleteLater()
+    QApplication.sendPostedEvents(window, QEvent.DeferredDelete)
+
+
 def _window(qapp):
     window = SessionPrepWindow()
-    window._session = SimpleNamespace(
-        tracks=[],
-        processors=[],
-        transfer_manifest=[],
-        output_tracks=[],
-        daw_state={},
-        prepare_state="none",
-        config={},
-    )
+    window._session = SessionContext([], {})
     window._detail_tabs.setTabEnabled(_TAB_GROUPS, True)
     window._detail_tabs.setTabEnabled(_TAB_SESSION, True)
     window._session_groups = copy.deepcopy(
@@ -105,7 +105,7 @@ def test_phase2_dirty_indicators_are_clean_on_preset_values(qapp):
         for item in window._session_dirty_items.values():
             assert item.icon(1).isNull()
     finally:
-        window.close()
+        _close_window(window)
 
 
 def test_default_group_preset_uses_existing_color_names(qapp):
@@ -130,15 +130,7 @@ def test_default_group_preset_uses_existing_color_names(qapp):
 def test_legacy_group_color_names_resolve_to_current_palette(qapp):
     window = SessionPrepWindow()
     try:
-        window._session = SimpleNamespace(
-            tracks=[],
-            processors=[],
-            transfer_manifest=[],
-            output_tracks=[],
-            daw_state={},
-            prepare_state="none",
-            config={},
-        )
+        window._session = SessionContext([], {})
         window._detail_tabs.setTabEnabled(_TAB_GROUPS, True)
         window._session_groups = [
             {"name": "Loops", "color": "Cafe Royale Light"},
@@ -159,21 +151,13 @@ def test_legacy_group_color_names_resolve_to_current_palette(qapp):
         assert set(window._group_color_map()) == {
             "Loops", "A.Gtr", "VOX", "Unknown"}
     finally:
-        window.close()
+        _close_window(window)
 
 
 def test_phase2_groups_tab_stays_clean_before_first_analysis_groups_load(qapp):
     window = SessionPrepWindow()
     try:
-        window._session = SimpleNamespace(
-            tracks=[],
-            processors=[],
-            transfer_manifest=[],
-            output_tracks=[],
-            daw_state={},
-            prepare_state="none",
-            config={},
-        )
+        window._session = SessionContext([], {})
         window._session_groups = []
         window._detail_tabs.setTabEnabled(_TAB_GROUPS, False)
 
@@ -182,7 +166,7 @@ def test_phase2_groups_tab_stays_clean_before_first_analysis_groups_load(qapp):
         assert window._detail_tabs.tabText(_TAB_GROUPS) == "Groups"
         assert not is_tab_marked(window._detail_tabs, _TAB_GROUPS)
     finally:
-        window.close()
+        _close_window(window)
 
 
 def test_phase2_groups_dirty_highlights_cell_and_tab(qapp):
@@ -206,7 +190,7 @@ def test_phase2_groups_dirty_highlights_cell_and_tab(qapp):
             == Qt.NoBrush
         )
     finally:
-        window.close()
+        _close_window(window)
 
 
 def test_phase2_groups_dirty_color_uses_centered_button_indicator(qapp):
@@ -229,7 +213,7 @@ def test_phase2_groups_dirty_color_uses_centered_button_indicator(qapp):
         assert widget._dirty_indicator is True
         assert "\u25cf" not in widget.text()
     finally:
-        window.close()
+        _close_window(window)
 
 
 def test_phase2_groups_added_row_marks_full_row(qapp):
@@ -242,7 +226,7 @@ def test_phase2_groups_added_row_marks_full_row(qapp):
         assert is_tab_marked(window._detail_tabs, _TAB_GROUPS)
         assert window._groups_dirty_cells()[row] == set(range(6))
     finally:
-        window.close()
+        _close_window(window)
 
 
 def test_phase2_groups_removed_row_marks_tab(qapp):
@@ -255,7 +239,7 @@ def test_phase2_groups_removed_row_marks_tab(qapp):
         assert is_tab_marked(window._detail_tabs, _TAB_GROUPS)
         assert window._groups_dirty_cells() == {}
     finally:
-        window.close()
+        _close_window(window)
 
 
 def test_phase2_config_analysis_dirty_marks_tree_and_tab(qapp):
@@ -283,7 +267,7 @@ def test_phase2_config_analysis_dirty_marks_tree_and_tab(qapp):
         if hasattr(bar, "accessibleTabName"):
             assert bar.accessibleTabName(_TAB_SESSION) == "Config"
     finally:
-        window.close()
+        _close_window(window)
 
 
 def test_phase2_config_child_dirty_marks_parent(qapp):
@@ -297,7 +281,7 @@ def test_phase2_config_child_dirty_marks_parent(qapp):
         assert not window._session_dirty_items[section].icon(1).isNull()
         assert not window._session_dirty_items["_presentation"].icon(1).isNull()
     finally:
-        window.close()
+        _close_window(window)
 
 
 def test_phase2_config_revert_clears_tree_and_tab(qapp):
@@ -314,7 +298,7 @@ def test_phase2_config_revert_clears_tree_and_tab(qapp):
         assert not is_tab_marked(window._detail_tabs, _TAB_SESSION)
         assert window._session_dirty_items["analysis"].icon(1).isNull()
     finally:
-        window.close()
+        _close_window(window)
 
 
 def test_phase2_change_tooltips_name_their_own_comparison_preset(qapp):
@@ -325,4 +309,4 @@ def test_phase2_change_tooltips_name_their_own_comparison_preset(qapp):
         assert window._phase2_change_tooltip(_TAB_GROUPS) == "Changed from group preset “Band groups”"
         assert window._phase2_change_tooltip(_TAB_SESSION) == "Changed from preset “Mix config”"
     finally:
-        window.close()
+        _close_window(window)
