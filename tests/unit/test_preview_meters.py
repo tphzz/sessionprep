@@ -173,3 +173,47 @@ def test_high_painter_uses_the_actual_frequency_of_the_partial_edge_rows():
     # The second cell extends to the midpoint at 20,026 Hz.
     assert renderer._spec_image.pixelColor(4, 89).red() == 255  # 20,010 Hz
     assert renderer._spec_image.pixelColor(4, 54).red() == 0    # 20,045 Hz
+
+
+@pytest.mark.parametrize("band", ["low", "high"])
+@pytest.mark.parametrize(("companion", "bins"), [
+    ("distant tone", None), ("resolved tone", 4), ("resolved tone", 8), ("noise", None),
+])
+def test_exact_dc_and_nyquist_keep_their_one_sided_level_with_other_audio(band, companion, bins):
+    rate = 48000
+    index = np.arange(8 * rate)
+    endpoint = np.ones(len(index))
+    if band == "high":
+        endpoint[1::2] = -1
+    source = .05 * endpoint
+    if companion == "distant tone":
+        source += .24 * np.sin(2 * np.pi * (1000 / rate) * index)
+    elif companion == "resolved tone":
+        frequency = bins if band == "low" else rate / 2 - 50 * bins
+        source += .24 * np.sin(2 * np.pi * (frequency / rate) * index + .48)
+    else:
+        source += np.random.default_rng(1107).normal(0., 2e-5, len(index))
+    source = source.astype(np.float32)
+    result, errors = [], []
+    worker = WaveformLoadWorker(source, rate, 256, band=band)
+    worker.finished.connect(result.append)
+    worker.failed.connect(errors.append)
+    worker.run()
+    assert not errors
+    view, = result
+    # A mean measures exactly DC. Alternating the observation signs measures
+    # exactly Nyquist. Neither endpoint has a separate negative-frequency image.
+    measured = 20 * np.log10(abs(np.mean((source * endpoint)[2 * rate:6 * rate])))
+    columns = np.flatnonzero((view["spec_times"] >= 2.) & (view["spec_times"] < 6.))
+    edge_row = 0 if band == "low" else -1
+    levels = view["spec_db"][edge_row, columns]
+    np.testing.assert_allclose(levels, measured, atol=.3)
+    expected_peak = 20 * np.log10(.24) if companion == "resolved tone" else measured
+    np.testing.assert_allclose(view["spec_db"][:, columns].max(axis=0), expected_peak, atol=.3)
+    renderer = SpectrogramRenderer()
+    renderer.set_colormap("grayscale")
+    renderer.set_inspection(view)
+    center = round(view["spec_times"][columns[np.argmax(levels)]] * rate)
+    renderer._build_spec_image(SpecRenderCtx(0, 6, 128, center - 1, center + 1, len(index), rate))
+    pixel = renderer._spec_image.pixelColor(3, 127 if band == "low" else 0).red()
+    assert abs(pixel - 255 * (measured + 80.) / 80.) <= 2

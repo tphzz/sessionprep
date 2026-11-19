@@ -208,3 +208,32 @@ def test_high_cells_keep_observed_noise_and_two_separate_tones(fixture):
             sums = transform @ (source[start:start + width] * window)
             peak = np.max(factors * np.abs(sums)) / window.sum()
             assert levels[row, column] == pytest.approx(20 * np.log10(max(1e-10, peak)), abs=1e-4)
+
+
+@pytest.mark.parametrize("band,first_hz,width", [("low", 40., 48000), ("high", 21200., 960)])
+@pytest.mark.parametrize("separation", [2, 3, 4])
+def test_two_tone_dip_matches_the_phase_averaged_window_response(band, first_hz, width, separation):
+    rate = 48000
+    spacing = rate / width
+    rows = first_hz + spacing * np.arange(separation + 1)
+    t = np.arange(2 * width) / rate
+    bins = rows[:, None] + spacing * np.array([-.5, -.25, 0., .25])
+    window_time = np.arange(width) / rate
+    kernel = np.exp(-2j * np.pi * bins[:, :, None] * window_time)
+    hann = .5 - .5 * np.cos(2 * np.pi * np.arange(width) / width)
+    measured, reference = [], []
+    for relative_phase in 2 * np.pi * np.arange(8) / 8:
+        audio = .2 * (np.cos(2 * np.pi * rows[0] * t + .17)
+                      + np.cos(2 * np.pi * rows[-1] * t + .17 + relative_phase))
+        times, hz, levels = inspection_spectrogram(audio, rate, band)
+        column = np.flatnonzero(times == width / rate).item()
+        measured.append(10 ** (levels[np.searchsorted(hz, rows), column] / 10))
+        window = audio[width // 2:3 * width // 2] * hann
+        summed = np.einsum("rbi,i->rb", kernel, window)
+        reference.append((2 * np.abs(summed).max(axis=1) / hann.sum()) ** 2)
+
+    def dip_db(relative_powers):
+        powers = np.mean(relative_powers, axis=0)
+        return 10 * np.log10(min(powers[0], powers[-1]) / min(powers[1:-1]))
+
+    assert dip_db(measured) == pytest.approx(dip_db(reference), abs=1e-4)

@@ -8,7 +8,7 @@ import pytest
 import soundfile as sf
 
 pytest.importorskip("PySide6")
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QEvent, QTimer
 from PySide6.QtWidgets import (
     QApplication, QDialog, QDoubleSpinBox, QFileDialog, QMessageBox, QPushButton,
 )
@@ -84,7 +84,12 @@ def project(app, tmp_path, monkeypatch, request):
     try:
         yield window
     finally:
-        window.close()
+        # Finish queued worker deliveries and destroy this test's window on
+        # the GUI thread before the next project creates its workers.
+        assert window.close()
+        app.processEvents()
+        window.deleteLater()
+        app.sendPostedEvents(window, QEvent.DeferredDelete)
 
 
 def dc_checkbox(widgets):

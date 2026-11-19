@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from concurrent.futures import CancelledError
 from dataclasses import dataclass
+from functools import lru_cache
 
 import numpy as np
 from scipy import fft, signal
@@ -118,6 +119,15 @@ class _EndpointBand:
         phase = omega * (np.arange(len(self.taps)) - self.radius)
         return np.einsum("i,i->", self.taps, np.cos(phase))
 
+    def local_bias(self, frame, start):
+        # Use the whole local support: the FIR observations lose one radius
+        # on each side, widening their taper enough to admit a resolved line.
+        if self.high:
+            pairs = len(frame) // 2
+            difference = np.subtract(frame[:2 * pairs:2], frame[1:2 * pairs:2], dtype=np.float64)
+            return (.5 if start % 2 == 0 else -.5) * _bias_level(difference)
+        return _bias_level(frame)
+
 
 @dataclass
 class _EdgeLine:
@@ -156,6 +166,94 @@ class _EdgeLine:
             real[1 - start % 2::2] *= -1
             quadrature[start % 2::2] *= -1
         return real + 1j * quadrature
+
+
+@lru_cache(maxsize=64)
+def _bias_weights(count):
+    """Unit DC response with strong rejection of other spectral lines."""
+    taper = signal.windows.blackmanharris(count)
+    return taper / taper.sum()
+
+
+def _bias_level(samples):
+    # Reduce long contexts by integration so their window storage is bounded.
+    # Plain subsampling could alias a distant tone to the endpoint.
+    stride = max(1, len(samples) // 128)
+    if stride > 1:
+        count = len(samples) // stride
+        samples = samples[:count * stride].reshape(count, stride).mean(axis=1, dtype=np.float64)
+    return np.einsum("i,i->", samples, _bias_weights(len(samples)))
+
+
+def _consistent_bias(samples, level):
+    # A 0.5% amplitude difference is about 0.043 dB: only a small part
+    # of the display's 0.3 dB calibration allowance. Independent means test
+    # the endpoint itself without requiring all other frequencies to be quiet.
+    if len(samples) < 12 or level == 0.:
+        return False
+    half = len(samples) // 2
+    return all(abs(_bias_level(part) - level) <= .005 * abs(level)
+               for part in (samples[:half], samples[half:]))
+
+
+def _context_starts(start, stop, span, length):
+    origins = ((start + stop - span) // 2, start, stop - span)
+    return dict.fromkeys(max(0, min(length - span, lo)) for lo in origins)
+
+
+@dataclass
+class _EndpointBias:
+    start: int
+    end: int
+    level: float
+    band: _EndpointBand
+
+    def local_components(self, frame, start):
+        local = self.band.local_bias(frame, start)
+        # One short window is noisier than the supporting interval. Require
+        # its measured level within 0.13 dB and leave the rest in the real FFT.
+        if abs(local - self.level) > .015 * abs(self.level):
+            return None
+        # Report the signed endpoint present in this window. Its DC or
+        # alternating component has no separate negative-frequency image.
+        real = np.full(len(frame), local)
+        if self.band.high:
+            real[1 - start % 2::2] *= -1
+        return real
+
+
+def _stationary_bias(band, start, stop, limit):
+    frame = band.channel[start:stop]
+    samples, _, _ = band.observations(start, stop)
+    level = band.local_bias(frame, start)
+    if level == 0.:
+        return None, None
+    # Prefer evidence on both sides, then allow a steady section next to an
+    # edit. Never import its amplitude into a window that fails the local test.
+    n = stop - start
+    span = min(2 * n, limit)
+    # Start with neighboring evidence. A stationary endpoint must survive
+    # the improved resolution here before testing much longer intervals.
+    while span > n:
+        agrees = False
+        for lo in _context_starts(start, stop, span, len(band.channel)):
+            context, _, _ = band.observations(lo, lo + span)
+            reference = _bias_level(context)
+            if abs(level - reference) > .015 * abs(reference):
+                continue
+            agrees = True
+            if all(_consistent_bias(part, reference) for part in np.array_split(context, 2)):
+                bias = _EndpointBias(lo, lo + span, reference, band)
+                return bias.local_components(frame, start), bias
+        if not agrees or span == limit:
+            break
+        span = min(span * 2, limit)
+    # An isolated section can be shorter than two windows. Its samples must
+    # themselves be flat to the same tolerance before it qualifies locally.
+    if np.max(np.abs(samples - level)) <= .005 * abs(level):
+        bias = _EndpointBias(start, stop, level, band)
+        return bias.local_components(frame, start), bias
+    return None, None
 
 
 def _measure_edge_line(band, start, stop, quantum):
@@ -242,29 +340,21 @@ def _endpoint_model(band, start, stop, rate, quantum, previous):
     if peak < 1e-15:
         return None, None
     x = samples / peak
-    if np.ptp(x) < 1e-11:
-        # A local constant contains no distinct positive/negative image.
-        real = np.full(len(frame), np.mean(samples), dtype=np.float64)
-        if band.high:
-            real[1 - start % 2::2] *= -1
-        return real, None
     # Only positive/negative lobes overlapping at a real-spectrum endpoint
     # need a quadrature estimate. Resolved frequencies use the ordinary STFT.
-    if np.mean(np.diff(x) ** 2) > np.mean(x ** 2) * (8 * np.pi / len(x)) ** 2 + .01:
-        return None, None
     span = n
     limit = min(len(band.channel), max(n * 4, rate * 8))
+    if np.mean(np.diff(x) ** 2) > np.mean(x ** 2) * (8 * np.pi / len(x)) ** 2 + .01:
+        return _stationary_bias(band, start, stop, limit)
     while True:
-        origins = ((start + stop - span) // 2, start, stop - span)
-        origins = dict.fromkeys(max(0, min(len(band.channel) - span, lo)) for lo in origins)
-        for lo in origins:
+        for lo in _context_starts(start, stop, span, len(band.channel)):
             line = _measure_edge_line(band, lo, lo + span, quantum)
             if line is not None:
                 components = line.local_components(frame, start)
                 if components is not None:
                     return components, line
         if span == limit:
-            return None, None
+            return _stationary_bias(band, start, stop, limit)
         span = min(span * 2, limit)
 
 
