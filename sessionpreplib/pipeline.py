@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import os
 import time
+import math
 from copy import deepcopy
 from dataclasses import replace
+from decimal import Decimal, ROUND_CEILING
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -522,20 +524,18 @@ class Pipeline:
                     raise ValueError("Prepared output must be separate from its source")
                 audio = resolve_entry_audio(entry, rendered)
                 try:
-                    check_output_headroom(audio, src.subtype)
+                    if len(set(names)) == 1:
+                        self._check_source_headroom(audio, src, original[src.filename][0],
+                                                    applied[src.filename], entry)
+                    else:
+                        check_output_headroom(audio, src.subtype)
                 except OutputHeadroomError as overload:
-                    if len(set(names)) != 1:
-                        raise
-                    gain, reduction = self._retry_trim(src, entry, original[src.filename][0],
-                                                       applied[src.filename], overload)
-                    previous = gain_adjustments.get(src.filename)
-                    if previous is None or (reduction, overload.peak_db) > (
-                            previous["reduction_db"], previous["peak_db"]):
-                        gain_adjustments[src.filename] = {
-                            "peak_db": overload.peak_db, "reduction_db": reduction, "gain_db": gain,
-                        }
-                    if reduction != overload.reduction_db:
-                        raise OutputHeadroomError(overload.peak_db, reduction, src.subtype) from overload
+                    advice = overload.adjustment
+                    if advice is not None:
+                        previous = gain_adjustments.get(src.filename)
+                        if previous is None or (advice["reduction_db"], advice["peak_db"]) > (
+                                previous["reduction_db"], previous["peak_db"]):
+                            gain_adjustments[src.filename] = advice
                     raise
                 fader = _routed_fader(entry, sources, rendered, applied)
                 identity = index not in rerouted
@@ -640,27 +640,52 @@ class Pipeline:
         session.prepare_state = ("stale" if output_tracks else "none") if errors else "ready"
         return session
 
-    def _retry_trim(self, track, entry, source_audio, applied, overload):
-        """Check a borderline decimal step using the same operations as a retry."""
+    def _check_source_headroom(self, audio, track, source_audio, applied, entry=None):
+        """Validate encoding and offer a trim in the units the caller can apply."""
         from .topology import resolve_entry_audio
+
+        try:
+            check_output_headroom(audio, track.subtype)
+            return
+        except OutputHeadroomError as exc:
+            overload = exc
 
         norm = track.processor_results.get("bimodal_normalize")
         normalizing = norm is not None and "bimodal_normalize" in applied
         gain = norm.gain_db if normalizing else (track.manual_gain_db or 0.0)
-        candidate = overload.boundary_db
-        if candidate is None:
-            return gain, overload.reduction_db
-        retry = replace(track, audio_data=source_audio, manual_gain_db=gain - candidate,
-                        processor_results=deepcopy(track.processor_results), _cache={})
-        if normalizing:
-            retry.processor_results["bimodal_normalize"].gain_db = retry.manual_gain_db
-        _, audio, _ = self._render_track(retry)
-        routed = resolve_entry_audio(entry, {track.filename: (audio, track.samplerate)})
-        try:
-            check_output_headroom(routed, track.subtype)
-        except OutputHeadroomError:
-            candidate = (round(candidate * 10) + 1) / 10
-        return gain, candidate
+        # Adjust Gain selects an absolute value on a decimal grid. The CLI
+        # gives a reduction in tenths from the user's full-precision setting.
+        limit = gain - overload.excess_db if entry is not None else -overload.excess_db
+        step = round(limit * 10)
+        if abs(step / 10 - limit) > 1e-9:
+            step = math.floor(limit * 10)
+        else:
+            target = step / 10
+            if entry is None:
+                decimal_target = float(Decimal(str(gain)) + Decimal(str(target)))
+                target = max(gain + target, decimal_target)
+            retry = replace(track, audio_data=source_audio, manual_gain_db=target,
+                            processor_results=deepcopy(track.processor_results), _cache={})
+            if normalizing:
+                retry.processor_results["bimodal_normalize"].gain_db = target
+            _, trial, _ = self._render_track(retry)
+            if entry is not None:
+                trial = resolve_entry_audio(entry, {track.filename: (trial, track.samplerate)})
+            try:
+                check_output_headroom(trial, track.subtype)
+            except OutputHeadroomError:
+                step -= 1
+        if entry is None:
+            reduction = -step / 10
+            target = gain - reduction
+        else:
+            target = step / 10
+            difference = Decimal(str(gain)) - Decimal(str(target))
+            reduction = float(difference.quantize(Decimal("0.1"), rounding=ROUND_CEILING))
+        advice = {"peak_db": overload.peak_db, "reduction_db": reduction,
+                  "gain_db": gain, "target_gain_db": target}
+        raise OutputHeadroomError(overload.peak_db, reduction, track.subtype,
+                                  excess_db=overload.excess_db, adjustment=advice) from overload
 
     # ------------------------------------------------------------------
     # Phase 3: Execute (apply gains, write files)
@@ -709,7 +734,7 @@ class Pipeline:
 
                 source = source_for_render(track)
                 corrected, audio, applied = self._render_track(source)
-                check_output_headroom(audio, track.subtype)
+                self._check_source_headroom(audio, source, source.audio_data, applied)
                 settling = (boundary_settling(source.audio_data, corrected, source.samplerate)
                             if source.repair_recipe.active else [])
                 norm = track.processor_results.get("bimodal_normalize")

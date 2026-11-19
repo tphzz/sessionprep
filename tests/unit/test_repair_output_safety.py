@@ -1,4 +1,5 @@
 """Regression coverage for repair source identity, encoding and output retirement."""
+import math
 import os
 from dataclasses import replace
 
@@ -144,6 +145,61 @@ def test_adjust_gain_recovers_positive_full_scale_through_a_routing_gain(tmp_pat
     pipeline.prepare(session, str(target))
     assert session.prepare_state == "ready"
     assert sf.read(target / path.name)[0].max() <= limit
+
+
+@pytest.mark.parametrize(("subtype", "bits", "code"), [
+    ("PCM_U8", 8, 87), ("PCM_16", 16, 16404),
+    ("PCM_24", 24, 4194316), ("PCM_32", 32, 1073741851),
+])
+def test_execute_reports_the_first_gain_step_that_can_actually_be_written(tmp_path, subtype, bits, code):
+    full_scale = 2 ** (bits - 1)
+    source = code / full_scale
+    limit = 1 - 1 / full_scale
+    path = tmp_path / "Input.wav"
+    sf.write(path, np.full(128, source), 48000, subtype=subtype)
+    track = load_track(str(path))
+    track.manual_gain_db = 20 * math.log10(limit / source) + 0.1
+    assert source * 10 ** ((track.manual_gain_db - 0.1) / 20) > limit
+    session = SessionContext([track], {})
+    pipeline = Pipeline([])
+    output = tmp_path / "out"
+    pipeline.execute(session, str(output))
+    assert not session.config["_executed_files"]
+    assert "at least 0.2 dB" in session.config["_execute_errors"][0][1]
+    track.manual_gain_db -= 0.2
+    pipeline.execute(session, str(output))
+    assert not session.config["_execute_errors"]
+    assert path.name in session.config["_executed_files"]
+    assert sf.read(output / path.name)[0].max() <= limit
+
+
+@pytest.mark.parametrize(("starting_gain", "routing_gain", "trim", "target_gain"), [
+    (4.1, 0.954992586021436, 3.8, 0.3),
+    (8.3, 0.9772372209558107, 8.1, 0.2),
+    (4.79, 10 ** (-4.62 / 20), 0.2, 4.6),
+])
+def test_routed_retry_checks_the_exact_decimal_gain_the_user_can_select(
+        tmp_path, starting_gain, routing_gain, trim, target_gain):
+    path = tmp_path / "Floor.wav"
+    sf.write(path, [-1.0, 0.0], 48000, subtype="PCM_16")
+    track = load_track(str(path))
+    track.manual_gain_db = starting_gain
+    topology = build_default_topology([track])
+    topology.entries[0].sources[0].routes[0].gain = routing_gain
+    session = SessionContext([track], {}, topology=topology)
+    output = tmp_path / "out"
+    pipeline = Pipeline([])
+    pipeline.prepare(session, str(output))
+    advice = session.config["_output_gain_adjustments"][track.filename]
+    assert advice["reduction_db"] == trim
+    assert advice["target_gain_db"] == target_gain
+    track.manual_gain_db = round(target_gain + 0.1, 1)
+    pipeline.prepare(session, str(output))
+    assert not session.config["_prepared_files"]
+    track.manual_gain_db = advice["target_gain_db"]
+    pipeline.prepare(session, str(output))
+    assert session.prepare_state == "ready"
+    assert sf.read(output / path.name)[0].min() >= -1
 
 
 def test_routed_dry_float_overload_is_rejected_before_publishing(tmp_path):

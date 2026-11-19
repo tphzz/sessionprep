@@ -112,13 +112,18 @@ def open_editor(window, track):
     return window._repair_editor
 
 
-def test_adjust_gain_suggests_a_representable_value_with_the_full_reduction(project, monkeypatch):
+@pytest.mark.parametrize(("adjustment", "expected"), [
+    ({"gain_db": 4.79, "peak_db": 0.1, "reduction_db": 0.1}, 4.6),
+    ({"gain_db": 4.79, "peak_db": 0.17, "reduction_db": 0.2, "target_gain_db": 4.6}, 4.6),
+    ({"gain_db": 0., "peak_db": 162., "reduction_db": 162., "target_gain_db": -162.}, -162.),
+])
+def test_adjust_gain_uses_the_verified_target_or_an_older_saved_reduction(
+        project, monkeypatch, adjustment, expected):
     track = project._session.tracks[0]
-    adjustments = {track.filename: {"gain_db": 4.79, "peak_db": 0.1, "reduction_db": 0.1}}
-    project._session.config["_output_gain_adjustments"] = adjustments
+    project._session.config["_output_gain_adjustments"] = {track.filename: adjustment}
 
     def cancel(dialog):
-        assert dialog.findChild(QDoubleSpinBox).value() == 4.6
+        assert dialog.findChild(QDoubleSpinBox).value() == expected
         return QDialog.Rejected
 
     monkeypatch.setattr(QDialog, "exec", cancel)

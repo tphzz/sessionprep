@@ -406,7 +406,7 @@ Automatic low-cut selection uses three consecutive 1 s windows at 50% overlap an
 
 Use **Preferences → Config Presets → Processors → Corrective processing** for automatic selection defaults. Phase 2 Config can override these for one project. **Review repair** in File and **Track repairs…** in Processing open the same per-track choices and measurements. **Use preset** releases a track override. Stereo compatibility remains a review finding.
 
-Corrections run before gain calculation. **Prepare** checks the final, routed samples against the destination encoding. If the level is too high, **Adjust Gain** offers the minimum safe reduction rounded up to 0.1 dB. Confirm the change and retry. Files are replaced after a successful render. A failed retry retains the previous file and marks it stale.
+Corrections run before gain calculation. **Prepare** checks the final, routed samples against the destination encoding. If the level is too high, **Adjust Gain** offers the highest safe output gain you can select in 0.1 dB steps. Confirm the change and retry. The CLI reports the necessary reduction in 0.1 dB steps from the current gain. Files are replaced after a successful render. A failed retry retains the previous file and marks it stale.
 
 Check the repair measurements for **Boundary settling** when a filter rings into an edit gap. For each channel with at least 100 ms of exact source silence, SessionPrep reports the first and last affected sample and the peak if it exceeds −120 dBFS before gain. The text and JSON delivery reports include the same measurements.
 

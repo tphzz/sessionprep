@@ -1512,11 +1512,14 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         form = QFormLayout(dialog)
         form.addRow(QLabel(track.filename))
         gain = FormDoubleSpinBox()
-        gain.setRange(-160, 60)
+        target = adjustment.get("target_gain_db")
+        if target is None:  # Projects saved before Prepare stored the checked target.
+            safe = Decimal(str(previous)) - Decimal(str(adjustment["reduction_db"]))
+            target = float(safe.quantize(Decimal("0.1"), rounding=ROUND_FLOOR))
+        gain.setRange(min(-160, target), max(60, target))
         gain.setDecimals(1)
         gain.setSingleStep(0.1)
-        safe = Decimal(str(previous)) - Decimal(str(adjustment["reduction_db"]))
-        gain.setValue(float(safe.quantize(Decimal("0.1"), rounding=ROUND_FLOOR)))
+        gain.setValue(target)
         form.addRow("Output gain (dB)", gain)
         forecast = QLabel()
         def show_peak():

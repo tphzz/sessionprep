@@ -93,10 +93,12 @@ def render_corrected(audio: np.ndarray, sample_rate: int, recipe: RepairRecipe) 
 
 
 class OutputHeadroomError(ValueError):
-    def __init__(self, peak_db: float, reduction_db: float, subtype: str, *, boundary_db=None):
+    def __init__(self, peak_db: float, reduction_db: float, subtype: str, *,
+                 excess_db: float | None = None, adjustment: dict[str, float] | None = None):
         self.peak_db = peak_db
         self.reduction_db = reduction_db
-        self.boundary_db = boundary_db
+        self.excess_db = reduction_db if excess_db is None else excess_db
+        self.adjustment = adjustment
         super().__init__(f"Output peak {peak_db:+.2f} dBFS exceeds {subtype}. "
                          f"Reduce the output gain by at least {reduction_db:.1f} dB and retry.")
 
@@ -136,10 +138,7 @@ def check_output_headroom(audio: np.ndarray, subtype: str) -> None:
         fits = high * attenuation <= positive_range and -low * attenuation <= negative_range
     reduction = (tenths if fits else tenths + 1) / 10
     peak_db = 20 * math.log10(max(-low, high))
-    # A retry at a decimal boundary can round differently when source gain is
-    # applied before the channel routes. The writer can test that exact path.
-    boundary = candidate_db if tenths > 0 and abs(exact_tenths - tenths) < 1e-8 else None
-    raise OutputHeadroomError(peak_db, reduction, subtype, boundary_db=boundary)
+    raise OutputHeadroomError(peak_db, reduction, subtype, excess_db=exact_tenths / 10)
 
 
 class _BoundaryPartial:
