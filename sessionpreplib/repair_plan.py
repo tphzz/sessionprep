@@ -5,10 +5,8 @@ from pathlib import Path
 
 import numpy as np
 
-from .audio import load_track, validate_analysis_level
-from .detectors.audio_classifier import AudioClassifierDetector
+from .audio import SourceChangedError, file_revision, load_track, validate_analysis_level
 from .detectors.dc_offset import DCOffsetDetector
-from .detectors.silence import SilenceDetector
 from .detectors.subsonic import SubsonicDetector
 from .detectors.ultrasonic import UltrasonicDetector
 from .repairs import RepairRecipe, band_evidence, render_corrected
@@ -70,27 +68,55 @@ def _low_cut_evidence(data, rate, config):
     )
 
 
+def check_source_signature(track, *, allow_digest=True):
+    if track.source_file_signature is not None:
+        stat = Path(track.filepath).stat()
+        changed = (stat.st_size, stat.st_mtime_ns) != track.source_file_signature
+        if not changed and track.source_file_revision is not None:
+            revision = file_revision(track.filepath, stat, allow_digest=allow_digest)
+            changed = revision is not None and revision != track.source_file_revision
+        if changed:
+            raise SourceChangedError(f"{track.filename} has changed since analysis. Reanalyze this source.")
+
+
+def revalidate_restored_source(track):
+    """On explicit retry, recognize restored PCM even if the filesystem revision changed."""
+    try:
+        check_source_signature(track)
+    except SourceChangedError:
+        if not track.source_sample_digest:
+            raise
+        restored = load_track(track.filepath)
+        if (restored.source_sample_digest != track.source_sample_digest
+                or (restored.total_samples, restored.channels, restored.samplerate, restored.subtype)
+                != (track.total_samples, track.channels, track.samplerate, track.subtype)):
+            raise
+        track.source_file_signature = restored.source_file_signature
+        track.source_file_revision = restored.source_file_revision
+        if track.audio_data is None:
+            track.audio_data = restored.audio_data
+
+
 def source_for_render(track):
     """Guard a saved plan against a replaced file before any audition or write."""
     if "repair_error" in track._cache:
         raise ValueError(track._cache["repair_error"])
-    if track.source_file_signature is not None:
-        stat = Path(track.filepath).stat()
-        if (stat.st_size, stat.st_mtime_ns) != track.source_file_signature:
-            raise ValueError(f"{track.filename} has changed since analysis. Reanalyze this source.")
+    check_source_signature(track)
     if track.audio_data is not None:
         return track
     loaded = load_track(track.filepath)
-    if track.source_file_signature is not None and loaded.source_file_signature != track.source_file_signature:
-        raise ValueError(f"{track.filename} has changed since analysis. Reanalyze this source.")
+    if ((track.source_file_signature is not None and loaded.source_file_signature != track.source_file_signature)
+            or (track.source_file_revision is not None and loaded.source_file_revision != track.source_file_revision)):
+        raise SourceChangedError(f"{track.filename} has changed since analysis. Reanalyze this source.")
     if (loaded.samplerate, loaded.channels, loaded.total_samples, loaded.subtype) != (
             track.samplerate, track.channels, track.total_samples, track.subtype):
-        raise ValueError(f"{track.filename} no longer matches its saved analysis. Reanalyze this source.")
+        raise SourceChangedError(f"{track.filename} no longer matches its saved analysis. Reanalyze this source.")
     return replace(track, audio_data=loaded.audio_data, _cache={},
-                   source_file_signature=loaded.source_file_signature)
+                   source_file_signature=loaded.source_file_signature, source_file_revision=loaded.source_file_revision,
+                   source_sample_digest=loaded.source_sample_digest)
 
 
-def plan_repairs(track, config):
+def plan_repairs(track, config, verification=None):
     """Keep source findings intact. Return a temporary track for gain analysis."""
     choices = track.repair_overrides
     dc = track.detector_results.get("dc_offset")
@@ -103,11 +129,27 @@ def plan_repairs(track, config):
     if not (choices or consider_dc or consider_low or high_rate):
         track.repair_recipe = RepairRecipe()
         track.repair_measurements = {}
+        track.corrected_analysis = None
         return track
     source = source_for_render(track)
+    cached = track._cache.pop("unvalidated_corrected_analysis", None)
+    if cached is not None:
+        # source_for_render just checked the complete on-disk revision.
+        source.corrected_analysis = cached
     data = source.audio_data
     validate_analysis_level(np.max(np.abs(data), initial=0.), len(data))
     rate = source.samplerate
+    if (any(choices.get(key) for key in ("dc_remove", "low_cut", "ultrasonic"))
+            or any(config.get(key) for key in ("repair_auto_dc", "repair_auto_low_cut", "repair_auto_ultrasonic"))):
+        if verification is None:
+            from .detectors import default_detectors
+            from .pipeline import Pipeline
+            verification = Pipeline(default_detectors(), config=config).repair_verification
+        verification.complete_original(source)
+        dc = source.detector_results.get("dc_offset")
+        sub = source.detector_results.get("subsonic")
+        consider_dc = config.get("dc_offset_enabled", True) and (dc is not None or config.get("repair_auto_dc"))
+        consider_low = config.get("subsonic_enabled", True) and (sub is not None or config.get("repair_auto_low_cut"))
     if consider_dc and dc is None:
         dc = _analyze(DCOffsetDetector, source, config)
     dc_suggested = bool(dc and dc.data.get("dc_warn") and config.get("dc_offset_enabled", True))
@@ -149,11 +191,11 @@ def plan_repairs(track, config):
     if high:
         measurements["original"]["ultrasonic"] = high.data
     gain_track = source
+    checked = None
     if recipe.active:
         audio = dc_audio if dc_audio is not None and not low_on and not high_on else render_corrected(data, rate, recipe)
-        gain_track = replace(source, audio_data=audio, _cache={}, detector_results=dict(source.detector_results))
-        for detector in (SilenceDetector, AudioClassifierDetector):
-            gain_track.detector_results[detector.id] = _analyze(detector, gain_track, config)
+        gain_track = replace(source, audio_data=audio, _cache={}, detector_results={}, processor_results={})
+        checked = verification.corrected(source, gain_track, recipe)
         most_recent = repair_levels(audio)
         measurements["boundary_settling"] = boundary_settling(data, audio, rate)
         if measure_low:
@@ -161,16 +203,28 @@ def plan_repairs(track, config):
             most_recent["low_band"] = corrected_low
             if low_on and low.get("regions"):
                 measurements["low_cut_resolved"] = not corrected_low["regions"]
-        if sub and (sub.data.get("subsonic_warn") or low_on):
-            result = _analyze(SubsonicDetector, gain_track, config)
+        result = gain_track.detector_results.get("subsonic")
+        if result and not result.error and result.applicable:
             most_recent["subsonic_ratio_db"] = result.data["subsonic_ratio_db"]
-            if sub.data.get("subsonic_warn"):
+            if sub and sub.data.get("subsonic_warn"):
                 measurements["subsonic_resolved"] = not result.data["subsonic_warn"]
-        if high and high_rate:
-            most_recent["ultrasonic"] = _analyze(UltrasonicDetector, gain_track, config).data
+        result = gain_track.detector_results.get("ultrasonic")
+        if result is None and high_rate and high_on:
+            # A manually selected filter still has before/after meters when
+            # the diagnostic is disabled. These readings are not findings.
+            result = _analyze(UltrasonicDetector, gain_track, config)
+        if high_rate and result and not result.error and result.applicable:
+            most_recent["ultrasonic"] = result.data
         measurements["corrected"] = most_recent
+        check_source_signature(source)
     else:
         measurements["corrected"] = measurements["original"].copy()
     track.repair_measurements = measurements
     track.repair_recipe = recipe
+    track.detector_analysis_key = source.detector_analysis_key
+    track.detector_sample_digest = source.detector_sample_digest
+    track.source_file_signature = source.source_file_signature
+    track.source_file_revision = source.source_file_revision
+    track.source_sample_digest = source.source_sample_digest
+    track.corrected_analysis = checked
     return gain_track

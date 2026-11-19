@@ -111,6 +111,7 @@ class AudioClassifierDetector(TrackDetector):
                 detector_id=self.id,
                 severity=Severity.CLEAN,
                 summary="silent track",
+                applicable=False,
                 data={
                     "peak_db": float(-np.inf),
                     "rms_max_db": float(-np.inf),

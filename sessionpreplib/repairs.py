@@ -1,10 +1,14 @@
 """Whole-track corrective processing at unity gain, before normalization."""
 from __future__ import annotations
 
+from collections import OrderedDict
+from collections.abc import Hashable
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import lru_cache, partial
+from hashlib import sha256
 import math
 from numbers import Real
+from threading import Lock
 
 import numpy as np
 from scipy import optimize, signal
@@ -167,8 +171,9 @@ class _BoundaryPartial:
             self.background = np.eye(len(self.bins)) - columns @ np.linalg.pinv(columns)
         self.grid = np.unique(np.clip(self.edge + np.arange(-2, 2.25, 0.5),
                                       1e-8, self.width / 2))
-        self.bases = np.stack([self._basis(f) for f in self.grid])
+        self.bases = self._basis(self.grid)
         self.inverses = np.linalg.pinv(self.bases)
+        self._trial_bases = {}
 
     def _rect(self, offsets):
         # Exact normalized finite geometric sum, periodic in DFT-bin units.
@@ -179,18 +184,18 @@ class _BoundaryPartial:
     def _basis(self, f):
         # The measured frame has its arithmetic mean removed before windowing.
         # Fit both images of a real sinusoid, including the windowed mean.
-        cycles = np.array([f, -f])[:, None]
+        cycles = np.stack((f, -f), axis=-1)[..., None]
         rect = self._rect(cycles - self.extended_bins)
-        tones = 0.5 * rect[:, 1:-1] - 0.25 * (rect[:, :-2] + rect[:, 2:])
+        tones = 0.5 * rect[..., 1:-1] - 0.25 * (rect[..., :-2] + rect[..., 2:])
         tones -= self._rect(cycles) * self.window_dc
-        cosine = (tones[0] + tones[1]) / 2
-        sine = (tones[0] - tones[1]) / (2j)
-        basis = np.column_stack((cosine, sine))
+        cosine = (tones[..., 0, :] + tones[..., 1, :]) / 2
+        sine = (tones[..., 0, :] - tones[..., 1, :]) / (2j)
+        basis = np.stack((cosine, sine), axis=-1)
         if self.background is not None:
             basis = self.background @ basis
-        basis = np.concatenate((basis.real, basis.imag))
+        basis = np.concatenate((basis.real, basis.imag), axis=-2)
         if self.dc_axis is not None:
-            basis -= np.outer(self.dc_axis, self.dc_axis @ basis)
+            basis -= self.dc_axis[:, None] * (self.dc_axis @ basis)[..., None, :]
         return basis
 
     def observe(self, spectrum):
@@ -220,7 +225,15 @@ class _BoundaryPartial:
             return centre, coeffs[best], True
 
         def fit_at(offset):
-            basis = self._basis(centre + offset)
+            frequency = centre + offset
+            basis = self._trial_bases.get(frequency)
+            if basis is None:
+                basis = self._basis(frequency)
+                # The bounded solver revisits the same trial frequencies in
+                # nearby audio frames. Keep a small, window-local working set.
+                if len(self._trial_bases) >= 96:
+                    self._trial_bases.clear()
+                self._trial_bases[frequency] = basis
             cs = np.linalg.lstsq(basis, vector, rcond=None)[0]
             residual = vector - basis @ cs
             return residual @ residual, cs
@@ -246,7 +259,10 @@ class _BandWindow:
         self.phase = 2 * np.pi * np.arange(width) / width
         self.window = signal.windows.hann(width, sym=False)
         self.window_energy = np.sum(self.window ** 2)
-        self.window_dc = np.fft.rfft(self.window) / width
+        window_dc = np.fft.rfft(self.window) / width
+        # Adjacent hops and channels often resolve the same neighboring FFT bins.
+        # Only the basis depends on the bin. Its fit still uses the current audio.
+        self._partial = lru_cache(maxsize=64)(partial(_BoundaryPartial, width=width, window_dc=window_dc))
         self.weights = np.full(len(self.freqs), 2.0 / (width * self.window_energy))
         # The signal's DC was removed before windowing. Tapering a real AC
         # component can put legitimate energy in the DC bin (and at Nyquist).
@@ -261,24 +277,12 @@ class _BandWindow:
             # here even when the upper decision edge is many bins away.
             self.partials.append(self._partial(0))
 
-    def _partial(self, cycles):
-        return _BoundaryPartial(cycles, len(self.window), self.window_dc)
-
-    def _resolve(self, partial, spectrum):
-        powers = np.abs(spectrum) ** 2
-        # Median power across broad frequency bands estimates the recording
-        # noise even for quantized periodic signals with a sparse noise floor.
-        bands = min(32, len(powers) // 16)
-        noise = 0.0
-        if bands:
-            bins = (len(powers) - 1) // bands
-            noise = np.median(powers[1:1 + bins * bands].reshape(bands, bins).mean(axis=1))
-            noise /= len(self.window) ** 2
+    def _resolve(self, partial, spectrum, powers, noise):
         vector = partial.observe(spectrum)
-        fit = partial.fit(vector, noise)
         if not np.any(vector):
             return None
-        cycles, cs = partial.edge, np.zeros(2)
+        fit = partial.fit(vector, noise)
+        cycles, cs = partial.edge, None
         if fit is not None:
             cycles, cs, resolved = fit
             if resolved:
@@ -287,9 +291,9 @@ class _BandWindow:
         # A separated program partial can leak into a quiet band-edge lobe.
         # Identify it at its own peak, subtract its predicted leakage only
         # from the coefficients being fitted, then check the edge fit again.
+        local_peak = powers[partial.bins].max()
         peaks = signal.find_peaks(powers)[0]
         distance = np.abs(peaks - partial.edge)
-        local_peak = powers[partial.bins].max()
         eligible = (distance >= 4) & (powers[peaks] >= 0.01 * local_peak)
         peaks, distance = peaks[eligible], distance[eligible]
         # The Hann sidelobe amplitude decays as inverse frequency cubed.
@@ -305,7 +309,8 @@ class _BandWindow:
             # Each initially fitted tone contains a little of the other's
             # sidelobe. Refine both estimates before trying another neighbor.
             for _ in range(3):
-                background = remote.fit(measured - remote._basis(cycles) @ cs, noise)
+                remote_vector = measured if cs is None else measured - remote._basis(cycles) @ cs
+                background = remote.fit(remote_vector, noise)
                 if background is None:
                     break
                 f, gains, _ = background
@@ -320,6 +325,17 @@ class _BandWindow:
                     return cycles, cs
             vector = corrected
         return None
+
+    def _noise_power(self, powers):
+        # Median power across broad frequency bands estimates the recording
+        # noise even for quantized periodic signals with a sparse noise floor.
+        bands = min(32, len(powers) // 16)
+        noise = 0.0
+        if bands:
+            bins = (len(powers) - 1) // bands
+            noise = np.median(powers[1:1 + bins * bands].reshape(bands, bins).mean(axis=1))
+            noise /= len(self.window) ** 2
+        return noise
 
     def _spectrum(self, ac):
         raw = np.fft.rfft(ac)
@@ -338,13 +354,15 @@ class _BandWindow:
         ac = np.asarray(block, dtype=np.float64) / scale
         ac -= ac.mean()
         spectrum, derivative, sides = self._spectrum(ac)
-        total = np.sum(np.abs(spectrum) ** 2 * self.weights)
+        powers = np.abs(spectrum) ** 2
+        total = np.sum(powers * self.weights)
         if not total:
             return -math.inf, -math.inf, -math.inf
         tol = 1e-7 * self.bin_hz
         partial_power = 0.0
+        noise = self._noise_power(powers)
         for partial in self.partials:
-            fit = self._resolve(partial, spectrum)
+            fit = self._resolve(partial, spectrum, powers, noise)
             if fit is None:
                 continue
             cycles, (cosine, sine) = fit
@@ -355,10 +373,12 @@ class _BandWindow:
                 partial_power += np.sum((line * self.window) ** 2) / self.window_energy
             ac -= line
             spectrum, derivative, sides = self._spectrum(ac)
+            powers = np.abs(spectrum) ** 2
+            noise = self._noise_power(powers)
 
         # Diffuse energy and overlapping lines use the local phase derivative
         # (Flandrin et al., Time-frequency reassignment, eq. 5.20).
-        powers = np.abs(spectrum) ** 2 * self.weights
+        powers *= self.weights
         shift = np.divide(derivative, spectrum, out=derivative, where=spectrum != 0)
         frequency = np.clip(self.freqs - shift.imag, 0, self.nyquist)
         inside = (frequency > 0) & (frequency >= self.low - tol) & (frequency <= self.high + tol)
@@ -383,6 +403,47 @@ class _BandWindow:
         return level, ratio, confidence_db
 
 
+# Cache window readings only. Each entry holds at most 32 triples of numbers.
+_band_readings = OrderedDict()
+_band_readings_lock = Lock()
+
+
+def _channel_readings(channel, meter, sample_rate, width, hop):
+    """Measure overlapping windows in bounded chunks, in their original order."""
+    parameters = (sample_rate, meter.low, meter.high)
+    if channel.dtype.hasobject or not all(isinstance(value, Hashable) for value in parameters):
+        # Object buffers and mutable numeric arguments such as 0-D arrays
+        # can be measured directly, but cannot identify immutable readings.
+        for start in range(0, len(channel) - width + 1, hop):
+            yield start, *meter.levels(channel[start:start + width])
+        return
+    # Limit the private sample copy to 2 MiB or one analysis window, whichever
+    # is larger. Hash and measure this same copy even if the caller edits its
+    # input buffer or the track came from a strided routing view.
+    chunk_samples = (2 * 1024 * 1024) // channel.itemsize
+    chunk_windows = max(1, min(32, 1 + (chunk_samples - width) // hop))
+    # NumPy scalar arithmetic can calibrate a boundary at a different
+    # precision even when its value compares equal to a Python number.
+    geometry = tuple((type(value), value) for value in parameters)
+    for start in range(0, len(channel) - width + 1, chunk_windows * hop):
+        count = min(chunk_windows, 1 + (len(channel) - start - width) // hop)
+        samples = channel[start:start + (count - 1) * hop + width].copy(order="C")
+        key = (geometry, width, samples.dtype.str, sha256(samples).digest())
+        with _band_readings_lock:
+            readings = _band_readings.get(key)
+            if readings is not None:
+                _band_readings.move_to_end(key)
+        if readings is None:
+            readings = tuple(meter.levels(samples[i * hop:i * hop + width]) for i in range(count))
+            with _band_readings_lock:
+                _band_readings[key] = readings
+                _band_readings.move_to_end(key)
+                if len(_band_readings) > 2048:
+                    _band_readings.popitem(last=False)
+        for i, (level, ratio, confidence) in enumerate(readings):
+            yield start + i * hop, level, ratio, confidence
+
+
 def band_evidence(audio, sample_rate, *, low_hz, high_hz, window_sec,
                   level_db, ratio_db, consecutive):
     """Measure sustained AC band energy per channel, with absolute and relative gates.
@@ -393,18 +454,16 @@ def band_evidence(audio, sample_rate, *, low_hz, high_hz, window_sec,
     data = np.asarray(audio)
     full_width = max(2, round(window_sec * sample_rate))
     width = min(len(data), full_width)
+    if width < 2 or not data.size:
+        return {"regions": [], "band_dbfs": None, "ratio_db": None}
     spans = []
     peak_level = peak_ratio = -math.inf
-    if width < 2 or not data.size:
-        return {"regions": spans, "band_dbfs": None, "ratio_db": None}
     channels = data.reshape(len(data), -1)
     hop = max(1, width // 2)
     meter = _BandWindow(width, sample_rate, low_hz, high_hz)
     for ch, channel in enumerate(channels.T):
         count = 0
-        for start in range(0, len(channel) - width + 1, hop):
-            block = channel[start:start + width]
-            level, ratio, confidence_db = meter.levels(block)
+        for start, level, ratio, confidence_db in _channel_readings(channel, meter, sample_rate, width, hop):
             if level > peak_level:
                 peak_level, peak_ratio = level, ratio
             if width < full_width or level + confidence_db < level_db or ratio + confidence_db < ratio_db:

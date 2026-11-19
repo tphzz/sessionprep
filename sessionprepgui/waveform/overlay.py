@@ -22,6 +22,22 @@ _SEVERITY_BORDER = {
 }
 
 
+def issue_y_bounds(issue, height, mode, channels, axis_min, axis_max, linear):
+    """Return the visible half-open pixel interval for painting and hit testing."""
+    if mode == "waveform" and issue.channel is not None:
+        if not 0 <= issue.channel < channels:
+            return 0, 0
+        return int(height * issue.channel / channels), int(height * (issue.channel + 1) / channels)
+    if mode == "spectrogram" and axis_max > axis_min:
+        def edge(hz, fallback):
+            if hz is None:
+                return fallback
+            axis_value = hz if linear else _hz_to_mel(hz)
+            return max(0, min(int(height), int(height * (axis_max - axis_value) / (axis_max - axis_min))))
+        return edge(issue.freq_max_hz, 0), edge(issue.freq_min_hz, int(height))
+    return 0, int(height)
+
+
 def draw_issue_overlays(
     painter: QPainter,
     x0: int,
@@ -46,10 +62,6 @@ def draw_issue_overlays(
     if view_len <= 0 or total_samples <= 0:
         return
 
-    lane_h = draw_h / max(num_channels, 1)
-    is_spec = display_mode == "spectrogram"
-    mel_range = (mel_view_max - mel_view_min) if is_spec else 0.0
-
     def _sample_to_x(sample: int) -> int:
         return x0 + int((sample - view_start) / view_len * draw_w)
 
@@ -66,30 +78,11 @@ def draw_issue_overlays(
         rx = ix1
         rw = max(ix2 - ix1, 2)
 
-        if is_spec and issue.freq_min_hz is not None and issue.freq_max_hz is not None and mel_range > 0:
-            mel_lo = issue.freq_min_hz if linear_frequency else _hz_to_mel(issue.freq_min_hz)
-            mel_hi = issue.freq_max_hz if linear_frequency else _hz_to_mel(issue.freq_max_hz)
-            frac_top = (mel_hi - mel_view_min) / mel_range
-            frac_bot = (mel_lo - mel_view_min) / mel_range
-            y_top = int(draw_h * (1.0 - frac_top))
-            y_bot = int(draw_h * (1.0 - frac_bot))
-            y_top = max(0, min(y_top, int(draw_h)))
-            y_bot = max(0, min(y_bot, int(draw_h)))
-            if y_top >= y_bot:
-                continue
-            ry, rh = y_top, y_bot - y_top
-        elif not is_spec:
-            if issue.channel is None:
-                ry, rh = 0, int(draw_h)
-            else:
-                ch = issue.channel
-                if ch < num_channels:
-                    ry = int(ch * lane_h)
-                    rh = int(lane_h)
-                else:
-                    continue
-        else:
-            ry, rh = 0, int(draw_h)
+        ry, bottom = issue_y_bounds(issue, draw_h, display_mode, num_channels,
+                                    mel_view_min, mel_view_max, linear_frequency)
+        rh = bottom - ry
+        if rh <= 0:
+            continue
 
         painter.fillRect(rx, ry, rw, rh, fill)
         painter.setPen(QPen(border, 1))

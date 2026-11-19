@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+from hashlib import file_digest, sha256
 from typing import Any
 
 import numpy as np
@@ -64,6 +65,43 @@ _SUBTYPE_MAP = {
 }
 
 
+if os.name == "nt":
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    class _FileBasicInfo(ctypes.Structure):
+        _fields_ = [(key, ctypes.c_int64) for key in
+                    ("creation", "access", "write", "change")] + [("attributes", wintypes.DWORD)]
+
+
+class SourceChangedError(ValueError):
+    """A source no longer matches the audio being read or its saved analysis."""
+
+
+def file_revision(path: str, stat: os.stat_result, *, allow_digest: bool = True) -> str | None:
+    """Detect replacements and rewrites that preserve the WAV size and mtime."""
+    if os.name == "nt":
+        with open(path, "rb") as stream:
+            info = _FileBasicInfo()
+            handle = wintypes.HANDLE(msvcrt.get_osfhandle(stream.fileno()))
+            if ctypes.windll.kernel32.GetFileInformationByHandleEx(
+                    handle, 0, ctypes.byref(info), ctypes.sizeof(info)) and info.change:
+                changed = info.change
+            else:
+                # Some remote filesystems provide no change timestamp.
+                return file_digest(stream, "sha256").hexdigest() if allow_digest else None
+    else:
+        changed = stat.st_ctime_ns
+    return f"{stat.st_dev}:{stat.st_ino}:{changed}"
+
+
+def sample_digest(data: np.ndarray) -> str:
+    """Identify both the sample values and their channel interpretation."""
+    pcm = np.ascontiguousarray(data)
+    return f"{pcm.dtype.str}:{pcm.shape}:{sha256(pcm).hexdigest()}"
+
+
 def discover_track(filepath: str) -> TrackContext:
     """Read audio file metadata without loading audio data.
 
@@ -90,13 +128,17 @@ def discover_track(filepath: str) -> TrackContext:
 def load_track(filepath: str) -> TrackContext:
     """Read an audio file (WAV/AIFF) and return a fully populated TrackContext."""
     stat = os.stat(filepath)
-    with sf.SoundFile(filepath) as stream:
-        samplerate, subtype = stream.samplerate, stream.subtype
-        data = stream.read(dtype='float64')
+    revision = file_revision(filepath, stat)
     signature = (stat.st_size, stat.st_mtime_ns)
-    latest = os.stat(filepath)
-    if signature != (latest.st_size, latest.st_mtime_ns):
-        raise ValueError("Source changed while it was being read")
+    try:
+        with sf.SoundFile(filepath) as stream:
+            samplerate, subtype = stream.samplerate, stream.subtype
+            data = stream.read(dtype='float64')
+    finally:
+        # A replacement can make the decoder fail before it returns any samples.
+        latest = os.stat(filepath)
+        if signature != (latest.st_size, latest.st_mtime_ns) or revision != file_revision(filepath, latest):
+            raise SourceChangedError("Source changed while it was being read. Reanalyze this source.")
     channels = 1 if data.ndim == 1 else data.shape[1]
     try:
         cids = _chunk_ids(filepath)
@@ -114,6 +156,8 @@ def load_track(filepath: str) -> TrackContext:
         duration_sec=len(data) / samplerate,
         chunk_ids=cids,
         source_file_signature=signature,
+        source_file_revision=revision,
+        source_sample_digest=sample_digest(data),
     )
 
 
@@ -382,43 +426,31 @@ def detect_clipping_ranges(
 
     ``channel`` is an int (0-based) for multi-channel data or ``None`` for mono.
     """
-    clip_level = 0.9999
+    total, ranges, _channels = clipping_evidence(data, threshold_count, max_ranges)
+    return total, ranges
 
-    def ranges_from_mask(mask: np.ndarray) -> list[tuple[int, int]]:
-        if mask.size == 0:
-            return []
-        idx = np.flatnonzero(mask)
-        if idx.size == 0:
-            return []
+
+def clipping_evidence(data: np.ndarray, threshold_count: int, max_ranges: int):
+    """Measure all channels but materialize only the requested number of overlay locations."""
+    channels = data.T if data.ndim == 2 else (data,)
+    total = 0
+    affected = []
+    ranges = []
+    for ch, samples in enumerate(channels):
+        idx = np.flatnonzero(np.abs(samples) >= 0.9999)
+        if not idx.size:
+            continue
         splits = np.flatnonzero(np.diff(idx) > 1)
-        starts = np.concatenate(([0], splits + 1))
-        ends = np.concatenate((splits, [idx.size - 1]))
-        ranges = []
-        for s_i, e_i in zip(starts, ends):
-            start = int(idx[s_i])
-            end = int(idx[e_i])
-            if (end - start + 1) >= int(threshold_count):
-                ranges.append((start, end))
-        return ranges
-
-    ranges: list[tuple[int, int, int | None]] = []
-    if data.ndim > 1 and data.shape[1] > 1:
-        for ch in range(int(data.shape[1])):
-            mask = np.abs(data[:, ch]) >= clip_level
-            for s, e in ranges_from_mask(mask):
-                ranges.append((s, e, ch))
-            if len(ranges) >= int(max_ranges):
-                break
-    else:
-        flat_data = data.flatten() if data.ndim > 1 else data
-        mask = np.abs(flat_data) >= clip_level
-        for s, e in ranges_from_mask(mask):
-            ranges.append((s, e, None))
-
-    if not ranges:
-        return 0, []
-
-    return len(ranges), ranges[:int(max_ranges)]
+        starts = idx[np.r_[0, splits + 1]]
+        ends = idx[np.r_[splits, idx.size - 1]]
+        qualifying = np.flatnonzero(ends - starts + 1 >= threshold_count)
+        if qualifying.size:
+            total += int(qualifying.size)
+            affected.append(ch)
+            label = ch if len(channels) > 1 else None
+            for i in qualifying[:max(0, int(max_ranges) - len(ranges))]:
+                ranges.append((int(starts[i]), int(ends[i]), label))
+    return total, ranges, affected
 
 
 def subsonic_stft_analysis(

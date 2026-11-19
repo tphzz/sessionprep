@@ -127,6 +127,7 @@ class StereoCompatDetector(TrackDetector):
                 detector_id=self.id,
                 severity=Severity.CLEAN,
                 summary="silent track",
+                applicable=False,
                 data={"lr_corr": None, "mono_loss_db": None,
                       "corr_warn": False, "mono_warn": False},
             )
@@ -137,6 +138,7 @@ class StereoCompatDetector(TrackDetector):
                 detector_id=self.id,
                 severity=Severity.CLEAN,
                 summary="not stereo",
+                applicable=False,
                 data={"lr_corr": None, "mono_loss_db": None,
                       "corr_warn": False, "mono_warn": False},
             )
@@ -146,6 +148,7 @@ class StereoCompatDetector(TrackDetector):
                 detector_id=self.id,
                 severity=Severity.CLEAN,
                 summary="multichannel (>2ch), skipped",
+                applicable=False,
                 data={"lr_corr": None, "mono_loss_db": None,
                       "corr_warn": False, "mono_warn": False},
             )

@@ -49,7 +49,7 @@ class SilenceDetector(TrackDetector):
                     severity=Severity.ATTENTION,
                     label="silence",
                     description="entire file is silent",
-                )],
+                )] if track.total_samples else [],
             )
         return DetectorResult(
             detector_id=self.id,

@@ -200,6 +200,11 @@ class _ViewControlRow(QWidget):
             self.more_button.setFocus(Qt.OtherFocusReason)
 
     def _fill_menu(self) -> None:
+        # PySide's QMenu.clear() can destroy a borrowed QAction, including a
+        # submenu's menuAction(). The toolbar still needs those on the next track.
+        for action in self.more_menu.actions():
+            if action.parent() is not self.more_menu:
+                self.more_menu.removeAction(action)
         self.more_menu.clear()
         for control in self.overflowed():
             if isinstance(control, AuditionSourceSelector):

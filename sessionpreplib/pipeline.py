@@ -29,7 +29,8 @@ from .models import (
 )
 from .detector import TrackDetector, SessionDetector
 from .processor import AudioProcessor
-from .repair_plan import boundary_settling, plan_repairs, repair_levels, source_for_render
+from .repair_plan import boundary_settling, plan_repairs, repair_levels, revalidate_restored_source, source_for_render
+from .repair_verification import RepairVerification, measure_detector
 from .repairs import OutputHeadroomError, check_output_headroom, render_corrected
 from .events import EventBus
 from .audio import load_track, format_duration, linear_to_db, AUDIO_EXTENSIONS
@@ -70,6 +71,7 @@ class Pipeline:
             d.configure(self.config)
         for d in self.session_detectors:
             d.configure(self.config)
+        self.repair_verification = RepairVerification(self.track_detectors, self.config)
 
         # Configure audio processors first, then filter to enabled only
         all_procs = audio_processors or []
@@ -115,12 +117,14 @@ class Pipeline:
         self._emit("track.analyze_start", filename=track.filename,
                    index=idx, total=total)
         t_track_start = time.perf_counter()
+        original_key = self.repair_verification.prepare_phase(track, detectors)
         for det in detectors:
             try:
                 self._emit("detector.start", detector_id=det.id,
                            filename=track.filename)
                 t0 = time.perf_counter()
-                result = det.analyze(track)
+                result = measure_detector(det, track, require_dependencies=False,
+                                          allowed=self.repair_verification.required_ids)
                 dt = (time.perf_counter() - t0) * 1000
                 log.debug(f"detector {det.id} on {track.filename}: {dt:.1f} ms")
                 track.detector_results[det.id] = result
@@ -135,6 +139,7 @@ class Pipeline:
                     data={},
                     error=str(e),
                 )
+        self.repair_verification.record_phase(track, detectors, original_key)
         dt_track = (time.perf_counter() - t_track_start) * 1000
         log.debug(f"all detectors on {track.filename}: {dt_track:.1f} ms")
         self._emit("track.analyze_complete", filename=track.filename,
@@ -142,7 +147,13 @@ class Pipeline:
 
     def _run_analysis_phase(self, session: SessionContext, phase: LifecyclePhase) -> SessionContext:
         """Run track-level and session-level detectors matching the specified phase."""
-        track_dets = [d for d in self.track_detectors if getattr(d, 'phase', LifecyclePhase.PHASE2) == phase]
+        phase_detectors = [d for d in self.track_detectors if d.phase == phase]
+        track_dets = [d for d in phase_detectors if d.id in self.repair_verification.required_ids]
+        disabled = {d.id for d in phase_detectors} - self.repair_verification.required_ids
+        if disabled:
+            for track in session.tracks:
+                for detector_id in disabled:
+                    track.detector_results.pop(detector_id, None)
         session_dets = [d for d in self.session_detectors if getattr(d, 'phase', LifecyclePhase.PHASE2) == phase]
 
         total = len(session.tracks)
@@ -204,7 +215,7 @@ class Pipeline:
 
         # Ensure the overall session.detectors always has all detectors
         # required for GUI overlay generation, independent of which phase ran
-        session.detectors = self.track_detectors + self.session_detectors
+        session.detectors = self.repair_verification.detectors + self.session_detectors
         return session
 
     def analyze_phase1(self, session: SessionContext) -> SessionContext:
@@ -221,7 +232,7 @@ class Pipeline:
     # Phase 2: Plan (run audio processors, compute gains)
     # ------------------------------------------------------------------
 
-    def _plan_track(self, track: TrackContext, idx: int, total: int, anchor_detectors=()):
+    def _plan_track(self, track: TrackContext, idx: int, total: int, anchor_detectors=(), revalidate_source=False):
         """Run all audio processors for a single track (thread-safe)."""
         if self.event_bus and self.event_bus.is_cancelled.is_set():
             return
@@ -230,15 +241,26 @@ class Pipeline:
                    index=idx, total=total)
         t_track_start = time.perf_counter()
         track._cache.pop("repair_error", None)
+        for detector_id in self.repair_verification.disabled_ids:
+            track.detector_results.pop(detector_id, None)
         try:
+            if revalidate_source:
+                revalidate_restored_source(track)
             source = track
             if anchor_detectors:
                 source = source_for_render(track)
                 self._analyze_track(source, idx, total, anchor_detectors)
-            gain_track = plan_repairs(source, self.config)
+            gain_track = plan_repairs(source, self.config, self.repair_verification)
             track.repair_recipe = source.repair_recipe
             track.repair_measurements = source.repair_measurements
+            track.detector_analysis_key = source.detector_analysis_key
+            track.detector_sample_digest = source.detector_sample_digest
+            track.corrected_analysis = source.corrected_analysis
+            track.source_file_signature = source.source_file_signature
+            track.source_file_revision = source.source_file_revision
+            track.source_sample_digest = source.source_sample_digest
         except Exception as exc:
+            track.corrected_analysis = None
             track._cache["repair_error"] = str(exc)
             track.processor_results.clear()
             self._emit("track.plan_complete", filename=track.filename, index=idx, total=total)
@@ -270,7 +292,7 @@ class Pipeline:
                    index=idx, total=total)
 
     def plan(self, session: SessionContext, *, preserve_selections: Collection[str] = (),
-             refresh_anchors: Collection[str] = ()) -> SessionContext:
+             refresh_anchors: Collection[str] = (), revalidate_sources: Collection[str] = ()) -> SessionContext:
         """
         Run all audio processors in priority order.
         Computes gains and classifications without modifying audio.
@@ -279,6 +301,7 @@ class Pipeline:
         For changed RMS anchors, refresh the original classification and its
         dependent findings before calculating processed gain. Per-track processors run in parallel.
         Group levelling and fader offsets run after all tracks complete.
+        An explicit retry may revalidate a restored file against its stored PCM and audio format.
         """
         log.info("Pipeline: plan (%d tracks)", len(session.tracks))
         session.config.pop("_execute_errors", None)
@@ -303,7 +326,8 @@ class Pipeline:
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = {
                 pool.submit(self._plan_track, track, idx, total,
-                            anchor_detectors if track.filename in refresh_anchors else ()): track
+                            anchor_detectors if track.filename in refresh_anchors else (),
+                            track.filename in revalidate_sources): track
                 for idx, track in ok_items
             }
             for future in as_completed(futures):
@@ -588,6 +612,12 @@ class Pipeline:
                     duration_sec=len(audio) / src.samplerate, applied_processors=ids,
                     prepared_fader_db=fader,
                     source_file_signature=dry_signature,
+                    source_file_revision=src.source_file_revision if identity else None,
+                    source_sample_digest=src.source_sample_digest if identity else None,
+                    detector_results=dict(src.detector_results) if identity else {},
+                    detector_analysis_key=src.detector_analysis_key if identity else None,
+                    detector_sample_digest=src.detector_sample_digest if identity else None,
+                    corrected_analysis=src.corrected_analysis if identity and src.repair_recipe.active else None,
                     processor_results=deepcopy(src.processor_results), _cache={},
                     repair_overrides=dict(src.repair_overrides),
                     repair_measurements=measurements,

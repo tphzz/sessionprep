@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from .theme import COLORS
+from sessionpreplib.repair_verification import remaining_results
 
 
 # ---------------------------------------------------------------------------
@@ -53,7 +54,11 @@ def track_analysis_label(track, detectors=None) -> tuple[str, str, str, int]:
     det_map = {d.id: d for d in detectors} if detectors else {}
 
     counts = {"problem": 0, "attention": 0, "information": 0}
-    for det_id, result in track.detector_results.items():
+    pending = bool(track._cache.get("repair_verification_pending") or
+                   (track.repair_recipe.active and track.corrected_analysis is None))
+    failed = bool(track._cache.get("repair_error") or
+                  (track.corrected_analysis and any(r.error for r in track.corrected_analysis.results.values())))
+    for det_id, result in remaining_results(track, detectors or [], pending=pending).items():
         det_inst = det_map.get(det_id)
         if det_inst and hasattr(det_inst, 'is_relevant') and not det_inst.is_relevant(result, track):
             continue
@@ -64,6 +69,8 @@ def track_analysis_label(track, detectors=None) -> tuple[str, str, str, int]:
             sev = eff.value
         else:
             sev = result.severity.value if hasattr(result.severity, "value") else str(result.severity)
+        if sev == "info":
+            sev = "information"
         if sev in counts:
             counts[sev] += 1
 
@@ -78,6 +85,14 @@ def track_analysis_label(track, detectors=None) -> tuple[str, str, str, int]:
             parts_plain.append(f"{c}{letter}")
             parts_html.append(
                 f'<span style="color:{color}; font-weight:bold;">{c}{letter}</span>')
+
+    if pending or failed:
+        label = "Unable to verify" if failed else "Checking…"
+        color = COLORS["attention" if failed else "metadata"]
+        parts_html.append(f'<span style="color:{color}">{label}</span>')
+        if not parts_plain:
+            return label, parts_html[-1], color, 2999
+        parts_plain.append(label)
 
     if parts_plain:
         plain = " ".join(parts_plain)

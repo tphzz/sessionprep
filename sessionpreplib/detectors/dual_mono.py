@@ -54,6 +54,7 @@ class DualMonoDetector(TrackDetector):
                 detector_id=self.id,
                 severity=Severity.CLEAN,
                 summary="silent track",
+                applicable=False,
                 data={"dual_mono": False},
             )
 
@@ -63,6 +64,7 @@ class DualMonoDetector(TrackDetector):
                 detector_id=self.id,
                 severity=Severity.CLEAN,
                 summary="mono track",
+                applicable=False,
                 data={"dual_mono": False},
             )
 

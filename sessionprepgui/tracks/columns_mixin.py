@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
 from sessionpreplib.utils import protools_sort_key
 
 from ..helpers import track_analysis_label
+from ..detail.repair_options import REPAIR_NAMES, track_repair_options
 from .table_widgets import _PAGE_TABS, _SortableItem, _make_analysis_cell
 from ..theme import (
     COLORS,
@@ -506,11 +507,11 @@ class TrackColumnsMixin:  # pylint: disable=too-few-public-methods
             action.setData(proc.id)
             action.toggled.connect(
                 lambda checked, a=action: self._on_processing_toggled(checked, a))
-        if processors:
-            menu.addSeparator()
-        repair_action = menu.addAction("Track repairs…")
-        repair_action.triggered.connect(lambda: self._open_track_repairs(track))
+        btn.repair_separator = menu.addSeparator() if processors else None
+        btn.repair_action = menu.addAction("Track repairs…")
+        btn.repair_action.triggered.connect(lambda: self._open_track_repairs(track))
         btn.setMenu(menu)
+        menu.aboutToShow.connect(lambda: self._update_processing_button_label(btn, track, processors))
 
         self._update_processing_button_label(btn, track, processors)
 
@@ -521,14 +522,19 @@ class TrackColumnsMixin:  # pylint: disable=too-few-public-methods
 
     def _update_processing_button_label(self, btn, track, processors):
         """Set the button label based on current processor_skip state."""
+        available = track_repair_options(track, self._session).available
+        btn.repair_action.setVisible(available)
+        if btn.repair_separator is not None:
+            btn.repair_separator.setVisible(available)
+        btn.setEnabled(bool(processors) or available)
         if track.repair_recipe.active:
-            names = {"dc_remove": "DC removal", "low_cut": "Subsonic filter", "ultrasonic": "Ultrasonic filter"}
             btn.setText("Repairs")
-            btn.setToolTip("Before normalization: " + ", ".join(names[key] for key in track.repair_recipe.applied_ids()))
+            btn.setToolTip("Before normalization: " + ", ".join(REPAIR_NAMES[key] for key in track.repair_recipe.applied_ids()))
             return
         if not processors:
             btn.setText("None")
-            btn.setToolTip("No audio processors enabled. Open Track repairs to review corrective processing.")
+            btn.setToolTip("Open Track repairs to review corrective processing." if available
+                           else "No audio processors enabled.")
             return
         def _label(p):
             return p.shorthand if p.shorthand else p.name

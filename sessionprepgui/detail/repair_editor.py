@@ -1,25 +1,29 @@
-"""Native track controls at the end of the independently scrolling File report."""
+"""Per-track repair choices and measurements for the File review page."""
 from __future__ import annotations
 
 import math
 
-from PySide6.QtCore import QEvent, Qt, QSignalBlocker, QTimer, Signal
-from PySide6.QtGui import QFont
+from PySide6.QtCore import QEvent, QSize, Qt, QSignalBlocker, Signal
+from PySide6.QtGui import QFont, QTextOption
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QFrame, QGridLayout, QHBoxLayout, QLabel,
-    QVBoxLayout, QWidget,
+    QSizePolicy, QTextBrowser, QToolButton, QVBoxLayout, QWidget,
 )
 
 from sessionpreplib.config import REPAIR_PARAMS
 from sessionpreplib.reports import format_boundary_settling
+from sessionpreplib.repair_verification import CheckOutcome, detector_check, local_band_regions, local_rumble_check, source_low_band
+from .repair_options import DETECTOR_REPAIRS, REPAIR_NAMES, track_repair_options
+from .verification import (
+    channel_names, compact_measurements, comparison_readings, measurement_note, measurement_table,
+    subsonic_note, verification_status,
+)
 from ..controls import FormActionButton, FormDoubleSpinBox
+from ..icons import icon
 from ..prefs.param_form import _FieldResetButton, _spin_decimals
 from ..theme import COLORS, REPORT_INSET
 
 
-_DETECTORS = {"dc_offset": "dc_remove", "subsonic": "low_cut", "subsonic-local": "low_cut",
-              "ultrasonic": "ultrasonic"}
-_REPAIRS = {"dc_remove": "DC removal", "low_cut": "Subsonic filter", "ultrasonic": "Ultrasonic filter"}
 _CUTOFF = next(spec for spec in REPAIR_PARAMS if spec.key == "repair_low_cut_hz")
 
 
@@ -69,20 +73,60 @@ def _region_count(regions):
     return f"{len(regions)} {'region' if len(regions) == 1 else 'regions'}"
 
 
+def _reading(value, places, units):
+    number = _number(value, places)
+    return number + units if number != "—" else number
+
+
+def _local_readings(track):
+    """Each channel list describes the regions found on that signal alone."""
+    bands = (source_low_band(track), source_low_band(track, corrected=True) if track.repair_recipe.active else None)
+    if not any(isinstance(band, dict) and band.get("regions") for band in bands):
+        return []
+    levels, counts, names = [], [], []
+    for band in bands:
+        regions = local_band_regions(band, track)
+        level = band.get("band_dbfs") if isinstance(band, dict) else None
+        levels.append(_reading(level, 1, " dBFS RMS"))
+        counts.append(str(len(regions)) if regions is not None else "—")
+        names.append(channel_names(sorted({ch for _, _, ch in regions}), track.channels)
+                     if regions is not None else "—")
+    return [("Band level", *levels), ("Regions", *counts), ("Affected channels", *names)]
+
+
 class _CutoffSpinBox(FormDoubleSpinBox):
     def textFromValue(self, value):
         text = super().textFromValue(value)
         return text.rstrip("0").rstrip(self.locale().decimalPoint()) if self.locale().decimalPoint() in text else text
 
 
+def _disclosure(text):
+    button = QToolButton()
+    button.setText(text)
+    button.setCheckable(True)
+    button.setAutoRaise(True)
+    button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+    button.setFocusPolicy(Qt.StrongFocus)
+    button.setIconSize(QSize(16, 16))
+    button.setIcon(icon("chevron-right"))
+    button.toggled.connect(lambda opened: button.setIcon(icon("chevron-down" if opened else "chevron-right")))
+    return button
+
+
 class _RepairRow(QFrame):
     def __init__(self, key, title, on_change):
         super().__init__()
         self.setObjectName("trackRepairRow")
-        self.name = _label(title)
-        self.description = _label()
-        self.evidence_title = _label(muted=True)
-        self.evidence = _label()
+        self.toggle = _disclosure(title)
+        font = QFont(self.toggle.font())
+        font.setWeight(QFont.DemiBold)
+        self.toggle.setFont(font)
+        self.description = _label(muted=True)
+        self.state = _label(muted=True)
+        self.verdict = _label()
+        self.verdict.setFont(font)
+        self.verdict.hide()
+        self.state.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.choice = QComboBox()
         self.choice.setAccessibleName(title)
         for text, value in (("Use preset (Off)", None), ("On", True), ("Off", False)):
@@ -92,75 +136,151 @@ class _RepairRow(QFrame):
         self.controls, self.reset = _control_pair(self.choice, title)
         self.choice.currentIndexChanged.connect(lambda _: on_change(key, self.choice.currentData()))
         self.reset.clicked.connect(lambda: on_change(key, None))
-        self.cutoff_box = None
-        self.grid = QGridLayout(self)
-        self.grid.setContentsMargins(0, 8, 0, 8)
-        self.grid.setHorizontalSpacing(12)
-        self.grid.setVerticalSpacing(5)
 
-    def arrange(self, narrow):
-        fields = [self.name, self.description, self.controls, self.evidence_title, self.evidence]
-        if self.cutoff_box is not None:
-            fields.insert(3, self.cutoff_box)
-        for widget in fields:
-            self.grid.removeWidget(widget)
-        self.grid.setColumnMinimumWidth(0, 0 if narrow else 164)
-        self.grid.setVerticalSpacing(8 if narrow else 5)
-        label_width = self.choice.fontMetrics().horizontalAdvance("Use preset (Off)")
-        self.choice.setFixedWidth(max(143 if narrow else 150, label_width + 40))
-        self.grid.setColumnStretch(0, int(narrow))
-        self.grid.setColumnStretch(1, int(not narrow))
-        if narrow:
-            for index, widget in enumerate(fields):
-                self.grid.addWidget(widget, index, 0)
+        self.grid = QGridLayout(self)
+        self.grid.setContentsMargins(0, 6, 0, 6)
+        self.grid.setHorizontalSpacing(8)
+        self.grid.setVerticalSpacing(4)
+        self.band = QFrame()
+        self.band.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.band.setStyleSheet(f"background:{COLORS['surface']}; border:0;")
+        self.grid.addWidget(self.band, 0, 0, 1, 4)
+        self.grid.addWidget(self.toggle, 0, 0, Qt.AlignLeft)
+        self.toggle.setStyleSheet(
+            f"QToolButton {{background:transparent; color:{COLORS['information']}; border:1px solid transparent;}}"
+            f"QToolButton:checked {{color:{COLORS['text']};}}"
+            f"QToolButton:disabled {{color:{COLORS['metadata']};}}"
+            f"QToolButton:hover {{background:{COLORS['accent']};}}"
+            f"QToolButton:focus {{border-color:{COLORS['information']};}}")
+        self.details = QWidget()
+        self.fields = QVBoxLayout(self.details)
+        self.fields.setSpacing(10)
+        self.evidence = _label()
+        self.evidence.setTextFormat(Qt.RichText)
+        self.evidence.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        self.evidence.setMaximumWidth(640)
+        self.evidence.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.fields.addWidget(self.evidence)
+        self.grid.addWidget(self.details, 4, 0, 1, 4)
+        self.editable = True
+        self.unavailable = ""
+        self._narrow = False
+        self._available_width = 0
+        self._shape = None
+        self._wide_evidence = self._compact_evidence = ""
+        self.update_disclosure()
+
+    def set_evidence(self, wide, compact):
+        self._wide_evidence, self._compact_evidence = wide, compact
+        self.evidence.setText(compact if self._narrow else wide)
+        self.evidence.setVisible(bool(wide))
+
+    def arrange(self, narrow, available_width):
+        if self._narrow != narrow:
+            self.evidence.setText(self._compact_evidence if narrow else self._wide_evidence)
+        self._narrow = narrow
+        self._available_width = available_width
+        self.update_disclosure()
+
+    def update_disclosure(self):
+        opened = self.toggle.isChecked()
+        title_font = QFont(self.font())
+        if opened and self._narrow:
+            title_font.setPointSizeF(title_font.pointSizeF() * 1.3)
+            title_font.setWeight(QFont.Bold)
         else:
-            for column, widget in enumerate(fields[:3]):
-                self.grid.addWidget(widget, 0, column, Qt.AlignVCenter)
-            if self.cutoff_box is not None:
-                self.grid.addWidget(self.cutoff_box, 1, 1, 1, 2)
-            self.grid.addWidget(self.evidence_title, 2, 0)
-            self.grid.addWidget(self.evidence, 2, 1, 1, 2)
+            title_font.setWeight(QFont.DemiBold)
+        if self.toggle.font() != title_font:
+            self.toggle.setFont(title_font)
+        self.state.setText(self.choice.currentText() if self.editable else
+                           self.unavailable if self._narrow else "Unavailable")
+        gap = self.grid.horizontalSpacing()
+        title_width = self.toggle.sizeHint().width()
+        verdict_width = self.verdict.fontMetrics().horizontalAdvance(self.verdict.text())
+        state_width = self.state.fontMetrics().horizontalAdvance(self.state.text())
+        has_verdict = bool(self.verdict.text())
+        wrap_verdict = self._narrow and has_verdict and title_width + gap + verdict_width > self._available_width
+        header_width = title_width + (gap + verdict_width if has_verdict and not wrap_verdict else 0)
+        wrap_state = self._narrow and not opened and header_width + gap + state_width > self._available_width
+        self.grid.setColumnMinimumWidth(0, 0 if self._narrow else min(214, self._available_width // 5))
+        shape = self._narrow, opened, has_verdict, wrap_state, wrap_verdict
+        if self._shape != shape:
+            self._shape = shape
+            for widget in (self.description, self.state, self.controls, self.verdict):
+                self.grid.removeWidget(widget)
+            self.grid.setColumnStretch(2, 1)
+            if wrap_verdict:
+                self.grid.addWidget(self.verdict, 1, 0, 1, 4)
+            else:
+                self.grid.addWidget(self.verdict, 0, 1)
+            if wrap_state:
+                self.grid.addWidget(self.state, 2 if wrap_verdict else 1, 0, 1, 4)
+            else:
+                self.grid.addWidget(self.state, 0, 3)
+            self.state.setWordWrap(self._narrow)
+            self.state.setAlignment((Qt.AlignLeft if wrap_state else Qt.AlignRight) | Qt.AlignVCenter)
+            if opened:
+                self.grid.addWidget(self.description, 2 if wrap_verdict else 1, 0, 1, 4)
+            elif has_verdict:
+                self.grid.addWidget(self.description, 0, 2)
+            else:
+                self.grid.addWidget(self.description, 0, 1, 1, 2)
+            if self._narrow:
+                self.grid.addWidget(self.controls, 3, 0, 1, 4, Qt.AlignLeft)
+            else:
+                self.grid.addWidget(self.controls, 0, 3, Qt.AlignRight)
+            indent = 0 if self._narrow else 38
+            self.fields.setContentsMargins(indent, 6, 0, 8)
+            self.grid.setRowMinimumHeight(0, 0 if self._narrow else 38)
+            self.description.setIndent(indent if opened else 0)
+        self.verdict.setVisible(has_verdict)
+        self.description.setVisible(bool(self.description.text()) and (opened or not self._narrow))
+        self.band.setVisible(opened and not self._narrow)
+        self.controls.setVisible(opened and self.editable)
+        self.state.setVisible(not opened)
+        self.details.setVisible(opened)
 
 
 class TrackRepairEditor(QFrame):
     choiceChanged = Signal(object, str, object)
     adjustGainRequested = Signal(object)
-    processingFocusRequested = Signal(str)
 
-    def __init__(self, report):
-        super().__init__(report.viewport())
-        self.report = report
-        self.track = self.session = self.detector = None
-        self._low_narrow = self._low_wide = ""
-        self._narrow = None
-        self._laying_out = False
+    def __init__(self):
+        super().__init__()
+        self.track = self.session = None
+        self._opening_finding = None
+        self._narrow = False
         self.setObjectName("trackRepairEditor")
         self.setAccessibleName("Track repairs")
         self.setFont(QApplication.font())
-        self.setStyleSheet(f"QFrame#trackRepairEditor {{background:{COLORS['bg_alt']};}}"
-                           f"QFrame#trackRepairRow {{border:0; border-top:1px solid {COLORS['accent']};}}")
+        self.setStyleSheet(f"QFrame#trackRepairRow {{border:0; border-top:1px solid {COLORS['accent']};}}")
         self.body = QVBoxLayout(self)
-        self.body.setSpacing(4)
+        self.body.setContentsMargins(REPORT_INSET, REPORT_INSET, REPORT_INSET, REPORT_INSET)
+        self.body.setSpacing(6)
         header = QHBoxLayout()
-        title = _label("Track repairs")
-        font = QFont(title.font())
+        self.back_button = FormActionButton("Back to findings")
+        self.back_button.setToolTip("Back to findings (Alt+Left)")
+        header.addWidget(self.back_button, 0, Qt.AlignLeft | Qt.AlignTop)
+        self.filename = _label(muted=True)
+        self.filename.setWordWrap(False)
+        self.filename.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        header.addWidget(self.filename, 1)
+        self.body.addLayout(header)
+        self.title = _label("Track repairs")
+        self.title.setWordWrap(False)
+        self.title.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        font = QFont(self.title.font())
         font.setWeight(QFont.Bold)
         font.setPointSizeF(font.pointSizeF() * 1.25)
-        title.setFont(font)
-        header.addWidget(title, 1)
-        self.close_button = FormActionButton("Close")
-        self.close_button.setAccessibleName("Close track repairs")
-        self.close_button.setToolTip("Close track repairs (Esc)")
-        self.close_button.setMinimumWidth(64)
-        self.close_button.clicked.connect(self.close_editor)
-        header.addWidget(self.close_button)
-        self.header = header
-        self.body.addLayout(header)
-        self.scope = _label(muted=True)
-        self.body.addWidget(self.scope)
+        self.title.setFont(font)
+        self.body.addWidget(self.title)
+        self.body.addWidget(_label("Whole track · before normalization", muted=True))
+        self.empty = _label("No repairable findings.", muted=True)
+        self.body.addWidget(self.empty)
         self.rows = {}
-        for key, name in _REPAIRS.items():
+        for key, name in REPAIR_NAMES.items():
             row = _RepairRow(key, name, self._change)
+            row.toggle.clicked.connect(lambda opened, key=key: self.select_repair(key if opened else None))
             self.rows[key] = row
             self.body.addWidget(row)
         self.cutoff = _CutoffSpinBox()
@@ -172,29 +292,49 @@ class TrackRepairEditor(QFrame):
         self.cutoff.valueChanged.connect(lambda value: self._change("low_cut_hz", value))
         self.cutoff_reset.clicked.connect(lambda: self._change("low_cut_hz", None))
         self.cutoff_box = QWidget()
-        cutoff_layout = QVBoxLayout(self.cutoff_box)
+        cutoff_layout = QGridLayout(self.cutoff_box)
         cutoff_layout.setContentsMargins(0, 3, 0, 3)
-        cutoff_layout.setSpacing(3)
-        cutoff_layout.addWidget(_label("Cutoff (Hz)"))
-        cutoff_layout.addWidget(cutoff_pair)
+        cutoff_layout.setSpacing(6)
+        cutoff_layout.addWidget(_label("Cutoff (Hz)"), 0, 0)
+        cutoff_layout.addWidget(cutoff_pair, 0, 1)
+        cutoff_layout.setColumnStretch(1, 1)
         self.cutoff_default = _label(muted=True)
-        cutoff_layout.addWidget(self.cutoff_default)
-        self.rows["low_cut"].cutoff_box = self.cutoff_box
-        for row in self.rows.values():
-            row.arrange(False)
-        self.peak_name = _label("Sample peak", muted=True)
+        cutoff_layout.addWidget(self.cutoff_default, 1, 0, 1, 2)
+        self.rows["low_cut"].fields.insertWidget(0, self.cutoff_box)
+        self.peak_name = _label("Sample peak before gain", muted=True)
+        self.peak_name.setWordWrap(False)
         self.peak = _label()
-        self.peak_layout = QGridLayout()
+        self.peak_box = QWidget()
+        self.peak_layout = QGridLayout(self.peak_box)
+        self.peak_layout.setContentsMargins(0, 6, 0, 6)
+        self.peak_layout.setColumnStretch(1, 1)
         self.peak_layout.addWidget(self.peak_name, 0, 0)
         self.peak_layout.addWidget(self.peak, 0, 1)
-        self.body.addLayout(self.peak_layout)
+        self.body.addWidget(self.peak_box)
+        self.boundary = _disclosure("Boundary settling")
+        self.body.addWidget(self.boundary, 0, Qt.AlignLeft)
+        self.boundary_details = _label()
+        self.boundary_details.setStyleSheet(f"color:{COLORS['attention']};")
+        self.body.addWidget(self.boundary_details)
+        self.boundary.toggled.connect(self.boundary_details.setVisible)
         self.recovery_title = _label("Output gain needs adjustment")
         title_font = QFont(self.recovery_title.font())
         title_font.setWeight(QFont.DemiBold)
         self.recovery_title.setFont(title_font)
         self.body.addWidget(self.recovery_title)
-        self.error = _label()
-        self.error.setStyleSheet(f"color:{COLORS['attention']};")
+        # A render error can contain an entire unbroken path. Let Qt wrap it
+        # anywhere and give the outer repair scroller all vertical scrolling.
+        self.error = QTextBrowser()
+        self.error.setAccessibleName("Repair error")
+        self.error.setWordWrapMode(QTextOption.WrapAtWordBoundaryOrAnywhere)
+        self.error.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        self.error.setFocusPolicy(Qt.ClickFocus)
+        self.error.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.error.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.error.setStyleSheet(f"color:{COLORS['attention']}; background:transparent; border:0; padding:0;")
+        self.error.document().setDocumentMargin(0)
+        self.error.document().documentLayout().documentSizeChanged.connect(
+            lambda size: self.error.setFixedHeight(math.ceil(size.height())))
         self.body.addWidget(self.error)
         self.recovery = _label()
         self.body.addWidget(self.recovery)
@@ -203,123 +343,130 @@ class TrackRepairEditor(QFrame):
         self.adjust_gain = FormActionButton("Adjust Gain")
         self.adjust_gain.clicked.connect(lambda: self.adjustGainRequested.emit(self.track))
         self.body.addWidget(self.adjust_gain, 0, Qt.AlignLeft)
+        self.body.addStretch()
+        order = [self.back_button]
+        for key, row in self.rows.items():
+            order.extend((row.toggle, row.choice, row.reset))
+            if key == "low_cut":
+                order.extend((self.cutoff, self.cutoff_reset))
+        order.extend((self.boundary, self.adjust_gain))
+        for first, second in zip(order, order[1:]):
+            QWidget.setTabOrder(first, second)
+        # The application also binds Space to playback. Focused controls get
+        # first use of it for activation and selection.
         for child in self.findChildren(QWidget):
             child.installEventFilter(self)
-        self._viewport_timer = QTimer(self)
-        self._viewport_timer.setSingleShot(True)
-        self._viewport_timer.timeout.connect(self.reflow)
-        report.viewport().installEventFilter(self)
-        self.hide()
-        report.reportChanged.connect(self._context_changed)
-        report.reportLayoutChanged.connect(self.reflow)
-        report.verticalScrollBar().valueChanged.connect(self._position)
-        QApplication.instance().focusChanged.connect(self._keep_focus_visible)
 
     def eventFilter(self, watched, event):
-        if watched is self.report.viewport():
-            if event.type() == QEvent.Resize and self.track is not None:
-                self._viewport_timer.start(0)
-            return super().eventFilter(watched, event)
-        if event.type() in (QEvent.ShortcutOverride, QEvent.KeyPress):
-            if event.key() == Qt.Key_Escape and QApplication.activePopupWidget() is None:
-                event.accept()
-                if event.type() == QEvent.KeyPress:
-                    self.close_editor()
-                return True
-            if event.type() == QEvent.ShortcutOverride and event.key() == Qt.Key_Space:
-                event.accept()
-                return True
+        if event.type() == QEvent.ShortcutOverride and event.key() == Qt.Key_Space:
+            event.accept()
+            return True
         return super().eventFilter(watched, event)
 
     def _change(self, key, value):
         if self.track is not None:
             self.choiceChanged.emit(self.track, key, value)
 
-    def open_track(self, track, session, detector=None):
-        if session is not self.report.report_session or track.filename != self.report.track_filename:
-            return
-        self.track, self.session, self.detector = track, session, detector
-        self._narrow = None
-        self.show()
-        self.refresh(track, session)
-        row = self.rows[_DETECTORS.get(detector, "dc_remove")]
-        focus = row.choice if row.choice.isVisible() and row.choice.isEnabled() else self.close_button
-        bar = self.report.verticalScrollBar()
-        bar.setValue(bar.value() + max(0, self.y() - 16))
-        focus.setFocus(Qt.OtherFocusReason)
-        self._keep_focus_visible(None, focus)
+    def select_repair(self, key):
+        for candidate, row in self.rows.items():
+            row.toggle.setChecked(candidate == key)
+            row.update_disclosure()
+        self._place_peak()
 
-    def _context_changed(self):
-        if self.track is None:
-            return
-        if self.session is not self.report.report_session or self.track.filename != self.report.track_filename:
-            self.close_editor(restore_focus=False)
+    def _place_peak(self):
+        # In the compact view the before-gain peak follows the open repair.
+        rows = list(self.rows.values())
+        row = next((r for r in rows if self._narrow and r.toggle.isChecked()), rows[-1])
+        pos = self.body.indexOf(row)
+        current = self.body.indexOf(self.peak_box)
+        if current != pos + 1:
+            self.body.removeWidget(self.peak_box)
+            self.body.insertWidget(self.body.indexOf(row) + 1, self.peak_box)
 
-    def close_editor(self, *, restore_focus=True):
-        if self.track is None:
-            return
-        filename, detector = self.track.filename, self.detector
-        self.track = self.session = self.detector = None
-        self.hide()
-        self.reflow()
-        if restore_focus:
-            if detector is None or self.report._anchor_cursor(href="report-repair:" + detector) is None:
-                self.processingFocusRequested.emit(filename)
-            else:
-                self.report.focus_report_link("report-repair", detector)
-                self.report.ensureCursorVisible()
+    def show_track(self, track, session, detector, options=None):
+        self.track, self.session = track, session
+        self._opening_finding = detector
+        self.boundary.setChecked(False)
+        options = options or track_repair_options(track, session)
+        first = next((key for key in self.rows if key in options.rows), None)
+        self.select_repair(options.targets.get(detector, first))
+        self.refresh(track, session, options)
 
-    def refresh(self, track, session):
-        if self.track is None or session is not self.session or self.track.filename != track.filename:
+    def refresh(self, track, session, options=None):
+        if track is not self.track or session is not self.session:
             return
-        self.track = track
+        options = options or track_repair_options(track, session)
+        focus = QApplication.focusWidget()
+        previous = next((key for key, row in self.rows.items() if row.toggle.isChecked()), None)
+        focus_removed = focus is not None and any(key not in options.rows and row.isAncestorOf(focus)
+                                                  for key, row in self.rows.items())
+        for key, row in self.rows.items():
+            row.setVisible(key in options.rows)
+        if previous is not None and previous not in options.rows:
+            self.select_repair(next((key for key in self.rows if key in options.rows), None))
+        if focus_removed:
+            target = next((row.toggle for key, row in self.rows.items() if key in options.rows), self.back_button)
+            target.setFocus(Qt.OtherFocusReason)
+        self.empty.setVisible(not options.available)
         measures = track.repair_measurements
         before, after = measures.get("original", {}), measures.get("corrected", {})
         suggested, inherited = measures.get("suggested", {}), measures.get("inherited", {})
         config, overrides = session.config, track.repair_overrides
         recipe = track.repair_recipe
         selected = {"dc_remove": recipe.dc_remove, "low_cut": recipe.low_cut_hz is not None, "ultrasonic": recipe.ultrasonic}
+        pending = bool(track._cache.get("repair_verification_pending"))
+        unavailable = pending or bool(track._cache.get("repair_error"))
+        if unavailable or not recipe.active:
+            after = {}
+        checks = {key: detector_check(track, detector_id, pending=pending)
+                  for detector_id, key in DETECTOR_REPAIRS.items() if detector_id != "subsonic-local"}
+        whole = checks["low_cut"]
+        low_check = whole
+        if options.targets.get("subsonic-local") == "low_cut":
+            local = local_rumble_check(track, config, whole)
+            outstanding = {CheckOutcome.NEW, CheckOutcome.REMAINING}
+            if (self._opening_finding == "subsonic-local"
+                    or options.targets.get("subsonic") != "low_cut"
+                    or (self._opening_finding != "subsonic" and local.outcome in outstanding
+                        and whole.outcome not in outstanding)):
+                low_check = local
         for key, row in self.rows.items():
+            check = low_check if key == "low_cut" else checks[key]
+            status = verification_status(check.outcome)
+            if check.outcome in {CheckOutcome.REMAINING, CheckOutcome.NEW}:
+                status = ("Still detected" if check.outcome == CheckOutcome.REMAINING else "New after repair",
+                          COLORS["attention"] if check.corrected.severity.value != "info" else COLORS["information"])
+            show_status = bool(status and (check.original or check.corrected or pending) and
+                               (key != "ultrasonic" or track.samplerate >= 50000))
+            row.verdict.setText(status[0] if show_status else "")
+            if show_status:
+                row.verdict.setStyleSheet(f"color:{status[1]};")
             value = overrides.get(key)
             with QSignalBlocker(row.choice):
                 row.choice.setItemText(0, f"Use preset ({'On' if inherited.get(key, selected[key] and value is None) else 'Off'})")
                 row.choice.setCurrentIndex(0 if value is None else 1 if value else 2)
             enabled = key != "ultrasonic" or track.samplerate >= 50000
-            row.controls.setVisible(enabled or value is not None)
-            row.choice.setVisible(enabled or value is not None)
+            row.editable = enabled or value is not None or selected[key]
+            row.toggle.setEnabled(row.editable)
+            row.unavailable = f"Unavailable at {track.samplerate / 1000:g} kHz" if not enabled else ""
             row.choice.model().item(1).setEnabled(enabled)
             row.reset.setEnabled(key in overrides)
         dc = self.rows["dc_remove"]
-        dc.description.setText("Suggested · 2 Hz high-pass" if suggested.get("dc_remove") and not recipe.dc_remove else "2 Hz high-pass")
-        dc.evidence_title.setText("DC mean (% FS)")
+        dc.description.setText("Suggested · 2 Hz high-pass" if options.targets.get("dc_offset") == "dc_remove"
+                               and not recipe.dc_remove else "2 Hz high-pass")
         dc_values = []
-        for i, (a, b) in enumerate(zip(before.get("signed_dc", []), after.get("signed_dc", []))):
-            label = ("Left", "Right")[i] if track.channels == 2 else f"Ch {i + 1}"
-            dc_values.append(f"{label}  {_number(a * 100, 2)} → {_number(b * 100, 2)}%")
-        dc.evidence.setText("  ·  ".join(dc_values) or "—")
+        dc_after = after.get("signed_dc", [])
+        for i, mean in enumerate(before.get("signed_dc", [])):
+            label = ("Left", "Right")[i] if track.channels == 2 and i < 2 else f"Ch {i + 1}"
+            corrected_dc = _reading(dc_after[i] * 100, 2, "%") if i < len(dc_after) else "—"
+            dc_values.append((label, _reading(mean * 100, 2, "%"), corrected_dc))
+        dc_table = measurement_table(dc_values, heading="DC mean (% FS)", editor=True) if dc_values else ""
+        dc.set_evidence(dc_table, dc_table)
         low = self.rows["low_cut"]
-        resolved = bool(recipe.dc_remove and recipe.low_cut_hz is None and measures.get("subsonic_resolved"))
-        low.description.setText("Resolved by DC removal" if resolved else "Suggested" if suggested.get("low_cut") else "")
-        low.description.setStyleSheet(f"color:{COLORS['hints' if resolved else 'metadata']};")
-        frequency = config.get("subsonic_hz", 30)
-        low.evidence_title.setText(f"Energy ≤{frequency:g} Hz")
-        low_evidence = []
-        if "subsonic_ratio_db" in before:
-            low_evidence.append(f"{_number(before['subsonic_ratio_db'], 1)} → "
-                                f"{_number(after.get('subsonic_ratio_db'), 1)} dB")
-        local_before, local_after = before.get("low_band", {}), after.get("low_band", {})
-        spans, corrected_spans = local_before.get("regions", []), local_after.get("regions", [])
-        if spans or corrected_spans:
-            channels = sorted({ch for _, _, ch in [*spans, *corrected_spans]})
-            names = [("Left", "Right")[ch] if track.channels == 2 and ch in (0, 1) else f"Ch {ch + 1}"
-                     for ch in channels]
-            low_evidence.append(f"Local ≤{min(frequency, 20):g} Hz · {_number(local_before.get('band_dbfs'), 1)} → "
-                                f"{_number(local_after.get('band_dbfs'), 1)} dBFS RMS")
-            low_evidence.append(f"{_region_count(spans)} → {_region_count(corrected_spans)} · {', '.join(names)}")
-        self._low_narrow = "\n".join(low_evidence)
-        if "subsonic_ratio_db" in before:
-            low_evidence[0] += " relative to program energy"
-        self._low_wide = "\n".join(low_evidence)
+        low.description.setText("Whole-track high-pass" if selected["low_cut"] else
+                                "Suggested" if "low_cut" in options.targets.values() else
+                                options.attribution("subsonic"))
+        self._set_low_evidence(before, after, checks["low_cut"])
         preset = config.get(_CUTOFF.key, _CUTOFF.default)
         cutoff_value = overrides.get("low_cut_hz", preset)
         with QSignalBlocker(self.cutoff):
@@ -327,7 +474,7 @@ class TrackRepairEditor(QFrame):
             self.cutoff.setValue(cutoff_value)
         self.cutoff_reset.setEnabled("low_cut_hz" in overrides)
         self.cutoff_default.setText(f"Preset: {preset:g} Hz")
-        self.cutoff_box.setVisible(selected["low_cut"] or overrides.get("low_cut") is True)
+        self.cutoff_box.setVisible(selected["low_cut"] or overrides.get("low_cut") is True or "low_cut_hz" in overrides)
         high = self.rows["ultrasonic"]
         original_high = before.get("ultrasonic", {})
         if track.samplerate < 50000:
@@ -337,28 +484,21 @@ class TrackRepairEditor(QFrame):
             high.description.setText(f"Suggested · Qualifying windows span {duration:.2f} s")
         else:
             high.description.setText("Audible passband through 20 kHz")
-        high.evidence_title.setText("Energy ≥24.1 kHz")
-        high.evidence.setText(f"{_number(original_high.get('band_dbfs'), 1)} → "
-                              f"{_number(after.get('ultrasonic', {}).get('band_dbfs'), 1)} dBFS RMS")
-        for row, visible in ((low, bool(low_evidence)), (dc, bool(dc_values)),
-                             (high, bool(original_high.get("eligible")))):
-            row.evidence_title.setVisible(visible)
-            row.evidence.setVisible(visible)
-            row.description.setVisible(bool(row.description.text()))
+        if original_high.get("eligible"):
+            high_values = [("Energy ≥24.1 kHz", _reading(original_high.get("band_dbfs"), 1, " dBFS RMS"),
+                            _reading(after.get("ultrasonic", {}).get("band_dbfs"), 1, " dBFS RMS"))]
+            high.set_evidence(measurement_table(high_values, editor=True), compact_measurements(high_values))
+        else:
+            high.set_evidence("", "")
+        for row in self.rows.values():
+            row.update_disclosure()
         def peak(data):
             value = data.get("peak_dbfs")
             return _number(value, 2 if value is not None and abs(value) < 1 else 1, sign=True)
         self.peak.setText(f"{peak(before)} → {peak(after)} dBFS")
-        self.peak_name.setVisible("peak_dbfs" in before)
-        self.peak.setVisible("peak_dbfs" in before)
-        names = {track.filename}
-        if session.topology:
-            names.update(entry.output_filename for entry in session.topology.entries
-                         if any(src.input_filename == track.filename for src in entry.sources))
-        errors = [str(msg) for name, msg in config.get("_prepare_errors", []) if name in names]
-        if track._cache.get("repair_error") and track._cache["repair_error"] not in errors:
-            errors.append(track._cache["repair_error"])
-        adjustment = config.get("_output_gain_adjustments", {}).get(track.filename)
+        self.peak_box.setVisible(recipe.active and "peak_dbfs" in before)
+        errors = options.errors
+        adjustment = options.gain_adjustment
         self.recovery_title.setVisible(bool(adjustment))
         details = []
         if adjustment:
@@ -369,74 +509,63 @@ class TrackRepairEditor(QFrame):
             if (not config.get("bimodal_normalize_enabled", True) or "bimodal_normalize" in track.processor_skip
                     or norm is None or norm.classification in ("Skip", "Silent")):
                 details.append("With normalization bypassed, Adjust Gain opens a manual output gain for this track.")
-            if session.prepare_state == "stale" and any(t.filename in names and t.processed_filepath
-                                                        for t in session.output_tracks):
+            if options.has_stale_output:
                 details.append("The previous prepared output is marked stale.")
         self.recovery_detail.setText(" ".join(details))
         self.recovery_detail.setVisible(bool(details))
-        messages = errors + format_boundary_settling(measures.get("boundary_settling", []))
-        self.error.setText("\n".join(messages))
-        self.error.setVisible(bool(messages))
+        regions = measures.get("boundary_settling", []) if recipe.active and not unavailable else []
+        self.boundary.setVisible(bool(regions))
+        self.boundary.setText("Boundary settling · " + _region_count(regions))
+        self.boundary_details.setText("\n".join(format_boundary_settling(regions)))
+        self.boundary_details.setVisible(bool(regions) and self.boundary.isChecked())
+        self.error.setPlainText("\n".join(errors))
+        self.error.setVisible(bool(errors))
         self.recovery.setVisible(bool(adjustment))
         self.adjust_gain.setVisible(bool(adjustment))
-        self.reflow()
 
-    def reflow(self):
-        """Reserve native controls inside the report's bottom margin and scroll them with it."""
-        if self._laying_out:
+    def _set_low_evidence(self, before, after, check):
+        config, track = self.session.config, self.track
+        frequency = config.get("subsonic_hz", 30)
+        rows = []
+        note = subsonic_note(config)
+        if check.corrected is not None:
+            verified, note, _, _ = comparison_readings(check, track, config)
+            rows = [entry for entry in verified if entry[0] not in ("Locations", "Result")]
+        if not rows and any("subsonic_ratio_db" in side for side in (before, after)):
+            rows = [(f"Energy at or below {frequency:g} Hz",
+                     *(_reading(side.get("subsonic_ratio_db"), 1, " dB") for side in (before, after)))]
+        wide = compact = ""
+        if rows:
+            wide = measurement_table(rows, editor=True) + measurement_note(note)
+            compact = compact_measurements(rows) + measurement_note(note)
+        local = _local_readings(track)
+        if local:
+            band = f"Local energy ≤{min(frequency, 20):g} Hz"
+            wide += measurement_table(local, heading=band, editor=True)
+            compact += measurement_table(local, heading=band, editor=True)
+        self.rows["low_cut"].set_evidence(wide, compact)
+
+    def set_viewport_width(self, width):
+        # Use the scroll viewport's available space. A child's old minimum
+        # size can exceed it precisely when a compact row needs to wrap.
+        narrow = width < 590
+        available = max(0, width - 2 * REPORT_INSET)
+        name = self.track.filename if self.track is not None else ""
+        label = self.title if narrow else self.filename
+        name_width = available if narrow else max(0, available - self.back_button.sizeHint().width() - 12)
+        label.setText(label.fontMetrics().elidedText(name, Qt.ElideMiddle, name_width))
+        label.setAccessibleName(name)
+        label.setToolTip(name)
+        if not narrow:
+            self.title.setText("Track repairs")
+            self.title.setAccessibleName("Track repairs")
+            self.title.setToolTip("")
+        for row in self.rows.values():
+            row.arrange(narrow, available)
+        if narrow == self._narrow:
             return
-        self._laying_out = True
-        try:
-            root = self.report.document().rootFrame()
-            fmt = root.frameFormat()
-            height = 0
-            if self.track is not None:
-                width = max(1, self.report.viewport().width() - 2 * REPORT_INSET)
-                narrow = width < 590
-                if narrow:
-                    width += REPORT_INSET // 2
-                self.rows["low_cut"].evidence.setText(self._low_narrow if narrow else self._low_wide)
-                if narrow != self._narrow:
-                    self._narrow = narrow
-                    self.body.setSpacing(8 if narrow else 4)
-                    self.body.setContentsMargins(0 if narrow else 12, 8, 0 if narrow else 12, 8)
-                    self.scope.setText("Whole track" if narrow else "Whole track · before normalization")
-                    self.body.removeWidget(self.close_button)
-                    self.header.removeWidget(self.close_button)
-                    if narrow:
-                        self.body.addWidget(self.close_button, 0, Qt.AlignLeft)
-                    else:
-                        self.header.addWidget(self.close_button)
-                    for key, row in self.rows.items():
-                        row.arrange(narrow)
-                        row.setVisible(not narrow or self.detector is None or _DETECTORS.get(self.detector) == key)
-                    # Explicit removal invalidates the old PySide layout item
-                    # before Qt can reuse its address for another object.
-                    self.peak_layout.removeWidget(self.peak)
-                    self.peak_layout.addWidget(self.peak, int(narrow), int(not narrow))
-                    self.peak_layout.setColumnMinimumWidth(0, 0 if narrow else 164)
-                    self.peak_layout.setColumnStretch(1, int(not narrow))
-                height = max(self.body.minimumSize().height(), self.body.totalHeightForWidth(width))
-                self.resize(width, height)
-                self.body.activate()
-            if fmt.bottomMargin() != height + REPORT_INSET:
-                fmt.setBottomMargin(height + REPORT_INSET)
-                root.setFrameFormat(fmt)
-            self._position()
-        finally:
-            self._laying_out = False
-
-    def _position(self):
-        if self.track is not None:
-            bottom = math.ceil(self.report.document().size().height()) - REPORT_INSET
-            self.move(REPORT_INSET, bottom - self.height() - self.report.verticalScrollBar().value())
-
-    def _keep_focus_visible(self, _old, widget):
-        if widget is None or self.track is None or not self.isAncestorOf(widget):
-            return
-        top = widget.mapTo(self.report.viewport(), widget.rect().topLeft()).y()
-        bar = self.report.verticalScrollBar()
-        if top < 0:
-            bar.setValue(bar.value() + top - 4)
-        elif top + widget.height() > self.report.viewport().height():
-            bar.setValue(bar.value() + top + widget.height() - self.report.viewport().height() + 4)
+        self._narrow = narrow
+        self.filename.setVisible(not narrow)
+        self.peak_layout.removeWidget(self.peak)
+        self.peak_layout.addWidget(self.peak, int(narrow), int(not narrow))
+        self._place_peak()

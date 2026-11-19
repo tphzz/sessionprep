@@ -55,6 +55,7 @@ class OneSidedSilenceDetector(TrackDetector):
                 detector_id=self.id,
                 severity=Severity.CLEAN,
                 summary="silent track",
+                applicable=False,
                 data={
                     "one_sided_silence": False,
                     "one_sided_silence_side": None,
@@ -69,6 +70,7 @@ class OneSidedSilenceDetector(TrackDetector):
                 detector_id=self.id,
                 severity=Severity.CLEAN,
                 summary="mono track",
+                applicable=False,
                 data={
                     "one_sided_silence": False,
                     "one_sided_silence_side": None,

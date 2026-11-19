@@ -23,7 +23,7 @@ class RepairPreview(QObject):
         self.preserve_view = False
         self.displayed = False
         self.cache = {}
-        self.panel.audition_source_changed.connect(self.request)
+        self.panel.audition_source_changed.connect(self._source_changed)
         self.panel.inspection_band_changed.connect(self.request)
         self.panel.preview_retry.connect(self.retry)
 
@@ -39,6 +39,7 @@ class RepairPreview(QObject):
                 self.panel.set_corrected(False)
         self.panel.set_audition_available(
             self.recipe.active, "Enable a repair to audition the corrected source.")
+        window._file_report.set_report_source(self.panel.corrected)
         self.panel.set_inspection_rate(track.samplerate)
         self.panel.update_play_mode_channels(track.channels)
         window._wf_container.set_content_available(True)
@@ -59,10 +60,21 @@ class RepairPreview(QObject):
         self.pending_play = None
         self.cache.clear()
 
+    @Slot(bool)
+    def _source_changed(self, corrected):
+        if self.track is not None and self.track is self.window._current_track:
+            self.window._pending_detector_visualization = None
+            self.window._file_report.set_report_source(corrected)
+            self.window._refresh_waveform_issues()
+            self.request()
+
     def planning(self):
         if self.track is None or self.track is not self.window._current_track:
             return
         self.clear_material()
+        if not (self.track.repair_recipe.active or self.track._cache.get("repair_verification_pending")):
+            self.panel.set_audition_available(False, "Enable a repair to audition the corrected source.")
+            self.window._file_report.set_report_source(False)
         if self.window._playback.is_playing:
             self.window._waveform.set_cursor(self.window._playback.current_sample())
             self.window._playback.stop()
@@ -75,7 +87,7 @@ class RepairPreview(QObject):
     def retry(self):
         if self.track is self.window._current_track and self.track is not None:
             if self.track._cache.get("repair_error"):
-                self.window._queue_repair_plan([self.track])
+                self.window._queue_repair_plan([self.track], revalidate_source=True)
             else:
                 self.select(self.track, refresh=True)
 
@@ -83,10 +95,10 @@ class RepairPreview(QObject):
         if self.audition is None:
             return
         self.pending_play = (sample, mode, channel)
-        self.request()
+        self.request(update_plot=False)
 
     @Slot()
-    def request(self):
+    def request(self, *, update_plot=True):
         window = self.window
         if self.track is None or self.track is not window._current_track:
             return
@@ -98,7 +110,8 @@ class RepairPreview(QObject):
         self.generation += 1
         self.pending = True
         self.preserve_view = self.displayed
-        window._waveform.set_loading(True, preserve_view=self.preserve_view)
+        if update_plot:
+            window._waveform.set_loading(True, preserve_view=self.preserve_view)
         if self.audition is None:
             self.panel.set_preview_notice()
             self.panel.play_btn.setEnabled(False)
@@ -164,13 +177,18 @@ class RepairPreview(QObject):
         worker = self.sender()
         if not self._current(worker):
             return
+        cached = self.cache.get(worker.corrected)
+        if cached and cached[1] is result and not self.window._waveform.is_loading:
+            # Play and seek validate the file even when this plot is already visible.
+            return
         self.cache[worker.corrected] = (worker.key, result)
         self.window._on_waveform_loaded(result, self.track, preserve_view=self.preserve_view)
         self.displayed = True
 
     @Slot(str)
     def _failed(self, detail):
-        if not self._current(self.sender()):
+        worker = self.sender()
+        if not self._current(worker):
             return
         self.audition = None
         self.pending_play = None
@@ -182,6 +200,15 @@ class RepairPreview(QObject):
         self.window._waveform_unavailable_generation = self.window._file_report.context_generation
         self.panel.set_content_available(False)
         self.panel.set_preview_notice(f"Preview unavailable · {detail}", retry=True)
+        if worker.invalid_source and (self.track.repair_recipe.active or self.track.corrected_analysis):
+            self.track.corrected_analysis = None
+            self.track._cache["repair_error"] = detail
+            self.window._mark_prepare_stale()
+            self.window._refresh_file_tab(self.track)
+            self.window._refresh_track_repair_editor(self.track)
+            self.window._update_track_row(self.track.filename)
+            self.window._refresh_verified_summary()
+            self.window._update_prepare_button()
 
     @Slot()
     def _settled(self):

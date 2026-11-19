@@ -1187,21 +1187,21 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
             self._topo_wf_panel.stop_btn.setEnabled(True)
 
     @Slot()
-    def _on_topo_stop(self):
+    def _on_topo_stop(self, *, return_to_start=True):
         was_playing = self._playback.is_playing
         start_sample = self._playback.play_start_sample
         self._playback.stop()
         self._topo_wf_panel.stop_btn.setEnabled(False)
         self._topo_wf_panel.play_btn.setEnabled(
             self._topo_cached_audio is not None)
-        if was_playing:
+        if was_playing and return_to_start:
             self._topo_wf_panel.waveform.set_cursor(start_sample)
             self._topo_update_time_label(start_sample)
 
     @Slot(int)
     def _on_topo_wf_seek(self, sample: int):
         if self._playback.is_playing:
-            self._on_topo_stop()
+            self._on_topo_stop(return_to_start=False)
         self._topo_update_time_label(sample)
 
     def _topo_update_time_label(self, current_sample: int):

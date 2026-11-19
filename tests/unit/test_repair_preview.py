@@ -3,7 +3,7 @@ import numpy as np
 import pytest
 
 pytest.importorskip("PySide6")
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QPoint, QRect, Qt, QTimer
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QWidgetAction
 
@@ -44,6 +44,7 @@ def _open_track(window, tmp_path, name, *, rate=96000):
     track = load_track(str(path))
     track.audio_data = None
     track.repair_recipe = RepairRecipe(low_cut_hz=30, ultrasonic=rate >= 50000)
+    track.repair_overrides.update(low_cut=True, low_cut_hz=30, ultrasonic=rate >= 50000)
     window._session = SessionContext([track], {})
     window._show_track_detail(track)
     return track
@@ -53,10 +54,11 @@ def _wait(app, window):
     import time
     limit = time.monotonic() + 8
     app.processEvents()
-    while window._repair_preview.worker is not None and time.monotonic() < limit:
+    while (window._repair_preview.worker is not None or window._repair_plan_worker is not None) and time.monotonic() < limit:
         app.processEvents()
         time.sleep(.005)
     assert window._repair_preview.worker is None
+    assert window._repair_plan_worker is None
 
 
 def test_real_file_panel_retains_zoom_cursor_and_native_spectral_scales(app, window, tmp_path):
@@ -143,9 +145,10 @@ def test_changed_repair_choice_immediately_withholds_old_audio_and_retry_replans
     window._refresh_repair_preview(track)
     _wait(app, window)
     retries = []
-    monkeypatch.setattr(window, "_queue_repair_plan", retries.extend)
+    monkeypatch.setattr(window, "_queue_repair_plan",
+                        lambda tracks, *, revalidate_source: retries.append((tracks, revalidate_source)))
     panel.preview_retry_button.click()
-    assert retries == [track] and panel.corrected
+    assert retries == [([track], True)] and panel.corrected
 
 
 def test_play_checks_disk_identity_after_render_and_cannot_start_stale_material(app, window, tmp_path, streams):
@@ -157,6 +160,170 @@ def test_play_checks_disk_identity_after_render_and_cannot_start_stale_material(
     assert not streams
     assert window._wf_panel.preview_retry_button.isVisible()
     assert "Restore the source" in window._wf_panel.preview_message.text()
+
+
+@pytest.mark.parametrize("analysis", [False, True], ids=["track-layout", "file"])
+def test_click_moves_cursor_without_repainting_the_cached_plot(app, window, analysis, tmp_path):
+    if analysis:
+        _open_track(window, tmp_path, "Click.wav")
+        _wait(app, window)
+        panel = window._wf_panel
+    else:
+        window._phase_tabs.setCurrentIndex(0)
+        panel = window._topo_wf_panel
+        panel.set_content_available(True)
+        panel.waveform.set_audio(np.sin(np.arange(12000) * .02), 48000)
+    panel.set_expanded(True)
+    waveform = panel.waveform
+    waveform.zoom_in()
+    QTest.qWait(200)  # Let the splitter's resize finish before measuring a seek.
+    waveform.grab()
+    background = waveform._bg_pixmap
+    assert background is not None
+    view = waveform._view_start, waveform._view_end
+    samples = []
+    waveform.position_clicked.connect(samples.append)
+    for fraction in (1, 3):
+        point = QPoint(waveform.width() * fraction // 4, waveform.height() // 3)
+        QTest.mouseClick(waveform, Qt.LeftButton, pos=point)
+        waveform.grab()
+        assert waveform._bg_pixmap is background
+        assert waveform._cursor_sample == samples[-1]
+        assert (waveform._view_start, waveform._view_end) == view
+    assert view[0] < samples[0] < samples[1] < view[1]
+
+
+def test_track_layout_seek_pauses_at_the_clicked_sample(app, window, streams):
+    window._phase_tabs.setCurrentIndex(0)
+    panel = window._topo_wf_panel
+    audio = np.sin(np.arange(96000) * .02)
+    window._topo_cached_audio = ("input", audio, audio, 48000)
+    panel.set_content_available(True)
+    panel.set_expanded(True)
+    panel.waveform.set_audio(audio, 48000)
+    panel.play_btn.setEnabled(True)
+    panel.waveform.set_cursor(4000)
+    panel.waveform.zoom_in()
+    view = panel.waveform._view_start, panel.waveform._view_end
+    try:
+        panel.play_btn.click()
+        assert window._playback.is_playing
+        positions = []
+        panel.position_clicked.connect(positions.append)
+        QTest.mouseClick(panel.waveform, Qt.LeftButton, pos=panel.waveform.rect().center())
+        assert not window._playback.is_playing
+        assert positions[0] != 4000 and panel.waveform._cursor_sample == positions[0]
+        assert (panel.waveform._view_start, panel.waveform._view_end) == view
+    finally:
+        for stream in streams:
+            stream.active = False
+
+
+@pytest.mark.parametrize("corrected_spectrogram", [False, True], ids=["original-waveform", "corrected-spectrogram"])
+def test_play_and_seek_keep_the_displayed_plot_during_source_validation(
+        app, window, tmp_path, streams, monkeypatch, corrected_spectrogram):
+    from threading import Event
+    from sessionprepgui.waveform import compute
+
+    _open_track(window, tmp_path, "Seek.wav")
+    _wait(app, window)
+    panel, waveform = window._wf_panel, window._waveform
+    panel.set_expanded(True)
+    if corrected_spectrogram:
+        panel.source_selector.buttons[1].click()
+        panel.spec_action.trigger()
+        _wait(app, window)
+    waveform.zoom_in()
+    QTest.qWait(200)
+    waveform.grab()
+    background = waveform._bg_pixmap
+    view = waveform._view_start, waveform._view_end
+    assert background is not None
+    # Sample the signal away from the playhead, its readout and the mouse guides.
+    signal_area = QRect(waveform.width() // 4, waveform.height() // 6,
+                        waveform.width() // 6, waveform.height() // 6)
+    signal_image = waveform.grab(signal_area).toImage()
+    validated, resume = Event(), Event()
+    validate = compute.source_for_render
+
+    def delayed_validation(track):
+        validated.set()
+        assert resume.wait(5)
+        return validate(track)
+
+    monkeypatch.setattr(compute, "source_for_render", delayed_validation)
+    try:
+        panel.play_btn.click()
+        assert validated.wait(2)
+        assert not waveform._loading
+        assert waveform._bg_pixmap is background
+        assert waveform.grab(signal_area).toImage() == signal_image
+        resume.set()
+        _wait(app, window)
+        assert window._playback.is_playing
+        assert waveform._bg_pixmap is background
+        validated.clear()
+        resume.clear()
+        point = waveform.rect().center()
+        QTest.mouseClick(waveform, Qt.LeftButton, pos=point)
+        assert validated.wait(2)
+        assert not waveform._loading
+        # A second click during the file check supersedes the first seek.
+        QTest.mouseClick(waveform, Qt.LeftButton, pos=point + QPoint(18, 0))
+        target = waveform._cursor_sample
+        waveform.grab()
+        assert waveform._bg_pixmap is background
+        assert waveform.grab(signal_area).toImage() == signal_image
+        resume.set()
+        _wait(app, window)
+        assert window._playback.play_start_sample == target
+        assert waveform._bg_pixmap is background
+        assert (waveform._view_start, waveform._view_end) == view
+    finally:
+        resume.set()
+        _wait(app, window)
+        for stream in streams:
+            stream.active = False
+
+
+@pytest.mark.parametrize("shortcut", [False, True], ids=["stop-button", "space"])
+def test_pending_seek_can_be_stopped_during_file_validation(app, window, tmp_path, streams, monkeypatch, shortcut):
+    from threading import Event
+    from sessionprepgui.waveform import compute
+
+    _open_track(window, tmp_path, "CancelSeek.wav")
+    _wait(app, window)
+    panel = window._wf_panel
+    panel.set_expanded(True)
+    panel.play_btn.click()
+    _wait(app, window)
+    assert window._playback.is_playing
+    validate = compute.source_for_render
+    resume = Event()
+
+    def delayed_validation(track):
+        assert resume.wait(5)
+        return validate(track)
+
+    monkeypatch.setattr(compute, "source_for_render", delayed_validation)
+    try:
+        QTest.mouseClick(panel.waveform, Qt.LeftButton, pos=panel.waveform.rect().center())
+        assert window._repair_preview.pending_play is not None
+        assert panel.stop_btn.isEnabled() and not panel.play_btn.isEnabled()
+        if shortcut:
+            window._space_shortcut.activated.emit()
+        else:
+            panel.stop_btn.click()
+        assert window._repair_preview.pending_play is None
+        resume.set()
+        _wait(app, window)
+        assert not window._playback.is_playing
+        assert panel.play_btn.isEnabled() and not panel.stop_btn.isEnabled()
+    finally:
+        resume.set()
+        _wait(app, window)
+        for stream in streams:
+            stream.active = False
 
 
 def test_playing_source_switch_does_not_wait_for_waveform_computation(app, window, tmp_path, streams, monkeypatch):
@@ -222,6 +389,36 @@ def test_wide_and_overflow_select_the_same_audition_source(app):
         assert not editor.buttons[1].toolTip()
         QTest.keyClick(editor.buttons[1], Qt.Key_Left)
         assert not panel.corrected and control.buttons[0].isChecked()
+    finally:
+        panel.close()
+
+
+def test_repeated_source_switches_in_overflow_keep_spectrogram_actions_for_next_track(app):
+    panel = WaveformPanel()
+    panel.set_audition_available(True)
+    panel.resize(400, 230)
+    panel.show()
+    try:
+        panel.spec_action.trigger()
+        panel.band_actions["low"].trigger()
+        app.processEvents()
+        row = panel._view_toolbar
+        settings = panel.spec_settings_btn.menu().menuAction()
+        for corrected in (True, False, True):
+            row._fill_menu()
+            assert settings in row.more_menu.actions()
+            assert panel.band_actions["low"] in row.more_menu.actions()
+            audition = next(a for a in row.more_menu.actions() if a.text() == "Audition source")
+            selector = audition.defaultWidget().findChild(AuditionSourceSelector)
+            selector.buttons[int(corrected)].click()
+            assert panel.corrected == corrected
+        # Loading another track updates the same range actions with its Nyquist limit.
+        panel.set_inspection_rate(32000)
+        assert not panel.band_actions["high"].isEnabled()
+        panel.set_inspection_rate(96000)
+        row._fill_menu()
+        panel.band_actions["high"].trigger()
+        assert panel.inspection_band == "high" and settings.menu() is panel.spec_settings_btn.menu()
     finally:
         panel.close()
 

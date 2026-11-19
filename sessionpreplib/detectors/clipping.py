@@ -3,7 +3,7 @@ from __future__ import annotations
 from ..models import ParamSpec
 from ..detector import TrackDetector
 from ..models import DetectorResult, IssueLocation, Severity, TrackContext
-from ..audio import detect_clipping_ranges, is_silent
+from ..audio import clipping_evidence, is_silent
 
 
 class ClippingDetector(TrackDetector):
@@ -56,10 +56,11 @@ class ClippingDetector(TrackDetector):
                 detector_id=self.id,
                 severity=Severity.CLEAN,
                 summary="silent track",
+                applicable=False,
                 data={"is_clipped": False, "runs": 0, "ranges": []},
             )
 
-        runs, ranges = detect_clipping_ranges(
+        runs, ranges, channels = clipping_evidence(
             track.audio_data, self.consecutive, self.max_ranges
         )
 
@@ -88,7 +89,7 @@ class ClippingDetector(TrackDetector):
             detector_id=self.id,
             severity=Severity.PROBLEM,
             summary=f"clipping detected ({runs} clipped ranges)",
-            data={"is_clipped": True, "runs": runs, "ranges": ranges},
+            data={"is_clipped": True, "runs": runs, "ranges": ranges, "affected_channels": channels},
             detail_lines=detail,
             hint="request reprint / check limiting",
             issues=issues,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections import Counter
+from dataclasses import replace
 from typing import Any
 
 import numpy as np
@@ -13,6 +14,7 @@ from .models import (
     TrackContext,
 )
 from .audio import dbfs_offset, format_duration, linear_to_db
+from .repair_verification import remaining_results
 
 
 # --------------------------------------------------------------------------
@@ -23,6 +25,8 @@ def build_diagnostic_summary(
     session: SessionContext,
     track_detectors: list | None = None,
     session_detectors: list | None = None,
+    *,
+    remaining: bool = False,
 ) -> dict[str, Any]:
     """
     Aggregate detector results into the four-category summary.
@@ -40,6 +44,18 @@ def build_diagnostic_summary(
     }
     """
     ok_tracks = [t for t in session.tracks if t.status == "OK"]
+    pending_tracks = set()
+    failed_tracks = set()
+    if remaining:
+        detectors = track_detectors if track_detectors is not None else session.detectors
+        for t in ok_tracks:
+            snapshot = t.corrected_analysis
+            if t._cache.get("repair_error") or (snapshot and any(r.error for r in snapshot.results.values())):
+                failed_tracks.add(t.filename)
+            elif t._cache.get("repair_verification_pending") or (t.repair_recipe.active and snapshot is None):
+                pending_tracks.add(t.filename)
+        ok_tracks = [replace(t, detector_results=remaining_results(t, detectors, pending=t.filename in pending_tracks))
+                     for t in ok_tracks]
     total_ok = len(ok_tracks)
     _off = dbfs_offset(session.config)
 
@@ -226,7 +242,7 @@ def build_diagnostic_summary(
     ultrasonic_items = []
     tail_items = []
 
-    issue_names = set(mismatch_names) | set(length_mismatch_names)
+    issue_names = set(mismatch_names) | set(length_mismatch_names) | pending_tracks | failed_tracks
 
     for t in ok_tracks:
         # Clipping
@@ -257,7 +273,8 @@ def build_diagnostic_summary(
         # Stereo compatibility (correlation + mono folddown, unified detector)
         if not _is_skipped("stereo_compat"):
             sc_r = t.detector_results.get("stereo_compat")
-            if sc_r and (sc_r.data.get("corr_warn") or sc_r.data.get("mono_warn")):
+            if sc_r and (sc_r.data.get("corr_warn") or sc_r.data.get("mono_warn")
+                         or sc_r.data.get("windowed_regions")):
                 parts = []
                 lr_corr = sc_r.data.get("lr_corr")
                 corr_warn_val = session.config.get("corr_warn", -0.3)
@@ -278,10 +295,17 @@ def build_diagnostic_summary(
                     else:
                         parts.append(
                             f"mono loss inf dB (> {float(mono_warn_val):g} dB)")
+                region_count = len(sc_r.data.get("windowed_regions", []))
+                if region_count:
+                    minimum = sc_r.data.get("min_window_corr")
+                    if remaining and minimum is not None:
+                        parts.append(f"minimum correlation {minimum:.2f}")
+                    parts.append(f"{region_count} marked {'location' if region_count == 1 else 'locations'}")
                 if parts:
                     add_item(
                         stereo_compat_items, t.filename,
-                        f'' + ', '.join(parts))
+                        ', '.join(parts))
+                    issue_names.add(t.filename)
 
         # Dual mono
         if not _is_skipped("dual_mono"):
@@ -290,6 +314,8 @@ def build_diagnostic_summary(
                 add_item(
                     dual_mono_items, t.filename,
                     f'dual-mono (identical L/R)')
+                if remaining:
+                    issue_names.add(t.filename)
 
         # Silent
         if not _is_skipped("silence"):
@@ -384,21 +410,33 @@ def build_diagnostic_summary(
         ("tail_exceedance",   "Tail regions exceeded anchor",
          "check for section-based riding", tail_items),
     ]
+    tracks_by_name = {t.filename: t for t in ok_tracks}
+    if remaining:
+        standard_ids = {group[0] for group in _det_groups}
+        for det in detectors:
+            if det.id in standard_ids or not hasattr(det, "is_relevant") or _is_skipped(det.id):
+                continue
+            extra = []
+            for t in ok_tracks:
+                result = t.detector_results.get(det.id)
+                if (result and result.applicable and not result.error and result.severity != Severity.CLEAN
+                        and det.is_relevant(result, t)):
+                    add_item(extra, t.filename, result.summary)
+                    issue_names.add(t.filename)
+            _det_groups.append((det.id, det.name, None, extra))
+
     for det_id, title, hint, items in _det_groups:
         if not items:
             continue
 
-        # Find actual severity emitted by this detector
-        actual_sev = Severity.INFO
-        for t in ok_tracks:
-            dr = t.detector_results.get(det_id)
-            if dr and dr.severity != Severity.CLEAN:
-                actual_sev = dr.severity
-                break
-
-        bucket = _routed_bucket(det_id, actual_sev)
-        if bucket is not None:
-            add_group(bucket, title, hint, items, detector_id=det_id)
+        severity_items = {}
+        for ref in item_refs[id(items)]:
+            result = tracks_by_name[ref["filename"]].detector_results[det_id]
+            severity = _det_map[det_id].effective_severity(result) if det_id in _det_map else result.severity
+            if severity is not None and severity != Severity.CLEAN:
+                add_item(severity_items.setdefault(severity, []), ref["filename"], ref["detail"])
+        for severity, listed in severity_items.items():
+            add_group(_buckets[severity.value], title, hint, listed, detector_id=det_id)
 
     # Grouping overlaps
     grouping_items = []
@@ -481,6 +519,7 @@ def build_diagnostic_summary(
         "clean_count": int(clean_count),
         "total_ok": int(total_ok),
         "overview": overview,
+        **({"verification_pending": sorted(pending_tracks), "verification_failed": sorted(failed_tracks)} if remaining else {}),
     }
 
 

@@ -4,15 +4,21 @@ from __future__ import annotations
 
 import inspect
 import logging
+from dataclasses import replace
 from numbers import Integral
 from urllib.parse import quote
 from ..icons import icon_path
 
 from sessionpreplib.chunks import read_chunks, STANDARD_CHUNKS, detect_origin
-from sessionpreplib.models import DetectorResult, Severity
+from sessionpreplib.detector import TrackDetector
+from sessionpreplib.repair_verification import CheckOutcome, audition_results, detector_check, original_report_track, separate_rumble_finding
+from .repair_options import track_repair_options
 from ..theme import COLORS, FILE_COLOR_TRANSIENT, FILE_COLOR_SUSTAINED
 from ..helpers import esc
 from .report_style import REPORT_SECTION_HEADING, REPORT_SECTION_SIZE, REPORT_TITLE_SIZE
+from .verification import (
+    compact_measurements, comparison_readings, measurement_note, measurement_table, verification_status,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -38,12 +44,12 @@ def _guidance(hint):
 
 
 def _location_text(result):
-    ranges = [(i.sample_start, i.sample_end) for i in result.issues]
+    ranges = [(i.sample_start, i.sample_end, i.channel) for i in result.issues]
     if not ranges:
-        ranges = [r[:2] for r in (result.data.get("ranges") or [])
+        ranges = [(r[0], r[1], r[2] if len(r) > 2 else None) for r in (result.data.get("ranges") or [])
                   if isinstance(r, (tuple, list)) and len(r) >= 2]
     valid = []
-    for start, end in ranges:
+    for start, end, channel in ranges:
         try:
             start = int(start)
             end = start if end is None else int(end)
@@ -51,8 +57,9 @@ def _location_text(result):
             continue
         if 0 <= start <= end:
             value = f"Samples {start}\u2013{end}" if end != start else f"Sample {start}"
-            if value not in valid:
-                valid.append(value)
+            if isinstance(channel, Integral):
+                value += f" · Ch {channel + 1}"
+            valid.append(value)
     if not valid:
         return "\u2014", ""
     return (valid[0] if len(valid) == 1 else f"{len(valid)} locations",
@@ -66,10 +73,11 @@ def _signed(value):
 
 
 def _location_html(location):
-    """Escape a location and keep its sample range on one line."""
+    """Keep the sample numbers together while allowing the channel label to wrap."""
     for prefix in ("Samples ", "Sample "):
         if location.startswith(prefix):
-            return esc(prefix) + "<nobr>" + esc(location[len(prefix):]) + "</nobr>"
+            samples, separator, channel = location[len(prefix):].partition(" · ")
+            return f"{prefix}<nobr>{esc(samples)}</nobr>{esc(separator + channel)}"
     return esc(location)
 
 
@@ -83,11 +91,11 @@ def _link(scheme, key, label, title=""):
             f'style="color:{COLORS["information"]}; text-decoration:none;">{label}</a>')
 
 
-def _table_header(labels, widths):
+def _table_header(labels, widths, *, table_width="100%"):
     cells = [_finding_cell(esc(label), width, header=True, index=i, columns=len(widths))
              for i, (label, width) in enumerate(zip(labels, widths))]
     # Qt drops a heading's bottom margin before a table; the table carries it.
-    return ('<table width="100%" cellpadding="0" cellspacing="0" '
+    return (f'<table width="{table_width}" cellpadding="0" cellspacing="0" '
             'style="margin-top:8px; border-collapse:collapse;">'
             '<tr>' + "".join(cells) + '</tr>')
 
@@ -109,6 +117,9 @@ def render_summary_html(summary, *, show_faders=True, show_clean=True, session=N
     parts.append(f'<p style="color:{COLORS["metadata"]}; margin-top:0; margin-bottom:8px;">'
                  f'Attention {counts["attention"]} &middot; Information {counts["information"]}</p>')
     tracks = {t.filename: t for t in session.tracks} if session else {}
+    for key, label in (("verification_pending", "Checking repaired audio"), ("verification_failed", "Unable to verify")):
+        if names := summary.get(key):
+            parts.append(f'<p style="color:{COLORS["attention"]};">{label} · {esc(", ".join(names))}</p>')
     widths = ("22.13%", "22.72%", "42.62%", "12.53%")
     findings_anchor = '<a name="report-findings"></a>'
     for category in categories:
@@ -136,7 +147,8 @@ def render_summary_html(summary, *, show_faders=True, show_clean=True, session=N
                 filename = ref.get("filename") if ref else None
                 detail = ref.get("detail", "") if ref else (items[index] if items else "\u2014")
                 track = tracks.get(filename)
-                result = track.detector_results.get(group.get("detector_id")) if track else None
+                result = (detector_check(track, "clipping", pending=bool(track._cache.get("repair_verification_pending"))).remaining_result
+                          if track and group.get("detector_id") == "clipping" else None)
                 if result is not None and group.get("detector_id") == "clipping":
                     runs = result.data.get("runs")
                     if isinstance(runs, int):
@@ -189,21 +201,21 @@ def _finding_line(body, height):
             f'<td valign="middle">{body}</td></tr></table>')
 
 
-def _finding_cell(body, width, *, header=False, active=False, index=0, columns=1):
+def _finding_cell(body, width, *, header=False, active=False, index=0, columns=1, expanded=False, valign="top"):
     size = f' width="{width}"' if width is not None else ""
     background = COLORS["surface"] if header or active else COLORS["bg"]
     padding = 4
     left = 12 if index == 0 else 6
     right = 12 if index == columns - 1 else 6
-    return (f'<td{size} valign="top" style="padding:{padding}px {right}px {padding}px {left}px;'
-            f' border-bottom:1px solid {COLORS["accent"]};'
+    rule = "" if expanded else f' border-bottom:1px solid {COLORS["accent"]};'
+    return (f'<td{size} valign="{valign}" style="padding:{padding}px {right}px {padding}px {left}px;{rule}'
             f' background-color:{background}; color:{COLORS["text"]};">'
             f'{body}</td>')
 
 
 def visualizable_issues(result, track):
     """Return existing locations that can safely be shown in this waveform."""
-    if result is None or result.error or track.total_samples <= 0 or track.channels <= 0:
+    if result is None or result.error or not result.applicable or track.total_samples <= 0 or track.channels <= 0:
         return []
     valid = []
     for issue in result.issues or []:
@@ -222,15 +234,13 @@ def visualizable_issues(result, track):
     return valid
 
 
-def _finding_actions(row, compact, *, narrow=False):
+def _finding_actions(row, compact):
     links = []
-    repair = ""
-    if row.get("review_repair"):
-        repair = _link("report-repair", row["id"], "<nobr>Review repair</nobr>",
-                       "Review corrective processing for this track")
-        if not narrow:
-            links.append((100, repair))
-    if row.get("visualize_labels"):
+    if row.get("retry"):
+        links.append((48, _link("report-retry", row["id"], "Retry")))
+    if source := row.get("location_source"):
+        links.append((144, _link(f"report-{source}", row["id"], f"Show {source} locations")))
+    elif row.get("visualize_labels"):
         links.append((80, _link("report-visualize", row["id"], "<nobr>Visualize</nobr>",
                                 "Show only this detector's locations and fit the whole file")))
     if row["help"]:
@@ -244,18 +254,55 @@ def _finding_actions(row, compact, *, narrow=False):
         cells = [f'<td height="32" width="{width}" align="center" valign="middle">'
                  f'{link}</td>' for width, link in links]
         body = "<tr>" + '<td width="8"></td>'.join(cells) + "</tr>"
-    result = '<table cellpadding="0" cellspacing="0">' + body + "</table>" if links else ""
-    return _finding_line(repair, 32) + result if narrow and repair else result
+    return '<table cellpadding="0" cellspacing="0">' + body + "</table>" if links else ""
 
 
-def _render_narrow_findings(rows, expanded, active_help):
+def _repair_action(scheme, key, label, action_size):
+    # A native form action occupies this cell in the interactive browser.
+    # The link also provides the static report and keyboard reading order.
+    size = action_size(scheme, key, label) if action_size else None
+    dimensions = f' width="{size.width()}" height="{size.height()}"' if size else ''
+    link = _link(scheme, key, f"<nobr>{label}</nobr>")
+    return (f'<table{dimensions} cellspacing="0" cellpadding="0"><tr>'
+            f'<td{dimensions} align="center" valign="middle">{link}</td></tr></table>')
+
+
+def _expanded_finding(row, narrow, action_size, *, compact=False):
+    comparison = row.get("comparison")
+    action = (_repair_action("report-repair", row["id"], "Review repair", action_size)
+              if row.get("review_repair") else "")
+    if comparison:
+        if narrow:
+            result = compact_measurements(row.get("compact_readings", comparison), stacked=True)
+        else:
+            result = measurement_table(comparison, action=action if action and not compact else None)
+        result += measurement_note(row.get("comparison_note"), stacked=narrow)
+        result += measurement_note(row.get("repair_attribution"), stacked=narrow)
+        if narrow or compact:
+            result += action
+        return result
+    result = "<b>Result</b> " + esc(row["summary"])
+    if action:
+        if narrow:
+            result += action
+        else:
+            result = (f'<table width="100%" cellspacing="0" cellpadding="0"><tr><td valign="middle">{result}</td>'
+                      f'<td align="right">{action}</td></tr></table>')
+    parts = [result, measurement_note(row.get("repair_attribution"), stacked=narrow)]
+    if row["locations"]:
+        parts.append("<div>" + "; ".join(_location_html(item) for item in row["locations"].split("; ")) + "</div>")
+    parts.append('<table cellpadding="3" cellspacing="0">' + row["fragment"] + "</table>")
+    return "".join(parts)
+
+
+def _render_narrow_findings(rows, expanded, active_help, action_size):
     """One stacked column: severity, title band, location and next step, actions."""
     parts = ['<table width="100%" cellpadding="0" cellspacing="0"'
              ' style="margin-top:8px; border-collapse:collapse;">']
     for row in rows:
         key = row["id"]
         token = quote(key, safe="")
-        color, label = _severity_meta(row["severity"])
+        color, label = _row_status(row)
         arrow = _image("chevron-down" if key in expanded else "chevron-right")
         title = _link("report-details", key, f'{arrow}&nbsp;&nbsp; <b>{esc(row["title"])}</b>',
                       "Toggle detector details")
@@ -275,25 +322,25 @@ def _render_narrow_findings(rows, expanded, active_help):
         if details:
             lines.append(f'<tr><td style="padding-left:24px; color:{COLORS["metadata"]};">'
                          + "<br>".join(details) + '</td></tr>')
-        actions = _finding_actions(row, False, narrow=True)
+        actions = _finding_actions(row, bool(row.get("comparison")))
         if actions:
             lines.append(f'<tr><td style="padding:6px 0;">{actions}</td></tr>')
         body = ('<table width="100%" cellpadding="0" cellspacing="0">'
                 + "".join(lines) + '</table>')
         active = key == active_help and color != COLORS["problems"]
-        parts.append("<tr>" + _finding_cell(body, None, active=active) + "</tr>")
+        compared = bool(row.get("comparison") and key in expanded)
+        parts.append("<tr>" + _finding_cell(body, None, active=active, expanded=compared) + "</tr>")
         if key in expanded:
-            parts.append('<tr><td style="padding:4px 12px 4px 36px;">'
-                         '<b>Result</b> ' + esc(row["summary"]) +
-                         ('<br>' + esc(row["locations"]) if row["locations"] else "") +
-                         '<table cellpadding="3" cellspacing="0">' + row["fragment"] +
-                         '</table></td></tr>')
+            padding = "4px 4px 4px 8px" if row.get("comparison") else "4px 12px 4px 36px"
+            rule = f' border-bottom:1px solid {COLORS["border"]};' if compared else ""
+            parts.append(f'<tr><td style="padding:{padding};{rule}">'
+                         + _expanded_finding(row, True, action_size) + '</td></tr>')
     parts.append("</table>")
     return parts
 
 
 def render_prepared_track_report(data, *, expanded=(), compact=False, narrow=False,
-                                 active_help=None):
+                                 active_help=None, action_size=None):
     """Render cached data with severity-leading rows; Help lives in its own pane.
 
     ``narrow`` (below the compact layout) stacks each finding in one column.
@@ -304,28 +351,45 @@ def render_prepared_track_report(data, *, expanded=(), compact=False, narrow=Fal
         header = data.get("header_compact", data["header"])
     else:
         header = data["header"]
-    parts = [header,
-             '<div>'
-             f'<p style="{REPORT_SECTION_HEADING} color:{COLORS["heading"]};">'
-             '<a name="report-findings"></a>Detector findings</p>']
+    heading = (f'<p style="{REPORT_SECTION_HEADING} color:{COLORS["heading"]};">'
+               '<a name="report-findings"></a>Detector findings</p>')
+    # Stack the heading action when Help leaves only a narrow reading column.
+    heading_row = f'<td valign="middle">{heading}</td>'
+    if data.get("can_review_repairs"):
+        if narrow:
+            heading_row += '</tr><tr>'
+        side = "left" if narrow else "right"
+        action = _repair_action("report-repairs", "track", "Track repairs…", action_size)
+        heading_row += f'<td align="{side}">{action}</td>'
+    parts = [header, '<div><table width="100%" cellspacing="0" cellpadding="0" style="margin-top:16px;"><tr>'
+             + heading_row + '</tr></table>']
+    if failure := data.get("source_failure"):
+        parts.append(f'<p style="color:{COLORS["attention"]};">Unable to verify · {esc(failure)} &nbsp; '
+                     + _link("report-retry", "track", "Retry") + "</p>")
     rows = data["rows"]
     if not rows:
         parts.append(f'<p style="color:{COLORS["metadata"]};">No findings to show.</p></div>')
         return "\n".join(parts)
     if narrow:
-        parts.extend(_render_narrow_findings(rows, expanded, active_help))
+        parts.extend(_render_narrow_findings(rows, expanded, active_help, action_size))
         parts.append("</div>")
         return "\n".join(parts)
-    repair_links = any(row.get("review_repair") for row in rows)
-    widths = (("100", None, "100" if repair_links else "80") if compact else
-              ("100", None, "96", "216", "244" if repair_links else "136"))
-    labels = (("Severity", "Finding, location and next step", "Actions") if compact
-              else ("Severity", "Finding", "Location", "Next step", "Actions"))
-    parts.append(_table_header(labels, widths))
+    paired = any("comparison" in row for row in rows)
+    status = "Status" if paired else "Severity"
+    width = "146" if paired else "100"
+    widths = ((width, None, "100" if paired else "80") if compact else
+              (width, None, "96", "216", "176" if paired else "136"))
+    if paired and not compact:
+        widths = ("17.5%", "23.5%", "14%", "20%", "25%")
+    labels = ((status, "Finding, location and next step", "Actions") if compact
+              else (status, "Finding", "Location", "Next step", "Actions"))
+    # QTextDocument rounds the percentage columns independently. At 100%
+    # the table can exceed its viewport by one pixel at ordinary pane widths.
+    parts.append(_table_header(labels, widths, table_width="99.9%" if paired and not compact else "100%"))
     for row in rows:
         key = row["id"]
         token = quote(key, safe="")
-        color, label = _severity_meta(row["severity"])
+        color, label = _row_status(row)
         arrow = _image("chevron-down" if key in expanded else "chevron-right")
         title = _link("report-details", key, f'{arrow}&nbsp;&nbsp; <b>{esc(row["title"])}</b>',
                       "Toggle detector details")
@@ -338,19 +402,28 @@ def render_prepared_track_report(data, *, expanded=(), compact=False, narrow=Fal
                         f'<span style="color:{COLORS["text"]};">{esc(row["hint"])}</span></p>')
         severity = _finding_line(f'<span style="color:{color};">{label}</span>', 32)
         actions = _finding_actions(row, compact)
+        location = _location_html(row["location"])
+        count_in_cell = not compact and row["location"].endswith((" location", " locations"))
+        location = f"<nobr>{location}</nobr>" if count_in_cell else _finding_line(location, 32)
         values = ((severity, finding, actions) if compact else
-                  (severity, finding, _finding_line(_location_html(row["location"]), 32),
-                   _finding_line(esc(row["hint"]), 32), actions))
+                  (severity, finding, location, _finding_line(esc(row["hint"]), 32), actions))
+        compared = bool(row.get("comparison") and key in expanded)
         parts.append("<tr>" + "".join(
             _finding_cell(value, width, active=key == active_help and color != COLORS["problems"],
-                          index=i, columns=len(widths))
+                          index=i, columns=len(widths), expanded=compared,
+                          valign="middle" if count_in_cell and i == 2 else "top")
             for i, (value, width) in enumerate(zip(values, widths))) + "</tr>")
-        if key in expanded:
+        if compared:
+            rule = f'border-bottom:1px solid {COLORS["border"]};'
+            # Start under the finding text beside its disclosure. Compact rows
+            # give the table the full line once the status and actions stack.
+            lead = "" if compact else f'<td style="{rule}"></td>'
+            span = len(widths) if compact else len(widths) - 1
+            parts.append(f'<tr>{lead}<td colspan="{span}" style="padding:8px 12px 12px 30px; {rule}">'
+                         + _expanded_finding(row, False, action_size, compact=compact) + '</td></tr>')
+        elif key in expanded:
             parts.append(f'<tr><td colspan="{len(widths)}" style="padding:4px 12px 4px 136px;">'
-                         '<b>Result</b> ' + esc(row["summary"]) +
-                         ('<br>' + esc(row["locations"]) if row["locations"] else "") +
-                         '<table cellpadding="3" cellspacing="0">' + row["fragment"] +
-                         '</table></td></tr>')
+                         + _expanded_finding(row, False, action_size) + '</td></tr>')
     parts.append("</table></div>")
     return "\n".join(parts)
 
@@ -361,19 +434,42 @@ def render_track_detail_html(track, session=None, *, show_clean=True, verbose=Fa
         prepare_track_report(track, session, show_clean=show_clean, verbose=verbose))
 
 
-def _track_findings(track):
+def _track_findings(track, config):
     """Keep the source detector and a qualifying local repair observation distinct."""
-    for key, result in track.detector_results.items():
-        yield key, key, result
-        if key != "subsonic" or result.error or result.data.get("subsonic_warn"):
-            continue
-        measures = track.repair_measurements
-        regions = measures.get("low_band", {}).get("regions", [])
-        if measures.get("suggested", {}).get("low_cut") and regions:
-            count = len(regions)
-            summary = f"Sustained infrasonic energy in {count} local {'region' if count == 1 else 'regions'}"
-            local = DetectorResult(key, Severity.INFO, summary, {"ranges": regions}, hint="review rumble")
-            yield "subsonic-local", key, local
+    signals = audition_results(track, corrected=True, pending=bool(track._cache.get("repair_verification_pending")))
+    for key in dict.fromkeys((*track.detector_results, *signals)):
+        result = track.detector_results.get(key) or signals[key]
+        yield key, key, result, None
+    local = separate_rumble_finding(track, config)
+    if local:
+        evidence = local.corrected if local.corrected and local.corrected.issues else local.original
+        yield "subsonic-local", "subsonic", evidence, local
+
+
+def _row_status(row):
+    outcome = row.get("outcome")
+    special = verification_status(outcome)
+    if special:
+        label, color = special
+        return color, label
+    color, label = _severity_meta(row["severity"])
+    if outcome == CheckOutcome.NEW:
+        label += " · New after repair"
+    return color, label
+
+
+def select_report_source(data, corrected):
+    """Select cached row evidence without rereading the file or recomputing detectors."""
+    for row in data["rows"]:
+        if "source_labels" in row:
+            original, repaired = row["source_labels"]
+            row["visualize_labels"] = repaired if corrected else original
+            row["location_source"] = None
+            if not row["visualize_labels"]:
+                if corrected and original and row.get("outcome") == CheckOutcome.RESOLVED:
+                    row["location_source"] = "original"
+                elif not corrected and repaired and row.get("outcome") == CheckOutcome.NEW:
+                    row["location_source"] = "corrected"
 
 
 # ---------------------------------------------------------------------------
@@ -463,6 +559,7 @@ def prepare_track_report(track, session=None, *, show_clean: bool = True,
     """
     parts = []
     rows = []
+    repairs = track_repair_options(track, session) if track.status == "OK" else None
     parts.append(f'<div style="color:{COLORS["heading"]}; font-size:{REPORT_TITLE_SIZE}; font-weight:600;">'
                  f'{esc(track.filename)}</div>')
 
@@ -547,30 +644,47 @@ def prepare_track_report(track, session=None, *, show_clean: bool = True,
                 )
 
         severity_order = {"problem": 0, "attention": 1, "information": 2, "info": 2, "clean": 3}
-        for row_id, det_id, result in _track_findings(track):
-            is_local = row_id != det_id
+        pending = bool(track._cache.get("repair_verification_pending"))
+        config = session.config if session else {}
+        original_track = original_report_track(track, session)
+        for row_id, det_id, result, local_check in _track_findings(track, config):
+            is_local = local_check is not None
             detector = det_map.get(det_id)
+            check = None
+            paired = (track.repair_recipe.active or pending or track._cache.get("repair_error"))
+            if paired and not is_local and (isinstance(detector, TrackDetector)
+                    or (track.corrected_analysis and det_id in track.corrected_analysis.results)):
+                if not config.get(f"{det_id}_enabled", True) or getattr(detector, "_report_as", "") == "skip":
+                    continue
+                check = detector_check(track, det_id, pending=pending)
+                is_relevant = getattr(detector, "is_relevant", None)
+                if check.corrected is not None and is_relevant and not is_relevant(check.corrected, track):
+                    if check.original is None or not is_relevant(check.original, original_track):
+                        continue
+                    # The original finding remains readable if the repaired signal uses a
+                    # normalization method to which this diagnostic does not apply.
+                    check = replace(check, outcome=CheckOutcome.INAPPLICABLE, corrected=replace(
+                        check.corrected, applicable=False, summary="Inactive for this normalization method"))
+                if check.outcome in {CheckOutcome.NEW, CheckOutcome.REMAINING}:
+                    result = check.corrected
             severity = (detector.effective_severity(result)
                         if detector and hasattr(detector, "effective_severity")
                         else result.severity)
             if severity is None:
                 continue
             severity = getattr(severity, "value", str(severity))
-            if not show_clean and severity == "clean":
+            if not show_clean and severity == "clean" and not (
+                    check and check.corrected and check.corrected.error):
                 continue
             if detector:
-                fragment = detector.render_html(result, track)
+                context = (original_track if check and result is check.original else track)
+                fragment = detector.render_html(result, context)
                 if not fragment:
                     continue
             else:
                 fragment = f'<tr><td>{esc(result.summary)}</td></tr>'
             location, locations = _location_text(result)
-            suggested = track.repair_measurements.get("suggested", {})
-            review_repair = not result.error and (
-                (det_id == "dc_offset" and (result.data.get("dc_warn") or suggested.get("dc_remove")))
-                or (det_id == "subsonic" and (result.data.get("subsonic_warn") or is_local))
-                or (det_id == "ultrasonic" and track.samplerate >= 50000
-                    and (result.data.get("regions") or suggested.get("ultrasonic"))))
+            repair_target = repairs.targets.get(row_id)
             if det_id == "dc_offset" and result.data.get("dc_warn"):
                 location = "Whole track"
             runs = result.data.get("runs")
@@ -579,19 +693,59 @@ def prepare_track_report(track, session=None, *, show_clean: bool = True,
             if callable(help_html):
                 help_html = help_html()
             title = detector.name if detector else det_id
-            rows.append({
+            row = {
                 "id": row_id, "title": f"{title} · local energy" if is_local else title,
                 "severity": severity, "summary": result.summary, "fragment": fragment,
                 "location": location, "locations": locations, "count": count,
                 "hint": _guidance(result.hint),
-                "review_repair": bool(review_repair),
+                "review_repair": bool(repair_target and not result.error),
+                "repair_attribution": repairs.attribution(row_id),
                 "help": help_html,
                 "visualize_labels": tuple(sorted({issue.label
                     for issue in visualizable_issues(result, track)})),
-            })
-        rows.sort(key=lambda row: (severity_order.get(row["severity"], 99), row["title"].lower()))
+            }
+            if check:
+                row["outcome"] = check.outcome
+                row["retry"] = check.outcome == CheckOutcome.FAILED and not track._cache.get("repair_error")
+                row["source_labels"] = tuple(
+                    tuple(sorted({i.label for i in visualizable_issues(r, track)})) for r in (check.original, check.corrected))
+                readings, note, counts, partial = comparison_readings(check, track, config)
+                row["comparison"] = [entry for entry in readings if not counts or entry[0] != "Locations"]
+                row["comparison_note"] = note
+                if det_id == "subsonic" and check.original and check.corrected:
+                    # At the 400 px minimum group each energy value with its channel count.
+                    _, left, right = readings[0]
+                    compact = []
+                    for r, value in ((check.original, left), (check.corrected, right)):
+                        if r.applicable and not r.error and "per_channel" in r.data:
+                            names = [int(i) for i, data in r.data["per_channel"].items() if data.get("warn")]
+                            if len(names) == 1 and track.channels == 2:
+                                value += " · " + ("Left", "Right")[names[0]]
+                            else:
+                                value += f" · {len(names)} channels"
+                        compact.append(value)
+                    row["compact_readings"] = [(readings[0][0], *compact)]
+                if counts:
+                    row["location"], row["count"] = counts, ""
+                if check.outcome == CheckOutcome.RESOLVED:
+                    row["hint"] = ""
+                elif partial:
+                    row["hint"] = partial
+                elif check.outcome == CheckOutcome.FAILED:
+                    row["hint"] = check.corrected.error if check.corrected else ""
+            elif is_local:
+                row["outcome"] = local_check.outcome
+                before, after = local_check.original, local_check.corrected
+                row["source_labels"] = tuple(tuple(sorted({i.label for i in visualizable_issues(r, track)}))
+                                             for r in (before, after))
+            rows.append(row)
+        rows.sort(key=lambda row: (row.get("outcome") == CheckOutcome.RESOLVED,
+                                   severity_order.get(row["severity"], 99), row["title"].lower()))
     wide = [p if isinstance(p, str) else p[0] for p in parts]
     compact = [p if isinstance(p, str) else p[1] for p in parts]
     narrow = [p if isinstance(p, str) else p[2] for p in parts]
-    return {"header": "\n".join(wide), "header_compact": "\n".join(compact),
-            "header_narrow": "\n".join(narrow), "rows": rows}
+    data = {"header": "\n".join(wide), "header_compact": "\n".join(compact),
+            "header_narrow": "\n".join(narrow), "rows": rows, "can_review_repairs": bool(repairs and repairs.available),
+            "source_failure": track._cache.get("repair_error")}
+    select_report_source(data, False)
+    return data

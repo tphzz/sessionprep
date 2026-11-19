@@ -14,11 +14,15 @@ maps version N → a callable that upgrades a raw dict from version N to N+1.
 from __future__ import annotations
 
 import json
+import math
 import os
+from copy import deepcopy
 from dataclasses import asdict
 from typing import Any, Callable
 
+from sessionpreplib.audio import file_revision
 from sessionpreplib.models import (
+    CorrectedAnalysis,
     DetectorResult,
     IssueLocation,
     ProcessorResult,
@@ -123,29 +127,69 @@ def _deser_issue(d: dict) -> IssueLocation:
 
 
 def _ser_detector_result(r: DetectorResult) -> dict:
-    return {
+    nonfinite = []
+    result = {
         "detector_id": r.detector_id,
         "severity": r.severity.value,
         "summary": r.summary,
         "detail_lines": r.detail_lines,
         "hint": r.hint,
         "error": r.error,
-        "data": _make_json_safe(r.data),
+        "data": _make_json_safe(r.data, nonfinite),
         "issues": [_ser_issue(i) for i in r.issues],
     }
+    if nonfinite:
+        result["nonfinite"] = nonfinite
+    if not r.applicable:
+        result["applicable"] = False
+    return result
 
 
 def _deser_detector_result(d: dict) -> DetectorResult:
+    data = deepcopy(d.get("data", {}))
+    for path, value in d.get("nonfinite", []):
+        parent = data
+        for part in path[:-1]:
+            parent = parent[part]
+        parent[path[-1]] = float(value)
+    if d["detector_id"] == "subsonic" and "per_channel" in data:
+        data["per_channel"] = {int(ch): reading for ch, reading in data["per_channel"].items()}
     return DetectorResult(
         detector_id=d["detector_id"],
         severity=Severity(d["severity"]),
         summary=d.get("summary", ""),
-        data=d.get("data", {}),
+        data=data,
         detail_lines=d.get("detail_lines", []),
         hint=d.get("hint"),
         error=d.get("error"),
         issues=[_deser_issue(i) for i in d.get("issues", [])],
+        applicable=d.get("applicable", True),
     )
+
+
+def _read_verified_results(records: dict, track: TrackContext) -> dict[str, DetectorResult]:
+    results = {}
+    for key, entry in records.items():
+        if (entry["detector_id"] != key or not isinstance(entry.get("data"), dict)
+                or not isinstance(entry.get("applicable", True), bool)):
+            raise ValueError("Invalid saved detector evidence")
+        result = _deser_detector_result(entry)
+        for issue in result.issues:
+            start = issue.sample_start
+            end = start if issue.sample_end is None else issue.sample_end
+            channel = issue.channel
+            if (type(start) is not int or type(end) is not int
+                    or not 0 <= start <= end < track.total_samples
+                    or (channel is not None and (type(channel) is not int or not 0 <= channel < track.channels))):
+                raise ValueError("Invalid saved detector location")
+            low, high = issue.freq_min_hz, issue.freq_max_hz
+            for bound in (low, high):
+                if bound is not None and (type(bound) not in (float, int) or not math.isfinite(bound) or bound < 0):
+                    raise ValueError("Invalid saved detector frequency")
+            if low is not None and high is not None and high < low:
+                raise ValueError("Invalid saved detector frequency range")
+        results[key] = result
+    return results
 
 
 def _ser_processor_result(r: ProcessorResult) -> dict:
@@ -170,15 +214,21 @@ def _deser_processor_result(d: dict) -> ProcessorResult:
     )
 
 
-def _make_json_safe(obj: Any) -> Any:
+def _make_json_safe(obj: Any, nonfinite: list | None = None, path: tuple = ()) -> Any:
     """Recursively convert non-JSON-serialisable values to safe equivalents."""
     if isinstance(obj, dict):
-        return {k: _make_json_safe(v) for k, v in obj.items()}
+        if nonfinite is None:
+            return {k: _make_json_safe(v) for k, v in obj.items()}
+        return {str(k): _make_json_safe(v, nonfinite, (*path, str(k))) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
-        return [_make_json_safe(v) for v in obj]
+        if nonfinite is None:
+            return [_make_json_safe(v) for v in obj]
+        return [_make_json_safe(v, nonfinite, (*path, i)) for i, v in enumerate(obj)]
     if isinstance(obj, float):
         # Handle inf / nan
-        if obj != obj or obj == float("inf") or obj == float("-inf"):  # pylint: disable=comparison-with-itself
+        if not math.isfinite(obj):
+            if nonfinite is not None:
+                nonfinite.append([list(path), str(obj)])
             return None
         return obj
     if hasattr(obj, "value"):  # Enum
@@ -214,6 +264,21 @@ def _serialize_track(track: TrackContext) -> dict:
         data["repair_overrides"] = dict(track.repair_overrides)
     if track.repair_recipe.active:
         data["repair_recipe"] = asdict(track.repair_recipe)
+    matches_file = track.source_sample_digest is not None and track.detector_sample_digest == track.source_sample_digest
+    if matches_file and track.detector_analysis_key is not None:
+        data["detector_analysis_key"] = track.detector_analysis_key
+    if matches_file:
+        data["detector_sample_digest"] = track.detector_sample_digest
+    if track.source_file_revision is not None:
+        data["source_file_revision"] = track.source_file_revision
+    if matches_file and track.corrected_analysis is not None and track.repair_recipe.active:
+        data["corrected_analysis"] = {
+            "key": track.corrected_analysis.key,
+            "results": {k: _ser_detector_result(v) for k, v in track.corrected_analysis.results.items()},
+        }
+        if track.corrected_analysis.support_results:
+            data["corrected_analysis"]["support_results"] = {
+                k: _ser_detector_result(v) for k, v in track.corrected_analysis.support_results.items()}
     if track.repair_measurements:
         data["repair_measurements"] = _make_json_safe(track.repair_measurements)
     if "repair_error" in track._cache:
@@ -247,6 +312,10 @@ def _deserialize_track(filename: str, filepath: str, d: dict, *, output: bool = 
     track.processor_skip = set(d.get("processor_skip", []))
     track.repair_overrides = dict(d.get("repair_overrides", {}))
     track.repair_recipe = RepairRecipe(**d.get("repair_recipe", {}))
+    track.detector_analysis_key = d.get("detector_analysis_key")
+    track.detector_sample_digest = d.get("detector_sample_digest")
+    track.source_sample_digest = track.detector_sample_digest
+    track.source_file_revision = d.get("source_file_revision")
     track.repair_measurements = d.get("repair_measurements", {})
     if d.get("repair_error"):
         track._cache["repair_error"] = d["repair_error"]
@@ -258,6 +327,28 @@ def _deserialize_track(filename: str, filepath: str, d: dict, *, output: bool = 
         k: _deser_detector_result(v)
         for k, v in d.get("detector_results", {}).items()
     }
+    verified = d.get("corrected_analysis")
+    if verified and track.repair_recipe.active and track.status == "OK":
+        try:
+            stat = os.stat(filepath)
+            if ((stat.st_size, stat.st_mtime_ns) == track.source_file_signature
+                    and track.source_file_revision is not None
+                    and isinstance(verified, dict) and isinstance(verified.get("key"), str)
+                    and isinstance(verified.get("results"), dict)
+                    and isinstance(verified.get("support_results", {}), dict)):
+                snapshot = CorrectedAnalysis(
+                    verified["key"], _read_verified_results(verified["results"], track),
+                    _read_verified_results(verified.get("support_results", {}), track))
+                revision = file_revision(filepath, stat, allow_digest=False)
+                if revision == track.source_file_revision:
+                    track.corrected_analysis = snapshot
+                elif revision is None:
+                    # Network volumes without a change stamp require a file
+                    # digest. The background planner validates it before reuse.
+                    track._cache["unvalidated_corrected_analysis"] = snapshot
+        except (OSError, KeyError, TypeError, ValueError, IndexError, AttributeError):
+            # An unavailable source or unreadable optional comparison needs a fresh check.
+            track.corrected_analysis = None
     track.processor_results = {
         k: _deser_processor_result(v)
         for k, v in d.get("processor_results", {}).items()

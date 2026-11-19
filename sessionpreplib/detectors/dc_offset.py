@@ -52,6 +52,7 @@ class DCOffsetDetector(TrackDetector):
                 detector_id=self.id,
                 severity=Severity.CLEAN,
                 summary="silent track",
+                applicable=False,
                 data={"dc_db": float(-np.inf), "dc_warn": False},
             )
 

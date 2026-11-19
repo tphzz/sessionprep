@@ -13,7 +13,7 @@ import numpy as np
 
 from PySide6.QtCore import QThread, Signal
 
-from sessionpreplib.audio import max_momentary_rms, squared_sample_prefix, validate_analysis_level
+from sessionpreplib.audio import SourceChangedError, max_momentary_rms, squared_sample_prefix, validate_analysis_level
 from sessionpreplib.audition import RepairAudition, inspection_spectrogram
 from sessionpreplib.repair_plan import source_for_render
 from sessionpreplib.spectrum import full_spectrogram, hz_to_mel as _hz_to_mel, mel_to_hz as _mel_to_hz
@@ -135,6 +135,7 @@ class WaveformLoadWorker(QThread):
         self.band = band
         self._cached = cached
         self.source_signature = source_signature
+        self.invalid_source = False
         self._cancelled = threading.Event()
 
     def cancel(self):
@@ -169,9 +170,11 @@ class WaveformLoadWorker(QThread):
                 self._compute()
         except CancelledError:
             pass
-        except FileNotFoundError:
+        except (FileNotFoundError, SourceChangedError) as exc:
+            self.invalid_source = True
             if not self._cancelled.is_set():
-                self.failed.emit("Source file is missing. Restore the source and retry.")
+                self.failed.emit("Source file is missing. Restore the source and retry."
+                                 if isinstance(exc, FileNotFoundError) else str(exc))
         except Exception as exc:
             if not self._cancelled.is_set():
                 log.exception("Waveform preview failed")

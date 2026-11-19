@@ -102,6 +102,7 @@ class TailExceedanceDetector(TrackDetector):
                 detector_id=self.id,
                 severity=Severity.CLEAN,
                 summary="silent track",
+                applicable=False,
                 data=empty_data,
             )
 
@@ -119,6 +120,7 @@ class TailExceedanceDetector(TrackDetector):
                 detector_id=self.id,
                 severity=Severity.CLEAN,
                 summary="tail reporting only for percentile anchoring",
+                applicable=False,
                 data=empty_data,
             )
 
@@ -129,6 +131,7 @@ class TailExceedanceDetector(TrackDetector):
                 detector_id=self.id,
                 severity=Severity.CLEAN,
                 summary="audio_classifier result missing",
+                applicable=False,
                 data=empty_data,
             )
 
@@ -141,6 +144,7 @@ class TailExceedanceDetector(TrackDetector):
                 detector_id=self.id,
                 severity=Severity.CLEAN,
                 summary="anchor is zero",
+                applicable=False,
                 data=empty_data,
             )
 
@@ -233,7 +237,8 @@ class TailExceedanceDetector(TrackDetector):
         issues = [
             IssueLocation(
                 sample_start=r["start_sample"],
-                sample_end=r["end_sample"],
+                # Region durations use an exclusive end. Plot and project issue bounds are inclusive.
+                sample_end=r["end_sample"] - 1,
                 channel=None,
                 severity=Severity.ATTENTION,
                 label="tail_exceedance",

@@ -132,6 +132,7 @@ class SubsonicDetector(TrackDetector):
                 detector_id=self.id,
                 severity=Severity.CLEAN,
                 summary="silent track",
+                applicable=False,
                 data={"subsonic_ratio_db": float(-np.inf), "subsonic_warn": False,
                       "per_channel": {}},
             )

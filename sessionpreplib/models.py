@@ -88,6 +88,16 @@ class DetectorResult:
     hint: str | None = None
     error: str | None = None
     issues: list[IssueLocation] = field(default_factory=list)
+    applicable: bool = True
+
+
+@dataclass(frozen=True)
+class CorrectedAnalysis:
+    """Detector evidence measured on one complete repair at unity gain."""
+
+    key: str
+    results: dict[str, DetectorResult]
+    support_results: dict[str, DetectorResult] = field(default_factory=dict, repr=False)
 
 
 @dataclass
@@ -153,6 +163,11 @@ class TrackContext:
     prepared_fader_db: float | None = None
     prepared_file_signature: tuple[int, int] | None = None
     source_file_signature: tuple[int, int] | None = None
+    detector_analysis_key: str | None = None
+    corrected_analysis: CorrectedAnalysis | None = None
+    source_file_revision: str | None = None
+    detector_sample_digest: str | None = None
+    source_sample_digest: str | None = None
 
 
 @dataclass

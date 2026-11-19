@@ -51,7 +51,7 @@ from .prefs import PreferencesDialog
 from .detail import PlaybackController, DetailMixin
 from .change_marker import install_tab_marker, use_marker_tab_bar
 from .detail.help_panel import FileReportPane
-from .detail.repair_editor import TrackRepairEditor
+from .detail.file_review import FileReviewPane
 from .detail.report_style import wrap_report_html
 from .waveform import WaveformPanel, WaveformLoadWorker
 from .widgets import ProgressPanel
@@ -176,6 +176,7 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
         self._repair_plan_worker = None
         self._repair_plan_pending = set()
         self._repair_plan_anchors = set()
+        self._repair_plan_revalidate = set()
 
         self._batch_manager = BatchManager(self)
         self._close_after_batch = False
@@ -827,15 +828,18 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
         self._file_splitter = content_splitter(Qt.Vertical)
 
         self._file_report = self._make_report_browser()
-        self._repair_editor = TrackRepairEditor(self._file_report)
+        self._file_report_pane = FileReportPane(self._file_report)
+        self._file_review = FileReviewPane(self._file_report_pane, self._file_splitter)
+        self._repair_editor = self._file_review.editor
         self._file_report.repairRequested.connect(lambda key: self._open_track_repairs(self._current_track, key))
         self._repair_editor.choiceChanged.connect(self._set_track_repair_choice)
         self._repair_editor.adjustGainRequested.connect(self._adjust_failed_output_gain)
-        self._repair_editor.processingFocusRequested.connect(self._focus_processing_menu)
+        self._file_review.processingFocusRequested.connect(self._focus_processing_menu)
         self._file_report.visualizeRequested.connect(self._visualize_detector)
+        self._file_report.sourceLocationsRequested.connect(self._show_source_locations)
+        self._file_report.verificationRetryRequested.connect(self._retry_detector_verification)
         self._file_report.reportChanged.connect(self._on_file_report_context_changed)
-        self._file_report_pane = FileReportPane(self._file_report)
-        self._file_splitter.addWidget(self._file_report_pane)
+        self._file_splitter.addWidget(self._file_review)
 
         # Waveform panel (toolbar + waveform + transport)
         self._wf_panel = WaveformPanel(analysis_mode=True)
@@ -1008,7 +1012,7 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
 
     def _apply_config_change_impact(self, impact: ConfigChangeImpact) -> None:
         """Apply a preset switch, including any confirmed reanalysis."""
-        self._refresh_effective_config(impact)
+        self._refresh_effective_config(impact, reanalyzing=impact.requires_phase1 or impact.requires_phase2)
         if impact.requires_phase1:
             self._on_topo_reanalyze()
         elif impact.requires_phase2:
@@ -1016,7 +1020,7 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
         elif not (impact.presentation_keys and self._session):
             self._refresh_config_changed_display()
 
-    def _refresh_effective_config(self, impact: ConfigChangeImpact) -> None:
+    def _refresh_effective_config(self, impact: ConfigChangeImpact, *, reanalyzing=False) -> None:
         """Refresh consumers that can apply settings without reanalysis."""
         if impact.daw_keys:
             self._refresh_daw_processors_from_config()
@@ -1025,8 +1029,15 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
             self._refresh_enabled_processors()
         if impact.requires_phase1 or impact.requires_phase2:
             self._mark_prepare_stale()
-        if impact.repair_keys and self._session and self._phase_tabs.isTabEnabled(_PHASE_ANALYSIS):
-            self._queue_repair_plan(self._session.tracks)
+        if self._session and self._phase_tabs.isTabEnabled(_PHASE_ANALYSIS) and not reanalyzing:
+            if impact.repair_keys:
+                self._queue_repair_plan(self._session.tracks)
+            elif impact.requires_phase1 or impact.requires_phase2:
+                flat = self._flat_config()
+                tracks = [t for t in self._session.tracks if t.repair_recipe.active
+                          or self._repair_settings_can_apply(t, flat)]
+                if tracks:
+                    self._queue_repair_plan(tracks)
         if impact.presentation_keys and self._session:
             self._refresh_presentation()
 
@@ -1114,10 +1125,12 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
                 self._refresh_config_changed_display()
             if self._source_dir and (impact.requires_phase1 or impact.requires_phase2):
                 phase = "Track Layout" if impact.requires_phase1 else "Phase 2 analysis"
+                message = (f"Rerun {phase} to update results for the current session."
+                           if not (self._repair_plan_worker or self._repair_plan_pending)
+                           else f"Repair checks update automatically. Rerun {phase} to refresh the full session.")
                 QMessageBox.information(
                     self, "Config preset updated",
-                    "Inherited settings have been updated from Preferences. "
-                    f"Rerun {phase} to update results for the current session.",
+                    f"Inherited settings have been updated from Preferences. {message}",
                 )
             elif impact.daw_keys:
                 self._status_bar.showMessage("Preferences saved. Phase 3 settings updated.")

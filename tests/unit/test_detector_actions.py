@@ -310,7 +310,7 @@ def test_real_refresh_callers_keep_suppressed_custom_labels_out(host, monkeypatc
         host._flat_config = lambda: {}
         host._render_summary = lambda: None
         host._refresh_analysis_column = lambda: None
-        monkeypatch.setattr(rendering, "build_diagnostic_summary", lambda session: None)
+        monkeypatch.setattr(rendering, "build_diagnostic_summary", lambda session, *, remaining: None)
         AnalysisMixin._refresh_presentation(host)
     assert [action.data() for action in host._overlay_menu.actions()] == ["subsonic-region"]
     assert {issue.label for issue in host._waveform._issues} == {"subsonic-region"}

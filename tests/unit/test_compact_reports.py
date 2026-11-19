@@ -215,6 +215,7 @@ def test_review_selects_identity_after_sort_and_refreshes_selected_widgets(qapp)
     called = []
     owner = SimpleNamespace(_session=session, _summary_view=summary,
                             _track_table=table, _file_report=ReportBrowser({}),
+                            _file_review=SimpleNamespace(back_to_findings=lambda: None),
                             _show_track_detail=called.append)
     DetailMixin._review_summary_file(owner, current.filename)
     assert called == [current]
@@ -230,6 +231,7 @@ def test_repeated_keyboard_activation_preserves_report_link_focus(qapp):
     from PySide6.QtCore import Qt
     from PySide6.QtTest import QTest
     session, current = session_with_findings()
+    current.repair_overrides["low_cut"] = False
     browser = ReportBrowser({})
     pane = FileReportPane(browser)
     pane.resize(1069, 620)
@@ -238,6 +240,11 @@ def test_repeated_keyboard_activation_preserves_report_link_focus(qapp):
     browser.present_track(current, session)
     qapp.processEvents()
     browser.setFocus()
+    QTest.keyClick(browser, Qt.Key_Tab)
+    entries = []
+    browser.repairRequested.connect(entries.append)
+    QTest.keyClick(browser, Qt.Key_Return)
+    assert entries == [""]
     QTest.keyClick(browser, Qt.Key_Tab)
     QTest.keyClick(browser, Qt.Key_Return)
     assert "Rich result d00" in browser.toPlainText()

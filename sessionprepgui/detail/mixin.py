@@ -9,6 +9,7 @@ from PySide6.QtCore import Qt, Slot, QTimer, QSignalBlocker
 from PySide6.QtGui import QAction
 
 from sessionpreplib.audio import get_window_samples
+from sessionpreplib.repair_verification import audition_results, original_report_track, separate_rumble_finding
 
 from ..helpers import fmt_time
 from ..tracks.table_widgets import _TAB_FILE, _TAB_SUMMARY, _PHASE_TOPOLOGY
@@ -43,24 +44,34 @@ class DetailMixin:  # pylint: disable=too-few-public-methods
         self._summary_view.present_summary(
             self._summary, self._session, show_clean=self._show_clean)
 
+    def _refresh_verified_summary(self):
+        if self._session is not None:
+            from sessionpreplib.rendering import build_diagnostic_summary
+            self._summary = build_diagnostic_summary(self._session, remaining=True)
+            self._render_summary()
+
     def _refresh_file_report(self, track=None):
         track = track if track is not None else self._current_track
         if track is not None and self._session is not None:
             self._file_report.present_track(
                 track, self._session, show_clean=self._show_clean,
-                verbose=self._verbose)
+                verbose=self._verbose, corrected=self._audition_is_corrected())
 
     def _open_track_repairs(self, track, detector_id=None):
-        if self._session is None or not any(current is track for current in self._session.tracks):
+        if (self._session is None or track is None or track.status != "OK" or
+                not any(current is track for current in self._session.tracks)):
             return
-        if track is not self._current_track or self._detail_tabs.currentIndex() != _TAB_FILE:
+        if (track is not self._current_track or self._file_report.report_track is not track
+                or self._file_report.report_session is not self._session):
             row = self._find_table_row(track.filename)
             if row < 0:
                 return
             with QSignalBlocker(self._track_table):
                 self._track_table.setCurrentCell(row, 7)
             self._show_track_detail(track)
-        self._repair_editor.open_track(track, self._session, detector_id)
+        elif self._detail_tabs.currentIndex() != _TAB_FILE:
+            self._detail_tabs.setCurrentIndex(_TAB_FILE)
+        self._file_review.open_track(track, self._session, detector_id)
 
     def _refresh_track_repair_editor(self, track=None):
         track = self._current_track if track is None else track
@@ -70,9 +81,11 @@ class DetailMixin:  # pylint: disable=too-few-public-methods
     def _focus_processing_menu(self, filename):
         row = self._find_table_row(filename)
         button = self._track_table.cellWidget(row, 7) if row >= 0 else None
-        if button is not None:
+        if button is not None and button.isEnabled():
             self._track_table.scrollToItem(self._track_table.item(row, 0))
             button.setFocus(Qt.OtherFocusReason)
+        else:
+            self._file_report.setFocus(Qt.OtherFocusReason)
 
     def _review_summary_file(self, filename):
         """Select the current file by identity, including after table sorting."""
@@ -91,6 +104,7 @@ class DetailMixin:  # pylint: disable=too-few-public-methods
                     self._track_table.selectRow(row)
                 self._track_table.scrollToItem(item)
                 self._show_track_detail(track)
+                self._file_review.back_to_findings()
                 self._file_report.setFocus()
                 return
 
@@ -102,6 +116,12 @@ class DetailMixin:  # pylint: disable=too-few-public-methods
         finding, RMS setup) is deferred to the next event-loop iteration
         via ``QTimer.singleShot`` so the tab switch paints first.
         """
+        if (track is self._current_track and self._file_report.report_track is track
+                and self._file_report.report_session is self._session):
+            # Moving between cells of this row can select File twice. Keep the
+            # existing audition, playhead and zoom when only keyboard focus moved.
+            self._detail_tabs.setCurrentIndex(_TAB_FILE)
+            return
         self._on_stop()
         self._pending_detector_visualization = None
         self._waveform_context_generation = None
@@ -310,11 +330,30 @@ class DetailMixin:  # pylint: disable=too-few-public-methods
                 and self._file_report.report_session is self._session
                 and self._file_report.track_filename == track.filename)
 
-    def _detector_visualization_issues(self, key):
+    def _audition_is_corrected(self):
+        preview = getattr(self, "_repair_preview", None)
+        return bool(preview and preview.track is self._current_track and preview.panel.corrected)
+
+    def _audition_results(self):
+        track = self._current_track
+        corrected = self._audition_is_corrected()
+        pending = bool(track._cache.get("repair_verification_pending"))
+        selected = audition_results(track, corrected=corrected, pending=pending)
+        if corrected and (pending or track._cache.get("repair_error")):
+            return selected
+        local = separate_rumble_finding(track, self._session.config)
+        if local:
+            evidence = local.corrected if corrected and track.repair_recipe.active else local.original
+            if evidence and evidence.issues:
+                return {**selected, "subsonic-local": evidence}
+        return selected
+
+    def _detector_visualization_issues(self, key, results=None):
         if not self._visualization_context_is_current():
             return []
-        detector = next((d for d in self._session.detectors if d.id == key), None)
-        result = self._current_track.detector_results.get(key)
+        detector_id = "subsonic" if key == "subsonic-local" else key
+        detector = next((d for d in self._session.detectors if d.id == detector_id), None)
+        result = (self._audition_results() if results is None else results).get(key)
         issues = visualizable_issues(result, self._current_track)
         if not issues:
             return []
@@ -323,15 +362,19 @@ class DetailMixin:  # pylint: disable=too-few-public-methods
             relevant = getattr(detector, "is_relevant", None)
             if callable(severity) and severity(result) is None:
                 return []
-            if callable(relevant) and not relevant(result, self._current_track):
+            context = self._current_track
+            if key == "tail_exceedance" and not self._audition_is_corrected():
+                context = original_report_track(context, self._session)
+            if callable(relevant) and not relevant(result, context):
                 return []
         return issues
 
     def _refresh_waveform_issues(self):
         issues = []
         if self._visualization_context_is_current():
-            for key in self._current_track.detector_results:
-                issues.extend(self._detector_visualization_issues(key))
+            results = self._audition_results()
+            for key in results:
+                issues.extend(self._detector_visualization_issues(key, results))
         self._waveform.set_issues(issues)
         self._update_overlay_menu(issues)
 
@@ -405,9 +448,32 @@ class DetailMixin:  # pylint: disable=too-few-public-methods
         self._overlay_btn.setText(
             f"Detector Overlays ({count})" if count else "Detector Overlays")
 
+    @Slot()
+    def _retry_detector_verification(self):
+        if self._visualization_context_is_current():
+            self._queue_repair_plan([self._current_track], revalidate_source=bool(self._current_track._cache.get("repair_error")))
+
+    @Slot(str, bool)
+    def _show_source_locations(self, key, corrected):
+        if not self._visualization_context_is_current() or not self._current_track.repair_recipe.active:
+            return
+        self._wf_panel._choose_source(corrected)
+        issues = self._detector_visualization_issues(key)
+        if issues:
+            selected = self._remembered_detector_overlays()
+            selected.clear()
+            selected.update(i.label for i in issues)
+            self._refresh_waveform_issues()
+            self._wf_panel.set_expanded(True)
+
     def _remembered_detector_overlays(self) -> set[str]:
         if not hasattr(self, "_selected_detector_overlays"):
             self._selected_detector_overlays = set()
+        if self._audition_is_corrected():
+            if getattr(self, "_corrected_overlay_track", None) is not self._current_track:
+                self._corrected_overlay_track = self._current_track
+                self._corrected_overlay_labels = self._selected_detector_overlays.copy()
+            return self._corrected_overlay_labels
         return self._selected_detector_overlays
 
     def _apply_active_detector_overlays(self, available_labels: set[str]) -> None:
@@ -426,35 +492,14 @@ class DetailMixin:  # pylint: disable=too-few-public-methods
             return
 
         # Build detector instance map from session
-        det_map: dict[str, object] = {}
-        det_names: dict[str, str] = {}
+        det_names: dict[str, str] = {"subsonic-local": "Subsonic Content · local energy"}
         if self._session and hasattr(self._session, "detectors"):
             for d in self._session.detectors:
-                det_map[d.id] = d
                 det_names[d.id] = d.name
 
-        # Filter out issues from detectors that suppress themselves or are skipped
-        track = self._current_track
-        filtered_issues = []
-        for issue in issues:
-            det = det_map.get(issue.label)
-            if det and track:
-                result = track.detector_results.get(issue.label)
-                if result:
-                    if hasattr(det, 'effective_severity') and det.effective_severity(result) is None:
-                        continue
-                    relevant = getattr(det, "is_relevant", None)
-                    if callable(relevant) and not relevant(result, track):
-                        continue
-            filtered_issues.append(issue)
-
-        if not filtered_issues:
-            self._apply_active_detector_overlays(set())
-            return
-
-        # Build {label: count} from filtered issue list
+        # These are the source- and relevance-filtered locations used by both plots.
         label_counts: dict[str, int] = {}
-        for issue in filtered_issues:
+        for issue in issues:
             label_counts[issue.label] = label_counts.get(issue.label, 0) + 1
 
         # Add a checkable action per detector that has issues
@@ -522,7 +567,10 @@ class DetailMixin:  # pylint: disable=too-few-public-methods
     @Slot()
     def _on_toggle_play(self):
         # Stop always works regardless of which phase started playback
-        if self._playback.is_playing:
+        preview = getattr(self, "_repair_preview", None)
+        if self._playback.is_playing or (preview and preview.pending_play is not None):
+            if preview:
+                preview.pending_play = None
             self._playback.stop()
             # Reset both phases' transport UI
             self._stop_btn.setEnabled(False)
@@ -556,7 +604,7 @@ class DetailMixin:  # pylint: disable=too-few-public-methods
                                 mode=mode, channel=channel)
         else:
             preview.play(start, mode, channel)
-        if self._playback.is_playing:
+        if self._playback.is_playing or (preview and preview.pending_play is not None):
             self._play_btn.setEnabled(False)
             self._stop_btn.setEnabled(True)
 
@@ -601,12 +649,15 @@ class DetailMixin:  # pylint: disable=too-few-public-methods
 
     @Slot(int)
     def _on_waveform_seek(self, sample_index: int):
-        if self._playback.is_playing:
-            self._on_stop()
+        preview = getattr(self, "_repair_preview", None)
+        if preview and preview.pending_play is not None:
+            _, mode, channel = preview.pending_play
+            preview.pending_play = (sample_index, mode, channel)
+        elif self._playback.is_playing:
+            self._playback.stop()
             self._waveform.set_cursor(sample_index)
             self._on_play()
-        else:
-            self._update_time_label(sample_index)
+        self._update_time_label(sample_index)
 
     def _update_time_label(self, sample_pos: int = 0):
         track = self._current_track

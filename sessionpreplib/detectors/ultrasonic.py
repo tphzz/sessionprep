@@ -17,7 +17,7 @@ class UltrasonicDetector(TrackDetector):
     def analyze(self, track):
         if track.samplerate < 50000:
             return DetectorResult(self.id, Severity.CLEAN, "sample rate below 50 kHz",
-                                  {"eligible": False, "regions": []})
+                                  {"eligible": False, "regions": []}, applicable=False)
         evidence = band_evidence(
             track.audio_data, track.samplerate, low_hz=24100, high_hz=track.samplerate / 2,
             window_sec=0.1, level_db=-60, ratio_db=-35, consecutive=5,

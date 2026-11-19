@@ -7,6 +7,8 @@ from dataclasses import replace
 import logging
 import threading
 
+import numpy as np
+
 log = logging.getLogger(__name__)
 
 from PySide6.QtCore import QThread, Signal
@@ -19,6 +21,15 @@ from sessionpreplib.processors import default_processors
 from sessionpreplib.rendering import build_diagnostic_summary
 from sessionpreplib.events import EventBus
 from sessionpreplib.models import LifecyclePhase
+
+
+def _gui_source_samples(samples):
+    """Share read-only source PCM with Qt workers; loads and edits replace the array."""
+    owner = samples
+    while isinstance(owner, np.ndarray):
+        owner.setflags(write=False)
+        owner = owner.base
+    return samples
 
 
 class DawCheckWorker(QThread):
@@ -181,7 +192,8 @@ class Phase1AnalyzeWorker(QThread):
             ok_tracks = [t for t in session.tracks if t.status == "OK"]
             num_ok = len(ok_tracks)
 
-            p1_track_dets = [d for d in pipeline.track_detectors if getattr(d, 'phase', LifecyclePhase.PHASE2) == LifecyclePhase.PHASE1]
+            p1_track_dets = [d for d in pipeline.track_detectors if d.phase == LifecyclePhase.PHASE1
+                             and d.id in pipeline.repair_verification.required_ids]
             p1_sess_dets = [d for d in pipeline.session_detectors if getattr(d, 'phase', LifecyclePhase.PHASE2) == LifecyclePhase.PHASE1]
 
             num_track_det = len(p1_track_dets)
@@ -208,7 +220,7 @@ class Phase1AnalyzeWorker(QThread):
                         t = futures[future]
                         try:
                             res = future.result()
-                            t.audio_data = res.audio_data
+                            t.audio_data = _gui_source_samples(res.audio_data)
                             # Preserve metadata since it might be updated
                             t.total_samples = res.total_samples
                             t.samplerate = res.samplerate
@@ -301,6 +313,7 @@ class AnalyzeWorker(QThread):
             session = load_session(self.source_dir, self.config, event_bus=event_bus,
                                   recursive=self.recursive)
             for track in session.tracks:
+                _gui_source_samples(track.audio_data)
                 for key, value in self.track_settings.get(track.filename, {}).items():
                     setattr(track, key, value)
 
@@ -321,13 +334,13 @@ class AnalyzeWorker(QThread):
             # Calculate total progress steps
             ok_tracks = [t for t in session.tracks if t.status == "OK"]
             num_ok = len(ok_tracks)
-            num_track_det = len([d for d in pipeline.track_detectors if getattr(d, 'phase', LifecyclePhase.PHASE2) == LifecyclePhase.PHASE2])
+            num_track_det = sum(d.phase == LifecyclePhase.PHASE2 and d.id in pipeline.repair_verification.required_ids
+                                for d in pipeline.track_detectors)
             num_session_det = len([d for d in pipeline.session_detectors if getattr(d, 'phase', LifecyclePhase.PHASE2) == LifecyclePhase.PHASE2])
-            num_proc = len(pipeline.audio_processors)
             total_steps = (
                 num_ok * num_track_det      # analyze: per-track detectors
                 + num_session_det           # analyze: session detectors
-                + num_ok * num_proc         # plan: per-track processors
+                + num_ok                    # plan: repairs and gain for each track
                 + 1                         # build summary
             )
             self._step = 0
@@ -357,14 +370,11 @@ class AnalyzeWorker(QThread):
                 if track:
                     self.track_analyzed.emit(filename, track)
 
-            def on_processor_complete(processor_id, filename, **_kw):
+            def on_track_plan_complete(filename, **_kw):
                 with self._step_lock:
                     self._step += 1
                     step = self._step
-                self.progress.emit(f"Planning {filename} \u2014 {processor_id}")
                 self.progress_value.emit(step, self._total)
-
-            def on_track_plan_complete(filename, **_kw):
                 track = track_map.get(filename)
                 if track:
                     self.track_planned.emit(filename, track)
@@ -372,7 +382,6 @@ class AnalyzeWorker(QThread):
             event_bus.subscribe("detector.complete", on_detector_complete)
             event_bus.subscribe("session_detector.complete", on_session_detector_complete)
             event_bus.subscribe("track.analyze_complete", on_track_analyze_complete)
-            event_bus.subscribe("processor.complete", on_processor_complete)
             event_bus.subscribe("track.plan_complete", on_track_plan_complete)
 
             # Phase 2: Analyze (per-track detectors run in parallel)
@@ -381,7 +390,7 @@ class AnalyzeWorker(QThread):
             session = pipeline.analyze_phase2(session)
 
             # Phase 2: Plan (per-track processors run in parallel)
-            self.progress.emit("Planning\u2026")
+            self.progress.emit("Checking track repairs and planning gains\u2026")
             session = pipeline.plan(session, preserve_selections={
                 name for name, settings in self.track_settings.items() if "processor_skip" in settings})
 
@@ -391,7 +400,7 @@ class AnalyzeWorker(QThread):
                 step = self._step
             self.progress.emit("Building summary\u2026")
             self.progress_value.emit(step, self._total)
-            summary = build_diagnostic_summary(session)
+            summary = build_diagnostic_summary(session, remaining=True)
 
             self.finished.emit(session, summary)
         except Exception as e:
@@ -434,7 +443,7 @@ class AudioLoadWorker(QThread):
 
             if self._cancelled:
                 return
-            self._track.audio_data = data
+            self._track.audio_data = _gui_source_samples(data)
             self._track.samplerate = sr
             self._track.total_samples = len(data)
             self.finished.emit(self._track)
@@ -696,15 +705,17 @@ class RepairPlanWorker(QThread):
     completed = Signal(object)
     progress_value = Signal(int, int)
 
-    def __init__(self, session, tracks, config, parent=None, *, refresh_anchors=()):
+    def __init__(self, session, tracks, config, parent=None, *, refresh_anchors=(), revalidate_sources=()):
         super().__init__(parent)
         self.session = session
         self.config = dict(config)
         self.refresh_anchors = frozenset(refresh_anchors)
+        self.revalidate_sources = frozenset(revalidate_sources)
+        self.targets = {track.filename: (track, _gui_source_samples(track.audio_data)) for track in tracks}
         self.tracks = [
-            replace(t, repair_overrides=dict(t.repair_overrides), processor_skip=set(t.processor_skip),
+            replace(t, audio_data=audio, repair_overrides=dict(t.repair_overrides), processor_skip=set(t.processor_skip),
                     _cache=dict(t._cache), detector_results=dict(t.detector_results), processor_results={})
-            for t in tracks
+            for t, audio in self.targets.values()
         ]
         self.failure = ""
         self._events = EventBus()
@@ -723,13 +734,12 @@ class RepairPlanWorker(QThread):
     def run(self):
         try:
             from sessionpreplib.models import SessionContext
-            detectors = default_detectors() if self.refresh_anchors else []
-            pipeline = Pipeline(detectors, default_processors(), self.config, self._events)
+            pipeline = Pipeline(default_detectors(), default_processors(), self.config, self._events)
             snapshot = SessionContext(self.tracks, self.config)
             pipeline.plan(snapshot, preserve_selections={t.filename for t in self.tracks},
-                          refresh_anchors=self.refresh_anchors)
+                          refresh_anchors=self.refresh_anchors, revalidate_sources=self.revalidate_sources)
         except Exception as exc:
-            self.failure = str(exc)
+            self.failure = str(exc) or type(exc).__name__
         self.completed.emit(self)
 
 
@@ -914,7 +924,7 @@ class TopologyApplyWorker(QThread):
                     continue
                 loaded = load_track(src_path)
                 if track:
-                    track.audio_data = loaded.audio_data
+                    track.audio_data = _gui_source_samples(loaded.audio_data)
                     track.samplerate = loaded.samplerate
                     track.total_samples = loaded.total_samples
                 source_audio[filename] = (loaded.audio_data, loaded.samplerate)

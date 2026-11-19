@@ -1041,7 +1041,7 @@ def default_detectors() -> list[TrackDetector | SessionDetector]:
 
 ## 7. Audio Processors
 
-Whole-track repairs form a pre-normalization stage. `repair_plan.plan_repairs` combines numeric evidence with preset defaults and sparse per-track choices. The immutable `RepairRecipe` and `repairs.render_corrected` are shared by planning, print and audition. Preserve source detector results when recalculating the classifier and normalization on repaired samples. A change to a repair setting requires replanning. It does not require rerunning the source detectors.
+Whole-track repairs form a pre-normalization stage. `repair_plan.plan_repairs` combines numeric evidence with preset defaults and sparse per-track choices. The immutable `RepairRecipe` and `repairs.render_corrected` are shared by planning, print and audition. `RepairVerification` pairs the original results with enabled signal-detector measurements on the corrected samples. Normalization reuses the corrected classifier. Original evidence is reusable across repair choices when its source and detector settings match. File, repair review and the plots read the saved results. GUI workers validate source revisions and publish only to the track and repair request that initiated the work.
 
 `audition.RepairAudition` holds the sample-aligned source and correction. `monitor.MonitorPlayback` applies their common pad, channel routing and 10 ms fades using buffers allocated before the device opens. Device callbacks advance their own cursor. The GUI requests source changes and releases, and closes or reopens the device after the release drains. The same monitor handles direct file playback.
 

@@ -44,7 +44,10 @@ from sessionpreplib.config import (
 )
 from sessionpreplib.detectors import default_detectors
 from sessionpreplib.models import SessionContext, TrackContext
+from sessionpreplib.pipeline import Pipeline
 from sessionpreplib.processors import default_processors
+from sessionpreplib.repair_plan import check_source_signature
+from sessionpreplib.repairs import RepairRecipe
 from sessionpreplib.topology import build_default_topology
 from sessionpreplib.utils import protools_sort_key
 
@@ -282,7 +285,10 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
             old_config, self._effective_session_config())
         self._refresh_session_config_dirty_indicators()
         self._refresh_effective_config(impact)
-        if impact.requires_phase1:
+        if (impact.requires_phase1 or impact.requires_phase2) and (self._repair_plan_worker or self._repair_plan_pending):
+            phase = "Track Layout" if impact.requires_phase1 else "Phase 2 analysis"
+            self._status_bar.showMessage(f"Repair checks update automatically. Rerun {phase} to refresh the full session.")
+        elif impact.requires_phase1:
             self._status_bar.showMessage(
                 "Config changed: rerun Track Layout to apply Phase 1 "
                 "detector settings.")
@@ -398,6 +404,7 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         self._cancel_worker("_repair_plan_worker")
         self._repair_plan_pending = set()
         self._repair_plan_anchors = set()
+        self._repair_plan_revalidate = set()
         self._batch_filenames = set()
         self._track_table.setSortingEnabled(True)
         for attr in ("_prepare_action", "_topo_apply_action", "_transfer_action"):
@@ -742,16 +749,7 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
 
         flat = self._flat_config()
 
-        # Re-instantiate detectors and processors (needed for label filtering)
-        all_detectors = default_detectors()
-        for d in all_detectors:
-            d.configure(flat)
-        all_processors = []
-        for proc in default_processors():
-            proc.configure(flat)
-            if proc.enabled:
-                all_processors.append(proc)
-        all_processors.sort(key=lambda p: p.priority)
+        pipeline = Pipeline(default_detectors(), default_processors(), flat)
 
         session_config_flat = dict(default_config())
         session_config_flat.update(flat)
@@ -764,19 +762,19 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         current_repairs = _config_section_values(effective, "processors.corrective")
         repair_defaults_changed = any(saved_repairs.get(p.key, p.default) !=
                                       current_repairs.get(p.key, p.default) for p in REPAIR_PARAMS)
-        if prepare_state == "ready":
-            since_saved = infer_session_overrides(effective, data.get("session_config"))
-            saved = resolve_session_config(effective, since_saved)
-            impact = classify_structured_config_change(saved, effective)
-            if impact.requires_phase1 or impact.requires_phase2 or repair_defaults_changed:
-                prepare_state = "stale"
+        since_saved = infer_session_overrides(effective, data.get("session_config"))
+        saved = resolve_session_config(effective, since_saved)
+        impact = classify_structured_config_change(saved, effective)
+        analysis_changed = impact.requires_phase1 or impact.requires_phase2
+        if prepare_state == "ready" and (analysis_changed or repair_defaults_changed):
+            prepare_state = "stale"
 
         session = SessionContext(
             tracks=tracks,
             config=session_config_flat,
             groups={},
-            detectors=all_detectors,
-            processors=all_processors,
+            detectors=pipeline.repair_verification.detectors + pipeline.session_detectors,
+            processors=pipeline.audio_processors,
             daw_state=daw_state,
             prepare_state=prepare_state,
             transfer_manifest=data.get("transfer_manifest", []),
@@ -791,7 +789,7 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         self._project_name_edit.setText(session.project_name)
         self._project_name_edit.blockSignals(False)
 
-        self._summary = build_diagnostic_summary(session)
+        self._summary = build_diagnostic_summary(session, remaining=True)
 
         # ── Populate file list in track table ─────────────────────────────────
         self._track_table.setSortingEnabled(False)
@@ -903,6 +901,12 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         self._start_peak_build(source_tracks, source_dir, (tracks, self._topology_dir))
         if repair_defaults_changed:
             self._queue_repair_plan(tracks)
+        else:
+            unverified = [t for t in tracks if (t.repair_recipe.active
+                          and not pipeline.repair_verification.has_current_evidence(t))
+                          or (analysis_changed and self._repair_settings_can_apply(t, flat))]
+            if unverified:
+                self._queue_repair_plan(unverified, verification_only=True)
 
     # ── Analyze ──────────────────────────────────────────────────────────
 
@@ -916,9 +920,13 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         # Phase 2 analysis reads from sp_01_tracklayout/ if available
         analyze_dir = self._topology_dir or self._source_dir
         log.info("Analyze: %s", analyze_dir)
+        if self._repair_plan_worker is not None:
+            self._repair_plan_pending.update(self._repair_plan_worker.targets)
+        interrupted_repairs = self._repair_plan_pending, self._repair_plan_anchors, self._repair_plan_revalidate
         self._cancel_worker("_repair_plan_worker")
         self._repair_plan_pending = set()
         self._repair_plan_anchors = set()
+        self._repair_plan_revalidate = set()
         self._batch_filenames = set()
         self._track_table.setSortingEnabled(True)
 
@@ -945,6 +953,7 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
 
         self._analyze_action.setEnabled(False)
         self._current_track = None
+        self._file_report.clear()
         self._detail_tabs.setTabEnabled(_TAB_FILE, False)
         self._track_table.setVisible(False)
 
@@ -961,6 +970,7 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
 
         self._worker = AnalyzeWorker(analyze_dir, config,
                                      recursive=self._recursive_scan, track_settings=track_settings)
+        self._worker.interrupted_repairs = interrupted_repairs
         self._worker.progress.connect(self._on_worker_progress)
         self._worker.progress_value.connect(self._on_worker_progress_value)
         self._worker.track_analyzed.connect(self._on_track_analyzed)
@@ -1188,6 +1198,9 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
                                    (self._topo_source_tracks, self._source_dir))
         elif self._source_dir:
             self._start_peak_build(session.tracks, self._source_dir)
+        if self._repair_plan_pending:
+            # Preferences may have changed after this analysis started.
+            self._queue_repair_plan([t for t in session.tracks if t.filename in self._repair_plan_pending])
 
     # ── Peak cache ────────────────────────────────────────────────────────
 
@@ -1305,6 +1318,12 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         self._analyze_action.setEnabled(True)
         self._track_table.setVisible(True)
         if self._worker is not None:
+            # The previous session is still open. Finish any repair work
+            # that the full analysis would otherwise have replaced.
+            pending, anchors, sources = self._worker.interrupted_repairs
+            self._repair_plan_pending.update(pending)
+            self._repair_plan_anchors.update(anchors)
+            self._repair_plan_revalidate.update(sources)
             self._worker.deleteLater()
             self._worker = None
 
@@ -1319,9 +1338,11 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         ))
         self._status_bar.showMessage(f"Error: {message}")
         self._progress_fail(message)
+        if self._repair_plan_pending:
+            self._queue_repair_plan([])
 
     def _set_track_repair_choice(self, track, key, value):
-        if self._session is None or not any(t is track for t in self._session.tracks):
+        if self._session is None or not any(t is track for t in self._session.tracks) or track.status != "OK":
             return
         if value is None:
             track.repair_overrides.pop(key, None)
@@ -1329,12 +1350,38 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
             track.repair_overrides[key] = value
         self._queue_repair_plan([track])
 
-    def _queue_repair_plan(self, tracks, *, refresh_anchors=False):
+    @staticmethod
+    def _repair_settings_can_apply(track, config):
+        """Whole-track checks are needed when a track override or an automatic repair is on."""
+        return any(track.repair_overrides.get(key, config.get(setting, False))
+                   for key, setting in (("dc_remove", "repair_auto_dc"), ("low_cut", "repair_auto_low_cut"),
+                                        ("ultrasonic", "repair_auto_ultrasonic")))
+
+    def _queue_repair_plan(self, tracks, *, refresh_anchors=False, verification_only=False, revalidate_source=False):
         """Coalesce edits while DSP is running and publish only the newest choice for each file."""
         if self._session is None:
             return
         pending = getattr(self, "_repair_plan_pending", set())
-        changed = {t.filename for t in tracks if t.status == "OK"}
+        config = {**self._session.config, **self._flat_config()}
+        changed = set()
+        for track in tracks:
+            if track.status != "OK":
+                continue
+            changed.add(track.filename)
+            if revalidate_source and track._cache.get("repair_error"):
+                self._repair_plan_revalidate.add(track.filename)
+            # The worker can reuse a matching key. Views must stop displaying
+            # the old verdict as soon as a new source or repair is requested.
+            if track.corrected_analysis is not None:
+                track._cache["unvalidated_corrected_analysis"] = track.corrected_analysis
+            track.corrected_analysis = None
+            track._cache.pop("repair_error", None)
+            if self._repair_settings_can_apply(track, config):
+                track._cache["repair_verification_pending"] = True
+            else:
+                track.repair_recipe = RepairRecipe()
+                track._cache.pop("repair_verification_pending", None)
+                track._cache.pop("unvalidated_corrected_analysis", None)
         pending.update(changed)
         preview = getattr(self, "_repair_preview", None)
         if preview and preview.track is not None and preview.track.filename in changed:
@@ -1344,16 +1391,25 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         self._repair_plan_pending = pending
         if not pending:
             return
-        self._mark_prepare_stale()
+        if changed:
+            if not verification_only:
+                self._mark_prepare_stale()
+            self._refresh_verified_summary()
+            for name in changed:
+                self._update_track_row(name)
+            current = self._current_track
+            if current and current.filename in changed:
+                self._refresh_file_tab(current)
+                self._refresh_track_repair_editor(current)
         self._save_session_action.setEnabled(False)
         self._prepare_action.setEnabled(False)
-        if getattr(self, "_repair_plan_worker", None) is not None or self._prepare_worker is not None:
+        if self._repair_plan_worker is not None or self._prepare_worker is not None or self._worker is not None:
             return
         tracks = [t for t in self._session.tracks if t.filename in pending]
         pending.clear()
-        config = {**self._session.config, **self._flat_config()}
         self._repair_plan_worker = RepairPlanWorker(
-            self._session, tracks, config, self, refresh_anchors=self._repair_plan_anchors)
+            self._session, tracks, config, self, refresh_anchors=self._repair_plan_anchors,
+            revalidate_sources=self._repair_plan_revalidate)
         if self._batch_filenames:
             self._repair_plan_worker.progress_value.connect(self._on_worker_progress_value)
         self._repair_plan_worker.completed.connect(self._repair_plan_finished, Qt.QueuedConnection)
@@ -1370,25 +1426,56 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         committed = []
         for planned in worker.tracks:
             t = current.get(planned.filename)
-            if t is None or planned.filename in self._repair_plan_pending:
+            if planned.filename in self._repair_plan_pending:
+                continue
+            target, source_audio = worker.targets[planned.filename]
+            if t is target and t.audio_data is not source_audio:
+                # Another load or edit replaced the source while the worker was
+                # running. Verify the current buffer before publishing either result.
+                self._repair_plan_pending.add(planned.filename)
+                continue
+            self._repair_plan_anchors.discard(planned.filename)
+            self._repair_plan_revalidate.discard(planned.filename)
+            if t is not target:
                 continue
             problem = worker.failure or planned._cache.get("repair_error")
+            if not problem:
+                try:
+                    if t.filepath != planned.filepath or t.status != "OK":
+                        raise ValueError(f"{t.filename} has changed since analysis. Reanalyze this source.")
+                    check_source_signature(planned, allow_digest=False)
+                except (OSError, ValueError) as exc:
+                    problem = str(exc)
+            t._cache.pop("repair_verification_pending", None)
+            t._cache.pop("unvalidated_corrected_analysis", None)
             if problem:
                 t._cache["repair_error"] = problem
+                t.corrected_analysis = None
+                t.processor_results = {}
+                self._mark_prepare_stale()
                 self._status_bar.showMessage(f"{t.filename}: {problem}")
             else:
+                if (t.repair_recipe != planned.repair_recipe
+                        or {k: r.gain_db for k, r in t.processor_results.items()}
+                        != {k: r.gain_db for k, r in planned.processor_results.items()}):
+                    self._mark_prepare_stale()
                 t._cache.pop("repair_error", None)
-            t.repair_recipe = planned.repair_recipe
-            t.repair_measurements = planned.repair_measurements
-            t.processor_results = planned.processor_results
-            if planned.filename in worker.refresh_anchors:
-                t.detector_results.update(planned.detector_results)
-                self._repair_plan_anchors.discard(planned.filename)
-            elif "ultrasonic" in planned.detector_results:
-                t.detector_results["ultrasonic"] = planned.detector_results["ultrasonic"]
+                if t.detector_sample_digest != planned.detector_sample_digest:
+                    t._cache.clear()
+                t.repair_recipe = planned.repair_recipe
+                t.repair_measurements = planned.repair_measurements
+                t.processor_results = planned.processor_results
+                t.detector_results = planned.detector_results
+                t.detector_analysis_key = planned.detector_analysis_key
+                t.detector_sample_digest = planned.detector_sample_digest
+                t.source_sample_digest = planned.source_sample_digest
+                t.source_file_signature = planned.source_file_signature
+                t.source_file_revision = planned.source_file_revision
+                t.corrected_analysis = planned.corrected_analysis
             committed.append(t)
         self._session.config.update(self._flat_config())
         self._apply_linked_group_levels()
+        self._refresh_verified_summary()
         for t in committed:
             self._update_track_row(t.filename)
             row = self._find_table_row(t.filename)
@@ -1460,6 +1547,7 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         if worker.failure:
             self._on_prepare_error(worker.failure)
             return
+        had_recovery = bool(self._session.config.get("_prepare_errors") or self._session.config.get("_output_gain_adjustments"))
         worker.publish()
         outdated = worker.outdated
         self._prepare_worker = None
@@ -1473,6 +1561,15 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
 
         prepared = len(self._session.config.get("_prepared_files", []))
         errors = self._session.config.get("_prepare_errors", [])
+        if had_recovery or errors or self._session.config.get("_output_gain_adjustments"):
+            tracks = {t.filename: t for t in self._session.tracks}
+            for row in range(self._track_table.rowCount()):
+                button = self._track_table.cellWidget(row, 7)
+                track = tracks.get(button.property("track_filename")) if button else None
+                if track is not None:
+                    self._update_processing_button_label(button, track, self._session.processors)
+            if self._current_track:
+                self._refresh_file_tab(self._current_track)
         if self._session.transfer_manifest:
             self._phase_tabs.setTabEnabled(_PHASE_SETUP, True)
         if self._current_track:
@@ -1650,7 +1747,7 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
 
         # 2. Rebuild diagnostic summary (bucketing depends on report_as)
         from sessionpreplib.rendering import build_diagnostic_summary
-        self._summary = build_diagnostic_summary(self._session)
+        self._summary = build_diagnostic_summary(self._session, remaining=True)
 
         # 3. Re-render summary HTML
         self._render_summary()

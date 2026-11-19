@@ -184,6 +184,18 @@ class FileReportPane(QWidget):
     def active_detector_id(self):
         return self._active_detector_id
 
+    def capture_help_position(self):
+        if self._active_detector_id is None:
+            return None
+        return (self._active_detector_id, self._capture_help_anchor(),
+                self.help_browser.horizontalScrollBar().value())
+
+    def restore_help_position(self, position):
+        if position is not None and position[0] == self._active_detector_id:
+            self._help_anchor = None
+            self._apply_help_anchor(position[1])
+            self.help_browser.horizontalScrollBar().setValue(position[2])
+
     def refresh_fonts(self, screen=None):
         cursor = self.help_browser.cursorForPosition(QPoint(0, 0))
         top = self.help_browser.cursorRect(cursor).top()

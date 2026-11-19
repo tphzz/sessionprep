@@ -186,7 +186,9 @@ For details on every detector, see [REFERENCE.md](REFERENCE.md).
 
 ### Correcting a finding
 
-In Phase 2, choose **Review repair** beside a DC, subsonic or ultrasonic finding, or open **Track repairs…** from the track's Processing menu. The selected preset suggests repairs by default. Choose **On** to apply one to the whole track or **Use preset** to follow its automatic selection. Switch between **Original** and **Corrected** in the preview to hear the difference before normalization. The waveform and spectrogram use the same time position for both sources.
+In Phase 2, **Track repairs…** appears in File and the track’s Processing menu when the track has a repairable finding, an existing repair setting, or an output that needs recovery. Expand a DC, subsonic or ultrasonic finding and choose **Review repair** to open the relevant control. Choose **On** to apply it to the whole track or **Use preset** to follow the selected preset. Switch between **Original** and **Corrected** in the shared waveform or spectrogram to audition the change before normalization. **Back to findings** or **Alt+Left** returns to your place in the report and any open detector Help.
+
+File shows **✓ Correction applied** when a detector rechecks the repaired audio and clears a finding. Expand the row for the before-and-after readings. The plots follow the selected source, and Summary counts the remaining findings.
 
 ### Processing: Bimodal normalization
 

@@ -5,12 +5,14 @@ from dataclasses import dataclass
 from math import ceil
 from urllib.parse import quote, unquote
 
-from PySide6.QtCore import QPoint, Qt, QUrl, Signal
+from PySide6.QtCore import QEvent, QPoint, Qt, QUrl, Signal
 from PySide6.QtGui import QTextCharFormat, QTextCursor, QTextDocument, QTextFormat
+from PySide6.QtWidgets import QApplication
 
-from ..theme import REPORT_INSET
+from ..controls import FormActionButton
+from ..theme import COLORS, REPORT_INSET
 from ..tracks.table_widgets import _HelpBrowser
-from .report import prepare_track_report, render_prepared_track_report, render_summary_html
+from .report import prepare_track_report, render_prepared_track_report, render_summary_html, select_report_source
 from .report_style import REPORT_CONTENT_SCALE, configure_report_browser, wrap_report_html
 
 # File report layouts by viewport width: wide, compact below 850 px, narrow
@@ -36,7 +38,13 @@ def _scan_document(document):
                         and not char.hasProperty(QTextFormat.FontSizeAdjustment)):
                     inherited.append((fragment.position(), fragment.length()))
                 if char.anchorHref():
-                    hrefs.setdefault(char.anchorHref(), fragment.position())
+                    href = char.anchorHref()
+                    start = fragment.position()
+                    end = start + fragment.length()
+                    if href not in hrefs:
+                        hrefs[href] = (start, end)
+                    elif hrefs[href][1] == start:
+                        hrefs[href] = (hrefs[href][0], end)
                 for name in char.anchorNames():
                     names.setdefault(name, fragment.position())
             iterator += 1
@@ -88,13 +96,15 @@ class ReportBrowser(_HelpBrowser):
     reviewRequested = Signal(str)
     helpRequested = Signal(str)
     visualizeRequested = Signal(str)
+    sourceLocationsRequested = Signal(str, bool)
+    verificationRetryRequested = Signal()
     repairRequested = Signal(str)
     reportChanged = Signal()
-    reportLayoutChanged = Signal()
 
     def __init__(self, help_map, parent=None):
         super().__init__(help_map, parent)
         self.report_session = None
+        self.report_track = None
         self._mode = None
         self._track_key = None
         self._prepared = None
@@ -107,6 +117,11 @@ class ReportBrowser(_HelpBrowser):
         self._generation = 0
         self._layout = "wide"  # "wide", "compact" or "narrow"
         self._active_help = None
+        self._repair_buttons = {}
+        self.repairs_button = self._make_repair_button("report-repairs:track", "Track repairs…")
+        self._focused_repair = ""
+        self.cursorPositionChanged.connect(self._update_repair_link_focus)
+        self.selectionChanged.connect(self._update_repair_link_focus)
         self.anchorClicked.connect(self.activate_report_link)
         self.setAccessibleName("Analysis report")
 
@@ -138,6 +153,7 @@ class ReportBrowser(_HelpBrowser):
     def clear(self):
         self._generation += 1
         self.report_session = None
+        self.report_track = None
         self._track_key = None
         self._states.clear()
         self._mode = None
@@ -148,6 +164,7 @@ class ReportBrowser(_HelpBrowser):
         self._named_positions.clear()
         self._finding_font_ranges.clear()
         self._minimum_header_cache = None
+        self._sync_repair_buttons()
         super().clear()
         _apply_report_inset(self.document())
         self.reportChanged.emit()
@@ -158,33 +175,52 @@ class ReportBrowser(_HelpBrowser):
         super().setHtml(html)
         _apply_report_inset(self.document())
 
-    def present_track(self, track, session, *, show_clean=True, verbose=False):
-        same = (session is self.report_session and self._mode == "file"
-                and self._track_key == track.filename)
+    def present_track(self, track, session, *, show_clean=True, verbose=False, corrected=False):
+        same = session is self.report_session and track is self.report_track
         anchor = self.capture_reading_anchor() if same else None
+        focused = self.textCursor().charFormat().anchorHref() if same and self.hasFocus() else ""
         if not same:
             self._generation += 1
+            if self.report_track is not track and self.track_filename == track.filename:
+                self._states.pop(track.filename, None)
         self._use_session(session)
+        self.report_track = track
         self._mode = "file"
         self._track_key = track.filename
         self._review_files.clear()
         self._prepared = prepare_track_report(
             track, session, show_clean=show_clean, verbose=verbose)
+        self._corrected = corrected
+        select_report_source(self._prepared, corrected)
         expanded = self._states.setdefault(self._track_key, set())
         expanded.intersection_update(r["id"] for r in self._prepared["rows"])
         self.reportChanged.emit()
         self._layout = self._wanted_layout()
         self._render_track()
+        if self.hasFocus() and focused.startswith(("report-repair:", "report-repairs:")):
+            url = QUrl(focused)
+            if not self.focus_report_link(url.scheme(), url.path()):
+                self.focus_report_link("report-repairs", "track")
         if anchor is not None:
             self.restore_reading_anchor(anchor)
         else:
             self.verticalScrollBar().setValue(0)
+
+    def set_report_source(self, corrected):
+        if self._mode != "file" or self._corrected == corrected:
+            return
+        anchor = self.capture_reading_anchor()
+        self._corrected = corrected
+        select_report_source(self._prepared, corrected)
+        self._render_track()
+        self.restore_reading_anchor(anchor)
 
     def present_summary(self, summary, session, *, show_clean=True):
         same_session = session is self.report_session
         self._generation += 1
         self._use_session(session)
         self._mode = "summary"
+        self.report_track = None
         self._prepared = None
         self._active_help = None
         self.reportChanged.emit()
@@ -203,6 +239,7 @@ class ReportBrowser(_HelpBrowser):
         self.verticalScrollBar().setValue(scroll)
 
     def _set_document(self, html):
+        self._anchor_positions.clear()
         super().setHtml(wrap_report_html(html))
         _apply_report_inset(self.document())
         self.document().documentLayout().documentSize()
@@ -211,6 +248,7 @@ class ReportBrowser(_HelpBrowser):
         self._named_positions = names
         self._finding_font_ranges = ranges
         self._apply_finding_font()
+        self._sync_repair_buttons()
 
     def _apply_finding_font(self):
         # Qt's HTML subset ignores em sizes. Use the native UI role without
@@ -223,17 +261,83 @@ class ReportBrowser(_HelpBrowser):
             self._set_document(render_prepared_track_report(
                 self._prepared, expanded=self._states[self._track_key],
                 compact=self._layout == "compact", narrow=self._layout == "narrow",
-                active_help=self._active_help))
-            self.reportLayoutChanged.emit()
+                active_help=self._active_help, action_size=self._repair_action_size))
 
-    def _anchor_cursor(self, *, name=None, href=None):
-        position = (self._named_positions.get(name) if name is not None
-                    else self._anchor_positions.get(href))
-        if position is not None:
-            cursor = QTextCursor(self.document())
-            cursor.setPosition(position)
-            return cursor
-        return None
+    def _make_repair_button(self, href, label):
+        button = FormActionButton(label, self.viewport())
+        button.setFont(QApplication.font())
+        button.setMinimumWidth(137 if href == "report-repairs:track" else 126)
+        # Its document link is the single tab stop in report reading order.
+        button.setFocusPolicy(Qt.NoFocus)
+        button.clicked.connect(lambda: self.activate_report_link(QUrl(href)))
+        button.hide()
+        self._repair_buttons[href] = button
+        return button
+
+    def _repair_action_size(self, scheme, key, label):
+        href = scheme + ":" + quote(key, safe="")
+        button = self._repair_buttons.get(href) or self._make_repair_button(href, label)
+        return button.sizeHint().expandedTo(button.minimumSize())
+
+    def _sync_repair_buttons(self):
+        for href in list(self._repair_buttons):
+            if href.startswith("report-repair:") and href not in self._anchor_positions:
+                button = self._repair_buttons.pop(href)
+                button.hide()
+                button.deleteLater()
+        self._position_repair_buttons()
+
+    def _position_repair_buttons(self):
+        for href, button in self._repair_buttons.items():
+            cursor = self._anchor_cursor(href=href)
+            table = cursor.currentTable() if cursor is not None else None
+            if table is None:
+                button.hide()
+                continue
+            # The inline table reserves the native face in the flowing document.
+            rect = self.document().documentLayout().frameBoundingRect(table).toAlignedRect()
+            rect.translate(-self.horizontalScrollBar().value(), -self.verticalScrollBar().value())
+            size = button.sizeHint().expandedTo(button.minimumSize())
+            x = rect.left() if self._layout == "narrow" else rect.right() - size.width() + 1
+            button.setGeometry(x, rect.center().y() - size.height() // 2, size.width(), size.height())
+            button.setVisible(self.viewport().rect().intersects(button.geometry()))
+        self._update_repair_link_focus()
+
+    def _update_repair_link_focus(self):
+        href = self.textCursor().charFormat().anchorHref() if self.hasFocus() else ""
+        focused = href if href in self._repair_buttons and href in self._anchor_positions else ""
+        if focused == self._focused_repair:
+            return
+        if self._focused_repair in self._repair_buttons:
+            self._repair_buttons[self._focused_repair].setStyleSheet("")
+        self._focused_repair = focused
+        if focused:
+            self._repair_buttons[focused].setStyleSheet(f"border:1px solid {COLORS['information']};")
+
+    def focusInEvent(self, event):
+        super().focusInEvent(event)
+        self._update_repair_link_focus()
+
+    def focusOutEvent(self, event):
+        super().focusOutEvent(event)
+        self._update_repair_link_focus()
+
+    def scrollContentsBy(self, dx, dy):
+        super().scrollContentsBy(dx, dy)
+        self._position_repair_buttons()
+
+    def _anchor_cursor(self, *, name=None, href=None, select=False):
+        if name is not None and name in self._named_positions:
+            start = end = self._named_positions[name]
+        elif href in self._anchor_positions:
+            start, end = self._anchor_positions[href]
+        else:
+            return None
+        cursor = QTextCursor(self.document())
+        cursor.setPosition(start)
+        if select:
+            cursor.setPosition(end, QTextCursor.KeepAnchor)
+        return cursor
 
     def _row_cursor(self, key):
         return self._anchor_cursor(href="report-details:" + quote(key, safe=""))
@@ -334,20 +438,27 @@ class ReportBrowser(_HelpBrowser):
 
     def focus_report_link(self, scheme, key):
         scroll = self.verticalScrollBar().value()
-        cursor = self._anchor_cursor(href=scheme + ":" + quote(key, safe=""))
+        cursor = self._anchor_cursor(href=scheme + ":" + quote(key, safe=""), select=True)
         if cursor is not None:
             self.setTextCursor(cursor)
+        elif self.textCursor().charFormat().anchorHref() not in self._anchor_positions:
+            self.setTextCursor(QTextCursor(self.document()))
         self.setFocus(Qt.OtherFocusReason)
         self.verticalScrollBar().setValue(scroll)
+        return cursor is not None
 
     def resizeEvent(self, event):
         anchor = self.capture_reading_anchor()
         super().resizeEvent(event)
         self._update_layout()
-        self.reportLayoutChanged.emit()
+        self._position_repair_buttons()
         self.restore_reading_anchor(anchor)
 
     def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Space and self._focused_repair and not event.modifiers():
+            self.activate_report_link(QUrl(self._focused_repair))
+            event.accept()
+            return
         # setHtml resets Qt's anchor focus; retain repeated keyboard activation.
         if event.key() in (Qt.Key_Return, Qt.Key_Enter):
             cursor = self.textCursor()
@@ -355,11 +466,21 @@ class ReportBrowser(_HelpBrowser):
             if not href:
                 cursor.movePosition(QTextCursor.NextCharacter, QTextCursor.KeepAnchor)
                 href = cursor.charFormat().anchorHref()
-            if QUrl(href).scheme() in {"report-review", "report-details", "report-help", "report-visualize", "report-repair"}:
+            if QUrl(href).scheme() in {"report-review", "report-details", "report-help", "report-visualize",
+                                       "report-repair", "report-repairs", "report-original", "report-corrected",
+                                       "report-retry"}:
                 self.activate_report_link(QUrl(href))
                 event.accept()
                 return
         super().keyPressEvent(event)
+
+    def event(self, event):
+        # Give the focused native report action Space ahead of playback.
+        if (event.type() == QEvent.ShortcutOverride and event.key() == Qt.Key_Space
+                and not event.modifiers() and self._focused_repair):
+            event.accept()
+            return True
+        return super().event(event)
 
     def activate_report_link(self, url):
         scheme = url.scheme()
@@ -376,8 +497,19 @@ class ReportBrowser(_HelpBrowser):
         elif scheme == "report-visualize":
             if self.visualization_labels(key):
                 self.visualizeRequested.emit(key)
+        elif scheme in {"report-original", "report-corrected"}:
+            source = scheme.removeprefix("report-")
+            if any(r["id"] == key and r.get("location_source") == source for r in self._prepared["rows"]):
+                self.sourceLocationsRequested.emit(key, source == "corrected")
+        elif scheme == "report-retry":
+            if ((key == "track" and self._prepared.get("source_failure"))
+                    or any(r.get("retry") and r["id"] == key for r in self._prepared["rows"])):
+                self.verificationRetryRequested.emit()
+        elif scheme == "report-repairs" and key == "track" and self._prepared.get("can_review_repairs"):
+            self.repairRequested.emit("")
         elif scheme == "report-repair":
-            if any(row["id"] == key and row.get("review_repair") for row in self._prepared["rows"]):
+            if key in self._states[self._track_key] and any(
+                    row["id"] == key and row.get("review_repair") for row in self._prepared["rows"]):
                 self.repairRequested.emit(key)
         elif scheme == "report-details" and any(r["id"] == key for r in self._prepared["rows"]):
             anchor = self.capture_reading_anchor()

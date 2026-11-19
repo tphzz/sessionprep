@@ -10,7 +10,7 @@ from PySide6.QtWidgets import QToolTip, QWidget
 
 from ..theme import COLORS
 from .compute import WaveformLoadWorker, _mel_to_hz  # noqa: F401 (re-export)
-from .overlay import draw_issue_overlays, draw_time_scale
+from .overlay import draw_issue_overlays, draw_time_scale, issue_y_bounds
 from .renderer import WaveformRenderCtx, WaveformRenderer
 from .spectrogram import SpecRenderCtx, SpectrogramRenderer
 
@@ -151,6 +151,10 @@ class WaveformWidget(QWidget):
         self._wf_renderer.set_peak_data(peak_data)
         self._invalidate_bg()
         return True
+
+    @property
+    def is_loading(self) -> bool:
+        return self._loading
 
     def set_loading(self, loading: bool, *, preserve_view=False):
         """Show or hide a 'Loading waveform…' placeholder."""
@@ -536,7 +540,8 @@ class WaveformWidget(QWidget):
                         self._cursor_y_value = None
                 else:
                     self._cursor_y_value = None
-            self._invalidate_bg()
+            # The playhead and its readout are painted over the cached plot.
+            self.update()
             self.position_clicked.emit(sample)
 
     def mouseMoveEvent(self, event):
@@ -553,9 +558,7 @@ class WaveformWidget(QWidget):
         mx = event.position().x()
         my = event.position().y()
         nch = self._num_channels
-        lane_h = draw_h / nch if nch > 0 else draw_h
         sample = self._x_to_sample(mx - x0, draw_w)
-        mouse_ch = max(0, min(int(my / lane_h) if lane_h > 0 else 0, nch - 1))
         view_len = self._view_end - self._view_start
         tolerance = int(view_len / max(draw_w, 1) * 5)
         tips: list[str] = []
@@ -576,9 +579,11 @@ class WaveformWidget(QWidget):
             s_end = issue.sample_end if issue.sample_end is not None else s_start
             if sample < s_start - tolerance or sample > s_end + tolerance:
                 continue
-            if self._display_mode == "waveform":
-                if issue.channel is not None and issue.channel != mouse_ch:
-                    continue
+            top, bottom = issue_y_bounds(issue, draw_h, self._display_mode, nch,
+                                         self._spec_renderer.mel_view_min, self._spec_renderer.mel_view_max,
+                                         self._spec_renderer.band != "full")
+            if not top <= my < bottom or not x0 <= mx < x0 + draw_w:
+                continue
             tips.append(issue.description)
         if tips:
             QToolTip.showText(event.globalPosition().toPoint(), "\n".join(tips), self)

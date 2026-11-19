@@ -8,13 +8,13 @@ import pytest
 import soundfile as sf
 
 pytest.importorskip("PySide6")
-from PySide6.QtCore import QEvent, QTimer
+from PySide6.QtCore import QEvent, QTimer, Qt
 from PySide6.QtWidgets import (
     QApplication, QDialog, QDoubleSpinBox, QFileDialog, QMessageBox, QPushButton,
 )
 
 from sessionprepgui import settings
-from sessionprepgui.analysis.worker import PrepareWorker, RepairPlanWorker
+from sessionprepgui.analysis.worker import AnalyzeWorker, PrepareWorker, RepairPlanWorker
 from sessionprepgui.mainwindow import SessionPrepWindow
 from sessionprepgui.prefs.dialog import PreferencesDialog
 from sessionprepgui.session.io import load_session, save_session
@@ -27,6 +27,32 @@ from sessionpreplib.models import SessionContext
 from sessionpreplib.pipeline import Pipeline
 from sessionpreplib.processors import default_processors
 from sessionpreplib.repairs import RepairRecipe, render_corrected
+
+
+@pytest.mark.parametrize(("normalize", "fail_repair"), [(True, False), (False, False), (True, True)])
+def test_analysis_names_repair_work_while_the_planner_is_running(tmp_path, monkeypatch, normalize, fail_repair):
+    sf.write(tmp_path / "Tone.wav", np.zeros(4000), 8000)
+    worker = AnalyzeWorker(str(tmp_path), {"bimodal_normalize_enabled": normalize, "dc_offset_enabled": False})
+    messages, during_scan, counts, planned, errors = [], [], [], [], []
+    worker.progress.connect(messages.append, Qt.DirectConnection)
+    worker.progress_value.connect(lambda done, total: counts.append((done, total)), Qt.DirectConnection)
+    worker.track_planned.connect(lambda name, track: planned.append((counts[-1][0], track)), Qt.DirectConnection)
+    worker.error.connect(errors.append, Qt.DirectConnection)
+    plan = pipeline_module.plan_repairs
+
+    def record_current_step(track, config, verification):
+        during_scan.append((messages[-1], counts[-1][0]))
+        if fail_repair:
+            raise ValueError("unreadable repair source")
+        return plan(track, config, verification)
+
+    monkeypatch.setattr(pipeline_module, "plan_repairs", record_current_step)
+    worker.run()
+    assert not errors
+    assert len(during_scan) == len(planned) == 1
+    assert during_scan[0] == ("Checking track repairs and planning gains…", planned[0][0] - 1)
+    assert bool(planned[0][1]._cache.get("repair_error")) == fail_repair
+    assert counts[-1][0] == counts[-1][1] > 0
 
 
 def wait_for(condition, seconds=8):
@@ -112,9 +138,49 @@ def save_dc_preference(window, monkeypatch, value):
 def open_editor(window, track):
     button = window._track_table.cellWidget(window._find_table_row(track.filename), 7)
     action, = [a for a in button.menu().actions() if a.text() == "Track repairs…"]
+    assert action.isVisible()
     action.trigger()
     assert window._repair_editor.track is track
     return window._repair_editor
+
+
+def test_processing_cell_focus_and_back_keep_the_active_audition(project, monkeypatch):
+    window = project
+    window.show()
+    window.activateWindow()
+    track = window._session.tracks[0]
+    row = window._find_table_row(track.filename)
+    window._track_table.setCurrentCell(row, 0)
+    window._show_track_detail(track)
+    wait_for(lambda: window._repair_preview.displayed)
+    loads = []
+    stops = []
+    monkeypatch.setattr(window, "_load_waveform", loads.append)
+    monkeypatch.setattr(window, "_on_stop", lambda: stops.append(True))
+    button = window._track_table.cellWidget(row, 7)
+    button.setFocus()
+    QApplication.processEvents()
+    assert window._track_table.currentColumn() == 7
+    editor = open_editor(window, track)
+    editor.back_button.click()
+    QApplication.processEvents()
+    assert button.hasFocus() and not loads and not stops
+    track.status = "Read error"
+    window._set_track_repair_choice(track, "dc_remove", True)
+    assert not track.repair_overrides and window._repair_plan_worker is None
+
+
+def test_failed_reanalysis_returns_to_findings_when_the_track_is_reselected(project, monkeypatch):
+    window = project
+    track = window._session.tracks[0]
+    editor = open_editor(window, track)
+    monkeypatch.setattr(AnalyzeWorker, "start", lambda self: None)
+    window._on_analyze()
+    assert editor.track is None and window._file_report.report_track is None
+    window._worker.error.emit("Analysis interrupted")
+    window._select_row(window._find_table_row(track.filename))
+    assert window._file_report.report_track is track
+    assert window._file_review.currentWidget() is window._file_report_pane
 
 
 @pytest.mark.parametrize(("adjustment", "expected"), [
@@ -218,7 +284,8 @@ def test_switching_project_detaches_a_completed_plan_before_it_can_publish(proje
     source.mkdir()
     # Both projects use the same track name so a stale filename-based update would match.
     path = source / old_source.filename
-    sf.write(path, np.sin(2 * np.pi * np.arange(24000) / 80) / 8, 8000, subtype="PCM_16")
+    # The replacement project has a genuine low-frequency finding to repair.
+    sf.write(path, np.sin(2 * np.pi * 15 * np.arange(24000) / 8000) / 8, 8000, subtype="PCM_16")
     restored = load_track(str(path))
     config = window._flat_config()
     new_session = SessionContext([restored], config)
@@ -255,6 +322,7 @@ def test_switching_project_detaches_a_completed_plan_before_it_can_publish(proje
         assert not finished.is_set()
         current, = window._session.tracks
         assert current.filepath == str(path) and not current.repair_recipe.active
+        assert current.detector_results["subsonic"].data["subsonic_warn"]
         low = open_editor(window, current).rows["low_cut"].choice
         low.setCurrentIndex(low.findData(True))
         idle(window)
