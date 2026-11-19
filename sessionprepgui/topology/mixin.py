@@ -825,7 +825,7 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
         worker.finished.connect(
             lambda t, fp=track.filepath, rid=request_id:
                 self._on_topo_audio_loaded(t, fp, rid))
-        worker.error.connect(self._on_topo_audio_error)
+        worker.error.connect(lambda message, rid=request_id: self._on_topo_audio_error(message, rid))
         worker.start()
 
     def _on_topo_audio_loaded(self, track, filepath: str,
@@ -842,7 +842,9 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
             filepath, track.audio_data, track.audio_data, track.samplerate)
         self._topo_show_waveform(track.audio_data, track.samplerate, request_id=request_id)
 
-    def _on_topo_audio_error(self, message: str):
+    def _on_topo_audio_error(self, message: str, request_id: int):
+        if not self._topo_is_current_waveform_request(request_id):
+            return
         self._topo_audio_worker = None
         self._topo_wf_panel.waveform.set_loading(False)
         self._status_bar.showMessage(f"Audio load error: {message}")
@@ -903,7 +905,7 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
         worker.finished.connect(
             lambda display, playback, sr, labels, rid=request_id:
                 self._on_topo_multi_done(display, playback, sr, labels, rid))
-        worker.error.connect(self._on_topo_multi_error)
+        worker.error.connect(lambda message, rid=request_id: self._on_topo_multi_error(message, rid))
         worker.start()
 
     # ── Output waveform loading ───────────────────────────────────────
@@ -956,7 +958,7 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
         worker.finished.connect(
             lambda audio, sr, rid=request_id:
                 self._on_topo_resolve_done(audio, sr, rid))
-        worker.error.connect(self._on_topo_resolve_error)
+        worker.error.connect(lambda message, rid=request_id: self._on_topo_resolve_error(message, rid))
         worker.start()
 
     def _on_topo_resolve_done(self, audio_data, samplerate: int,
@@ -971,7 +973,9 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
             "__output__", audio_data, audio_data, samplerate)
         self._topo_show_waveform(audio_data, samplerate, request_id=request_id)
 
-    def _on_topo_resolve_error(self, message: str):
+    def _on_topo_resolve_error(self, message: str, request_id: int):
+        if not self._topo_is_current_waveform_request(request_id):
+            return
         self._topo_resolve_worker = None
         self._topo_wf_panel.waveform.set_loading(False)
         self._status_bar.showMessage(f"Preview error: {message}")
@@ -1037,7 +1041,7 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
         worker.finished.connect(
             lambda display, playback, sr, labels, rid=request_id:
                 self._on_topo_multi_done(display, playback, sr, labels, rid))
-        worker.error.connect(self._on_topo_multi_error)
+        worker.error.connect(lambda message, rid=request_id: self._on_topo_multi_error(message, rid))
         worker.start()
 
     def _on_topo_multi_done(self, display_audio, playback_audio,
@@ -1055,7 +1059,9 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
         self._topo_show_waveform(
             display_audio, samplerate, labels=labels, request_id=request_id)
 
-    def _on_topo_multi_error(self, message: str):
+    def _on_topo_multi_error(self, message: str, request_id: int):
+        if not self._topo_is_current_waveform_request(request_id):
+            return
         self._topo_multi_worker = None
         self._topo_wf_panel.waveform.set_loading(False)
         self._status_bar.showMessage(f"Multi-track load error: {message}")

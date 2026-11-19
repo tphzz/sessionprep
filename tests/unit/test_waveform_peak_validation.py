@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from threading import Event
 from time import monotonic, sleep
 
 import numpy as np
@@ -9,10 +10,12 @@ import soundfile as sf
 
 pytest.importorskip("PySide6")
 
-from PySide6.QtCore import QEvent
-from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import QEvent, Qt
+from PySide6.QtWidgets import QApplication, QTreeWidgetItem
 
-from sessionprepgui.analysis.worker import TopologyApplyWorker
+from sessionprepgui.analysis.worker import (
+    AudioLoadWorker, TopoAudioResolveWorker, TopoMultiAudioWorker, TopologyApplyWorker,
+)
 from sessionprepgui import settings
 from sessionprepgui.mainwindow import SessionPrepWindow
 from sessionprepgui.session.io import load_session, save_session
@@ -109,6 +112,62 @@ def test_replacing_a_project_with_disk_caches_clears_its_unfinished_progress(qap
     qapp.processEvents()
     assert not window._progress_running
     assert next(iter(window._peak_cache.values())).levels[0].data.max() == .25
+
+
+@pytest.mark.parametrize(("kind", "worker_type", "attribute", "prefix"), [
+    ("input", AudioLoadWorker, "_topo_audio_worker", "Audio load error"),
+    ("output", TopoAudioResolveWorker, "_topo_resolve_worker", "Preview error"),
+    ("input-multi", TopoMultiAudioWorker, "_topo_multi_worker", "Multi-track load error"),
+    ("output-multi", TopoMultiAudioWorker, "_topo_multi_worker", "Multi-track load error"),
+])
+def test_late_phase1_read_error_preserves_new_request(
+        qapp, window, tmp_path, monkeypatch, kind, worker_type, attribute, prefix):
+    path = tmp_path / "Bass.wav"
+    sf.write(path, np.zeros(4096), 48000)
+    track = load_track(str(path))
+    item = QTreeWidgetItem()
+    item.setData(0, Qt.UserRole, ("file", path.name))
+    current_can_finish = Event()
+    messages = iter(("previous file", "current file"))
+
+    def fail_read(worker):
+        message = next(messages)
+        if message == "current file":
+            current_can_finish.wait(5)
+        worker.error.emit(message)
+
+    def select():
+        window._source_dir = str(tmp_path)
+        window._topo_source_tracks = [track]
+        window._topo_topology = TopologyMapping([TopologyEntry(path.name, 1, [
+            TopologySource(path.name, [ChannelRoute(0, 0, 1.)])])])
+        if kind == "input":
+            window._topo_load_input_waveform(path.name)
+        elif kind == "output":
+            window._topo_load_output_waveform(path.name)
+        elif kind == "input-multi":
+            window._topo_load_multi_input([item])
+        else:
+            window._topo_load_multi_output([item])
+        return getattr(window, attribute)
+
+    monkeypatch.setattr(worker_type, "run", fail_read)
+    old = select()
+    assert old.wait(5000)
+    window._clear_workspace()
+    current = select()
+    try:
+        qapp.processEvents()
+        assert getattr(window, attribute) is current
+        assert window._topo_wf_panel.waveform._loading
+        assert "previous file" not in window._status_bar.currentMessage()
+    finally:
+        current_can_finish.set()
+        assert current.wait(5000)
+    qapp.processEvents()
+    assert getattr(window, attribute) is None
+    assert not window._topo_wf_panel.waveform._loading
+    assert window._status_bar.currentMessage() == f"{prefix}: current file"
 
 
 @pytest.mark.parametrize(("source_cached", "routed_cached"), [
