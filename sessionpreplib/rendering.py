@@ -14,6 +14,7 @@ from .models import (
     TrackContext,
 )
 from .audio import dbfs_offset, format_duration, linear_to_db
+from .detectors.stereo_compat import format_mono_loss
 from .repair_verification import remaining_results
 
 
@@ -286,15 +287,11 @@ def build_diagnostic_summary(
                 mono_loss_db = sc_r.data.get("mono_loss_db")
                 mono_warn_val = session.config.get("mono_loss_warn_db", 6.0)
                 if sc_r.data.get("mono_warn"):
-                    if mono_loss_db is None:
+                    if mono_loss_db is None or np.isnan(mono_loss_db):
                         parts.append("mono loss > threshold")
-                    elif np.isfinite(mono_loss_db):
-                        parts.append(
-                            f"mono loss {float(mono_loss_db):.1f} dB "
-                            f"(> {float(mono_warn_val):g} dB)")
                     else:
                         parts.append(
-                            f"mono loss inf dB (> {float(mono_warn_val):g} dB)")
+                            f"mono loss {format_mono_loss(mono_loss_db)} (> {float(mono_warn_val):g} dB)")
                 region_count = len(sc_r.data.get("windowed_regions", []))
                 if region_count:
                     minimum = sc_r.data.get("min_window_corr")

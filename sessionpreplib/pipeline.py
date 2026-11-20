@@ -154,7 +154,6 @@ class Pipeline:
             for track in session.tracks:
                 for detector_id in disabled:
                     track.detector_results.pop(detector_id, None)
-        session_dets = [d for d in self.session_detectors if getattr(d, 'phase', LifecyclePhase.PHASE2) == phase]
 
         total = len(session.tracks)
         ok_items = [
@@ -183,9 +182,17 @@ class Pipeline:
             log.debug(f"analyze {phase.value} (track detectors): {n} tracks in "
                 f"{dt_phase:.1f} ms ({dt_phase / n:.1f} ms/track avg)")
 
-        # Session-level detectors
+        self.analyze_session_detectors(session, phase)
+        # Keep the complete detector set available for GUI overlay generation.
+        session.detectors = self.repair_verification.detectors + self.session_detectors
+        return session
+
+    def analyze_session_detectors(self, session: SessionContext, phase: LifecyclePhase) -> None:
+        """Update findings that depend on the complete set of tracks in this phase."""
         track_map = {t.filename: t for t in session.tracks}
-        for det in session_dets:
+        for det in self.session_detectors:
+            if det.phase != phase:
+                continue
             if self.event_bus and self.event_bus.is_cancelled.is_set():
                 break
 
@@ -212,11 +219,6 @@ class Pipeline:
                         error=str(e),
                     )
                 ]
-
-        # Ensure the overall session.detectors always has all detectors
-        # required for GUI overlay generation, independent of which phase ran
-        session.detectors = self.repair_verification.detectors + self.session_detectors
-        return session
 
     def analyze_phase1(self, session: SessionContext) -> SessionContext:
         """Run structural/formatting detectors for track layout and validation."""

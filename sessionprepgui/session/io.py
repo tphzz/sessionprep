@@ -21,10 +21,13 @@ from dataclasses import asdict
 from typing import Any, Callable
 
 from sessionpreplib.audio import file_revision
+from sessionpreplib.detector import TrackDetector
+from sessionpreplib.detectors import default_detectors
 from sessionpreplib.models import (
     CorrectedAnalysis,
     DetectorResult,
     IssueLocation,
+    LifecyclePhase,
     ProcessorResult,
     Severity,
     TrackContext,
@@ -373,6 +376,50 @@ def _serialize_output_track(track: TrackContext) -> dict:
     return d
 
 
+_LAYOUT_SIGNAL_IDS = frozenset(
+    d.id for d in default_detectors() if isinstance(d, TrackDetector) and d.phase == LifecyclePhase.PHASE1
+)
+
+
+def capture_phase1_sources(tracks: list[TrackContext]) -> dict:
+    """Save measurements of the inputs independently of any edits to the layout."""
+    records = {}
+    for track in tracks:
+        if track.status != "OK" or not track.source_file_revision or not track.layout_analysis_key:
+            continue
+        results = {key: _ser_detector_result(result) for key, result in track.detector_results.items()
+                   if key in _LAYOUT_SIGNAL_IDS}
+        if results:
+            records[track.filename] = {
+                "revision": track.source_file_revision,
+                "signature": track.source_file_signature,
+                "settings": track.layout_analysis_key,
+                "results": results,
+            }
+    return records
+
+
+def restore_phase1_source(track: TrackContext, record: dict | None, verification) -> bool:
+    """Reuse a complete input measurement only when the original file still matches."""
+    try:
+        if (not isinstance(record, dict) or record["settings"] != verification.layout_settings_key
+                or record["results"].keys() != verification.layout_ids
+                or tuple(record["signature"]) != track.source_file_signature):
+            return False
+        stat = os.stat(track.filepath)
+        revision = file_revision(track.filepath, stat, allow_digest=False)
+        if (not revision or revision != record["revision"]
+                or (stat.st_size, stat.st_mtime_ns) != track.source_file_signature):
+            return False
+        results = _read_verified_results(record["results"], track)
+    except (OSError, TypeError, KeyError, ValueError, IndexError, AttributeError):
+        return False
+    track.detector_results.update(results)
+    track.layout_analysis_key = verification.layout_settings_key
+    track.source_file_revision = revision
+    return True
+
+
 def restore_layout_sources(data: dict, default_folder: str) -> str | None:
     """Rebind Phase 2 tracks to their routed sources, including legacy sessions."""
     if not data.get("topology_applied"):
@@ -493,6 +540,7 @@ def serialize_session_state(data: dict) -> dict:
             track.filename: _serialize_track(track)
             for track in data.get("tracks", [])
         },
+        "phase1_sources": data.get("phase1_sources", {}),
         "output_tracks": {
             track.filename: _serialize_output_track(track)
             for track in data.get("output_tracks", [])
@@ -547,6 +595,7 @@ def deserialize_session_state(raw: dict) -> dict:
         "session_groups": raw.get("session_groups", []),
         "daw_state": raw.get("daw_state", {}),
         "tracks": tracks,
+        "phase1_sources": raw.get("phase1_sources", {}),
         "output_tracks": output_tracks,
         "topology": topology,
         "transfer_manifest": transfer_manifest,

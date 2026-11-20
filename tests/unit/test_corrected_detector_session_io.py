@@ -9,10 +9,11 @@ import soundfile as sf
 
 from sessionprepgui.session.io import load_session, save_session
 from sessionpreplib.audio import SourceChangedError, load_track
-from sessionpreplib.detectors import ClippingDetector, default_detectors
+from sessionpreplib.detectors import ClippingDetector, StereoCompatDetector, default_detectors
 from sessionpreplib.models import SessionContext, Severity
 from sessionpreplib.pipeline import Pipeline
 from sessionpreplib.processors import default_processors
+from sessionpreplib.reports import save_json
 
 
 def _pipeline():
@@ -43,6 +44,28 @@ def _write_project(tmp_path, track):
 
 def _forbid_nonstandard_json(constant):
     pytest.fail(f"Project contains the non-JSON number {constant}")
+
+
+@pytest.mark.parametrize(("right_gain", "warn"), [(-0.25, False), (-0.5, True), (-1.0, True)])
+def test_whole_track_mono_loss_warning_remains_a_boolean_after_reopen(tmp_path, right_gain, warn):
+    path = tmp_path / "fold.wav"
+    left = np.tile([0.25, -0.25], 2400)
+    sf.write(path, np.column_stack((left, right_gain * left)), 48000, subtype="PCM_24")
+    track = load_track(str(path))
+    detector = StereoCompatDetector()
+    detector.configure({"corr_warn": -1.0, "corr_windowed": False, "mono_loss_warn_db": 6.0})
+    track.detector_results[detector.id] = detector.analyze(track)
+    project = _write_project(tmp_path, track)
+    raw = json.loads(project.read_text(encoding="utf-8"), parse_constant=_forbid_nonstandard_json)
+    assert raw["tracks"][track.filename]["detector_results"][detector.id]["data"]["mono_warn"] is warn
+    reopened = load_session(str(project))["tracks"][0]
+    result = reopened.detector_results[detector.id]
+    assert result.data["mono_warn"] is warn
+    assert result.severity == (Severity.INFO if warn else Severity.CLEAN)
+    report = tmp_path / "report.json"
+    save_json(SessionContext([reopened], {}), {}, str(report), [])
+    exported = json.loads(report.read_text(encoding="utf-8"), parse_constant=_forbid_nonstandard_json)
+    assert exported["tracks"][0]["diagnostics"]["mono_loss_warn"] is warn
 
 
 def test_replacement_during_decode_invalidates_source_evidence(tmp_path, monkeypatch):

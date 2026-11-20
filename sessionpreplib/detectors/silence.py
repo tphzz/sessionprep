@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from ..detector import TrackDetector
 from ..models import DetectorResult, IssueLocation, Severity, TrackContext, LifecyclePhase
-from ..audio import get_peak
+from ..audio import is_silent
 
 
 class SilenceDetector(TrackDetector):
@@ -29,10 +29,7 @@ class SilenceDetector(TrackDetector):
         )
 
     def analyze(self, track: TrackContext) -> DetectorResult:
-        peak = get_peak(track)
-        silent = peak == 0.0
-
-        if silent:
+        if is_silent(track):
             return DetectorResult(
                 detector_id=self.id,
                 severity=Severity.ATTENTION,

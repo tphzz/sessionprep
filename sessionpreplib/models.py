@@ -168,6 +168,7 @@ class TrackContext:
     source_file_revision: str | None = None
     detector_sample_digest: str | None = None
     source_sample_digest: str | None = None
+    layout_analysis_key: str | None = None
 
 
 @dataclass

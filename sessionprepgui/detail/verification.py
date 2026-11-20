@@ -83,7 +83,7 @@ def verification_status(outcome):
 def _level(value, unit, places=1):
     if not isinstance(value, (int, float)) or isinstance(value, bool) or math.isnan(value):
         return "—"
-    return f"{value:.{places}f}".replace("-inf", "−∞").replace("-", "−") + unit
+    return f"{value:.{places}f}".replace("inf", "∞").replace("-", "−") + unit
 
 
 def subsonic_note(config):

@@ -5,7 +5,7 @@ import numpy as np
 from ..models import ParamSpec, LifecyclePhase
 from ..detector import TrackDetector
 from ..models import DetectorResult, IssueLocation, Severity, TrackContext
-from ..audio import dbfs_offset, get_stereo_rms, is_silent, linear_to_db
+from ..audio import dbfs_offset, is_silent, linear_to_db, stereo_layout_levels
 
 
 class OneSidedSilenceDetector(TrackDetector):
@@ -64,12 +64,12 @@ class OneSidedSilenceDetector(TrackDetector):
                 },
             )
 
-        stereo_rms = get_stereo_rms(track)
-        if stereo_rms is None:
+        levels = stereo_layout_levels(track)
+        if levels is None:
             return DetectorResult(
                 detector_id=self.id,
                 severity=Severity.CLEAN,
-                summary="mono track",
+                summary="requires a stereo track",
                 applicable=False,
                 data={
                     "one_sided_silence": False,
@@ -79,7 +79,8 @@ class OneSidedSilenceDetector(TrackDetector):
                 },
             )
 
-        l_rms_lin, r_rms_lin, l_rms_db, r_rms_db = stereo_rms
+        _, l_rms_lin, r_rms_lin = levels
+        l_rms_db, r_rms_db = linear_to_db(l_rms_lin), linear_to_db(r_rms_lin)
         silence_lin = float(10.0 ** (self.threshold_db / 20.0))
 
         one_sided = False

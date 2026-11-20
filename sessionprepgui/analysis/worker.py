@@ -13,6 +13,7 @@ log = logging.getLogger(__name__)
 
 from PySide6.QtCore import QThread, Signal
 
+from sessionpreplib.audio import SourceChangedError
 from sessionpreplib.daw_processor import DawProcessor
 from sessionpreplib.detector import TrackDetector
 from sessionpreplib.pipeline import Pipeline, load_session
@@ -21,6 +22,7 @@ from sessionpreplib.processors import default_processors
 from sessionpreplib.rendering import build_diagnostic_summary
 from sessionpreplib.events import EventBus
 from sessionpreplib.models import LifecyclePhase
+from sessionpreplib.repair_plan import check_source_signature
 
 
 def _gui_source_samples(samples):
@@ -30,6 +32,31 @@ def _gui_source_samples(samples):
         owner.setflags(write=False)
         owner = owner.base
     return samples
+
+
+def _adopt_decoded_source(track, decoded):
+    """Keep the project-relative name and publish the PCM with its decoder metadata."""
+    track.channels = decoded.channels
+    track.samplerate = decoded.samplerate
+    track.total_samples = decoded.total_samples
+    track.duration_sec = decoded.duration_sec
+    track.bitdepth = decoded.bitdepth
+    track.subtype = decoded.subtype
+    track.chunk_ids = decoded.chunk_ids
+    track.source_file_signature = decoded.source_file_signature
+    track.source_file_revision = decoded.source_file_revision
+    track.source_sample_digest = decoded.source_sample_digest
+    track.audio_data = _gui_source_samples(decoded.audio_data)
+
+
+def _needs_source_decode(track):
+    if track.audio_data is None:
+        return True
+    try:
+        check_source_signature(track)
+    except (OSError, SourceChangedError):
+        return True
+    return False
 
 
 class DawCheckWorker(QThread):
@@ -188,10 +215,6 @@ class Phase1AnalyzeWorker(QThread):
                 event_bus=event_bus,
             )
 
-            # Calculate total progress steps for Phase 1
-            ok_tracks = [t for t in session.tracks if t.status == "OK"]
-            num_ok = len(ok_tracks)
-
             p1_track_dets = [d for d in pipeline.track_detectors if d.phase == LifecyclePhase.PHASE1
                              and d.id in pipeline.repair_verification.required_ids]
             p1_sess_dets = [d for d in pipeline.session_detectors if getattr(d, 'phase', LifecyclePhase.PHASE2) == LifecyclePhase.PHASE1]
@@ -199,42 +222,39 @@ class Phase1AnalyzeWorker(QThread):
             num_track_det = len(p1_track_dets)
             num_session_det = len(p1_sess_dets)
 
-            # Load audio data first, since lightweight discovery doesn't load it
-            if num_ok > 0 and ok_tracks[0].audio_data is None:
+            # Preview can already have decoded individual sources.
+            missing = [track for track in session.tracks
+                       if track.status == "OK" and _needs_source_decode(track)]
+            if missing:
                 from sessionpreplib.audio import load_track
                 from concurrent.futures import ThreadPoolExecutor, as_completed
                 import os
 
                 self.progress.emit("Loading audio data\u2026")
-                self.progress_value.emit(0, num_ok)
+                self.progress_value.emit(0, len(missing))
 
                 with ThreadPoolExecutor(max_workers=min(os.cpu_count() or 4, 8)) as pool:
                     futures = {
                         pool.submit(load_track, t.filepath): t
-                        for t in ok_tracks
+                        for t in missing
                     }
-                    loaded = 0
-                    for future in as_completed(futures):
+                    for loaded, future in enumerate(as_completed(futures), 1):
                         if self._is_cancelled:
                             break
                         t = futures[future]
                         try:
-                            res = future.result()
-                            t.audio_data = _gui_source_samples(res.audio_data)
-                            # Preserve metadata since it might be updated
-                            t.total_samples = res.total_samples
-                            t.samplerate = res.samplerate
-                            # VERY IMPORTANT: clear cache in case `get_peak()` was called
-                            # while audio_data was None, so it doesn't stay 0.0 forever.
-                            t._cache.clear()
+                            _adopt_decoded_source(t, future.result())
                         except Exception as e:
                             t.status = "ERROR"
                             t.error = str(e)
-                        loaded += 1
-                        self.progress_value.emit(loaded, num_ok)
+                            t.audio_data = None
+                        self.progress_value.emit(loaded, len(missing))
 
-            # Re-filter OK tracks after loading (some might have failed)
+            # Discovery-time measurements (such as the peak of an unloaded source)
+            # are stale even when the preview worker supplied the samples.
             ok_tracks = [t for t in session.tracks if t.status == "OK"]
+            for track in ok_tracks:
+                track._cache.clear()
             num_ok = len(ok_tracks)
 
             total_steps = (
@@ -428,25 +448,24 @@ class AudioLoadWorker(QThread):
 
     def run(self):
         try:
-            import time, logging
+            import time
             t0 = time.perf_counter()
-            log = logging.getLogger(__name__)
 
             from sessionpreplib.audio import load_track
-            import soundfile as sf
-            import numpy as np
-            data, sr = sf.read(self._track.filepath, dtype='float64')
+            track = self._track
+            decoded = load_track(track.filepath)
 
             elapsed = (time.perf_counter() - t0) * 1000
-            if getattr(self._track, 'filename', None):
-                log.debug("[Trace] AudioLoadWorker I/O (sf.read) for '%s': %.2f ms", self._track.filename, elapsed)
+            log.debug("AudioLoadWorker decoded '%s' in %.2f ms", track.filename, elapsed)
 
             if self._cancelled:
                 return
-            self._track.audio_data = _gui_source_samples(data)
-            self._track.samplerate = sr
-            self._track.total_samples = len(data)
-            self.finished.emit(self._track)
+            if ((track.source_file_revision is not None and track.source_file_revision != decoded.source_file_revision)
+                    or (track.detector_results and track.source_file_signature is not None
+                        and track.source_file_signature != decoded.source_file_signature)):
+                raise SourceChangedError(f"{track.filename} has changed since analysis. Reanalyze this source.")
+            _adopt_decoded_source(track, decoded)
+            self.finished.emit(track)
         except Exception as exc:
             self.error.emit(str(exc))
 
@@ -833,11 +852,12 @@ class TopologyApplyWorker(QThread):
     error = Signal(str)
 
     def __init__(self, session, output_dir: str, source_dir: str | None = None,
-                 peaks_dir: str | None = None):
+                 peaks_dir: str | None = None, *, source_tracks=None):
         super().__init__()
         self._session = session
         self._output_dir = output_dir
         self._source_dir = source_dir
+        self._source_tracks = source_tracks
         self._peaks_dir = peaks_dir
         self._is_cancelled = False
 
@@ -847,9 +867,10 @@ class TopologyApplyWorker(QThread):
     def run(self):
         try:
             import os
-            import numpy as np
+            from pathlib import Path
             import soundfile as sf
             from sessionpreplib.audio import load_track, AUDIO_EXTENSIONS
+            from sessionpreplib.repair_plan import check_source_signature
             from sessionpreplib.topology import resolve_entry_audio
             from sessionpreplib.models import TrackContext
 
@@ -860,47 +881,27 @@ class TopologyApplyWorker(QThread):
                 return
 
             output_dir = self._output_dir
-
-            # Clean stale audio files from output dir (recursive)
-            if os.path.isdir(output_dir):
-                for dirpath, _dirnames, filenames in os.walk(
-                        output_dir, topdown=False):
-                    for fname in filenames:
-                        if os.path.splitext(fname)[1].lower() not in AUDIO_EXTENSIONS:
-                            continue
-                        fp = os.path.join(dirpath, fname)
-                        try:
-                            os.unlink(fp)
-                        except OSError:
-                            pass
-                    # Prune empty subdirectories
-                    if dirpath != output_dir:
-                        try:
-                            os.rmdir(dirpath)
-                        except OSError:
-                            pass
-            os.makedirs(output_dir, exist_ok=True)
+            output_path = Path(output_dir).resolve()
+            source_root = Path(self._source_dir).resolve() if self._source_dir else None
+            if source_root is not None and source_root.is_relative_to(output_path):
+                raise ValueError("The layout output folder must be separate from the source folder.")
 
             # Collect source filenames referenced by topology
-            ok_tracks = [t for t in session.tracks if t.status == "OK"]
-            track_map = {t.filename: t for t in ok_tracks}
+            tracks = self._source_tracks if self._source_tracks is not None else session.tracks
+            track_map = {t.filename: t for t in tracks if t.status == "OK"}
 
-            needed_sources: set[str] = set()
-            for entry in topology.entries:
-                for src in entry.sources:
-                    needed_sources.add(src.input_filename)
+            needed_sources = {src.input_filename for entry in topology.entries
+                              if entry.output_channels > 0 for src in entry.sources}
 
             n_sources = len(needed_sources)
             n_entries = len(topology.entries)
             # Total includes peak building phase when peaks_dir is set
             total = n_sources + n_entries + (n_entries if self._peaks_dir else 0)
 
-            # Phase A: Load source audio
-            # After a previous Apply+Analyze cycle, session.tracks may
-            # only contain *output* filenames.  Sources that were merged
-            # (e.g. 12_ElecGtr2.wav into 11_ElecGtr1.wav) won't be in
-            # track_map.  Fall back to loading directly from source_dir.
+            # Phase 2 tracks may be renders with the same relative names. Keep
+            # the PCM and format together, anchored to the original source path.
             source_audio: dict[str, tuple] = {}
+            sources: dict[str, TrackContext] = {}
             for step, filename in enumerate(sorted(needed_sources)):
                 if self._is_cancelled:
                     return
@@ -909,25 +910,56 @@ class TopologyApplyWorker(QThread):
                 self.progress.emit(f"Loading {filename}")
                 self.progress_value.emit(step, total)
                 track = track_map.get(filename)
-                if track and track.audio_data is not None and track.audio_data.size > 0:
-                    source_audio[filename] = (track.audio_data, track.samplerate)
+                if source_root is None and track is None:
+                    raise ValueError(f"Missing source: {filename}")
+                path = (source_root / filename if source_root is not None else Path(track.filepath)).resolve()
+                if path.is_relative_to(output_path):
+                    raise ValueError(f"{filename}: the original source is inside the layout output folder.")
+                if source_root is not None and track is not None and Path(track.filepath).resolve() != path:
+                    track = None
+                if (track is not None and track.audio_data is not None and
+                        (source_root is None or (track.source_file_signature and track.source_file_revision))):
+                    source = track
+                else:
+                    source = load_track(str(path))
+                    if track is not None:
+                        source.group = track.group
+                if source_root is not None and track is not None:
+                    check_source_signature(track)
+                sources[filename] = source
+                source_audio[filename] = (source.audio_data, source.samplerate)
+
+            # Validate every route before replacing any previous layout audio.
+            for entry in topology.entries:
+                if entry.output_channels < 1:
                     continue
-                # Determine best path to load from
-                src_path = None
-                if self._source_dir:
-                    candidate = os.path.join(self._source_dir, filename)
-                    if os.path.isfile(candidate):
-                        src_path = candidate
-                if src_path is None and track:
-                    src_path = track.filepath
-                if src_path is None:
-                    continue
-                loaded = load_track(src_path)
-                if track:
-                    track.audio_data = _gui_source_samples(loaded.audio_data)
-                    track.samplerate = loaded.samplerate
-                    track.total_samples = loaded.total_samples
-                source_audio[filename] = (loaded.audio_data, loaded.samplerate)
+                for src in entry.sources:
+                    samples = sources[src.input_filename].audio_data
+                    channels = 1 if samples.ndim == 1 else samples.shape[1]
+                    for route in src.routes:
+                        if not 0 <= route.source_channel < channels:
+                            raise ValueError(f"{src.input_filename}: source channel {route.source_channel + 1} "
+                                             f"is unavailable ({channels} channels).")
+                        if not 0 <= route.target_channel < entry.output_channels:
+                            raise ValueError(f"{entry.output_filename}: output channel {route.target_channel + 1} "
+                                             f"is unavailable ({entry.output_channels} channels).")
+
+            if self._is_cancelled:
+                return
+            if os.path.isdir(output_dir):
+                for dirpath, _dirnames, filenames in os.walk(output_dir, topdown=False):
+                    for fname in filenames:
+                        if os.path.splitext(fname)[1].lower() in AUDIO_EXTENSIONS:
+                            try:
+                                os.unlink(os.path.join(dirpath, fname))
+                            except OSError:
+                                pass
+                    if dirpath != output_dir:
+                        try:
+                            os.rmdir(dirpath)
+                        except OSError:
+                            pass
+            os.makedirs(output_dir, exist_ok=True)
 
             # Phase B: Resolve topology + write output files (no peak building)
             output_tracks = []
@@ -948,35 +980,13 @@ class TopologyApplyWorker(QThread):
                     continue
 
                 try:
-                    # Check all sources are available before resolving
-                    missing = [
-                        s.input_filename for s in entry.sources
-                        if s.input_filename not in source_audio
-                    ]
-                    if missing:
-                        errors.append((
-                            entry.output_filename,
-                            f"missing source(s): {', '.join(missing)}"))
-                        continue
                     resolved = resolve_entry_audio(entry, source_audio)
-                    # Get format info from first source (track_map or source_audio)
-                    src_track = None
-                    sr = 44100
-                    subtype = "PCM_24"
-                    bitdepth = "24-bit"
-                    if entry.sources:
-                        first_src = entry.sources[0].input_filename
-                        src_track = track_map.get(first_src)
-                        if src_track:
-                            sr = src_track.samplerate
-                            subtype = src_track.subtype
-                            bitdepth = src_track.bitdepth
-                        elif first_src in source_audio:
-                            _, sr = source_audio[first_src]
+                    src_track = sources[entry.sources[0].input_filename]
+                    sr = src_track.samplerate
 
                     dst = os.path.join(output_dir, entry.output_filename)
                     os.makedirs(os.path.dirname(dst), exist_ok=True)
-                    sf.write(dst, resolved, sr, subtype=subtype)
+                    sf.write(dst, resolved, sr, subtype=src_track.subtype)
                     written_files.append((entry.output_filename, dst, sr))
 
                     n_samples = resolved.shape[0]
@@ -987,10 +997,10 @@ class TopologyApplyWorker(QThread):
                         samplerate=sr,
                         channels=entry.output_channels,
                         total_samples=n_samples,
-                        bitdepth=bitdepth,
-                        subtype=subtype,
+                        bitdepth=src_track.bitdepth,
+                        subtype=src_track.subtype,
                         duration_sec=(n_samples / sr) if sr > 0 else 0.0,
-                        group=src_track.group if src_track else None,
+                        group=src_track.group,
                     )
                     output_tracks.append(out_tc)
                 except Exception as e:
@@ -998,6 +1008,7 @@ class TopologyApplyWorker(QThread):
 
             # Free source audio memory before peak building
             source_audio.clear()
+            sources.clear()
 
             # Phase C: Build peak caches (re-reading from just-written files)
             if self._peaks_dir:

@@ -230,7 +230,9 @@ def get_peak_db(track: TrackContext) -> float:
 
 def is_silent(track: TrackContext) -> bool:
     """True if the file is absolute silence (peak == 0)."""
-    return get_peak(track) == 0.0
+    peak = get_peak(track)
+    validate_analysis_level(peak, track.total_samples)
+    return peak == 0.0
 
 
 def validate_analysis_level(peak: float, samples: int) -> None:
@@ -345,6 +347,54 @@ def get_gated_rms_data(
 # ---------------------------------------------------------------------------
 # Stereo helpers (cached)
 # ---------------------------------------------------------------------------
+
+def _channel_ac_rms(channel: np.ndarray, block_size: int) -> float:
+    low, high = float(channel.min()), float(channel.max())
+    if low == high:
+        return 0.0
+    # Work relative to the signal's range so a small ripple around a large
+    # DC offset survives centering. A square wave at the threshold has
+    # unit mean square at every file length.
+    midpoint = low + (high - low) * 0.5
+    scale = max(high - midpoint, midpoint - low)
+    mean = 0.0
+    sum_squares = 0.0
+    for start in range(0, len(channel), block_size):
+        block = np.subtract(channel[start:start + block_size], midpoint, dtype=np.float64)
+        block /= scale
+        block_mean = float(block.mean())
+        block -= block_mean
+        # Pool the two centered sums using their difference in means.
+        weight = len(block) / (start + len(block))
+        delta = block_mean - mean
+        sum_squares += float(np.sum(np.square(block, out=block))) + delta**2 * start * weight
+        mean += delta * weight
+    return scale * math.sqrt(sum_squares / len(channel))
+
+
+def stereo_layout_levels(track: TrackContext) -> tuple[float, float, float] | None:
+    """Peak absolute L/R difference and DC-removed RMS of each complete channel.
+
+    Both layout detectors can recommend discarding a channel. Share exact
+    measurements and keep only the three scalar results in the track cache.
+    """
+    key = "stereo_layout_levels"
+    if key not in track._cache:
+        data = track.audio_data
+        if data is None or data.ndim != 2 or data.shape[1] != 2 or not len(data):
+            return None
+        left, right = data.T
+        max_difference = 0.0
+        block_size = 65_536
+        for start in range(0, len(data), block_size):
+            block = data[start:start + block_size]
+            difference = np.subtract(block[:, 0], block[:, 1], dtype=np.float64)
+            max_difference = np.maximum(max_difference, np.max(np.abs(difference)))
+        left_rms = _channel_ac_rms(left, block_size)
+        right_rms = left_rms if max_difference == 0 else _channel_ac_rms(right, block_size)
+        track._cache[key] = float(max_difference), left_rms, right_rms
+    return track._cache[key]
+
 
 def get_stereo_channels_subsampled(
     track: TrackContext,
@@ -634,7 +684,7 @@ def windowed_stereo_correlation(
     _NAN = float('nan')
 
     if (left.ndim != 1 or right.ndim != 1
-            or left.size < 8 or left.size != right.size
+            or left.size == 0 or left.size != right.size
             or samplerate <= 0):
         return _NAN, 0.0, []
 
@@ -655,9 +705,32 @@ def windowed_stereo_correlation(
     L = l.reshape(n_win, win_samples)
     R = r.reshape(n_win, win_samples)
 
-    # Per-window DC removal
-    L = L - L.mean(axis=1, keepdims=True)
-    R = R - R.mean(axis=1, keepdims=True)
+    counts = np.full(n_win, win_samples)
+    counts[-1] = n - (n_win - 1) * win_samples
+
+    # Fold first: independently centering L and R can create or erase a
+    # residual. Subtracting a reference sample gives any constant fold an
+    # exact AC norm of zero. Scale before squaring to retain very small nulls.
+    folded = L + R
+    folded -= folded[:, :1].copy()
+    folded[-1, counts[-1]:] = 0.0
+    scales = np.maximum(folded.max(axis=1), -folded.min(axis=1))
+    scales[scales == 0] = 1.0
+    folded /= scales[:, None]
+    folded -= folded.sum(axis=1, keepdims=True) / counts[:, None]
+    folded[-1, counts[-1]:] = 0.0
+    # Keep the scaling factor in log power. Reconstructing a very small
+    # norm in linear units would round away part of a measurable residual.
+    with np.errstate(divide='ignore'):
+        mono_log_power = (np.log(np.einsum('ij,ij->i', folded, folded))
+                          + 2.0 * (np.log(scales) - math.log(2.0)))
+    del folded
+
+    # Center L and R independently for Pearson correlation and stereo RMS.
+    L -= L.sum(axis=1, keepdims=True) / counts[:, None]
+    R -= R.sum(axis=1, keepdims=True) / counts[:, None]
+    L[-1, counts[-1]:] = 0.0
+    R[-1, counts[-1]:] = 0.0
 
     # Per-window dot products (vectorized)
     dot_ll = np.sum(L * L, axis=1)
@@ -665,27 +738,22 @@ def windowed_stereo_correlation(
     dot_lr = np.sum(L * R, axis=1)
 
     # Per-window RMS for silence gating
-    rms_l = np.sqrt(dot_ll / win_samples)
-    rms_r = np.sqrt(dot_rr / win_samples)
+    rms_l = np.sqrt(dot_ll / counts)
+    rms_r = np.sqrt(dot_rr / counts)
     active = np.maximum(rms_l, rms_r) >= silence_rms
 
     # --- Per-window correlation ---
-    denom = np.sqrt(dot_ll * dot_rr)
+    denom = np.sqrt(dot_ll) * np.sqrt(dot_rr)
     with np.errstate(divide='ignore', invalid='ignore'):
-        corr = np.where(denom > 0, dot_lr / denom, 0.0)
+        corr = np.clip(np.where(denom > 0, dot_lr / denom, 0.0), -1.0, 1.0)
     corr[~active] = _NAN
 
     # --- Per-window mono folddown loss ---
-    # stereo_power = (dot_ll + dot_rr) / 2
-    # mono_power   = (dot_ll + 2*dot_lr + dot_rr) / 4
     stereo_p = (dot_ll + dot_rr) / 2.0
-    mono_p = (dot_ll + 2.0 * dot_lr + dot_rr) / 4.0
+    to_db = 10.0 / math.log(10.0)
     with np.errstate(divide='ignore', invalid='ignore'):
-        mono_loss = np.where(
-            (mono_p > 0) & (stereo_p > 0),
-            10.0 * np.log10(stereo_p / mono_p),
-            np.where(stereo_p > 0, np.inf, 0.0),
-        )
+        mono_loss = np.maximum(0.0, to_db * (np.log(stereo_p) - mono_log_power))
+    mono_loss[stereo_p == 0] = 0.0
     mono_loss[~active] = _NAN
 
     # --- Whole-file aggregation (from cumulative dot products) ---
@@ -693,15 +761,13 @@ def windowed_stereo_correlation(
     sum_rr = float(np.sum(dot_rr[active]))
     sum_lr = float(np.sum(dot_lr[active]))
 
-    whole_denom = np.sqrt(sum_ll * sum_rr)
-    whole_corr = float(sum_lr / whole_denom) if whole_denom > 0 else _NAN
+    whole_denom = np.sqrt(sum_ll) * np.sqrt(sum_rr)
+    whole_corr = float(np.clip(sum_lr / whole_denom, -1.0, 1.0)) if whole_denom > 0 else _NAN
 
     whole_stereo_p = (sum_ll + sum_rr) / 2.0
-    whole_mono_p = (sum_ll + 2.0 * sum_lr + sum_rr) / 4.0
-    if whole_mono_p > 0 and whole_stereo_p > 0:
-        whole_mono_loss = float(10.0 * np.log10(whole_stereo_p / whole_mono_p))
-    elif whole_stereo_p > 0:
-        whole_mono_loss = float('inf')
+    if whole_stereo_p > 0:
+        whole_mono_log_power = float(np.logaddexp.reduce(mono_log_power[active], initial=-np.inf))
+        whole_mono_loss = max(0.0, to_db * (math.log(whole_stereo_p) - whole_mono_log_power))
     else:
         whole_mono_loss = 0.0
 

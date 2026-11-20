@@ -12,7 +12,7 @@ from .config import ANALYSIS_PARAMS
 from .detector import TrackDetector
 from .detectors.audio_classifier import AudioClassifierDetector
 from .detectors.silence import SilenceDetector
-from .models import CorrectedAnalysis, DetectorResult, IssueLocation, Severity
+from .models import CorrectedAnalysis, DetectorResult, IssueLocation, LifecyclePhase, Severity
 
 
 class CheckOutcome(Enum):
@@ -247,7 +247,15 @@ class RepairVerification:
         implementations = [(d.id, type(d).__module__, type(d).__qualname__, d.depends_on)
                            for d in self.detectors]
         # Bump the evidence version when detector or render semantics change.
-        self.settings_key = _digest([4, implementations, settings])
+        self.settings_key = _digest([5, implementations, settings])
+        # Source layout evidence survives Apply. Bind it only to settings that
+        # affect these measurements, independently of repairs and normalization.
+        layout = [d for d in detectors if d.phase == LifecyclePhase.PHASE1 and d.id in self.required_ids]
+        self.layout_ids = {d.id for d in layout}
+        layout_params = [(d.id, type(d).__module__, type(d).__qualname__,
+                          {s.key: config.get(s.key, s.default)
+                           for s in d.config_params() if not s.presentation_only}) for d in layout]
+        self.layout_settings_key = _digest([1, config.get("dbfs_convention", "standard"), layout_params])
 
     def original_key(self, track):
         samples = track.detector_sample_digest
@@ -257,6 +265,7 @@ class RepairVerification:
                 # Cached peak, RMS envelopes and stereo measurements all refer
                 # to the previous PCM, including when the same array was edited.
                 track._cache = {}
+                track.layout_analysis_key = None
                 track.detector_analysis_key = None
                 track.corrected_analysis = None
             track.detector_sample_digest = samples
@@ -317,6 +326,12 @@ class RepairVerification:
             else:
                 measured.discard(detector.id)
         track._cache["detectors_measured"] = (key, measured)
+        if self.layout_ids and self.layout_ids <= {d.id for d in detectors}:
+            complete = (track.source_sample_digest is not None
+                        and track.detector_sample_digest == track.source_sample_digest
+                        and self.layout_ids <= measured
+                        and all(not track.detector_results[i].error for i in self.layout_ids))
+            track.layout_analysis_key = self.layout_settings_key if complete else None
         track.detector_analysis_key = key if self.ids <= measured else None
         track.corrected_analysis = None
 

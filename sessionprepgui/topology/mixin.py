@@ -230,6 +230,8 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
 
         # Worker references
         self._topo_apply_worker = None
+        self._p1_worker = None
+        self._topo_pending_sources = []
         self._topo_audio_worker = None
         self._topo_wf_worker = None
         self._topo_resolve_worker = None
@@ -259,7 +261,7 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
             return
 
         # Auto-build default topology if none exists
-        if self._topo_topology is None:
+        if self._topo_topology is None and not self._topo_pending_sources:
             ok = [t for t in self._topo_source_tracks if t.status == "OK"]
             if ok:
                 self._topo_topology = build_default_topology(
@@ -361,7 +363,7 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
         self._session.topology = self._topo_topology
         self._topo_apply_worker = TopologyApplyWorker(
             self._session, output_dir, source_dir=self._source_dir,
-            peaks_dir=peaks_dir)
+            peaks_dir=peaks_dir, source_tracks=self._topo_source_tracks)
         self._topo_apply_worker.progress.connect(self._on_topo_apply_progress)
         self._topo_apply_worker.progress_value.connect(
             self._on_topo_apply_progress_value)
@@ -384,7 +386,7 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
         self._topo_apply_worker = None
         set_action_busy(self._topo_apply_action, False)
         self._topo_apply_action.setEnabled(True)
-        self._topo_reset_action.setEnabled(True)
+        self._topo_reset_action.setEnabled(not self._topo_pending_sources)
 
         errors = self._session.config.get("_topology_apply_errors", [])
         n_out = len(self._session.output_tracks)
@@ -415,7 +417,7 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
         self._topo_apply_worker = None
         set_action_busy(self._topo_apply_action, False)
         self._topo_apply_action.setEnabled(True)
-        self._topo_reset_action.setEnabled(True)
+        self._topo_reset_action.setEnabled(not self._topo_pending_sources)
         self._progress_fail(message)
         self._status_bar.showMessage(f"Apply topology error: {message}")
 
@@ -423,8 +425,8 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
 
     @Slot()
     def _on_topo_reset(self):
-        """Reset topology to default passthrough."""
-        if not self._session:
+        """Rebuild the recommended layout from the original source findings."""
+        if not self._session or self._topo_pending_sources:
             return
         self._topo_topology = build_default_topology(self._topo_source_tracks)
         self._topo_changed()

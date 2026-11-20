@@ -326,7 +326,9 @@ def save_json(
                 "samples": int(t.total_samples),
                 "is_clipped": bool(is_clipped),
                 "is_silent": bool(is_silent),
-                "mono_loss_db": None if mono_loss_db is None else float(mono_loss_db),
+                "mono_loss_db": (float(mono_loss_db) if mono_loss_db is not None
+                                 and math.isfinite(mono_loss_db) else None),
+                "mono_fully_cancelled": bool(mono_loss_db == math.inf),
                 "mono_loss_warn": bool(mono_warn),
             },
             "processing": outcomes[t.filename],

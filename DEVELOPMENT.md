@@ -866,16 +866,15 @@ Contains audio I/O, cached DSP helpers, and stateless DSP functions.
 - `get_window_samples(track, window_ms) -> int`
 - `get_gated_rms_data(track, window_ms, stereo_mode, gate_relative_db) -> dict`
   Returns `{"active_means", "active_mask", "all_means", "max_mean", "rms_max_db"}`
-- `get_stereo_channels_subsampled(track) -> tuple[ndarray, ndarray] | None`
-- `get_stereo_channels_dc_removed(track) -> tuple[ndarray, ndarray] | None`
-- `get_stereo_rms(track) -> dict | None`
-  Returns `{"l_rms_lin", "r_rms_lin", "l_rms_db", "r_rms_db"}`
+- `stereo_layout_levels(track)` measures every stereo frame in bounded blocks and caches three scalars (peak absolute L/R difference, left DC-removed RMS, right DC-removed RMS). Phase 1 uses these readings for channel extraction.
+- `get_stereo_channels_subsampled(track)` and `get_stereo_channels_dc_removed(track)` return sampled L/R arrays and their stride for approximate analysis.
+- `get_stereo_rms(track)` returns the two sampled linear RMS readings followed by their dB values. Each stereo helper returns `None` for inapplicable input.
 
 **Stateless DSP functions:**
 
 - `detect_clipping_ranges(data, threshold_count, max_ranges) -> (int, list[tuple[int, int, int|None]])` — ranges are `(start, end, channel)`
 - `subsonic_stft_analysis(signal, samplerate, cutoff_hz, *, window_ms, hop_ms, abs_gate_db, silence_rms) -> (float, list[tuple[int, int, float]])` — single-pass STFT subsonic analysis on a 1-D signal; returns `(whole_file_ratio_db, per_window_ratios)`. Uses `scipy.signal.stft` with Hann windowing, vectorised band/total power computation, and silence + absolute power gates.
-- `windowed_stereo_correlation(left, right, samplerate, window_ms, silence_rms) -> (float, float, list[tuple[int, int, float, float]])` — windowed Pearson correlation + mono folddown loss for stereo L/R; returns `(whole_corr, whole_mono_loss_db, per_window_results)`. Vectorised numpy with per-window DC removal, silence gating, and whole-file aggregation from cumulative dot products.
+- `windowed_stereo_correlation(left, right, samplerate, window_ms, silence_rms)` returns `(whole_corr, whole_mono_loss_db, per_window_results)`. The active windows contribute their centered stereo energy and the energy of their actual mono fold-down. Positive infinity denotes exact cancellation. A partial window uses its actual frame count for centering and gating.
 - `linear_to_db(linear) -> float`
 - `db_to_linear(db) -> float`
 - `format_duration(samples, samplerate) -> str`

@@ -8,11 +8,12 @@ import logging
 log = logging.getLogger(__name__)
 
 import copy
+from dataclasses import replace
 from decimal import Decimal, ROUND_FLOOR
 import os
 from typing import Any
 
-from PySide6.QtCore import Qt, Slot, QSize
+from PySide6.QtCore import QObject, QSize, Qt, SIGNAL, SLOT, Slot
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -43,7 +44,7 @@ from sessionpreplib.config import (
     resolve_session_config,
 )
 from sessionpreplib.detectors import default_detectors
-from sessionpreplib.models import SessionContext, TrackContext
+from sessionpreplib.models import LifecyclePhase, SessionContext, TrackContext
 from sessionpreplib.pipeline import Pipeline
 from sessionpreplib.processors import default_processors
 from sessionpreplib.repair_plan import check_source_signature
@@ -56,7 +57,8 @@ from ..prefs.config_pages import _config_section_values
 from ..prefs.param_form import ConfigResetButton, _read_widget, _set_widget_value
 from ..prefs.param_widgets import build_config_pages, load_config_widgets
 from ..session.io import (
-    load_session as _load_session_file, restore_layout_sources, save_session as _save_session_file,
+    capture_phase1_sources, load_session as _load_session_file, restore_layout_sources,
+    restore_phase1_source, save_session as _save_session_file,
 )
 from ..settings import build_defaults
 from ..tracks.table_widgets import (
@@ -357,6 +359,12 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
     def _cancel_worker(self, worker_attr: str) -> None:
         """Safely detach and cancel a background worker to avoid QThread GC destruction."""
         worker = getattr(self, worker_attr, None)
+        if isinstance(worker, Phase1AnalyzeWorker):
+            setattr(self, worker_attr, None)
+            worker.cancel()
+            if not worker.isRunning():
+                worker.deleteLater()
+            return
         if isinstance(worker, (RepairPlanWorker, PrepareWorker)):
             setattr(self, worker_attr, None)
             worker.disconnect(self)
@@ -428,6 +436,7 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         self._topology_dir = None
         self._source_dir = None
         self._topo_source_tracks = []
+        self._topo_pending_sources = []
         self._topo_topology = None
 
         if getattr(self, "_topo_input_tree", None) is not None:
@@ -554,23 +563,46 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
             self._topo_apply_action.setEnabled(False)
 
         self._progress_start("Analyzing Format & Layout\u2026")
+        self._start_phase1_worker(self._session)
 
+    def _start_phase1_worker(self, session):
         config = self._flat_config()
         config["_source_dir"] = self._source_dir
+        worker = Phase1AnalyzeWorker(session, config)
+        worker.setParent(self)
+        # The worker's finished(session) signal shadows QThread.finished().
+        # Release a superseded scan and its PCM after the native thread exits.
+        QObject.connect(worker, SIGNAL("finished()"), worker, SLOT("deleteLater()"))
+        self._p1_worker = worker
+        if not self._topo_pending_sources:
+            worker.progress.connect(self._on_phase1_progress, Qt.QueuedConnection)
+            worker.progress_value.connect(self._on_phase1_progress_value, Qt.QueuedConnection)
+        worker.finished.connect(self._on_phase1_done)
+        worker.error.connect(self._on_phase1_error, Qt.QueuedConnection)
+        worker.start()
 
-        self._p1_worker = Phase1AnalyzeWorker(self._session, config)
-        self._p1_worker.progress.connect(self._on_worker_progress)
-        self._p1_worker.progress_value.connect(self._on_worker_progress_value)
-        self._p1_worker.finished.connect(self._on_phase1_done)
-        self._p1_worker.error.connect(self._on_analyze_error)
-        self._p1_worker.start()
+    @Slot(str)
+    def _on_phase1_progress(self, message):
+        if self._p1_worker is not None and self.sender() is self._p1_worker:
+            self._progress_message(message)
+
+    @Slot(int, int)
+    def _on_phase1_progress_value(self, current, total):
+        if self._p1_worker is not None and self.sender() is self._p1_worker:
+            self._progress_value(current, total)
 
     @Slot(object)
     def _on_phase1_done(self, session):
+        worker = self._p1_worker
+        if worker is None or worker.session_context is not session:
+            return
+        self._p1_worker = None
+        if not worker.isRunning():
+            worker.deleteLater()
+        if self._topo_pending_sources:
+            self._on_reopened_sources_checked(session)
+            return
         self._session = session
-        if self._p1_worker is not None:
-            self._p1_worker.deleteLater()
-            self._p1_worker = None
 
         # Rebuild topology intelligently using Phase 1 results
         self._topo_topology = build_default_topology(session.tracks)
@@ -596,6 +628,47 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
 
         # Eagerly build peak cache for all source tracks in the background
         self._start_peak_build(session.tracks, self._source_dir)
+
+    def _check_reopened_layout_sources(self):
+        """Backfill legacy or changed source findings when Track Layout is opened."""
+        if not self._topo_pending_sources or self._p1_worker is not None:
+            return
+        # The displayed inputs and saved routes remain usable while the worker runs.
+        tracks = [replace(t, _cache={}, detector_results={}) for t in self._topo_pending_sources]
+        self._status_bar.showMessage("Checking Track Layout source files…")
+        self._start_phase1_worker(SessionContext(tracks=tracks, config={}))
+
+    def _on_reopened_sources_checked(self, checked):
+        refreshed = {t.filename: t for t in checked.tracks}
+        for track in checked.tracks:
+            track.audio_data = None
+            track._cache.clear()
+        self._topo_source_tracks = [refreshed.get(t.filename, t) for t in self._topo_source_tracks]
+        self._topo_pending_sources = []
+        pipeline = Pipeline(default_detectors(), config=self._flat_config())
+        pipeline.analyze_session_detectors(SessionContext(self._topo_source_tracks, {}),
+                                           LifecyclePhase.PHASE1)
+        if self._topo_apply_worker is None:
+            self._populate_topology_tab()
+            self._topo_reset_action.setEnabled(True)
+        else:
+            self._topo_input_tree.populate(self._topo_source_tracks, self._topo_topology)
+        failed = sum(t.status != "OK" for t in checked.tracks)
+        self._status_bar.showMessage(f"Track Layout checked. {failed} unreadable source file(s)."
+                                     if failed else "Track Layout source checks complete.")
+
+    @Slot(str)
+    def _on_phase1_error(self, message):
+        worker = self._p1_worker
+        if worker is None or self.sender() is not worker:
+            return
+        self._p1_worker = None
+        if not worker.isRunning():
+            worker.deleteLater()
+        if self._topo_pending_sources:
+            self._status_bar.showMessage(f"Could not check Track Layout sources: {message}")
+        else:
+            self._on_analyze_error(message)
 
     @Slot()
     def _on_save_session(self):
@@ -641,6 +714,7 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
             "daw_state": self._session.daw_state if self._session else {},
             "active_daw_processor_id": active_dp_id,
             "tracks": self._session.tracks if self._session else [],
+            "phase1_sources": capture_phase1_sources(self._topo_source_tracks),
             "output_tracks": getattr(self._session, "output_tracks", []) if self._session else [],
             "topology": self._topo_topology,
             "transfer_manifest": self._session.transfer_manifest if self._session else [],
@@ -694,6 +768,7 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         self._clear_workspace()
         self._source_dir = source_dir
         self._track_table.set_source_dir(source_dir)
+        self._topo_input_tree.set_source_dir(source_dir)
 
         # Re-discover original source tracks for Phase 1 topology input table
         was_recursive = data.get("recursive_scan", False)
@@ -750,6 +825,16 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         flat = self._flat_config()
 
         pipeline = Pipeline(default_detectors(), default_processors(), flat)
+
+        records = data.get("phase1_sources")
+        records = records if isinstance(records, dict) else {}
+        self._topo_pending_sources = [
+            t for t in source_tracks
+            if not restore_phase1_source(t, records.get(t.filename), pipeline.repair_verification)
+        ]
+        pipeline.analyze_session_detectors(SessionContext(source_tracks, {}), LifecyclePhase.PHASE1)
+        self._topo_reset_action.setEnabled(bool(source_tracks) and not self._topo_pending_sources)
+        self._topo_reanalyze_action.setEnabled(bool(source_tracks))
 
         session_config_flat = dict(default_config())
         session_config_flat.update(flat)

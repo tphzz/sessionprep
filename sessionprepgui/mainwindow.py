@@ -69,7 +69,7 @@ from .tracks import (
     TrackColumnsMixin, GroupsMixin,
     _DraggableTrackTable, _TAB_FILE, _TAB_GROUPS, _TAB_SESSION,
     _PAGE_TABS,
-    _PHASE_ANALYSIS, _PHASE_SETUP,
+    _PHASE_ANALYSIS, _PHASE_TOPOLOGY, _PHASE_SETUP,
 )
 from .daw import DawMixin
 from .topology import TopologyMixin
@@ -952,6 +952,8 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
 
     @Slot(int)
     def _on_phase_tab_changed(self, index: int):
+        if index == _PHASE_TOPOLOGY and getattr(self, "_topo_pending_sources", None):
+            self._check_reopened_layout_sources()
         if getattr(self, "_progress_running", False):
             self._show_progress_on_phase(index)
         if index == _PHASE_SETUP:
@@ -1211,7 +1213,10 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
         self._repair_preview.close()
         # Qt destroys child threads along with their window. A long filter can
         # finish its current track after cancellation, including on a closed project.
-        from .analysis.worker import RepairPlanWorker
+        from .analysis.worker import Phase1AnalyzeWorker, RepairPlanWorker
+        for worker in self.findChildren(Phase1AnalyzeWorker):
+            worker.cancel()
+            worker.wait()
         for worker in self.findChildren(RepairPlanWorker):
             worker.cancel()
             worker.wait()

@@ -88,6 +88,7 @@ A detector earns its place if it meets at least one of these criteria:
 - **Why it matters:** low or negative correlation indicates phase differences between channels that cause level loss or cancellation in mono playback (phone speakers, mono PA systems).
 - **Controls:** `--corr_warn`, `--mono_loss_warn_db`, `--corr_windowed`, `--corr_window_ms` (default 250 ms), `--corr_max_regions`
 - **Windowed analysis:** when enabled, per-window Pearson correlation and mono folddown loss are computed. Contiguous windows exceeding either threshold are merged into regions with waveform overlays.
+- Complete cancellation in mono is reported as `∞ dB` loss. The JSON export records `mono_fully_cancelled: true` and `mono_loss_db: null` for this case. Finite losses keep their numeric dB value.
 - **Categorization:**
   - ATTENTION: localized regions with poor stereo compatibility detected.
   - INFORMATION: whole-file correlation or mono loss exceeds threshold (no localized regions).
@@ -95,10 +96,10 @@ A detector earns its place if it meets at least one of these criteria:
 
 ### 2.7 Dual-mono (identical L/R)
 
-- **What it means:** a stereo file appears to have the same signal in L and R.
+- **What it means:** the largest absolute difference between corresponding left and right samples in one stereo file is at or below the configured tolerance. Every frame is checked. A pair of separate mono files remains two inputs.
 - **Why it matters:** usually a valid delivery choice and often intentional.
-- **Controls:** `--dual_mono_eps`
-- **Track Layout:** Triggers a layout recommendation (`topology_action: extract_channel`) to downmix output to a single channel, saving storage and DSP overhead.
+- **Controls:** `--dual_mono_eps` defaults to `0.00001` of full scale. Even perfectly correlated channels can differ by more than this if one has a different gain.
+- **Track Layout:** Recommends keeping the left channel as a mono output. A completely silent file follows the Silent Files rule.
 - **Categorization:**
   - INFORMATION: `Dual-mono (identical L/R)` with per-file details.
 
@@ -113,7 +114,7 @@ A detector earns its place if it meets at least one of these criteria:
 
 ### 2.9 One-sided silence
 
-- **What it means:** a stereo file has one channel that is effectively silent while the other has signal.
+- **What it means:** exactly one channel's RMS is at or below the configured level after subtracting that channel's mean. Both RMS readings use the entire file.
 - **Why it matters:** often an export/cabling/routing mistake; importing it as stereo can cause unexpected balance issues.
 - **Controls:** `--one_sided_silence_db`
 - **Track Layout:** Triggers a layout recommendation (`topology_action: extract_channel`) to extract specifically the active, non-silent channel into a mono output track.
@@ -198,6 +199,7 @@ visible issue.
 - **What it means:** contiguous regions where momentary RMS exceeds the file's anchor by more than `--tail_min_exceed_db`.
 - **Why it matters:** highlights "quiet overall but occasionally very loud" tracks that may need section-based rides.
 - **Controls:** `--tail_min_exceed_db`, `--tail_hop_ms`, `--tail_max_regions`
+- Each marked region covers consecutive, touching measurement windows above the threshold. A gated-out interval separates the passages on either side of it.
 - **Categorization:**
   - ATTENTION: `Tail regions exceeded anchor` with per-file details.
 

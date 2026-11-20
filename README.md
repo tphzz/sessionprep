@@ -173,6 +173,8 @@ SessionPrep operates in three phases:
 
 In Track Layout, **Unassigned** marks an input channel with no output routes. Collapse the input file to see how many of its channels are unassigned.
 
+Reopening a project restores your edited routes. **Reset to Default** rebuilds the recommended layout from the original input files. When an older project lacks source findings, or a source file or detection threshold has changed, opening Track Layout checks the affected inputs in the background.
+
 ### Diagnostic categories
 
 The output is organized into four categories:

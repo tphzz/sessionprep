@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-import numpy as np
-
 from ..models import ParamSpec, LifecyclePhase
 from ..detector import TrackDetector
 from ..models import DetectorResult, Severity, TrackContext
-from ..audio import get_stereo_channels_subsampled, is_silent
+from ..audio import is_silent, stereo_layout_levels
 
 
 class DualMonoDetector(TrackDetector):
@@ -58,21 +56,18 @@ class DualMonoDetector(TrackDetector):
                 data={"dual_mono": False},
             )
 
-        raw = get_stereo_channels_subsampled(track)
-        if raw is None:
+        levels = stereo_layout_levels(track)
+        if levels is None:
             return DetectorResult(
                 detector_id=self.id,
                 severity=Severity.CLEAN,
-                summary="mono track",
+                summary="requires a stereo track",
                 applicable=False,
                 data={"dual_mono": False},
             )
 
-        l_raw, r_raw, _step = raw
-        diff = l_raw - r_raw
-        dual_mono = bool(np.max(np.abs(diff)) <= float(self.eps))
-
-        if dual_mono:
+        max_difference, _, _ = levels
+        if max_difference <= self.eps:
             return DetectorResult(
                 detector_id=self.id,
                 severity=Severity.INFO,

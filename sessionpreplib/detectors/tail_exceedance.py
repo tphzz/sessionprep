@@ -184,7 +184,9 @@ class TailExceedanceDetector(TrackDetector):
                 },
             )
 
-        splits = np.flatnonzero(np.diff(idx) > 1)
+        # Gating compacts the arrays. Only consecutive, touching analysis
+        # windows on the original timeline can form one continuous region.
+        splits = np.flatnonzero(np.diff(active_hop_indices[idx]) > min(hop_samples, window_samples))
         starts = np.concatenate(([0], splits + 1))
         ends = np.concatenate((splits, [idx.size - 1]))
 
@@ -217,14 +219,18 @@ class TailExceedanceDetector(TrackDetector):
         regions = regions[:int(self.tail_max_regions)]
         regions.sort(key=lambda r: r["start_sample"])
 
-        total_duration_sec = sum(
-            (r["end_sample"] - r["start_sample"]) / samplerate for r in regions
-        )
+        # Separate runs of qualifying hops can still share RMS window support.
+        covered_samples = 0
+        covered_end = 0
+        for region in regions:
+            start = max(covered_end, region["start_sample"])
+            covered_samples += max(0, region["end_sample"] - start)
+            covered_end = max(covered_end, region["end_sample"])
         max_exceed = max((r["max_exceed_db"] for r in regions), default=0.0)
 
         tail_summary = {
             "regions": len(regions),
-            "total_duration_sec": float(total_duration_sec),
+            "total_duration_sec": covered_samples / samplerate,
             "max_exceed_db": float(max_exceed),
             "anchor_db": float(rms_anchor_db),
         }
