@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QToolBar,
 )
 
+from qt_helpers import dispose_window
 from sessionprepgui.controls import bind_primary_action, set_action_busy
 from sessionprepgui.icons import icon
 from sessionprepgui.theme import apply_dark_theme
@@ -233,7 +234,7 @@ def test_primary_busy_is_cleared_when_workspace_cancels_worker(qapp, monkeypatch
         window._prepare_action.setEnabled(True)
         assert window._prepare_action.isEnabled()
     finally:
-        window.close()
+        dispose_window(window)
 
 
 def test_table_selectors_reserve_label_gap_and_chevron(qapp):

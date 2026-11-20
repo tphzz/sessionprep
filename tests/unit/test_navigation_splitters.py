@@ -7,6 +7,7 @@ pytest.importorskip("PySide6")
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication, QSplitter, QStackedWidget, QTreeWidget
 
+from qt_helpers import dispose_window
 from sessionprepgui.controls import fit_navigation_pane
 from sessionprepgui.prefs.dialog import PreferencesDialog
 from sessionprepgui.settings import build_defaults
@@ -58,16 +59,18 @@ def test_fit_navigation_pane_ignores_incomplete_splitters(qapp):
 
 def test_preferences_trees_have_no_gap_beside_the_splitter(qapp):
     dialog = PreferencesDialog(copy.deepcopy(build_defaults()))
-    dialog.resize(1150, 720)
-    dialog.show()
-    qapp.processEvents()
-    for index in range(dialog._tabs.count()):
-        dialog._tabs.setCurrentIndex(index)
+    try:
+        dialog.resize(1150, 720)
+        dialog.show()
         qapp.processEvents()
-        splitter = dialog._tabs.currentWidget().findChild(QSplitter)
-        _assert_no_gap(splitter)
-        assert splitter.widget(0).width() == splitter.widget(0).maximumWidth()
-    dialog.close()
+        for index in range(dialog._tabs.count()):
+            dialog._tabs.setCurrentIndex(index)
+            qapp.processEvents()
+            splitter = dialog._tabs.currentWidget().findChild(QSplitter)
+            _assert_no_gap(splitter)
+            assert splitter.widget(0).width() == splitter.widget(0).maximumWidth()
+    finally:
+        dispose_window(dialog)
 
 
 def test_fit_navigation_pane_leaves_uncapped_trees_to_qt(qapp):

@@ -393,7 +393,7 @@ def test_monitor_font_refresh_preserves_report_and_help_reading_positions(qapp, 
         assert pane.active_detector_id == "d25"
 
 
-def test_stock_normalization_report_stays_readable_with_help_at_large_scale(qapp, pane):
+def test_stock_normalization_report_stays_readable_with_help_at_large_scale(qapp, pane, form_font):
     from sessionpreplib.models import ProcessorResult
     from sessionpreplib.processors.bimodal_normalize import BimodalNormalizeProcessor
 
@@ -414,9 +414,6 @@ def test_stock_normalization_report_stays_readable_with_help_at_large_scale(qapp
          "gain_for_rms": 5.0, "fader_offset": -5.0})
     pane.resize(713, 412)
     pane.report.refresh_font(Screen())
-    from PySide6.QtGui import QFontInfo
-    if not QFontInfo(pane.report.font()).family():
-        pytest.skip("Geometry requires a resolved platform font; Qt exposes no font face")
     pane.refresh_fonts(Screen())
     pane.report.present_track(current, session)
     _activate(pane, "d00")

@@ -11,25 +11,37 @@ except ImportError:
     pt = None
 
 
-@pytest.fixture
-def form_font(qapp):
-    """Resolve the reference font when Qt's offscreen platform has no fonts."""
-    from PySide6.QtGui import QFont, QFontDatabase, QFontInfo
+@pytest.fixture(scope="session")
+def _font_app():
+    """Keep the fallback face registered for the lifetime of headless Qt tests."""
+    from PySide6.QtGui import QFont, QFontDatabase
+    from PySide6.QtWidgets import QApplication
 
-    original = qapp.font()
+    app = QApplication.instance() or QApplication([])
+    original = app.font()
     font_id = -1
-    if not QFontInfo(original).family():
-        windows_directory = os.environ.get("WINDIR")
-        if windows_directory:
-            font_file = Path(windows_directory) / "Fonts" / "segoeui.ttf"
-            font_id = QFontDatabase.addApplicationFont(str(font_file))
-        if font_id < 0:
-            pytest.skip("Form geometry requires a resolved platform font")
-        qapp.setFont(QFont(QFontDatabase.applicationFontFamilies(font_id)[0], 9))
-    yield
-    qapp.setFont(original)
+    windows_directory = os.environ.get("WINDIR")
+    if windows_directory and app.platformName() == "offscreen" and not QFontDatabase.families():
+        font_file = Path(windows_directory) / "Fonts" / "segoeui.ttf"
+        font_id = QFontDatabase.addApplicationFont(str(font_file))
+        if font_id >= 0:
+            app.setFont(QFont(QFontDatabase.applicationFontFamilies(font_id)[0], 9))
+    yield app
     if font_id >= 0:
+        app.setFont(original)
         QFontDatabase.removeApplicationFont(font_id)
+
+
+@pytest.fixture
+def form_font(_font_app):
+    """Restore the application's font after a geometry test changes its size."""
+    from PySide6.QtGui import QFontDatabase, QFontInfo
+
+    original = _font_app.font()
+    if not QFontDatabase.families() or not QFontInfo(original).family():
+        pytest.skip("Form geometry requires a resolved platform font")
+    yield
+    _font_app.setFont(original)
 
 
 @pytest.fixture

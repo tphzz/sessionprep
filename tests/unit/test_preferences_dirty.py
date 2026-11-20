@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
+from qt_helpers import dispose_window
 from sessionprepgui.prefs.dialog import PreferencesDialog
 from sessionprepgui.prefs.config_pages import DawProjectTemplatesWidget
 from sessionprepgui.prefs.param_form import _build_param_page
@@ -181,7 +182,7 @@ def test_generated_reset_faces_follow_existing_field_paint_and_hit_target(qapp, 
                       if b.text().startswith("Browse"))
         assert browse.width() >= browse.sizeHint().width()
     finally:
-        dialog.close()
+        dispose_window(dialog)
 
 
 def test_template_form_row_fits_editors_and_round_trips_changes(qapp, form_font, monkeypatch):
@@ -218,7 +219,7 @@ def test_template_form_row_fits_editors_and_round_trips_changes(qapp, form_font,
         assert templates.get_templates() == [dict(original, fader_ceiling_db=8.4)]
         assert changed.count() == 1
     finally:
-        templates.close()
+        dispose_window(templates)
 
 
 def test_named_preset_actions_match_the_selector_height(qapp, form_font):
@@ -256,7 +257,7 @@ def test_preferences_dirty_indicators_are_clean_on_open(qapp):
         for item in dlg._preset_items.values():
             assert item.icon(1).isNull()
     finally:
-        dlg.close()
+        dispose_window(dlg)
 
 
 def test_preferences_general_dirty_dot_tracks_changed_and_restored_value(qapp):
@@ -283,7 +284,7 @@ def test_preferences_general_dirty_dot_tracks_changed_and_restored_value(qapp):
         assert dlg._save_btn.text() == "Save Preferences"
         assert not is_button_marked(dlg._save_btn)
     finally:
-        dlg.close()
+        dispose_window(dlg)
 
 
 def test_preferences_colors_dirty_dot_tracks_palette_edit(qapp):
@@ -296,7 +297,7 @@ def test_preferences_colors_dirty_dot_tracks_palette_edit(qapp):
         assert dlg._save_btn.text() == "Save Preferences"
         assert is_button_marked(dlg._save_btn)
     finally:
-        dlg.close()
+        dispose_window(dlg)
 
 
 def test_preferences_groups_dirty_dot_tracks_group_edit(qapp):
@@ -310,7 +311,7 @@ def test_preferences_groups_dirty_dot_tracks_group_edit(qapp):
         assert dlg._save_btn.text() == "Save Preferences"
         assert is_button_marked(dlg._save_btn)
     finally:
-        dlg.close()
+        dispose_window(dlg)
 
 
 def test_preferences_config_analysis_dirty_dot_tracks_changed_and_restored_value(qapp):
@@ -334,7 +335,7 @@ def test_preferences_config_analysis_dirty_dot_tracks_changed_and_restored_value
         assert dlg._save_btn.text() == "Save Preferences"
         assert not is_button_marked(dlg._save_btn)
     finally:
-        dlg.close()
+        dispose_window(dlg)
 
 
 def test_preferences_config_detector_dirty_dot_marks_child_and_parent(qapp):
@@ -350,7 +351,7 @@ def test_preferences_config_detector_dirty_dot_marks_child_and_parent(qapp):
         assert dlg._save_btn.text() == "Save Preferences"
         assert is_button_marked(dlg._save_btn)
     finally:
-        dlg.close()
+        dispose_window(dlg)
 
 
 def test_preferences_config_protools_templates_mark_child_and_parent(qapp):
@@ -367,7 +368,7 @@ def test_preferences_config_protools_templates_mark_child_and_parent(qapp):
         assert dlg._save_btn.text() == "Save Preferences"
         assert is_button_marked(dlg._save_btn)
     finally:
-        dlg.close()
+        dispose_window(dlg)
 
 
 def test_preferences_config_preset_list_changes_mark_config_tab(qapp):
@@ -382,4 +383,4 @@ def test_preferences_config_preset_list_changes_mark_config_tab(qapp):
         assert dlg._save_btn.text() == "Save Preferences"
         assert is_button_marked(dlg._save_btn)
     finally:
-        dlg.close()
+        dispose_window(dlg)

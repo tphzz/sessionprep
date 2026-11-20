@@ -8,11 +8,12 @@ import pytest
 import soundfile as sf
 
 pytest.importorskip("PySide6")
-from PySide6.QtCore import QEvent, QTimer, Qt
+from PySide6.QtCore import QTimer, Qt
 from PySide6.QtWidgets import (
     QApplication, QDialog, QDoubleSpinBox, QFileDialog, QMessageBox, QPushButton,
 )
 
+from qt_helpers import dispose_window
 from sessionprepgui import settings
 from sessionprepgui.analysis.worker import AnalyzeWorker, PrepareWorker, RepairPlanWorker
 from sessionprepgui.mainwindow import SessionPrepWindow
@@ -112,10 +113,7 @@ def project(app, tmp_path, monkeypatch, request):
     finally:
         # Finish queued worker deliveries and destroy this test's window on
         # the GUI thread before the next project creates its workers.
-        assert window.close()
-        app.processEvents()
-        window.deleteLater()
-        app.sendPostedEvents(window, QEvent.DeferredDelete)
+        dispose_window(window)
 
 
 def dc_checkbox(widgets):

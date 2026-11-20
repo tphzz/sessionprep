@@ -7,6 +7,7 @@ pytest.importorskip("PySide6")
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication
 
+from qt_helpers import dispose_window
 from sessionprepgui.batch import BatchQueueDock
 from sessionprepgui.mainwindow import SessionPrepWindow
 from sessionprepgui.tracks.table_widgets import (
@@ -66,7 +67,7 @@ def test_phase_progress_panels_exist_and_start_hidden(qapp):
         assert not hasattr(window, "_progress_label")
         assert not hasattr(window, "_progress_bar")
     finally:
-        window.close()
+        dispose_window(window)
 
 
 def test_analysis_progress_uses_global_panel_not_status_bar(qapp):
@@ -87,7 +88,7 @@ def test_analysis_progress_uses_global_panel_not_status_bar(qapp):
         assert window._status_bar.currentMessage() == "Idle"
         assert _progress_layout_contains(window, _PHASE_ANALYSIS)
     finally:
-        window.close()
+        dispose_window(window)
 
 
 def test_prepare_progress_uses_global_panel_not_status_bar(qapp):
@@ -106,7 +107,7 @@ def test_prepare_progress_uses_global_panel_not_status_bar(qapp):
         assert progress._bar.value() == 4
         assert window._status_bar.currentMessage() == "Idle"
     finally:
-        window.close()
+        dispose_window(window)
 
 
 def test_topology_apply_progress_uses_global_panel(qapp):
@@ -124,7 +125,7 @@ def test_topology_apply_progress_uses_global_panel(qapp):
         assert progress._bar.value() == 1
         assert _progress_layout_contains(window, _PHASE_TOPOLOGY)
     finally:
-        window.close()
+        dispose_window(window)
 
 
 def test_daw_transfer_progress_uses_global_panel_not_status_bar(qapp):
@@ -145,7 +146,7 @@ def test_daw_transfer_progress_uses_global_panel_not_status_bar(qapp):
         assert window._status_bar.currentMessage() == "Idle"
         assert _progress_layout_contains(window, _PHASE_SETUP)
     finally:
-        window.close()
+        dispose_window(window)
 
 
 def test_progress_panel_switches_phase_during_running_operation(qapp):
@@ -166,7 +167,7 @@ def test_progress_panel_switches_phase_during_running_operation(qapp):
         assert progress._bar.maximum() == 12
         assert progress._bar.value() == 4
     finally:
-        window.close()
+        dispose_window(window)
 
 
 @pytest.mark.parametrize("phase_index", [
@@ -194,7 +195,7 @@ def test_phase_progress_panel_shrinks_content_above(qapp, phase_index):
         assert content.geometry().height() < before_height
         assert progress.geometry().top() >= content.geometry().bottom()
     finally:
-        window.close()
+        dispose_window(window)
 
 
 def test_batch_dock_uses_progress_panel(qapp):

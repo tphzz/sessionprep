@@ -11,9 +11,9 @@ import pytest
 import soundfile as sf
 
 pytest.importorskip("PySide6")
-from PySide6.QtCore import QEvent
 from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
 
+from qt_helpers import dispose_window
 from sessionprepgui import settings
 from sessionprepgui.mainwindow import SessionPrepWindow
 from sessionprepgui.prefs.dialog import PreferencesDialog
@@ -56,10 +56,7 @@ def window(app, tmp_path, monkeypatch):
         yield win
     finally:
         _idle(win)
-        win.close()
-        app.processEvents()
-        win.deleteLater()
-        app.sendPostedEvents(win, QEvent.DeferredDelete)
+        dispose_window(win)
 
 
 def _save_fixture(window, folder, *, active):

@@ -7,6 +7,7 @@ pytest.importorskip("PySide6")
 from PySide6.QtCore import QPoint
 from PySide6.QtWidgets import QApplication, QDialogButtonBox, QTableWidget
 
+from qt_helpers import dispose_window
 from sessionprepgui import settings
 from sessionprepgui.daw_tools.protools.window import ProToolsUtilsWindow
 from sessionprepgui.log_viewer import LogViewerWindow
@@ -80,7 +81,7 @@ def test_preferences_tabs_are_flush_with_the_client_area(qapp):
         assert right == dialog.width() - WINDOW_MARGIN
         assert bottom == dialog.height() - WINDOW_MARGIN
     finally:
-        dialog.close()
+        dispose_window(dialog)
 
 
 @pytest.fixture
@@ -91,7 +92,7 @@ def protools(qapp, monkeypatch):
     window.show()
     qapp.processEvents()
     yield window
-    window.close()
+    dispose_window(window)
 
 
 def test_protools_tool_pages_share_the_window_inset(protools):
@@ -104,7 +105,10 @@ def test_protools_tool_pages_share_the_window_inset(protools):
 
 def test_preferences_colour_preview_grid_keeps_its_own_margin(qapp):
     page = ColorsPage()
-    assert _margins(page._grid_preview) == (4, 4, 4, 4)  # only the Color Picker changed
+    try:
+        assert _margins(page._grid_preview) == (4, 4, 4, 4)  # only the Color Picker changed
+    finally:
+        dispose_window(page)
 
 
 @pytest.mark.parametrize("tool_name", ["_color_tool", "_track_height_tool"])

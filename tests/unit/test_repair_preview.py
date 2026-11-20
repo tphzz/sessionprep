@@ -7,6 +7,7 @@ from PySide6.QtCore import QPoint, QRect, Qt, QTimer
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QWidgetAction
 
+from qt_helpers import dispose_window
 from sessionprepgui.detail.playback import PlaybackController
 from sessionprepgui.waveform.panel import WaveformPanel
 from sessionprepgui.waveform.source_selector import AuditionSourceSelector
@@ -28,8 +29,7 @@ def window(app, monkeypatch):
     owner.show()
     app.processEvents()
     yield owner
-    owner.close()
-    app.processEvents()
+    dispose_window(owner)
 
 
 def _open_track(window, tmp_path, name, *, rate=96000):

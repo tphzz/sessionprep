@@ -158,15 +158,23 @@ def test_execute_reports_the_first_gain_step_that_can_actually_be_written(tmp_pa
     path = tmp_path / "Input.wav"
     sf.write(path, np.full(128, source), 48000, subtype=subtype)
     track = load_track(str(path))
-    track.manual_gain_db = 20 * math.log10(limit / source) + 0.1
-    assert source * 10 ** ((track.manual_gain_db - 0.1) / 20) > limit
+    gain = 20 * math.log10(limit / source) + 0.1
+    # log10 and pow can round to opposite sides of the encoder ceiling on
+    # different platforms. Exercise the side where a 0.1 dB retry still clips.
+    while source * 10 ** ((gain - 0.1) / 20) <= limit:
+        gain = math.nextafter(gain, math.inf)
+    track.manual_gain_db = gain
     session = SessionContext([track], {})
     pipeline = Pipeline([])
     output = tmp_path / "out"
     pipeline.execute(session, str(output))
     assert not session.config["_executed_files"]
     assert "at least 0.2 dB" in session.config["_execute_errors"][0][1]
-    track.manual_gain_db -= 0.2
+    track.manual_gain_db = gain - 0.1
+    pipeline.execute(session, str(output))
+    assert not session.config["_executed_files"]
+    assert session.config["_execute_errors"]
+    track.manual_gain_db = gain - 0.2
     pipeline.execute(session, str(output))
     assert not session.config["_execute_errors"]
     assert path.name in session.config["_executed_files"]

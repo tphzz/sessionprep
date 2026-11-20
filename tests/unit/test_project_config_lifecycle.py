@@ -8,6 +8,7 @@ pytest.importorskip("PySide6")
 
 from PySide6.QtWidgets import QApplication
 
+from qt_helpers import dispose_window
 from sessionprepgui import settings
 from sessionprepgui.analysis.worker import (
     AnalyzeWorker, Phase1AnalyzeWorker, PrepareWorker, TopologyApplyWorker,
@@ -62,7 +63,7 @@ def project(qapp, tmp_path, monkeypatch):
     try:
         yield window
     finally:
-        window.close()
+        dispose_window(window)
 
 
 def _set_project_override(window, path):

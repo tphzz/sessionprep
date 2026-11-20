@@ -10,6 +10,7 @@ pytest.importorskip("PySide6")
 
 from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox, QPushButton
 
+from qt_helpers import dispose_window
 from sessionprepgui import settings
 from sessionprepgui.analysis.worker import DawCheckWorker, DawFetchWorker, DawTransferWorker
 from sessionprepgui.mainwindow import SessionPrepWindow
@@ -78,7 +79,7 @@ def phase3_project(qapp, messages, monkeypatch, tmp_path):
         window._phase_tabs.setCurrentIndex(_PHASE_SETUP)
         yield window
     finally:
-        window.close()
+        dispose_window(window)
 
 
 @pytest.fixture

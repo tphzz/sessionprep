@@ -10,7 +10,9 @@ pytest.importorskip("PySide6")
 from PySide6.QtCore import QRect
 from PySide6.QtGui import QShowEvent
 from PySide6.QtWidgets import QApplication
+from shiboken6 import isValid
 
+from qt_helpers import dispose_window
 import sessionprepgui.daw_tools.protools.window as pt_utils_window
 from sessionprepgui.daw_tools.protools.connection_common import (
     connection_button_state,
@@ -357,7 +359,7 @@ def test_track_height_mode_dropdown_announces_preferred_height_change():
 
         assert emitted
     finally:
-        tool.deleteLater()
+        dispose_window(tool)
 
 
 def test_color_grid_aspect_limit_keeps_cells_square_or_wide():
@@ -413,7 +415,23 @@ def test_protools_utils_prepare_for_show_applies_geometry_once(qapp, monkeypatch
         assert geometries == [QRect(0, 0, 1280, 420)]
         assert window._initial_geometry_applied
     finally:
-        window.close()
+        dispose_window(window)
+
+
+def test_disposing_tool_window_releases_active_and_inactive_pages(qapp):
+    window = ProToolsUtilsWindow({"colors": []})
+    color, heights = window._color_tool, window._track_height_tool
+    try:
+        window._tabs.setCurrentWidget(heights)
+        assert window._tabs.currentWidget() is heights
+        assert color.isHidden()
+        window._tabs.setCurrentWidget(color)
+        assert window._tabs.currentWidget() is color
+        assert heights.isHidden()
+    finally:
+        dispose_window(window)
+    assert not isValid(color)
+    assert not isValid(heights)
 
 
 def test_protools_utils_show_event_does_not_apply_geometry_or_connect_sync(
@@ -451,7 +469,7 @@ def test_protools_utils_show_event_does_not_apply_geometry_or_connect_sync(
         assert len(scheduled) == 1
         assert scheduled[0][0] == 0
     finally:
-        window.close()
+        dispose_window(window)
 
 
 def test_color_tool_grid_can_use_extra_vertical_space():
@@ -471,7 +489,7 @@ def test_color_tool_grid_can_use_extra_vertical_space():
         assert layout.stretch(grid_index) == 1
         assert tool._grid.maximumHeight() >= 1000000
     finally:
-        tool.deleteLater()
+        dispose_window(tool)
 
 @pytest.mark.parametrize("full_size,available_size,expected_width", [
     ((3440, 1440), (3440, 1400), 1881),
@@ -501,4 +519,4 @@ def test_utils_ultrawide_startup_width_preserves_normal_displays(
         window.prepare_for_show()
         assert window.width() == expected_width - 50
     finally:
-        window.close()
+        dispose_window(window)

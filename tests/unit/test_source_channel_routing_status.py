@@ -8,6 +8,7 @@ from PySide6.QtGui import QDropEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
+from qt_helpers import dispose_window
 from sessionprepgui import mainwindow, settings
 from sessionpreplib.models import DetectorResult, SessionContext, Severity, TrackContext
 from sessionpreplib.topology import build_default_topology
@@ -45,7 +46,7 @@ def layout_window(qapp, monkeypatch, tmp_path):
     try:
         yield window
     finally:
-        window.close()
+        dispose_window(window)
 
 
 def _output_item(window, filename, channel=None):

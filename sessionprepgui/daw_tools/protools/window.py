@@ -83,7 +83,8 @@ class _ToolTabs(QWidget):
     def addTab(self, widget: QWidget, label: str):
         index = len(self._widgets)
         self._widgets.append(widget)
-        widget.setParent(None)
+        widget.setParent(self._content)
+        widget.hide()
         self._tab_bar.addTab(label)
         if self._current_index < 0:
             self._tab_bar.setCurrentIndex(index)
@@ -114,7 +115,7 @@ class _ToolTabs(QWidget):
         current = self.currentWidget()
         if current is not None:
             self._content_layout.removeWidget(current)
-            current.setParent(None)
+            current.hide()
 
         self._current_index = index
         widget = self._widgets[index]

@@ -7,6 +7,7 @@ pytest.importorskip("PySide6")
 from PySide6.QtCore import QPoint, QSignalBlocker, Qt, QUrl
 from PySide6.QtWidgets import QApplication, QLabel, QPushButton, QSplitter, QTableWidgetItem, QToolBar
 
+from qt_helpers import dispose_window
 from sessionprepgui import mainwindow, settings
 from sessionprepgui.detail import report
 from sessionprepgui.detail.browser import ReportBrowser
@@ -90,8 +91,7 @@ def window(qapp, monkeypatch):
     owner.show()
     qapp.processEvents()
     yield owner, tracks
-    owner.close()
-    qapp.processEvents()
+    dispose_window(owner)
 
 
 def _show_tab(qapp, owner, index):

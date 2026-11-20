@@ -257,8 +257,15 @@ also supported. An invalid explicit path fails immediately. Run
 `python packaging/windows/build_installer.py check` to verify the compiler
 available to the current account before building.
 
-The dev-only PyYAML dependency supports semantic workflow tests. Run the unit
-suite with `uv run pytest tests/unit`. `actionlint` uses `.github/actionlint.yaml`
+The dev-only PyYAML dependency supports semantic workflow tests. Before any
+platform starts building, the checks job runs the full unit suite and reports
+its 15 slowest test phases. Reproduce it with
+`uv run --frozen pytest tests/unit --durations=15`.
+GUI tests that own a main window or Preferences dialog use
+`dispose_window` from `tests/unit/qt_helpers.py` at teardown. Closing a Qt
+window can leave its children alive for later application-wide style changes.
+
+`actionlint` uses `.github/actionlint.yaml`
 for existing custom runner labels; its narrow queue-property exception covers
 GitHub's newer `queue: max`, which is independently checked by workflow tests.
 Native installer fixture tests compile all three Inno variants when Inno Setup

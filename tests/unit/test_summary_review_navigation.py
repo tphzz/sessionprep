@@ -8,6 +8,7 @@ from PySide6.QtCore import QItemSelectionModel, QPoint, QSignalBlocker, Qt, QUrl
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QTableWidgetItem
 
+from qt_helpers import dispose_window
 from sessionprepgui import mainwindow, settings
 from sessionprepgui.detail import report
 from sessionpreplib.detectors.clipping import ClippingDetector
@@ -70,8 +71,7 @@ def window(qapp, monkeypatch):
     owner.activateWindow()
     qapp.processEvents()
     yield owner, tracks
-    owner.close()
-    qapp.processEvents()
+    dispose_window(owner)
 
 
 def review(owner, target, method):

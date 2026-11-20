@@ -8,6 +8,7 @@ import soundfile as sf
 pytest.importorskip("PySide6")
 from PySide6.QtWidgets import QApplication, QMessageBox
 
+from qt_helpers import dispose_window
 from sessionprepgui import settings
 from sessionprepgui.mainwindow import SessionPrepWindow
 from sessionprepgui.session.io import load_session, save_session
@@ -57,7 +58,7 @@ def project(app, tmp_path, monkeypatch):
     try:
         yield window
     finally:
-        window.close()
+        dispose_window(window)
 
 
 def wait_for_edits(window):

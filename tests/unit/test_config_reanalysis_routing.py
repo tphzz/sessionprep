@@ -6,6 +6,7 @@ pytest.importorskip("PySide6")
 
 from PySide6.QtWidgets import QApplication
 
+from qt_helpers import dispose_window
 from sessionprepgui.mainwindow import SessionPrepWindow
 from sessionpreplib.config import ConfigChangeImpact
 
@@ -32,7 +33,7 @@ def test_phase1_config_impact_routes_to_track_layout_reanalysis(qapp, monkeypatc
                     "detectors.dual_mono.dual_mono_eps",
                 })))
     finally:
-        window.close()
+        dispose_window(window)
 
     assert calls == ["phase1"]
 
@@ -51,7 +52,7 @@ def test_phase2_config_impact_routes_to_phase2_reanalysis(qapp, monkeypatch):
                     "processors.bimodal_normalize.target_rms",
                 })))
     finally:
-        window.close()
+        dispose_window(window)
 
     assert calls == ["phase2"]
 
@@ -71,7 +72,7 @@ def test_mixed_preset_change_refreshes_daw_before_analysis_rerun(qapp, monkeypat
             )
         )
     finally:
-        window.close()
+        dispose_window(window)
 
     assert calls == ["daw", "analysis"]
 
@@ -101,6 +102,6 @@ def test_daw_only_config_impact_refreshes_phase3_without_reanalysis(
                     "daw_processors.protools.protools_project_dir",
                 })))
     finally:
-        window.close()
+        dispose_window(window)
 
     assert calls == ["daw", "display"]

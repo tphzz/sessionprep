@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QPushButton,
 )
 
+from qt_helpers import dispose_window
 from sessionprepgui import settings
 from sessionprepgui.change_marker import is_tab_marked
 from sessionprepgui.mainwindow import SessionPrepWindow
@@ -86,7 +87,7 @@ def window(qapp, app_config, monkeypatch):
     try:
         yield win
     finally:
-        win.close()
+        dispose_window(win)
 
 
 def _open_project(window, config, tmp_path, preset="Default", *, tracks=()):
@@ -470,7 +471,7 @@ def test_switching_config_presets_preserves_float_editor_step(qapp, app_config):
         assert delay.decimals() == original_decimals
         assert delay.singleStep() == original_step
     finally:
-        dialog.close()
+        dispose_window(dialog)
 
 
 @pytest.mark.parametrize("key, label", [
@@ -627,7 +628,7 @@ def test_preferences_port_and_path_resets_still_use_built_in_defaults(qapp, app_
         assert saved["protools_port"] == 31416
         assert saved["protools_project_dir"] == ""
     finally:
-        dialog.close()
+        dispose_window(dialog)
 
 
 def test_blank_project_directory_remains_an_override_until_revert(

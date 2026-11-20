@@ -10,9 +10,10 @@ import soundfile as sf
 
 pytest.importorskip("PySide6")
 
-from PySide6.QtCore import QEvent, Qt
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication, QTreeWidgetItem
 
+from qt_helpers import dispose_window
 from sessionprepgui.analysis.worker import (
     AudioLoadWorker, TopoAudioResolveWorker, TopoMultiAudioWorker, TopologyApplyWorker,
 )
@@ -42,10 +43,7 @@ def window(qapp, tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "get_app_dir", lambda: str(tmp_path / "settings"))
     win = SessionPrepWindow()
     yield win
-    assert win.close()
-    qapp.processEvents()
-    win.deleteLater()
-    qapp.sendPostedEvents(win, QEvent.DeferredDelete)
+    dispose_window(win)
 
 
 def wait_until(qapp, condition):

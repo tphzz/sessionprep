@@ -5,6 +5,7 @@ pytest.importorskip("PySide6")
 from PySide6.QtCore import QObject, Signal
 from PySide6.QtWidgets import QApplication
 
+from qt_helpers import dispose_window
 from sessionprepgui import mainwindow, settings
 from sessionprepgui.analysis import worker as worker_module
 from sessionpreplib.models import SessionContext
@@ -41,7 +42,7 @@ def window(qapp, monkeypatch):
     owner._session = SessionContext([], {})
     owner._source_dir = "unused-source"
     yield owner
-    owner.close()
+    dispose_window(owner)
 
 
 def test_apply_keeps_the_toolbar_summary_and_uses_the_progress_strip(qapp, window, monkeypatch):
