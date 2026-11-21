@@ -146,15 +146,13 @@ def resolve_entry_audio(
 
     # Determine output length from the longest source
     max_samples = 0
+    samplerate = None
     for src in entry.sources:
-        audio, _sr = track_audio[src.input_filename]
-        n = audio.shape[0]
-        max_samples = max(max_samples, n)
-
-    if max_samples == 0:
-        if entry.output_channels == 1:
-            return np.zeros(0, dtype=np.float64)
-        return np.zeros((0, entry.output_channels), dtype=np.float64)
+        audio, rate = track_audio[src.input_filename]
+        if samplerate is not None and rate != samplerate:
+            raise ValueError("Routed sources have different sample rates")
+        samplerate = rate
+        max_samples = max(max_samples, audio.shape[0])
 
     # Allocate output buffer
     out = np.zeros((max_samples, entry.output_channels), dtype=np.float64)
@@ -170,9 +168,12 @@ def resolve_entry_audio(
         for route in src.routes:
             src_ch = route.source_channel
             tgt_ch = route.target_channel
-            if src_ch < audio_2d.shape[1]:
-                n = audio_2d.shape[0]
-                out[:n, tgt_ch] += audio_2d[:, src_ch] * route.gain
+            if not 0 <= src_ch < audio_2d.shape[1]:
+                raise ValueError(f"{src.input_filename}: source channel {src_ch} out of range")
+            if not 0 <= tgt_ch < entry.output_channels:
+                raise ValueError(f"{entry.output_filename}: target channel {tgt_ch} out of range")
+            n = audio_2d.shape[0]
+            out[:n, tgt_ch] += audio_2d[:, src_ch] * route.gain
 
     # Squeeze mono to 1-D
     if entry.output_channels == 1:

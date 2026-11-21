@@ -491,6 +491,7 @@ class DawMixin:  # pylint: disable=too-few-public-methods
         self._daw_check_label.setStyleSheet(f"color: {COLORS['dim']};")
         self._daw_check_worker = DawCheckWorker(processor, parent=self)
         self._daw_check_worker.result.connect(self._on_daw_check_result)
+        self._daw_check_worker.finished.connect(self._resume_close_after_daw)
         self._daw_check_worker.finished.connect(self._daw_check_worker.deleteLater)
         self._update_daw_lifecycle_buttons()
         self._daw_check_worker.start()
@@ -501,6 +502,8 @@ class DawMixin:  # pylint: disable=too-few-public-methods
         if worker is None:
             return
         self._daw_check_worker = None
+        if self._close_after_daw:
+            return
         if ok:
             self._daw_check_label.setText(message)
             self._daw_check_label.setStyleSheet(f"color: {COLORS['clean']};")
@@ -556,6 +559,7 @@ class DawMixin:  # pylint: disable=too-few-public-methods
         self._daw_fetch_worker.progress.connect(self._on_transfer_progress)
         self._daw_fetch_worker.progress_value.connect(self._on_transfer_progress_value)
         self._daw_fetch_worker.result.connect(self._on_daw_fetch_result)
+        self._daw_fetch_worker.finished.connect(self._resume_close_after_daw)
         self._daw_fetch_worker.finished.connect(self._daw_fetch_worker.deleteLater)
         self._update_daw_lifecycle_buttons()
         self._daw_fetch_worker.start()
@@ -566,6 +570,8 @@ class DawMixin:  # pylint: disable=too-few-public-methods
         if worker is None:
             return
         self._daw_fetch_worker = None
+        if self._close_after_daw:
+            return
         if worker._session is not self._session:
             self._update_daw_lifecycle_buttons()
             return
@@ -759,6 +765,7 @@ class DawMixin:  # pylint: disable=too-few-public-methods
         worker.progress.connect(self._on_transfer_progress)
         worker.progress_value.connect(self._on_transfer_progress_value)
         worker.result.connect(self._on_daw_transfer_result)
+        worker.finished.connect(self._resume_close_after_daw)
         worker.finished.connect(worker.deleteLater)
         self._update_daw_lifecycle_buttons()
         worker.start()
@@ -777,6 +784,8 @@ class DawMixin:  # pylint: disable=too-few-public-methods
             return
         set_action_busy(self._transfer_action, False)
         self._daw_transfer_worker = None
+        if self._close_after_daw:
+            return
         self._update_daw_lifecycle_buttons()
         if ok:
             log.info("DAW transfer complete")
@@ -803,12 +812,12 @@ class DawMixin:  # pylint: disable=too-few-public-methods
         # Build children map: parent_id -> [child folders]
         children_map: dict[str | None, list] = {}
         for f in folders:
-            parent = f["parent_id"]
+            parent = f.get("parent_id")
             children_map.setdefault(parent, []).append(f)
 
         # Sort children by index
         for children in children_map.values():
-            children.sort(key=lambda f: f["index"])
+            children.sort(key=lambda f: f.get("index", 0))
 
         # Build inverse assignments: folder_id -> [filenames]
         # Use track_order for stable ordering, fall back to sorted
@@ -850,7 +859,7 @@ class DawMixin:  # pylint: disable=too-few-public-methods
             item.setText(0, folder["name"])
             item.setData(0, Qt.UserRole, folder["id"])
             item.setData(0, Qt.UserRole + 1, "folder")
-            if folder["folder_type"] == "routing":
+            if folder.get("folder_type") == "routing":
                 item.setIcon(0, routing_icon)
             else:
                 item.setIcon(0, basic_icon)

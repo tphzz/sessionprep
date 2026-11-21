@@ -60,7 +60,7 @@ def qapp():
 
 @pytest.fixture
 def pane(qapp, monkeypatch):
-    monkeypatch.setattr(report, "read_chunks", lambda _: ("WAVE", []))
+    monkeypatch.setattr(report, "chunk_sizes", lambda _: [])
     view = FileReportPane(ReportBrowser({}))
     view.resize(1069, 620)
     view.show()
@@ -100,7 +100,7 @@ def test_invalid_locations_do_not_offer_visualize(pane, start, end, channel):
 
 def test_visualize_keyboard_dispatch_preserves_help_details_and_cached_content(qapp, pane, monkeypatch):
     reads = []
-    monkeypatch.setattr(report, "read_chunks", lambda path: (reads.append(path) or ("WAVE", [])))
+    monkeypatch.setattr(report, "chunk_sizes", lambda path: (reads.append(path) or []))
     session, current = session_with_issues()
     pane.report.present_track(current, session)
     pane.report.activate_report_link(QUrl("report-help:tail"))

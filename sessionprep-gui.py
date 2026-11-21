@@ -62,4 +62,11 @@ if __name__ == "__main__":
 
     from sessionprepgui import main
 
-    main()
+    if "--gui-smoke-test" in sys.argv:
+        import argparse
+
+        parser = argparse.ArgumentParser(description="Check the packaged Qt window and runtime resources.")
+        parser.add_argument("--gui-smoke-test", type=Path, required=True, nargs=2, metavar=("WAV", "RECEIPT"))
+        main(smoke_files=parser.parse_args().gui_smoke_test)
+    else:
+        main()

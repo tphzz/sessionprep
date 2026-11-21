@@ -71,7 +71,7 @@ def _settle(qapp, pane):
 
 @pytest.fixture
 def pane(qapp, monkeypatch):
-    monkeypatch.setattr(report, "read_chunks", lambda path: ("WAVE", []))
+    monkeypatch.setattr(report, "chunk_sizes", lambda path: [])
     browser = ReportBrowser({})
     view = FileReportPane(browser)
     view.resize(1069, 620)
@@ -167,7 +167,7 @@ def test_repeating_help_retains_help_scroll_switching_resets_only_help(qapp, pan
 
 def test_help_and_details_reuse_prepared_metadata_and_detector_content(qapp, pane, monkeypatch):
     reads = []
-    monkeypatch.setattr(report, "read_chunks", lambda path: (reads.append(path) or ("WAVE", [])))
+    monkeypatch.setattr(report, "chunk_sizes", lambda path: (reads.append(path) or []))
     session, current = _session(long_help=True)
     pane.report.present_track(current, session)
     for detector in ("d00", "d01", "d01"):

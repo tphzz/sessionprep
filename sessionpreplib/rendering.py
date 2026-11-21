@@ -16,6 +16,7 @@ from .models import (
 from .audio import dbfs_offset, format_duration, linear_to_db
 from .detectors.stereo_compat import format_mono_loss
 from .repair_verification import remaining_results
+from .utils import GROUP_OVERLAP_PREFIX
 
 
 # --------------------------------------------------------------------------
@@ -438,7 +439,7 @@ def build_diagnostic_summary(
     # Grouping overlaps
     grouping_items = []
     for w in session.warnings:
-        if str(w).startswith("Grouping overlap:"):
+        if str(w).startswith(GROUP_OVERLAP_PREFIX):
             grouping_items.append(str(w))
     add_group(attention_groups, "Grouping overlaps",
               "review group patterns", grouping_items)

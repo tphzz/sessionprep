@@ -64,7 +64,7 @@ def window(qapp, monkeypatch):
     monkeypatch.setattr(mainwindow, "save_config", lambda *args: None)
     monkeypatch.setattr(mainwindow.SessionPrepWindow, "_configure_daw_processors",
                         lambda self: setattr(self, "_daw_processors", []))
-    monkeypatch.setattr(report, "read_chunks", lambda path: ("WAVE", []))
+    monkeypatch.setattr(report, "chunk_sizes", lambda path: [])
     owner = mainwindow.SessionPrepWindow()
     # No audio, devices or DAW services are involved in this layout test.
     monkeypatch.setattr(owner, "_load_waveform", lambda track: None)
@@ -212,7 +212,7 @@ class _Detector:
 
 @pytest.fixture
 def pane(qapp, monkeypatch):
-    monkeypatch.setattr(report, "read_chunks", lambda path: ("WAVE", []))
+    monkeypatch.setattr(report, "chunk_sizes", lambda path: [])
     view = FileReportPane(ReportBrowser({}))
     view.resize(1069, 620)
     view.show()
@@ -284,7 +284,7 @@ def test_constrained_help_dock_keeps_its_inset_and_minimum(qapp, pane, monkeypat
 
 
 def test_scrolling_report_keeps_text_inset_inside_the_viewport(qapp, monkeypatch):
-    monkeypatch.setattr(report, "read_chunks", lambda path: ("WAVE", []))
+    monkeypatch.setattr(report, "chunk_sizes", lambda path: [])
     current = TrackContext("Long.wav", "missing.wav", None, 48000, 1, 96000,
                            "24-bit", "PCM_24", 2.0)
     detectors = []

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Callable
 
 log = logging.getLogger(__name__)
@@ -87,7 +88,13 @@ class BatchManager(QObject):
             self.batch_progress_message.emit(f"[{item.project_name}] Checking DAW...")
 
             try:
+                source_dir = item.session_state.get("source_dir")
+                if source_dir and not os.path.isdir(source_dir):
+                    raise ValueError(f"Source directory is unavailable: {source_dir}")
+                if item.output_path and os.path.lexists(item.output_path):
+                    raise ValueError(f"Project already exists: {item.output_path}. Choose a new destination before retrying.")
                 self._current_session = self._rehydrate_session(item.session_state)
+                self._current_session.config["_batch_transfer"] = True
                 self._current_dp = self._get_daw_processor(
                     item.daw_processor_id, self._current_session.config)
             except Exception as exc:

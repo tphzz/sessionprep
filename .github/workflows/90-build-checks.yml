@@ -71,14 +71,14 @@ jobs:
         UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/sessionprep-env-${{ github.run_id }}-${{ github.run_attempt }}-checks
         RELEASE_DRAFTS: ${{ inputs.publish_drafts }}
         HAS_RELEASE_TOKEN: ${{ secrets.GH_TOKEN != '' }}
-    - name: Run unit tests
+    - name: Run non-live regression tests
       shell: bash
       env:
         UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/sessionprep-env-${{ github.run_id }}-${{ github.run_attempt }}-checks
       run: |
         set -euo pipefail
         cd "$SOURCE_DIR"
-        uv run --frozen pytest tests/unit --durations=15
+        uv run --frozen pytest -m "not ptsl_live" --durations=15 -rs
     - name: Clean only run-owned workspace
       if: ${{ always() }}
       shell: bash

@@ -21,6 +21,8 @@ from dataclasses import asdict
 from typing import Any, Callable
 
 from sessionpreplib.audio import file_revision
+from sessionpreplib.config import resolve_session_config, validate_structured_config
+from sessionpreplib.file_io import atomic_writer
 from sessionpreplib.detector import TrackDetector
 from sessionpreplib.detectors import default_detectors
 from sessionpreplib.models import (
@@ -81,7 +83,11 @@ _MIGRATIONS: dict[int, Callable[[dict], dict]] = {
 
 def _migrate(data: dict) -> dict:
     """Upgrade *data* in-place from its stored version to CURRENT_VERSION."""
+    if not isinstance(data, dict):
+        raise ValueError("Expected a session object.")
     v = data.get("version", 1)
+    if type(v) is not int:
+        raise ValueError("Session version must be an integer.")
     if v > CURRENT_VERSION:
         raise ValueError(
             f"Session file was saved with a newer version of SessionPrep "
@@ -358,6 +364,7 @@ def _deserialize_track(filename: str, filepath: str, d: dict, *, output: bool = 
     }
     if output:
         track.processed_filepath = d.get("processed_filepath")
+        track.prepared_file_revision = d.get("prepared_file_revision")
         track.prepared_fader_db = d.get("prepared_fader_db")
         signature = d.get("prepared_file_signature")
         if signature is not None:
@@ -369,6 +376,8 @@ def _serialize_output_track(track: TrackContext) -> dict:
     d = _serialize_track(track)
     d["filepath"] = track.filepath
     d["processed_filepath"] = track.processed_filepath
+    if track.prepared_file_revision is not None:
+        d["prepared_file_revision"] = track.prepared_file_revision
     if track.prepared_fader_db is not None:
         d["prepared_fader_db"] = track.prepared_fader_db
     if track.prepared_file_signature is not None:
@@ -565,9 +574,89 @@ def serialize_session_state(data: dict) -> dict:
         "active_daw_processor_id": data.get("active_daw_processor_id"),
     }
 
+def _validate_daw_state(states: dict) -> None:
+    """Check the folder data consumed by the bundled adapters and their tree."""
+    for processor_id, state in states.items():
+        base, _, index = processor_id.partition("_")
+        if base not in ("dawproject", "protools") or (index and not index.isdecimal()):
+            continue
+        if not isinstance(state, dict):
+            raise ValueError(f"Expected an object for DAW state '{processor_id}'.")
+        folders = state.get("folders", [])
+        if not isinstance(folders, list):
+            raise ValueError(f"Invalid folders for '{processor_id}'.")
+        folder_ids = set()
+        for folder in folders:
+            if (not isinstance(folder, dict) or not isinstance(folder.get("id"), str)
+                    or not isinstance(folder.get("name"), str) or folder["id"] in folder_ids
+                    or type(folder.get("index", 0)) is not int
+                    or not isinstance(folder.get("folder_type", "basic"), str)
+                    or not isinstance(folder.get("parent_id"), (str, type(None)))):
+                raise ValueError(f"Invalid or duplicate folder in '{processor_id}'.")
+            folder_ids.add(folder["id"])
+        assignments = state.get("assignments", {})
+        if not isinstance(assignments, dict) or any(not isinstance(v, str) for v in assignments.values()):
+            raise ValueError(f"Invalid folder assignments for '{processor_id}'.")
+        order = state.get("track_order", {})
+        if not isinstance(order, dict) or any(
+                not isinstance(tracks, list) or any(not isinstance(name, str) for name in tracks)
+                for tracks in order.values()):
+            raise ValueError(f"Invalid track order for '{processor_id}'.")
+
+
+def _validate_editable_fields(raw: dict) -> None:
+    for group in raw.get("session_groups", []):
+        if not isinstance(group, dict):
+            raise ValueError("Each session group must be an object.")
+        for key in ("name", "color", "daw_target", "match_method", "match_pattern"):
+            if key in group and not isinstance(group[key], str):
+                raise ValueError(f"Invalid session group '{key}': expected text.")
+        if "gain_linked" in group and not isinstance(group["gain_linked"], bool):
+            raise ValueError("Invalid session group 'gain_linked': expected a boolean.")
+    for pair in raw.get("prepare_errors", []):
+        if not isinstance(pair, (list, tuple)) or len(pair) != 2 or not all(isinstance(v, str) for v in pair):
+            raise ValueError("Each Prepare error must contain a filename and message.")
+    for name, advice in raw.get("output_gain_adjustments", {}).items():
+        if not isinstance(advice, dict) or not {"peak_db", "reduction_db"} <= advice.keys():
+            raise ValueError(f"Incomplete output gain adjustment for '{name}'.")
+        for key in ("peak_db", "reduction_db", "gain_db", "target_gain_db"):
+            if key in advice and (type(advice[key]) not in (float, int) or not math.isfinite(advice[key])):
+                raise ValueError(f"Invalid '{key}' in output gain adjustment for '{name}'.")
+    _validate_daw_state(raw.get("daw_state", {}))
+
+
 def deserialize_session_state(raw: dict) -> dict:
     """Deserialize a JSON-safe dict back into a session state dict."""
     raw = _migrate(raw)
+    for key, kind in (
+        ("source_dir", str), ("project_name", str), ("active_config_preset", str),
+        ("use_processed", bool), ("topology_applied", bool), ("recursive_scan", bool),
+        ("session_groups", list), ("tracks", dict), ("output_tracks", dict), ("daw_state", dict),
+        ("prepare_errors", list), ("output_gain_adjustments", dict), ("prepare_state", str),
+    ):
+        if key in raw and not isinstance(raw[key], kind):
+            raise ValueError(f"Invalid session field '{key}': expected {kind.__name__}.")
+    for key in ("topology_dir", "active_daw_processor_id"):
+        if raw.get(key) is not None and not isinstance(raw[key], str):
+            raise ValueError(f"Invalid session field '{key}': expected text.")
+    _validate_editable_fields(raw)
+    snapshot = raw.get("session_config")
+    overrides = raw.get("session_config_overrides")
+    for config in (snapshot, overrides):
+        if config is not None and not isinstance(config, dict):
+            raise ValueError("Session configuration must be an object.")
+    for config in (snapshot, resolve_session_config({}, overrides or {})):
+        if config:
+            for section in ("analysis", "presentation", "detectors", "processors", "daw_processors"):
+                values = config.get(section, {})
+                if not isinstance(values, dict):
+                    raise ValueError(f"Invalid session configuration: '{section}' must be an object.")
+                if section in ("detectors", "processors", "daw_processors") and any(
+                        not isinstance(component, dict) for component in values.values()):
+                    raise ValueError(f"Invalid session configuration: '{section}' contains an invalid component.")
+            errors = validate_structured_config(config)
+            if errors:
+                raise ValueError(f"Invalid session configuration: {errors[0].key}: {errors[0].message}")
 
     source_dir = raw.get("source_dir", "")
     track_dir = (raw.get("topology_dir") or source_dir) if raw.get("topology_applied") else source_dir
@@ -621,7 +710,7 @@ def save_session(path: str, data: dict) -> None:
     types except for ``TrackContext`` objects under ``"tracks"``).
     """
     payload = serialize_session_state(data)
-    with open(path, "w", encoding="utf-8") as fh:
+    with atomic_writer(path) as fh:
         json.dump(payload, fh, indent=2, ensure_ascii=False)
 
 
@@ -643,7 +732,7 @@ def load_session(path: str) -> dict:
     with open(path, "r", encoding="utf-8") as fh:
         raw = json.load(fh)
 
-    if not raw.get("source_dir"):
+    if not isinstance(raw, dict) or not raw.get("source_dir"):
         raise ValueError("Session file is missing 'source_dir'.")
 
     return deserialize_session_state(raw)

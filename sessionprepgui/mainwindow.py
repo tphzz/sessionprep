@@ -38,6 +38,7 @@ from sessionpreplib.config import (
     resolve_session_config,
 )
 from sessionpreplib.detectors import detector_help_map
+from sessionpreplib.file_io import atomic_writer
 
 from .settings import (
     DEFAULT_SCALE_FACTOR,
@@ -180,6 +181,7 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
 
         self._batch_manager = BatchManager(self)
         self._close_after_batch = False
+        self._close_after_daw = False
         self._batch_manager.finished.connect(self._on_batch_finished)
         self._batch_manager.item_finished.connect(self._on_batch_item_finished)
 
@@ -348,6 +350,9 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
         """Return the flattened effective configuration for runtime consumers."""
         flat = default_config()
         flat.update(flatten_structured_config(self._effective_session_config()))
+        destination = getattr(self, "_active_daw_processor", None)
+        if destination is not None:
+            flat["_fader_ceiling_db"] = destination.fader_ceiling_db
         return flat
 
     def _effective_session_config(self) -> dict[str, Any]:
@@ -567,7 +572,7 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
 
         try:
             state = self._batch_dock.get_state()
-            with open(path, "w", encoding="utf-8") as f:
+            with atomic_writer(path) as f:
                 json.dump(state, f, indent=2)
             self._status_bar.showMessage(f"Batch queue saved to {path}")
         except Exception as exc:
@@ -602,16 +607,21 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
 
             replace_btn = msg.addButton("Replace", QMessageBox.AcceptRole)
             append_btn = msg.addButton("Append", QMessageBox.AcceptRole)
-            cancel_btn = msg.addButton("Cancel", QMessageBox.RejectRole)
+            msg.addButton("Cancel", QMessageBox.RejectRole)
 
             msg.exec()
 
-            if msg.clickedButton() == cancel_btn:
-                return
-            if msg.clickedButton() == append_btn:
+            choice = msg.clickedButton()
+            if choice == append_btn:
                 append = True
+            elif choice != replace_btn:
+                return
 
-        self._batch_dock.load_state(state, append=append)
+        try:
+            self._batch_dock.load_state(state, append=append)
+        except ValueError as exc:
+            QMessageBox.critical(self, "Load Batch Queue Failed", str(exc))
+            return
 
         self._batch_mode_action.setChecked(True)
         self._clear_workspace()
@@ -632,8 +642,8 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
             )
             if reply != QMessageBox.Yes:
                 return
-        self._restore_session_state(item.session_state)
-        self._batch_dock.remove_item(item.id)
+        if self._restore_session_state(item.session_state):
+            self._batch_dock.remove_item(item.id)
 
     @Slot(object)
     def _on_open_batch_project_folder(self, item):
@@ -1190,8 +1200,13 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
             f"for mix session preparation.</p>",
         )
 
+    @Slot()
+    def _resume_close_after_daw(self):
+        if self._close_after_daw:
+            self.close()
+
     def closeEvent(self, event):
-        if self._batch_dock.has_items and not self._close_after_batch:
+        if self._batch_dock.has_items and not (self._close_after_batch or self._close_after_daw):
             reply = QMessageBox.warning(
                 self, "Pending Batch Items",
                 "You have pending sessions in the batch queue. Are you sure you want to quit?",
@@ -1206,17 +1221,24 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
             self._batch_manager.stop_after_current()
             event.ignore()
             return
-        self._close_after_batch = False
-
-        self._playback.close()
         self._pending_after_check = None
+        # A host call can outlive its result signal. Keep the window and Qt
+        # event loop alive until its actual thread has returned.
+        for kind in (DawCheckWorker, DawFetchWorker, DawTransferWorker):
+            if any(worker.isRunning() for worker in self.findChildren(kind)):
+                self._close_after_daw = True
+                event.ignore()
+                return
+        self._close_after_daw = self._close_after_batch = False
+        self._playback.close()
         self._repair_preview.close()
         # Qt destroys child threads along with their window. A long filter can
         # finish its current track after cancellation, including on a closed project.
-        from .analysis.worker import Phase1AnalyzeWorker, RepairPlanWorker
-        for worker in self.findChildren(Phase1AnalyzeWorker):
-            worker.cancel()
-            worker.wait()
+        from .analysis.worker import AnalyzeWorker, Phase1AnalyzeWorker, RepairPlanWorker
+        for kind in (Phase1AnalyzeWorker, AnalyzeWorker):
+            for worker in self.findChildren(kind):
+                worker.cancel()
+                worker.wait()
         for worker in self.findChildren(RepairPlanWorker):
             worker.cancel()
             worker.wait()
@@ -1245,10 +1267,16 @@ class SessionPrepWindow(  # pylint: disable=too-many-ancestors
                     worker.cancel()
                 else:
                     worker.requestInterruption()
-                worker.wait(500)
+                worker.wait()
             setattr(self, worker_attr, None)
         if hasattr(self, "_topo_cancel_workers"):
             self._topo_cancel_workers()
+        # Superseded topology preview workers are still children even when
+        # their attributes have been rebound to the next source.
+        for worker in self.findChildren(QThread):
+            if worker.isRunning():
+                worker.requestInterruption()
+                worker.wait()
 
         super().closeEvent(event)
 
@@ -1270,7 +1298,7 @@ def _app_icon() -> QIcon:
     return icon
 
 
-def main():
+def main(*, smoke_files=None):
     from sessionpreplib.logging_setup import setup_logging
     setup_logging()
 
@@ -1322,6 +1350,26 @@ def main():
         _rect_text(window.frameGeometry()),
         _window_state_text(window.windowState()),
     ))
+
+    if smoke_files is not None:
+        def check_window():
+            try:
+                if not window.isVisible() or app.windowIcon().pixmap(32, 32).isNull():
+                    raise RuntimeError("Qt main window or packaged icon did not load")
+                from hashlib import sha256
+                from sessionpreplib import __version__
+                from sessionpreplib.audio import load_track
+                audio_file, receipt_file = smoke_files
+                track = load_track(str(audio_file))
+                with receipt_file.open("x", encoding="utf-8") as receipt:
+                    _json.dump(dict(version=__version__, rate=track.samplerate, frames=track.total_samples,
+                                    pcm_sha256=sha256(track.audio_data.astype("<f8", copy=False)).hexdigest()), receipt)
+            except Exception:
+                log.exception("GUI smoke test failed")
+                app.exit(1)
+            else:
+                window.close()
+        QTimer.singleShot(0, check_window)
 
     dbg(f"main() total: {(time.perf_counter() - t_main) * 1000:.1f} ms")
     sys.exit(app.exec())

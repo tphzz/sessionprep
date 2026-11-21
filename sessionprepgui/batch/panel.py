@@ -51,15 +51,32 @@ class BatchItem:
 
     @classmethod
     def from_dict(cls, data: dict) -> BatchItem:
+        if not isinstance(data, dict):
+            raise ValueError("Expected a batch item object.")
+        for key in ("id", "project_name", "daw_processor_id", "daw_processor_name", "output_path", "result_text"):
+            if key in data and not isinstance(data[key], str):
+                raise ValueError(f"Invalid {key}.")
+        if not data.get("project_name") or not data.get("daw_processor_id"):
+            raise ValueError("Missing project name or DAW processor.")
+        session_state = deserialize_session_state(data["session_state"])
+        if not session_state["source_dir"]:
+            raise ValueError("Missing source directory.")
+        status = data.get("status", "Pending")
+        result = data.get("result_text", "")
+        if status == "Running":
+            status = "Failed"
+            result = "Transfer was interrupted. Check the project destination before retrying."
+        if status not in ("Pending", "Success", "Failed"):
+            raise ValueError(f"Invalid batch status: {status}")
         return cls(
-            id=data.get("id", str(uuid.uuid4())),
+            id=data.get("id") or str(uuid.uuid4()),
             project_name=data.get("project_name", ""),
             daw_processor_id=data.get("daw_processor_id", ""),
             daw_processor_name=data.get("daw_processor_name", ""),
             output_path=data.get("output_path", ""),
-            session_state=deserialize_session_state(data.get("session_state", {})),
-            status=data.get("status", "Pending"),
-            result_text=data.get("result_text", ""),
+            session_state=session_state,
+            status=status,
+            result_text=result,
         )
 
 
@@ -433,11 +450,22 @@ class BatchQueueDock(QDockWidget):
         return [item.to_dict() for item in self._items]
 
     def load_state(self, state: list[dict], append: bool = False):
-        if not append:
-            self._items.clear()
-            self._refresh_table()
-
-        for item_data in state:
-            new_item = BatchItem.from_dict(item_data)
-            # add_item handles duplicates and refreshing the table
-            self.add_item(new_item)
+        if self._is_running:
+            raise ValueError("Wait for the current batch to finish before loading a queue.")
+        items = list(self._items) if append else []
+        ids = {item.id for item in items}
+        names = {item.project_name.casefold() for item in items}
+        for row, record in enumerate(state, 1):
+            try:
+                item = BatchItem.from_dict(record)
+                if item.id in ids:
+                    raise ValueError(f"Duplicate item ID '{item.id}'.")
+                if item.project_name.casefold() in names:
+                    raise ValueError(f"Duplicate project name '{item.project_name}'.")
+            except (KeyError, ValueError, AttributeError, TypeError, IndexError) as exc:
+                raise ValueError(f"Queue item {row}: {exc}") from exc
+            items.append(item)
+            ids.add(item.id)
+            names.add(item.project_name.casefold())
+        self._items = items
+        self._refresh_table()

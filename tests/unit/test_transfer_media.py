@@ -2,9 +2,9 @@
 from copy import deepcopy
 import json
 from pathlib import Path
-import sys
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from xml.etree import ElementTree
+from zipfile import ZipFile
 
 import pytest
 import numpy as np
@@ -40,38 +40,38 @@ def media(tmp_path):
 
 
 @pytest.fixture
-def export_project(media, tmp_path, monkeypatch):
-    # Exercise the adapter through transfer(), substituting only the file-format library.
-    dawproject = MagicMock()
-    monkeypatch.setitem(sys.modules, "dawproject", dawproject)
-    folder = SimpleNamespace(channel=None, tracks=[])
-    dawproject.DawProject.load_project.return_value = SimpleNamespace(structure=[folder], arrangement=None)
-    processor = DawProjectDawProcessor()
-    monkeypatch.setattr(processor, "_build_folder_map", lambda _, found: found.update(folder=folder))
+def export_project(media, tmp_path):
+    template = tmp_path / "Template.dawproject"
+    with ZipFile(template, "w") as archive:
+        archive.writestr("project.xml", '<Project version="1.0"><Application name="Fixture" version="1"/>'
+                         '<Structure><Track id="folder" name="Band" contentType="tracks"/></Structure></Project>')
+    processor = DawProjectDawProcessor(template_path=str(template))
     session = SessionContext(
         [media], {}, output_tracks=[media], prepare_state="ready",
         transfer_manifest=[TransferEntry("guitar", media.filename, "Guitar")],
         daw_state={"dawproject": {"folders": [{"id": "folder", "name": "Band"}],
                                   "assignments": {"guitar": "folder"}}},
     )
-    return dawproject, session, lambda: processor.transfer(session, str(tmp_path / "Mix.dawproject"))
+    output = tmp_path / "Mix.dawproject"
+    return output, session, lambda: processor.transfer(session, str(output))
 
 
 @pytest.mark.parametrize("processed", [False, True])
 def test_dawproject_references_selected_file_and_only_compensates_rendered_gain(media, export_project, processed):
-    api, session, export = export_project
+    output, session, export = export_project
     session.config["_use_processed"] = processed
     results = export()
     assert all(result.success for result in results)
     expected = media.processed_filepath if processed else media.filepath
-    assert Path(api.FileReference.call_args.kwargs["path"]) == Path(expected)
-    assert api.Utility.create_track.call_args.kwargs["volume"] == pytest.approx(
-        10 ** (-2.5 / 20) if processed else 1.0)
+    with ZipFile(output) as archive:
+        project = ElementTree.fromstring(archive.read("project.xml"))
+    assert Path(project.find(".//Audio/File").get("path")) == Path(expected)
+    assert float(project.find(".//Channel/Volume").get("value")) == pytest.approx(10 ** (-2.5 / 20) if processed else 1.0)
 
 
 @pytest.mark.parametrize("invalid", ["missing", "stale", "replaced"])
 def test_unavailable_prepared_media_never_creates_a_clip(media, export_project, invalid):
-    api, session, export = export_project
+    output, session, export = export_project
     session.config["_use_processed"] = True
     path = Path(media.processed_filepath)
     stamp = path.stat()
@@ -85,8 +85,7 @@ def test_unavailable_prepared_media_never_creates_a_clip(media, export_project, 
     errors = [result for result in export() if not result.success]
     assert len(errors) == 1
     assert errors[0].command.target == "guitar"
-    api.Utility.create_clip.assert_not_called()
-    api.DawProject.save.assert_not_called()
+    assert not output.exists()
 
 
 @pytest.mark.parametrize("processed", [False, True])

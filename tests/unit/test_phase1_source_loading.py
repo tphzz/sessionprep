@@ -197,8 +197,8 @@ def _apply(session, output_dir, source_dir=None, **kwargs):
                                  str(source_dir) if source_dir else None, **kwargs)
     errors = []
     completed = []
-    worker.error.connect(errors.append)
-    worker.apply_finished.connect(lambda: completed.append(True))
+    worker.error.connect(lambda worker, message: errors.append(message))
+    worker.apply_finished.connect(lambda worker: completed.append(True))
     worker.run()
     if completed:
         assert completed == [True]
@@ -213,6 +213,56 @@ def _route_one_channel(filename, channel):
     return TopologyMapping([TopologyEntry(filename, 1, [
         TopologySource(filename, extract_channel(channel)),
     ])])
+
+
+@pytest.mark.parametrize("failure", ["encoder", "cancel", "publish"])
+def test_layout_retry_preserves_previous_files_and_unrelated_media(tmp_path, monkeypatch, failure):
+    from pathlib import Path
+    import os
+
+    layout = tmp_path / "layout"
+    for name in ["A.wav", "B.wav"]:
+        _write_stereo(tmp_path / name, identical=False)
+    tracks = [load_track(str(tmp_path / name)) for name in ["A.wav", "B.wav"]]
+    session = SessionContext(tracks, {}, topology=TopologyMapping([
+        _route_one_channel(t.filename, 0).entries[0] for t in tracks]))
+    assert _apply(session, layout, tmp_path) == []
+    sentinel = layout / "Notes.wav"
+    _write_stereo(sentinel)
+    files = [layout / t.filename for t in tracks] + [sentinel] + [Path(t.filepath) for t in tracks]
+    previous = {path: path.read_bytes() for path in files}
+    for entry in session.topology.entries:
+        entry.sources[0].routes = extract_channel(1)
+    worker = TopologyApplyWorker(session, str(layout), str(tmp_path))
+    errors, finished = [], []
+    worker.error.connect(lambda worker, message: errors.append(message))
+    worker.apply_finished.connect(lambda worker: finished.append(True))
+    write, publish = sf.write, os.replace
+
+    def fail_second_encoder(path, *args, **kwargs):
+        if Path(path).name == "B.wav":
+            raise OSError("encoder failed")
+        write(path, *args, **kwargs)
+        if failure == "cancel":
+            worker.cancel()
+
+    def fail_second_publication(source, dest):
+        if Path(dest) == layout / "B.wav" and Path(source).name == "B.wav":
+            raise OSError("locked destination")
+        publish(source, dest)
+
+    with monkeypatch.context() as fault:
+        if failure == "publish":
+            fault.setattr(os, "replace", fail_second_publication)
+        else:
+            fault.setattr(sf, "write", fail_second_encoder)
+        worker.run()
+    assert errors and not finished
+    assert {path: path.read_bytes() for path in files} == previous
+    assert _apply(session, layout, tmp_path) == []
+    for track in tracks:
+        np.testing.assert_array_equal(sf.read(layout / track.filename)[0], track.audio_data[:, 1])
+    assert sentinel.read_bytes() == previous[sentinel]
 
 
 def test_apply_then_reapply_right_channel_of_detected_duplicate(tmp_path):
@@ -230,6 +280,113 @@ def test_apply_then_reapply_right_channel_of_detected_duplicate(tmp_path):
     session.topology = _route_one_channel(source.name, 1)
     assert _apply(session, layout, tmp_path) == []
     np.testing.assert_array_equal(sf.read(layout / source.name)[0], original.audio_data[:, 1])
+
+
+@pytest.mark.parametrize("replacement", ["unrecognized", "modified", "unchanged"])
+def test_apply_from_a_new_session_verifies_existing_destinations(tmp_path, replacement):
+    layout = tmp_path / "layout"
+    path = tmp_path / "Keys.wav"
+    _write_stereo(path, identical=False)
+    target = layout / "Keys.wav"
+    track = load_track(str(path))
+    if replacement != "unrecognized":
+        first = SessionContext([track], {}, topology=_route_one_channel(path.name, 0))
+        assert _apply(first, layout, tmp_path) == []
+    if replacement != "unchanged":
+        layout.mkdir(exist_ok=True)
+        sf.write(target, np.full(512, 0.1875), 48000, subtype="PCM_24")
+    before = target.read_bytes()
+    next_session = SessionContext([track], {}, topology=_route_one_channel(path.name, 1))
+    errors = _apply(next_session, layout, tmp_path)
+    if replacement == "unchanged":
+        assert not errors
+        np.testing.assert_array_equal(sf.read(target)[0], track.audio_data[:, 1])
+    else:
+        assert errors
+        assert target.read_bytes() == before
+
+
+@pytest.mark.parametrize("absolute", [False, True])
+def test_apply_rejects_input_references_outside_restored_source_directory(tmp_path, absolute):
+    folder = tmp_path / "project"
+    folder.mkdir()
+    foreign = tmp_path / "External.wav"
+    _write_stereo(foreign)
+    topology = _route_one_channel(foreign.name, 0)
+    topology.entries[0].sources[0].input_filename = str(foreign) if absolute else "../External.wav"
+    session = SessionContext([], {}, topology=topology)
+    assert _apply(session, folder / "layout", folder)
+    assert not (folder / "layout" / foreign.name).exists()
+
+
+def test_cancelling_peak_cache_after_commit_keeps_the_complete_layout(tmp_path, monkeypatch):
+    from sessionprepgui.waveform import peakcache
+
+    for name in ("Kick.wav", "Snare.wav"):
+        _write_stereo(tmp_path / name, identical=False)
+    tracks = [load_track(str(tmp_path / name)) for name in ("Kick.wav", "Snare.wav")]
+    session = SessionContext(tracks, {}, topology=TopologyMapping([
+        _route_one_channel(track.filename, 1).entries[0] for track in tracks]), prepare_state="ready")
+    output = tmp_path / "layout"
+    worker = TopologyApplyWorker(session, str(output), str(tmp_path), str(output / "peaks"))
+    built = []
+    build_peaks = peakcache.build_peaks
+
+    def cancel_after_first(*args, **kwargs):
+        built.append(True)
+        worker.cancel()
+        return build_peaks(*args, **kwargs)
+
+    monkeypatch.setattr(peakcache, "build_peaks", cancel_after_first)
+    finished, errors = [], []
+    worker.apply_finished.connect(finished.append)
+    worker.error.connect(lambda _, error: errors.append(error))
+    worker.run()
+    assert finished == [worker] and not errors and built == [True]
+    assert session.prepare_state == "none"
+    assert [t.filename for t in session.output_tracks] == [t.filename for t in tracks]
+    for track in tracks:
+        np.testing.assert_array_equal(sf.read(output / track.filename)[0], track.audio_data[:, 1])
+
+
+def test_concurrent_layout_publish_cannot_interleave_or_remove_other_generations(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from dataclasses import replace
+    import os
+    from pathlib import Path
+    from threading import Event
+    from sessionpreplib.layout_files import publish_layout
+
+    root = tmp_path / "layout"
+    root.mkdir()
+    stages = [tmp_path / label for label in ("first", "second")]
+    target = root / "Take.wav"
+    for stage, level in zip(stages, (0.125, 0.25), strict=True):
+        stage.mkdir()
+        sf.write(stage / target.name, np.full(16, level), 8000)
+    track = replace(discover_track(str(stages[0] / target.name)), filepath=str(target))
+    publishing, proceed = Event(), Event()
+    rename = os.replace
+
+    def hold_first(source, dest):
+        if Path(source) == stages[0] / target.name:
+            publishing.set()
+            assert proceed.wait(5)
+        rename(source, dest)
+
+    monkeypatch.setattr(os, "replace", hold_first)
+    with ThreadPoolExecutor(1) as pool:
+        first = pool.submit(publish_layout, root, stages[0], [track], [])
+        try:
+            assert publishing.wait(5)
+            with pytest.raises(OSError, match="lock"):
+                publish_layout(root, stages[1], [replace(track)], [])
+        finally:
+            proceed.set()
+        first.result(timeout=5)
+    np.testing.assert_array_equal(sf.read(target)[0], np.full(16, 0.125))
+    publish_layout(root, stages[1], [replace(track)], [])
+    np.testing.assert_array_equal(sf.read(target)[0], np.full(16, 0.25))
 
 
 @pytest.mark.parametrize("hydrated_output", [True, False])

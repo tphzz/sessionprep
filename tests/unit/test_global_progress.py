@@ -8,7 +8,9 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication
 
 from qt_helpers import dispose_window
+from sessionprepgui.analysis.worker import AnalyzeWorker, PrepareWorker, TopologyApplyWorker
 from sessionprepgui.batch import BatchQueueDock
+from sessionpreplib.models import SessionContext
 from sessionprepgui.mainwindow import SessionPrepWindow
 from sessionprepgui.tracks.table_widgets import (
     _PHASE_ANALYSIS,
@@ -77,8 +79,11 @@ def test_analysis_progress_uses_global_panel_not_status_bar(qapp):
         window._progress_start("Analyzing...")
         window._status_bar.showMessage("Idle")
 
-        window._on_worker_progress("Analyzing Kick.wav - clipping")
-        window._on_worker_progress_value(3, 10)
+        worker = window._worker = AnalyzeWorker(".", {})
+        worker.progress.connect(window._on_worker_progress)
+        worker.progress_value.connect(window._on_worker_progress_value)
+        worker.progress.emit(worker, "Analyzing Kick.wav - clipping")
+        worker.progress_value.emit(worker, 3, 10)
 
         progress = _progress_panel(window, _PHASE_ANALYSIS)
         assert progress._label.text() == (
@@ -98,8 +103,11 @@ def test_prepare_progress_uses_global_panel_not_status_bar(qapp):
         window._progress_start("Preparing...")
         window._status_bar.showMessage("Idle")
 
-        window._on_prepare_progress("Writing Snare.wav")
-        window._on_prepare_progress_value(4, 12)
+        worker = window._prepare_worker = PrepareWorker(SessionContext([], {}), [], ".")
+        worker.progress.connect(window._on_prepare_progress)
+        worker.progress_value.connect(window._on_prepare_progress_value)
+        worker.progress.emit(worker, "Writing Snare.wav")
+        worker.progress_value.emit(worker, 4, 12)
 
         progress = _progress_panel(window, _PHASE_ANALYSIS)
         assert progress._label.text() == "Writing Snare.wav"
@@ -116,8 +124,11 @@ def test_topology_apply_progress_uses_global_panel(qapp):
         _select_phase(window, _PHASE_TOPOLOGY)
         window._progress_start("Applying topology...")
 
-        window._on_topo_apply_progress("Writing 01_Kick.wav")
-        window._on_topo_apply_progress_value(1, 8)
+        worker = window._topo_apply_worker = TopologyApplyWorker(SessionContext([], {}), ".")
+        worker.progress.connect(window._on_topo_apply_progress)
+        worker.progress_value.connect(window._on_topo_apply_progress_value)
+        worker.progress.emit(worker, "Writing 01_Kick.wav")
+        worker.progress_value.emit(worker, 1, 8)
 
         progress = _progress_panel(window, _PHASE_TOPOLOGY)
         assert progress._label.text() == "Writing 01_Kick.wav"

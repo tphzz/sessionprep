@@ -60,6 +60,7 @@ def test_low_memory_option_reaches_each_nuitka_target(tmp_path, monkeypatch, tar
     build.run_nuitka(target, low_memory=low_memory, debug=True, build_version="0.3.5")
 
     assert ("--low-memory" in calls[0]) is low_memory
+    assert ("--include-package=rich._unicode_data" in calls[0]) is (target == "cli")
     assert "--unstripped" in calls[0]
     assert "--lto=no" in calls[0]
 

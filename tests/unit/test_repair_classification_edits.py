@@ -6,7 +6,7 @@ import pytest
 import soundfile as sf
 
 pytest.importorskip("PySide6")
-from PySide6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtWidgets import QApplication, QCheckBox, QMessageBox
 
 from qt_helpers import dispose_window
 from sessionprepgui import settings
@@ -185,3 +185,79 @@ def test_single_plain_classification_and_bypass_update_linked_gain_and_faders(pr
     assert repaired.processor_results[selected].data["fader_offset"] == 0
     assert plain.processor_results[selected].gain_db == pytest.approx(individual)
     assert plain.processor_results[selected].data["fader_offset"] == pytest.approx(-individual)
+
+
+def test_group_link_recomputes_named_anchor_after_edits_and_reopen(project, tmp_path):
+    window = project
+    session = window._session
+    anchor, peer, _ = session.tracks
+    window._session_overrides.update({"analysis.anchor": anchor.filename, "analysis.fader_headroom_db": 0})
+    session.config.update(window._flat_config())
+    session.config["_gain_linked_groups"] = set()
+    for track, gain in zip(session.tracks, (6.0, -2.0, 1.0)):
+        track.manual_gain_db = gain
+    pipeline = Pipeline(default_detectors(), default_processors(), session.config, max_workers=1)
+    pipeline.plan(session)
+    window._session_groups = [{"name": "Pair", "gain_linked": False}]
+    window._populate_groups_tab()
+    window._refresh_group_combos()
+    for track in (anchor, peer):
+        choose(window, track, 6, "Pair")
+
+    def check(session, gains, faders):
+        results = [track.processor_results["bimodal_normalize"] for track in session.tracks]
+        assert [r.gain_db for r in results] == pytest.approx(gains)
+        assert [r.data["fader_offset"] for r in results] == pytest.approx(faders)
+
+    check(session, [6, -2, 1], [0, 8, 5])
+    link = window._groups_tab_table.cellWidget(0, 2).findChild(QCheckBox)
+    link.click()
+    check(session, [-2, -2, 1], [0, 0, -3])
+    session.config["_gain_linked_groups"] = {"Pair"}
+    pipeline.plan(session)
+    check(session, [-2, -2, 1], [0, 0, -3])
+    link.click()
+    check(session, [6, -2, 1], [0, 8, 5])
+    link.click()
+
+    saved = tmp_path / "linked.spsession"
+    save_session(str(saved), window._capture_session_state())
+    window._restore_session_state(load_session(str(saved)))
+    check(window._session, [-2, -2, 1], [0, 0, -3])
+    restored_anchor = window._session.tracks[0]
+    choose(window, restored_anchor, 3, "Transient")
+    assert restored_anchor.classification_override == "Transient"
+    check(window._session, [-2, -2, 1], [0, 0, -3])
+    button = window._track_table.cellWidget(window._find_table_row(restored_anchor.filename), 7)
+    toggle = next(action for action in button.menu().actions() if action.data() == "bimodal_normalize")
+    toggle.setChecked(False)
+    wait_for_edits(window)
+    assert [t.processor_results["bimodal_normalize"].data["fader_offset"]
+            for t in window._session.tracks] == pytest.approx([0, 2, -1])
+    toggle.setChecked(True)
+    wait_for_edits(window)
+    check(window._session, [-2, -2, 1], [0, 0, -3])
+    link = window._groups_tab_table.cellWidget(0, 2).findChild(QCheckBox)
+    link.click()
+    check(window._session, [6, -2, 1], [0, 8, 5])
+
+
+def test_reopened_group_edit_uses_the_selected_template_fader_ceiling(project, tmp_path):
+    window = project
+    window._config["config_presets"]["Default"]["daw_processors"]["dawproject"].update(
+        dawproject_templates=[{"name": "Studio", "template_path": str(tmp_path / "studio.dawproject"),
+                               "fader_ceiling_db": 6.0}],
+    )
+    window._configure_daw_processors()
+    daw = next(dp for dp in window._daw_processors if dp.fader_ceiling_db == 6.0)
+    window._populate_daw_combo(daw.id)
+    saved = tmp_path / "headroom.spsession"
+    save_session(str(saved), window._capture_session_state())
+    window._restore_session_state(load_session(str(saved)))
+    assert window._active_daw_processor.id == daw.id
+    # With 8 dB of headroom on a +6 dB console, the highest fader is -2 dB.
+    for track, gain in zip(window._session.tracks, (-10.0, 0.0, 1.0)):
+        track.processor_results["bimodal_normalize"].data["original_gain_db"] = gain
+    window._apply_linked_group_levels()
+    assert [t.processor_results["bimodal_normalize"].data["fader_offset"]
+            for t in window._session.tracks] == pytest.approx([-2.0, -12.0, -13.0])

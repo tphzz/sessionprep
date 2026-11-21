@@ -162,6 +162,7 @@ class TrackContext:
     manual_gain_db: float | None = None
     prepared_fader_db: float | None = None
     prepared_file_signature: tuple[int, int] | None = None
+    prepared_file_revision: str | None = None
     source_file_signature: tuple[int, int] | None = None
     detector_analysis_key: str | None = None
     corrected_analysis: CorrectedAnalysis | None = None

@@ -8,6 +8,7 @@ import math
 import os
 import stat
 from typing import Any
+from .audio import file_revision
 
 from .models import ParamSpec
 from .models import DawCommand, DawCommandResult, SessionContext, TrackContext
@@ -26,6 +27,7 @@ def resolve_transfer_audio(session: SessionContext, track: TrackContext) -> Tran
     choice = session.config.get("_use_processed")
     prepared = bool(track.processed_filepath) if choice is None else choice
     path = track.processed_filepath if prepared else track.filepath
+    source_track = track
     if not path:
         raise ValueError("The selected audio is unavailable. Run Prepare again.")
     if prepared:
@@ -37,6 +39,7 @@ def resolve_transfer_audio(session: SessionContext, track: TrackContext) -> Tran
         if source is None or _same_audio_path(source.filepath, track.processed_filepath):
             raise ValueError("The routed source is unavailable. Apply Track Layout and Prepare again.")
         path = source.filepath
+        source_track = source
 
     try:
         info = os.stat(path)
@@ -44,8 +47,10 @@ def resolve_transfer_audio(session: SessionContext, track: TrackContext) -> Tran
         raise ValueError(f"The selected audio file could not be opened. {path}") from exc
     if not stat.S_ISREG(info.st_mode):
         raise ValueError(f"The selected audio path is not a file. {path}")
-    signature = track.prepared_file_signature if prepared else track.source_file_signature
-    if signature is not None and signature != (info.st_size, info.st_mtime_ns):
+    signature = track.prepared_file_signature if prepared else source_track.source_file_signature
+    revision = track.prepared_file_revision if prepared else source_track.source_file_revision
+    if ((signature is not None and signature != (info.st_size, info.st_mtime_ns))
+            or (revision is not None and revision != file_revision(path, info))):
         if prepared:
             raise ValueError("The prepared file has changed. Run Prepare again.")
         raise ValueError("The routed source file has changed. Reanalyze this track.")

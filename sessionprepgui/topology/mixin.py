@@ -364,6 +364,8 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
         self._topo_apply_worker = TopologyApplyWorker(
             self._session, output_dir, source_dir=self._source_dir,
             peaks_dir=peaks_dir, source_tracks=self._topo_source_tracks)
+        self._topo_apply_worker.setParent(self)
+        self._topo_apply_worker.finished.connect(self._topo_apply_worker.deleteLater)
         self._topo_apply_worker.progress.connect(self._on_topo_apply_progress)
         self._topo_apply_worker.progress_value.connect(
             self._on_topo_apply_progress_value)
@@ -371,17 +373,24 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
         self._topo_apply_worker.error.connect(self._on_topo_apply_error)
         self._topo_apply_worker.start()
 
-    @Slot(str)
-    def _on_topo_apply_progress(self, message: str):
+    @Slot(object, str)
+    def _on_topo_apply_progress(self, worker, message: str):
+        if worker is not self._topo_apply_worker:
+            return
         log.debug("Apply topology: %s", message)
         self._progress_message(message)
 
-    @Slot(int, int)
-    def _on_topo_apply_progress_value(self, current: int, total: int):
+    @Slot(object, int, int)
+    def _on_topo_apply_progress_value(self, worker, current: int, total: int):
+        if worker is not self._topo_apply_worker:
+            return
         self._progress_value(current, total)
 
-    @Slot()
-    def _on_topo_apply_done(self):
+    @Slot(object)
+    def _on_topo_apply_done(self, worker):
+        if worker is not self._topo_apply_worker:
+            return
+        worker.wait()
         log.info("Apply topology complete")
         self._topo_apply_worker = None
         set_action_busy(self._topo_apply_action, False)
@@ -411,8 +420,11 @@ class TopologyMixin:  # pylint: disable=too-few-public-methods
         self._phase_tabs.setCurrentIndex(_PHASE_ANALYSIS)
         self._on_analyze()
 
-    @Slot(str)
-    def _on_topo_apply_error(self, message: str):
+    @Slot(object, str)
+    def _on_topo_apply_error(self, worker, message: str):
+        if worker is not self._topo_apply_worker:
+            return
+        worker.wait()
         log.error("Apply topology failed: %s", message)
         self._topo_apply_worker = None
         set_action_busy(self._topo_apply_action, False)

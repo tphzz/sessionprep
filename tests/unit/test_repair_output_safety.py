@@ -276,7 +276,7 @@ def test_retirement_cannot_unlink_the_new_revision_at_the_same_path(tmp_path):
     np.testing.assert_array_equal(sf.read(destination)[0], track.audio_data)
 
 
-@pytest.mark.parametrize("state", ["generated", "replaced", "unverified", "input"])
+@pytest.mark.parametrize("state", ["generated", "replaced", "same_stamp", "unverified", "input"])
 def test_retire_only_an_owned_unchanged_output(tmp_path, state):
     track, session = source_session(tmp_path)
     entry = session.topology.entries[0]
@@ -287,6 +287,11 @@ def test_retire_only_an_owned_unchanged_output(tmp_path, state):
     retired = output / entry.output_filename
     if state == "replaced":
         sf.write(retired, [0.25, -0.125], 48000, subtype="PCM_16")
+    elif state == "same_stamp":
+        stamp = retired.stat()
+        sf.write(retired, -track.audio_data, track.samplerate, subtype=track.subtype)
+        os.utime(retired, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+        assert retired.stat().st_size == stamp.st_size
     elif state == "unverified":
         session.output_tracks[0].prepared_file_signature = None
     elif state == "input":
@@ -302,3 +307,32 @@ def test_retire_only_an_owned_unchanged_output(tmp_path, state):
         assert not retired.exists()
     else:
         assert retired.read_bytes() == preserved
+
+
+@pytest.mark.parametrize("prepared", [True, False])
+def test_transfer_rejects_same_length_substitution_after_reopen(tmp_path, prepared):
+    from pathlib import Path
+    from sessionprepgui.session.io import save_session, load_session
+    from sessionpreplib.daw_processor import resolve_transfer_audio
+
+    track, session = source_session(tmp_path)
+    # A scaled route has a separate dry render as well as a prepared render.
+    session.topology.entries[0].sources[0].routes[0].gain = 0.5
+    pipeline = Pipeline([])
+    output = tmp_path / "prepared"
+    pipeline.prepare(session, str(output))
+    project = tmp_path / "mix.spsession"
+    save_session(str(project), {"source_dir": str(tmp_path), "output_tracks": session.output_tracks})
+    media = load_session(str(project))["output_tracks"][0]
+    session.config["_use_processed"] = prepared
+    path = Path(resolve_transfer_audio(session, media).filepath)
+    stamp = path.stat()
+    samples, sr = sf.read(path)
+    sf.write(path, -samples, sr, subtype=sf.info(path).subtype)
+    os.utime(path, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+    assert path.stat().st_size == stamp.st_size
+    with pytest.raises(ValueError, match="changed"):
+        resolve_transfer_audio(session, media)
+    pipeline.prepare(session, str(output))
+    replacement = resolve_transfer_audio(session, session.output_tracks[0]).filepath
+    np.testing.assert_array_equal(sf.read(replacement)[0], samples)

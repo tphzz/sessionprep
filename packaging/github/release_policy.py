@@ -205,6 +205,14 @@ def publish(client, *, mode, ref_name, release_tag, target, run_id, title, asset
         completed = {item["name"]: item["size"] for item in uploaded if item.get("state") == "uploaded"}
         if len(uploaded) != len(expected) or completed != expected:
             raise ValueError(f"Uploaded asset count/name/size mismatch or unfinished upload for release {identifier}")
+        by_name = {item["name"]: item for item in uploaded}
+        for path in assets:
+            digest = hashlib.sha256()
+            with path.open("rb") as source:
+                for block in iter(lambda: source.read(1024 * 1024), b""):
+                    digest.update(block)
+            if by_name[path.name].get("digest") != "sha256:" + digest.hexdigest():
+                raise ValueError(f"Uploaded asset digest mismatch for {path.name}")
         # Another producer or a human may have acted during uploads.
         fresh = [item for item in client.releases() if item["id"] != identifier]
         fresh_plan = replacement_plan(fresh, mode, ref_name, release_tag, run_id)

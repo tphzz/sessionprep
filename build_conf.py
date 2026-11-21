@@ -138,6 +138,8 @@ TARGETS = {
         ],
         "nuitka_plugins": [],
         "nuitka_include_modules": [BUILD_VERSION_MODULE],
+        # Rich selects versioned terminal-width tables through importlib at runtime.
+        "nuitka_include_packages": ["rich._unicode_data"],
         "include_data": [],
     },
     "gui": {

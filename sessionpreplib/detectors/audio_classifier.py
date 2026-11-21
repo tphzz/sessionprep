@@ -53,10 +53,9 @@ class AudioClassifierDetector(TrackDetector):
                 min=0.0, max=1.0,
                 label="Sparse track density threshold",
                 description=(
-                    "Fraction of active (non-silent) RMS windows below which "
-                    "a track is classified as transient regardless of crest "
-                    "and decay. Catches sparse percussion like toms, crashes, "
-                    "and FX hits that have moderate crest and slow decay."
+                    "A track below this fraction of active RMS windows is "
+                    "classified as transient if its crest factor or decay "
+                    "exceeds the corresponding threshold."
                 ),
             ),
         ]
@@ -69,8 +68,8 @@ class AudioClassifierDetector(TrackDetector):
             "metrics: crest factor (peak-to-RMS ratio), envelope decay "
             "rate (how fast energy drops after the loudest moment), and "
             "density (fraction of the track containing active content). "
-            "Very sparse tracks are classified as Transient regardless "
-            "of crest and decay. Otherwise, crest and decay vote together "
+            "Very sparse tracks are classified as Transient when either "
+            "crest or decay exceeds its threshold. Otherwise, crest and decay vote together "
             "with decay acting as tiebreaker."
             "<br/><br/>"
             "<b>Results</b><br/>"
@@ -79,7 +78,7 @@ class AudioClassifierDetector(TrackDetector):
             "to verbose."
             "<br/><br/>"
             "<b>Interpretation</b><br/>"
-            "Sparse track (density below threshold) → Transient.<br/>"
+            "Sparse track with high crest or fast decay → Transient.<br/>"
             "High crest + fast decay → drums, percussion (Transient).<br/>"
             "Low crest + slow decay → pads, bass, vocals (Sustained).<br/>"
             "High crest + slow decay → plucked/piano (Sustained).<br/>"

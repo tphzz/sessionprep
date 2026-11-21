@@ -338,6 +338,46 @@ runpy.run_path(sys.argv[2])[sys.argv[3]]()
     )
 
 
+def _quit_during_interactive_check():
+    from PySide6.QtWidgets import QApplication, QMessageBox
+    from sessionprepgui import settings
+    from sessionprepgui.mainwindow import SessionPrepWindow
+
+    app = QApplication([])
+    app.setQuitOnLastWindowClosed(False)
+    gate = _WorkerGate()
+    exited = Event()
+    created = []
+    prompts = []
+
+    class Adapter:
+        name = "Offline adapter"
+
+        def check_connectivity(self):
+            gate.pause()
+            exited.set()
+            return False, "Disconnected while quitting"
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(settings, "get_app_dir", lambda: str(Path.cwd() / "prefs"))
+        patch.setattr(QMessageBox, "warning", lambda *args: prompts.append(args[1]))
+        window = SessionPrepWindow()
+        window.show()
+        window._run_daw_check_then(Adapter(), lambda: created.append(True))
+        _wait_until(lambda: gate.delivered)
+        try:
+            accepted = window.close()
+            assert not accepted or exited.is_set(), "Window accepted close with a running DAW check"
+        finally:
+            gate.release.set()
+        _wait_until(lambda: exited.is_set() and not window.isVisible())
+        assert not created and not prompts, "A completed check triggered a new action after Quit"
+
+
+def test_quit_owns_slow_interactive_daw_worker_until_its_thread_exits(tmp_path):
+    _run_isolated(_quit_during_interactive_check, tmp_path)
+
+
 def test_run_single_waits_for_both_worker_threads(tmp_path):
     _run_isolated(_single_worker_lifetime, tmp_path)
 

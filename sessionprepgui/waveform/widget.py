@@ -297,8 +297,8 @@ class WaveformWidget(QWidget):
         view_len = self._view_end - self._view_start
         if w <= 0 or view_len <= 0:
             return 0
-        return max(0, min(self._view_start + int(x / w * view_len),
-                          self._total_samples - 1))
+        offset = max(0, min(int(x / w * view_len), view_len - 1))
+        return self._view_start + offset
 
     def _make_wf_ctx(self, x0: int, draw_w: int, draw_h: int) -> WaveformRenderCtx:
         return WaveformRenderCtx(

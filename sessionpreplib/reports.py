@@ -3,41 +3,16 @@ from __future__ import annotations
 import json
 import math
 import os
-import stat
 from collections import Counter
-from contextlib import contextmanager
 from datetime import datetime
-from pathlib import Path
 from typing import Any
-from uuid import uuid4
 
 import numpy as np
 
 from .audio import dbfs_offset, format_duration
+from .file_io import atomic_writer
 from .models import SessionContext
 from .utils import protools_sort_key
-
-
-@contextmanager
-def _atomic_report(output_path):
-    """Close the complete report before replacing its directory entry."""
-    target = Path(output_path)
-    temporary = target.with_name(f".sp-report-{uuid4().hex}.tmp")
-    stream = temporary.open("x", encoding="utf-8")
-    try:
-        with stream:
-            yield stream
-        if os.name != "nt":
-            try:
-                previous_mode = target.lstat().st_mode
-            except FileNotFoundError:
-                pass
-            else:
-                if stat.S_ISREG(previous_mode):
-                    temporary.chmod(stat.S_IMODE(previous_mode))
-        os.replace(temporary, target)
-    finally:
-        temporary.unlink(missing_ok=True)
 
 
 def _report_db(value) -> float | None:
@@ -178,28 +153,24 @@ def generate_report(
         "-" * 80,
         "MOMENTARY RMS UPPER TAIL (Expected Windows Above Anchor)",
         "-" * 80,
-        f"Anchor Mode: {rms_anchor} | Window: {window} ms" + (
+        f"Default Anchor Mode: {rms_anchor} | Window: {window} ms" + (
             f" | Percentile: P{rms_percentile:g}" if rms_anchor == "percentile" else ""
         ),
         f"Report Limit: {tail_max_regions} regions per file | Min Exceed: {tail_min_exceed_db} dB | Hop: {tail_hop_ms} ms",
         "",
     ])
 
-    if rms_anchor != "percentile":
-        lines.append("Tail reporting is only computed for percentile anchoring.")
+    measured_tails = []
+    for track in session.tracks:
+        tail = track.detector_results.get("tail_exceedance")
+        if track.status == "OK" and tail and tail.applicable and not tail.error:
+            measured_tails.append((track, tail))
+    if not measured_tails:
+        lines.append("No applicable tail measurements. Tail reporting requires percentile anchoring.")
         lines.append("")
     else:
         any_tail_reported = False
-        for t in session.tracks:
-            if t.status != "OK":
-                continue
-            sil_r = t.detector_results.get("silence")
-            if sil_r and sil_r.data.get("is_silent"):
-                continue
-
-            tail_r = t.detector_results.get("tail_exceedance")
-            if not tail_r:
-                continue
+        for t, tail_r in measured_tails:
             regions = tail_r.data.get("tail_regions") or []
             if not regions:
                 continue
@@ -210,14 +181,17 @@ def generate_report(
             max_exceed = summary.get("max_exceed_db", 0.0)
 
             lines.append(f"{t.filename}")
-            lines.append(f"  Anchor RMS: {anchor_db:.2f} dBFS")
+            classifier = t.detector_results.get("audio_classifier")
+            anchor_label = classifier.data.get("rms_anchor_label") if classifier else None
+            anchor_note = f" ({anchor_label})" if anchor_label else ""
+            lines.append(f"  Anchor RMS: {anchor_db:.2f} dBFS{anchor_note}")
             lines.append(f"  Tail Regions Reported: {int(summary.get('regions', 0))} | Total Tail Duration: {total_dur:.3f}s | Max Exceed: +{max_exceed:.2f} dB")
 
             any_tail_reported = True
             for i, reg in enumerate(regions, start=1):
                 lines.append(
                     f"  {i:>2}. {reg['start_time']} - {reg['end_time']} | "
-                    f"samples {reg['start_sample']}-{reg['end_sample']} | "
+                    f"samples {reg['start_sample']}-{reg['end_sample'] - 1} | "
                     f"max +{reg['max_exceed_db']:.2f} dB (RMS {reg['max_rms_db']:.2f} dBFS)"
                 )
             lines.append("")
@@ -270,7 +244,7 @@ def generate_report(
 
     report_text = "\n".join(lines)
 
-    with _atomic_report(output_path) as f:
+    with atomic_writer(output_path) as f:
         f.write(report_text)
 
     return report_text
@@ -335,7 +309,7 @@ def save_json(
         })
         sort_index += 1
 
-    with _atomic_report(output_path) as f:
+    with atomic_writer(output_path) as f:
         json.dump(data, f, indent=4, ensure_ascii=False)
 
 

@@ -199,18 +199,24 @@ def extract_created_track(resp: dict, fallback_name: str = "") -> tuple[str, str
 
 # ── Session queries ──────────────────────────────────────────────────
 
-def is_session_open(engine) -> bool:
-    """Check if Pro Tools currently has a session open.
+def _only_no_open_session(error) -> bool:
+    from ptsl import PTSL_pb2 as pt
+    return bool(error.error_responses) and all(
+        item.command_error_type == pt.PT_NoOpenedSession for item in error.error_responses)
 
-    Returns True if a session is open, False otherwise.
-    """
+
+def is_session_open(engine) -> bool:
+    """Return False only when Pro Tools explicitly reports that no session is open."""
+    from ptsl.errors import CommandError
     try:
-        # If a session is open, session_name() will return a non-empty string.
         name = engine.session_name()
-        return bool(name)
-    except Exception:
-        # PTSL commands typically fail if no session is open.
-        return False
+    except CommandError as exc:
+        if _only_no_open_session(exc):
+            return False
+        raise
+    if not name:
+        raise RuntimeError("Pro Tools returned an empty session name. Cannot verify the open session.")
+    return True
 
 
 def session_matches_path(engine, expected_path: str) -> bool:
@@ -220,7 +226,7 @@ def session_matches_path(engine, expected_path: str) -> bool:
     try:
         current_path = engine.session_path()
     except CommandError as exc:
-        if exc.error_name != "PT_NoOpenedSession":
+        if not _only_no_open_session(exc):
             raise
         return False
     if not current_path:
@@ -293,18 +299,10 @@ def get_selected_track_names(engine) -> list[str]:
     not implicit children of selected folders (``SetImplicitly``).
     """
     from ptsl import PTSL_pb2 as pt
-    try:
-        resp = run_command(
-            engine, pt.CommandId.CId_GetTrackList, {})
-        tracks = (resp or {}).get("track_list", [])
-        selected = []
-        for t in tracks:
-            attrs = t.get("track_attributes", {})
-            if attrs.get("is_selected") == "SetExplicitly":
-                selected.append(t["name"])
-        return selected
-    except Exception:
-        return []
+    resp = run_command(engine, pt.CommandId.CId_GetTrackList,
+                       {"pagination_request": {"limit": 0, "offset": 0}})
+    return [track["name"] for track in (resp or {}).get("track_list", [])
+            if track.get("track_attributes", {}).get("is_selected") in ("SetExplicitly", "TAState_SetExplicitly")]
 
 
 def get_session_audio_dir(engine) -> str:
@@ -451,12 +449,8 @@ def create_batch_job(engine, name: str, description: str,
 def complete_batch_job(engine, batch_job_id: str) -> None:
     """Complete a PTSL batch job."""
     from ptsl import PTSL_pb2 as pt
-    try:
-        run_command(engine, pt.CommandId.CId_CompleteBatchJob,
-                    {"id": batch_job_id})
-        log.debug("Batch job completed")
-    except Exception as exc:
-        log.debug(f"CompleteBatchJob failed: {exc}")
+    run_command(engine, pt.CommandId.CId_CompleteBatchJob, {"id": batch_job_id})
+    log.debug("Batch job completed")
 
 
 def cancel_batch_job(engine, batch_job_id: str) -> None:

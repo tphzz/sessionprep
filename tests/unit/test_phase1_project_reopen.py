@@ -1,6 +1,7 @@
 """Phase 1 source findings must survive separately from the user's output layout."""
 
 import os
+import json
 
 import numpy as np
 import pytest
@@ -8,7 +9,7 @@ import soundfile as sf
 
 pytest.importorskip("PySide6")
 from PySide6.QtCore import QThread
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
 
 from qt_helpers import dispose_window
 from sessionprepgui import settings
@@ -47,6 +48,7 @@ def project(tmp_path, monkeypatch):
         assert scans == [["Keys.wav"]]
         yield window, folder, scans
     finally:
+        window._batch_dock.clear_all()
         dispose_window(window)
         app.processEvents()
 
@@ -55,6 +57,59 @@ def _edited_route(window):
     entry, = window._topo_topology.entries
     entry.sources[0].routes = extract_channel(1)
     window._topo_changed()
+
+
+def test_apply_and_reanalyze_preserve_unowned_audio_without_analyzing_it(project):
+    window, source, _ = project
+    layout = source / "sp_01_tracklayout"
+    layout.mkdir(exist_ok=True)
+    sentinel = layout / "External take.wav"
+    _write_source(sentinel, duplicate=False)
+    original = sentinel.read_bytes()
+    window._on_topo_apply()
+    window._on_analyze()
+    assert [track.filename for track in window._session.tracks] == ["Keys.wav"]
+    assert sentinel.read_bytes() == original
+
+
+@pytest.mark.parametrize("batch", [False, True], ids=["save-session", "save-batch"])
+def test_desktop_save_error_preserves_previous_document_and_retry(project, tmp_path, monkeypatch, batch):
+    from sessionprepgui.batch.panel import BatchItem
+
+    window, _, _ = project
+    path = tmp_path / ("queue.spbatch" if batch else "project.spsession")
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *_: (str(path), ""))
+    messages = []
+    monkeypatch.setattr(QMessageBox, "critical", lambda _, title, msg: messages.append((title, msg)))
+    if batch:
+        item = BatchItem("a", "Before", "dawproject", "DAWproject", "", window._capture_session_state())
+        window._batch_dock.add_item(item)
+        save = window._on_save_batch_queue
+    else:
+        window._project_name_edit.setText("Before")
+        save = window._on_save_session
+    save()
+    previous = path.read_bytes()
+    if batch:
+        window._batch_dock.add_item(BatchItem("b", "After", "dawproject", "DAWproject", "",
+                                              window._capture_session_state()))
+    else:
+        window._project_name_edit.setText("After")
+
+    def short_write(_state, stream, **_kwargs):
+        stream.write("{")
+        raise OSError("short write")
+
+    with monkeypatch.context() as fault:
+        fault.setattr(json, "dump", short_write)
+        save()
+    assert messages and "short write" in messages[0][1]
+    assert path.read_bytes() == previous
+    save()
+    if batch:
+        assert [record["project_name"] for record in json.loads(path.read_text())] == ["Before", "After"]
+    else:
+        assert load_session(str(path))["project_name"] == "After"
 
 
 @pytest.mark.parametrize("applied", [False, True], ids=["before-apply", "after-apply"])

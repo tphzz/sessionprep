@@ -9,7 +9,7 @@ from numbers import Integral
 from urllib.parse import quote
 from ..icons import icon_path
 
-from sessionpreplib.chunks import read_chunks, STANDARD_CHUNKS, detect_origin
+from sessionpreplib.chunks import chunk_sizes, STANDARD_CHUNKS, detect_origin
 from sessionpreplib.detector import TrackDetector
 from sessionpreplib.repair_verification import CheckOutcome, audition_results, detector_check, original_report_track, separate_rumble_finding
 from .repair_options import track_repair_options
@@ -575,8 +575,7 @@ def prepare_track_report(track, session=None, *, show_clean: bool = True,
 
         # Chunk metadata + DAW origin (single line)
         try:
-            _container, all_chunks = read_chunks(track.filepath)
-            notable = [ch for ch in all_chunks if ch.id not in STANDARD_CHUNKS]
+            notable = [(name, size) for name, size in chunk_sizes(track.filepath) if name not in STANDARD_CHUNKS]
         except (ValueError, OSError):
             notable = []
         origin = detect_origin(track.chunk_ids, track.filepath)
@@ -589,8 +588,8 @@ def prepare_track_report(track, session=None, *, show_clean: bool = True,
                     return f"{n / 1024:.1f} KB"
                 return f"{n / (1024 * 1024):.1f} MB"
             chunk_parts = [
-                f'{esc(ch.id.strip())} ({_fmt_size(ch.size)})'
-                for ch in notable
+                f'{esc(name.strip())} ({_fmt_size(size)})'
+                for name, size in notable
             ]
             meta_parts.append(f'Chunks: {" &middot; ".join(chunk_parts)}')
         if origin:

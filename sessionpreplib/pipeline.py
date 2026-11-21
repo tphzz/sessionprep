@@ -19,6 +19,7 @@ log = logging.getLogger(__name__)
 
 import numpy as np
 
+from .gain_staging import apply_group_gains
 from .models import (
     DetectorResult,
     ProcessorResult,
@@ -33,7 +34,8 @@ from .repair_plan import boundary_settling, plan_repairs, repair_levels, revalid
 from .repair_verification import RepairVerification, measure_detector
 from .repairs import OutputHeadroomError, check_output_headroom, render_corrected
 from .events import EventBus
-from .audio import load_track, format_duration, linear_to_db, AUDIO_EXTENSIONS
+from .file_io import ensure_audio_backup
+from .audio import file_revision, load_track, format_duration, linear_to_db, AUDIO_EXTENSIONS
 from .config import ConfigError, validate_config
 from .utils import (
     protools_sort_key,
@@ -87,11 +89,7 @@ class Pipeline:
 
     def _validate(self):
         """Validate pipeline configuration at construction time."""
-        all_ids = set()
-        for d in self.track_detectors:
-            if d.id in all_ids:
-                raise ConfigError(f"Duplicate detector ID: {d.id}")
-            all_ids.add(d.id)
+        all_ids = {d.id for d in self.track_detectors}
         for d in self.session_detectors:
             if d.id in all_ids:
                 raise ConfigError(f"Duplicate detector ID: {d.id}")
@@ -167,16 +165,17 @@ class Pipeline:
         workers = min(self.max_workers, n) if ok_items else 1
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = {
-                pool.submit(self._analyze_track, track, idx, total, track_dets): track
+                pool.submit(self._analyze_track, track, idx, total, track_dets): (idx, track)
                 for idx, track in ok_items
             }
             for future in as_completed(futures):
                 exc = future.exception()
                 if exc:
-                    track = futures[future]
+                    idx, track = futures[future]
+                    track.status = f"Error: {exc}"
                     self._emit("track.analyze_complete",
                                filename=track.filename,
-                               index=0, total=total)
+                               index=idx, total=total)
         dt_phase = (time.perf_counter() - t_phase) * 1000
         if n:
             log.debug(f"analyze {phase.value} (track detectors): {n} tracks in "
@@ -196,6 +195,8 @@ class Pipeline:
             if self.event_bus and self.event_bus.is_cancelled.is_set():
                 break
 
+            for track in session.tracks:
+                track.detector_results.pop(det.id, None)
             try:
                 self._emit("session_detector.start", detector_id=det.id)
                 t0 = time.perf_counter()
@@ -351,118 +352,13 @@ class Pipeline:
                     if track.status == "OK" and track.filename not in preserve_selections:
                         track.processor_skip.add(proc.id)
 
-        # --- Group gain levelling ---
-        t0 = time.perf_counter()
-        self._apply_group_levels(session)
-        dt = (time.perf_counter() - t0) * 1000
-        log.debug(f"group levelling: {dt:.1f} ms")
-
-        # --- Fader offsets ---
-        t0 = time.perf_counter()
-        self._compute_fader_offsets(session)
-        dt = (time.perf_counter() - t0) * 1000
-        log.debug(f"fader offsets: {dt:.1f} ms")
-
-        # Store configured processor instances on the session for render-time access
         session.processors = list(self.audio_processors)
-
+        apply_group_gains(
+            session, linked_groups=session.config.get("_gain_linked_groups"),
+            headroom_db=self.config.get("fader_headroom_db", 8.0),
+            anchor=self.config.get("anchor"),
+        )
         return session
-
-    def _apply_group_levels(self, session: SessionContext):
-        """Apply group levels for gain-linked groups (minimum gain of the group).
-
-        Reads ``_gain_linked_groups`` from *session.config* — a set of group
-        names whose members should share the same gain.  If the key is absent
-        **all** groups are levelled (backward-compatible CLI behaviour).
-        """
-        linked: set[str] | None = session.config.get("_gain_linked_groups")
-
-        for proc in self.audio_processors:
-            by_gid: dict[str, list[TrackContext]] = {}
-            for track in session.tracks:
-                if track.status != "OK" or track.group is None:
-                    continue
-                pr = track.processor_results.get(proc.id)
-                if (pr is None or pr.error or pr.classification in ("Silent", "Skip")
-                        or proc.id in track.processor_skip):
-                    continue
-                # Preserve the per-track gain before any group adjustment
-                if "original_gain_db" not in pr.data:
-                    pr.data["original_gain_db"] = pr.gain_db
-                by_gid.setdefault(track.group, []).append(track)
-
-            for gid, members in by_gid.items():
-                if linked is not None and gid not in linked:
-                    continue
-                orig = [m.processor_results[proc.id].data["original_gain_db"]
-                        for m in members]
-                group_gain = min(orig) if orig else 0.0
-                for m in members:
-                    m.processor_results[proc.id].gain_db = float(group_gain)
-
-    def _compute_fader_offsets(self, session: SessionContext):
-        """Compute fader offsets (inverse of gain) with headroom rebalancing."""
-        ceiling = session.config.get("_fader_ceiling_db", 12.0)
-        headroom = self.config.get("fader_headroom_db", 8.0)
-        max_allowed = ceiling - headroom
-
-        for proc in self.audio_processors:
-            valid = []
-            for track in session.tracks:
-                if track.status != "OK":
-                    continue
-                pr = track.processor_results.get(proc.id)
-                if pr is None:
-                    continue
-                pr.data.pop("fader_rebalance_shift", None)
-                if pr.error or pr.classification in ("Silent", "Skip") or proc.id in track.processor_skip:
-                    pr.data["fader_offset"] = 0.0
-                else:
-                    pr.data["fader_offset"] = -float(pr.gain_db)
-                    valid.append(track)
-
-            # Headroom rebalancing: shift faders so max ≤ ceiling - headroom
-            rebalance_shift = 0.0
-            if headroom > 0.0 and valid:
-                fader_offsets = [
-                    t.processor_results[proc.id].data.get("fader_offset", 0.0)
-                    for t in valid
-                ]
-                max_fader = max(fader_offsets)
-                if max_fader > max_allowed:
-                    rebalance_shift = max_fader - max_allowed
-                    for track in valid:
-                        pr = track.processor_results.get(proc.id)
-                        if pr:
-                            pr.data["fader_offset"] -= rebalance_shift
-                            pr.data["fader_rebalance_shift"] = rebalance_shift
-            session.config[f"_fader_rebalance_{proc.id}"] = rebalance_shift
-            if rebalance_shift != 0.0:
-                log.debug(f"fader rebalance ({proc.id}): shifted {rebalance_shift:+.1f} dB "
-                    f"(ceiling {ceiling}, headroom {headroom})")
-
-            # Anchor-track adjustment (user-selected anchor)
-            anchor_name = self.config.get("anchor")
-            anchor_offset = 0.0
-            if anchor_name and valid:
-                anchor_track = next(
-                    (t for t in valid
-                     if anchor_name.lower() in t.filename.lower()),
-                    None,
-                )
-                if anchor_track:
-                    pr = anchor_track.processor_results.get(proc.id)
-                    if pr:
-                        anchor_offset = pr.data.get("fader_offset", 0.0)
-
-            # Store anchor offset for GUI-side recomputation
-            session.config[f"_anchor_offset_{proc.id}"] = anchor_offset
-
-            if anchor_offset != 0.0:
-                for track in valid:
-                    pr = track.processor_results.get(proc.id)
-                    if pr:
-                        pr.data["fader_offset"] = pr.data.get("fader_offset", 0.0) - anchor_offset
 
     # ------------------------------------------------------------------
     # Prepare (apply processors, write processed files)
@@ -498,6 +394,11 @@ class Pipeline:
         """Render each output atomically. A failed retry retains its last successful render."""
         from .topology import build_default_topology, build_transfer_manifest, resolve_entry_audio
 
+        # A callback may cancel the render after only some files have been replaced.
+        # Publish readiness only once every requested output has been checked.
+        session.prepare_state = "stale" if session.output_tracks else "none"
+        written = []
+        session.config["_prepared_files"] = written
         root = Path(output_dir).resolve()
         root.mkdir(parents=True, exist_ok=True)
         topology = session.topology or build_default_topology(session.tracks)
@@ -527,7 +428,7 @@ class Pipeline:
                 source_errors[name] = str(exc)
 
         prior = {t.filename: t for t in session.output_tracks}
-        output_tracks, errors, written = [], [], []
+        output_tracks, errors = [], []
         gain_adjustments = {}
         input_paths = {Path(t.filepath).resolve() for t in session.tracks if t.filepath}
         for index, entry in enumerate(topology.entries):
@@ -575,6 +476,7 @@ class Pipeline:
                     measurements["corrected"] = deepcopy(measurements.get("original", {}))
                 dry_path = src.filepath
                 dry_signature = src.source_file_signature
+                dry_revision = src.source_file_revision
                 if not identity:
                     # A gain mix or channel mapping has no single dry source file.
                     # Give each routed revision its own path so a failed retry
@@ -599,12 +501,15 @@ class Pipeline:
                     dry = root / ".routed" / str(src.samplerate) / digest / (Path(name).name + ".wav")
                     old = prior.get(name)
                     current_signature = None
+                    dry_revision = None
                     if dry.is_file():
                         stat = dry.stat()
                         current_signature = (stat.st_size, stat.st_mtime_ns)
+                        dry_revision = file_revision(dry, stat)
                     if (current_signature is None or old is None or Path(old.filepath) != dry
-                            or old.source_file_signature != current_signature):
-                        current_signature = _write_atomic(dry, dry_audio, src.samplerate, "FLOAT")
+                            or old.source_file_signature != current_signature
+                            or old.source_file_revision != dry_revision):
+                        current_signature, dry_revision = _write_atomic(dry, dry_audio, src.samplerate, "FLOAT")
                     dry_path = str(dry)
                     dry_signature = current_signature
                 ids = list(dict.fromkeys(pid for n in names for pid in applied[n]))
@@ -614,7 +519,7 @@ class Pipeline:
                     duration_sec=len(audio) / src.samplerate, applied_processors=ids,
                     prepared_fader_db=fader,
                     source_file_signature=dry_signature,
-                    source_file_revision=src.source_file_revision if identity else None,
+                    source_file_revision=dry_revision,
                     source_sample_digest=src.source_sample_digest if identity else None,
                     detector_results=dict(src.detector_results) if identity else {},
                     detector_analysis_key=src.detector_analysis_key if identity else None,
@@ -624,13 +529,15 @@ class Pipeline:
                     repair_overrides=dict(src.repair_overrides),
                     repair_measurements=measurements,
                 )
-                out.prepared_file_signature = _write_atomic(dest, audio, src.samplerate, src.subtype)
+                out.prepared_file_signature, out.prepared_file_revision = _write_atomic(
+                    dest, audio, src.samplerate, src.subtype)
                 output_tracks.append(out)
                 written.append(name)
                 if identity:
                     src.processed_filepath = str(dest)
                     src.applied_processors = list(ids)
                     src.prepared_file_signature = out.prepared_file_signature
+                    src.prepared_file_revision = out.prepared_file_revision
                     src.prepared_fader_db = out.prepared_fader_db
                 self._emit("track.prepared", filename=name, index=index, total=len(topology.entries))
             except Exception as exc:
@@ -656,7 +563,9 @@ class Pipeline:
                             or resolved.is_relative_to(root / ".routed") or path.is_symlink()):
                         continue
                     stat = path.stat()
-                    if (stat.st_size, stat.st_mtime_ns) == obsolete.prepared_file_signature:
+                    if ((stat.st_size, stat.st_mtime_ns) == obsolete.prepared_file_signature
+                            and obsolete.prepared_file_revision is not None
+                            and file_revision(path, stat) == obsolete.prepared_file_revision):
                         path.unlink()
                 except FileNotFoundError:
                     pass
@@ -664,7 +573,6 @@ class Pipeline:
                     log.warning("Could not remove obsolete prepared file %s: %s", path, exc)
         session.config["_prepare_errors"] = errors
         session.config["_output_gain_adjustments"] = gain_adjustments
-        session.config["_prepared_files"] = written
         session.output_tracks = output_tracks
         manifest = build_transfer_manifest(topology, session.tracks, session.transfer_manifest or None)
         session.transfer_manifest = manifest
@@ -731,8 +639,6 @@ class Pipeline:
         is_overwriting: bool = False,
     ) -> SessionContext:
         """Apply audio processor gains and write files."""
-        import shutil
-
         os.makedirs(output_dir, exist_ok=True)
         if backup_dir and is_overwriting:
             os.makedirs(backup_dir, exist_ok=True)
@@ -753,6 +659,7 @@ class Pipeline:
 
             try:
                 src_filepath = track.filepath
+                record_backup_render = None
                 dst_filepath = (root / track.filename).resolve()
                 if (not dst_filepath.is_relative_to(root) or destinations[dst_filepath] != 1 or
                         dst_filepath in inputs and
@@ -760,9 +667,11 @@ class Pipeline:
                     raise ValueError("Output filename conflicts with another track or its source")
 
                 if is_overwriting and backup_dir:
-                    backup_path = os.path.join(backup_dir, track.filename)
-                    if not os.path.exists(backup_path):
-                        shutil.copy2(src_filepath, backup_path)
+                    backup_root = Path(backup_dir).resolve()
+                    backup_path = backup_root / track.filename
+                    if not backup_path.resolve().is_relative_to(backup_root) or backup_path.resolve() in inputs:
+                        raise ValueError("Backup filename conflicts with its source or backup directory")
+                    record_backup_render = ensure_audio_backup(src_filepath, backup_path)
 
                 source = source_for_render(track)
                 corrected, audio, applied = self._render_track(source)
@@ -777,7 +686,8 @@ class Pipeline:
                 if not np.isfinite([gain, fader]).all():
                     raise ValueError("Output gain and fader offset must be finite")
                 peak = linear_to_db(float(np.max(np.abs(audio)))) if audio.size else -np.inf
-                signature = _write_atomic(dst_filepath, audio, track.samplerate, track.subtype)
+                signature, revision = _write_atomic(dst_filepath, audio, track.samplerate, track.subtype,
+                                                    before_publish=record_backup_render)
                 for result in track.processor_results.values():
                     result.data["out_peak"] = peak
                 receipt = {"gain_db": gain, "fader_db": fader, "applied_processors": applied}
@@ -787,6 +697,7 @@ class Pipeline:
                 track.processed_filepath = str(dst_filepath)
                 track.applied_processors = applied
                 track.prepared_file_signature = signature
+                track.prepared_file_revision = revision
                 track.prepared_fader_db = fader
             except Exception as exc:
                 errors.append((track.filename, str(exc)))
@@ -848,7 +759,7 @@ def _routed_fader(entry, sources, rendered, applied) -> float:
 
 
 def _write_atomic(destination: Path, audio: np.ndarray, sample_rate: int,
-                  subtype: str) -> tuple[int, int]:
+                  subtype: str, *, before_publish=None) -> tuple[tuple[int, int], str | None]:
     """Publish only a fully closed audio file, including on Windows."""
     import soundfile as sf
 
@@ -858,9 +769,11 @@ def _write_atomic(destination: Path, audio: np.ndarray, sample_rate: int,
         path = Path(temp.name)
     try:
         sf.write(path, audio, sample_rate, subtype=subtype)
-        stat = path.stat()
+        if before_publish is not None:
+            before_publish(path)
         os.replace(path, destination)
-        return stat.st_size, stat.st_mtime_ns
+        stat = destination.stat()
+        return (stat.st_size, stat.st_mtime_ns), file_revision(destination, stat)
     finally:
         path.unlink(missing_ok=True)
 
@@ -915,6 +828,7 @@ def load_session(
     config: dict[str, Any],
     event_bus: EventBus | None = None,
     recursive: bool = False,
+    *, filenames: Collection[str] | None = None,
 ) -> SessionContext:
     """
     Load all audio files from source_dir into a SessionContext.
@@ -925,7 +839,14 @@ def load_session(
     become relative paths (e.g. ``"drums/01_Kick.wav"``).
     """
     from .audio import discover_audio_files
-    files = discover_audio_files(source_dir, recursive=recursive)
+    if filenames is None:
+        files = discover_audio_files(source_dir, recursive=recursive)
+    else:
+        # A committed Track Layout can share its directory with other user media.
+        root = Path(source_dir).resolve()
+        files = list(filenames)
+        if any(not (root / name).resolve().is_relative_to(root) for name in files):
+            raise ValueError("A layout input is outside its source directory")
 
     total = len(files)
     workers = min(os.cpu_count() or 4, 8, total) if total else 1
@@ -966,7 +887,11 @@ def _topo_sort_detectors(detectors: list[TrackDetector]) -> list[TrackDetector]:
     Topological sort by depends_on.
     Raises ConfigError if a cycle is detected or a dependency is missing.
     """
-    by_id = {d.id: d for d in detectors}
+    by_id = {}
+    for detector in detectors:
+        if detector.id in by_id:
+            raise ConfigError(f"Duplicate detector ID: {detector.id}")
+        by_id[detector.id] = detector
     all_ids = set(by_id.keys())
 
     # Validate dependencies exist

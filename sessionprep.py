@@ -1,6 +1,7 @@
 import os
 import sys
 import argparse
+from io import TextIOWrapper
 from pathlib import Path
 
 from sessionpreplib.logging_setup import setup_logging
@@ -21,12 +22,13 @@ from sessionpreplib import __version__
 from sessionpreplib.pipeline import Pipeline, load_session
 from sessionpreplib.detectors import default_detectors
 from sessionpreplib.processors import default_processors
-from sessionpreplib.config import default_config, merge_configs
+from sessionpreplib.config import default_config, merge_configs, validate_config_fields
 from sessionpreplib.rendering import build_diagnostic_summary, render_diagnostic_summary_text
 from sessionpreplib.reports import build_warnings, format_boundary_settling, generate_report, save_json
 from sessionpreplib.utils import protools_sort_key
 from sessionpreplib.audio import AUDIO_EXTENSIONS, discover_audio_files
 from sessionpreplib.events import EventBus
+from sessionpreplib.file_io import BACKUP_RECEIPT_SUFFIX
 
 console = Console()
 
@@ -264,8 +266,11 @@ def _prepare_cli_destinations(source, output, backup, filenames, report, json_re
             if path.exists() and not path.is_file():
                 raise ValueError(f"The backup must name a file. {path}")
             reserve(path, "backup audio")
+            reserve(path.with_name(path.name + BACKUP_RECEIPT_SUFFIX), "backup receipt")
     reports = [output / report, output / json_report]
     for path, role in zip(reports, ("text report", "JSON report")):
+        if any(p.name.casefold().endswith(BACKUP_RECEIPT_SUFFIX) for p in (path, path.resolve())):
+            raise ValueError(f"The {role} would replace a backup receipt. {path}")
         if path.exists() and not path.is_file():
             raise ValueError(f"The {role} must name a file. {path}")
         reserve(path, role)
@@ -284,6 +289,11 @@ def _prepare_cli_destinations(source, output, backup, filenames, report, json_re
 
 
 def process_files():
+    # Redirected Windows output can use a legacy code page. Preserve its encoding
+    # and escape unrepresentable filenames and status symbols in the console log.
+    if (isinstance(sys.stdout, TextIOWrapper) and not sys.stdout.isatty()
+            and sys.stdout.errors in {"strict", "surrogateescape", "surrogatepass"}):
+        sys.stdout.reconfigure(errors="backslashreplace")
     args = parse_arguments()
     source_dir = args.directory
 
@@ -335,6 +345,11 @@ def process_files():
         "_source_dir": source_dir,
     }
     config = merge_configs(config, cli_overrides)
+    errors = validate_config_fields(config)
+    if errors:
+        for error in errors:
+            print(f"{error.key}: {error.message}", file=sys.stderr)
+        return 2
 
     # --- HEADER PANEL ---
     rms_anchor_label = f"{args.rms_anchor}" + (f" P{args.rms_percentile:g}" if args.rms_anchor == "percentile" else "")
@@ -427,10 +442,6 @@ def process_files():
             group_table.add_row(gname, gain_str, member_list)
 
         console.print(group_table)
-
-        for w in session.warnings:
-            if str(w).startswith("Group overlap:"):
-                console.print(f"  [yellow]⚠ {w}[/]")
 
         console.print("")
 

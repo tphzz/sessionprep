@@ -222,6 +222,8 @@ three attempts per asset for timeouts and temporary upload failures. The publish
 checks the provisional draft after an ambiguous upload result. It accepts a
 completed upload with the expected size and can clear an empty `starter` asset
 before retrying. A preparation failure keeps the previous draft available.
+Before retiring any draft, the publisher verifies the name, state, size and
+GitHub-reported SHA-256 digest of every uploaded asset against the staged files.
 Every destructive cleanup rechecks draft/tag/body state.
 Published releases are protected. If retirement has begun and promotion fails,
 the complete provisional draft is retained for review/retry. GitHub does not
@@ -238,3 +240,23 @@ and Workflows write. Preflight checks this condition before long builds.
 No token is exposed to platform builds. See [GitHub's release API rule](https://docs.github.com/en/rest/releases/releases#create-a-release).
 
 See [the publisher CLI](README.md) for isolated local staging/dry-run commands.
+
+### Runtime and performance checks
+
+Windows and Linux builds exercise the newly compiled CLI on a generated WAV
+and verify its rendered samples and JSON report. On every platform, including
+the GUI-only macOS bundles, the GUI must enter the Qt event loop, load its
+packaged icon, decode the WAV with the expected sample digest and close.
+The packaged worker must answer its self-test on
+platforms that ship PTSL. The ordinary regression gate collects both unit and
+offline integration tests and lists skip reasons and the slowest tests.
+
+The manually dispatched **Check fresh installs and DSP performance** job runs
+separately from platform builds. It checks the CLI wheel in a new environment
+outside the checkout, the source launcher's automatic GUI extras, and cold
+and warm gain planning on generated audio. To run those checks locally:
+
+```sh
+uv run --frozen --all-extras python packaging/github/smoke.py fresh --version <expected-version>
+uv run --frozen --all-extras python tests/benchmark_gain_planning.py
+```

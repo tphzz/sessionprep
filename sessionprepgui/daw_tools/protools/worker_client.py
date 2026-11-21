@@ -246,6 +246,9 @@ class ProToolsWorkerClient(QObject):
             )
             return
         self._stopping = False
+        self._stdout = JsonLineBuffer()
+        self._stderr = ""
+        self._stderr_partial = ""
         process = QProcess(self)
         program, args, launch_mode = _worker_launch_command()
         process.setProgram(program)
@@ -362,6 +365,8 @@ class ProToolsWorkerClient(QObject):
         state = process.state()
         if state == QProcess.NotRunning:
             self._process = None
+            self._connected = False
+            process.deleteLater()
             return
 
         if state == QProcess.Running:
@@ -495,6 +500,13 @@ class ProToolsWorkerClient(QObject):
         self._append_stderr_text(text)
 
     def _on_error(self, error_code):
+        process = self.sender()
+        if process is not self._process:
+            return
+        if error_code == QProcess.FailedToStart:
+            self._process = None
+            self._connected = False
+            process.deleteLater()
         if self._stopping:
             log.debug(
                 "Ignoring Pro Tools worker process error during stop: "
@@ -503,10 +515,7 @@ class ProToolsWorkerClient(QObject):
                 self._process_state_text(),
             )
             return
-        error_string = (
-            self._process.errorString()
-            if self._process is not None else ""
-        )
+        error_string = process.errorString()
         log.error(
             "Pro Tools worker process error: code=%s error_string=%r "
             "state=%s pending=%s stderr_summary=%s",
@@ -527,6 +536,9 @@ class ProToolsWorkerClient(QObject):
         self.worker_failed.emit(error, title, hint)
 
     def _on_finished(self, exit_code, exit_status):
+        process = self.sender()
+        if process is not self._process:
+            return
         self._flush_new_stderr_lines(force=True)
         log.debug(
             "Pro Tools worker finished: exit_code=%s exit_status=%s "
@@ -537,6 +549,10 @@ class ProToolsWorkerClient(QObject):
             self._connected,
             self._pending_summary(),
         )
+        was_connected = self._connected
+        self._process = None
+        self._connected = False
+        process.deleteLater()
         if not self._stopping:
             error = self._stderr or "The Pro Tools worker process exited."
             self._fail_pending(
@@ -544,14 +560,12 @@ class ProToolsWorkerClient(QObject):
                 "Connection failed",
                 "Start Pro Tools and click Connect to try again.",
             )
-            if self._connected:
+            if was_connected:
                 self.worker_failed.emit(
                     error,
                     "Connection failed",
                     "Start Pro Tools and click Connect to try again.",
                 )
-        self._process = None
-        self._connected = False
 
     def _on_timeout(self, request_id: int):
         pending = self._pending.get(request_id)

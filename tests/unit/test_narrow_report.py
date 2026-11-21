@@ -26,7 +26,7 @@ def qapp():
 
 @pytest.fixture(autouse=True)
 def _no_chunks(monkeypatch):
-    monkeypatch.setattr(report, "read_chunks", lambda path: ("WAVE", []))
+    monkeypatch.setattr(report, "chunk_sizes", lambda path: [])
 
 
 HELP = ("<h3>Description</h3><p>Help body.</p>"

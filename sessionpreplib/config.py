@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import platform
 from copy import deepcopy
@@ -413,6 +414,9 @@ def validate_param_values(
 
         # -- numeric range --
         if isinstance(value, (int, float)) and not isinstance(value, bool):
+            if isinstance(value, float) and not math.isfinite(value):
+                errors.append(ConfigFieldError(spec.key, value, f"{spec.label} must be finite."))
+                continue
             if spec.min is not None:
                 if spec.min_exclusive and value <= spec.min:
                     errors.append(
@@ -776,6 +780,30 @@ def flatten_structured_config(structured: dict[str, Any]) -> dict[str, Any]:
     return flat
 
 
+def _validate_daw_templates(dp_id: str, section: dict[str, Any]) -> list[ConfigFieldError]:
+    key = f"{dp_id}_templates"
+    path = f"daw_processors.{dp_id}.{key}"
+    templates = section.get(key, [])
+    if not isinstance(templates, list):
+        return [ConfigFieldError(path, templates, "Expected a list of templates.")]
+    errors = []
+    fields = ("name", "group") if dp_id == "protools" else ("name", "template_path")
+    for index, template in enumerate(templates):
+        if not isinstance(template, dict) or any(not isinstance(template.get(f, ""), str) for f in fields):
+            errors.append(ConfigFieldError(f"{path}[{index}]", template, "Invalid template row."))
+            continue
+        if dp_id == "dawproject":
+            ceiling = template.get("fader_ceiling_db", 6.0)
+            try:
+                valid = not isinstance(ceiling, bool) and math.isfinite(float(ceiling))
+            except (TypeError, ValueError, OverflowError):
+                valid = False
+            if not valid:
+                errors.append(ConfigFieldError(f"{path}[{index}].fader_ceiling_db", ceiling,
+                                               "Expected a finite fader ceiling in dB."))
+    return errors
+
+
 def validate_structured_config(
     structured: dict[str, Any],
 ) -> list[ConfigFieldError]:
@@ -838,6 +866,8 @@ def validate_structured_config(
         dp = dp_map.get(dp_id)
         if dp is None or not isinstance(section, dict):
             continue
+        if dp_id in ("protools", "dawproject"):
+            errors.extend(_validate_daw_templates(dp_id, section))
         for err in validate_param_values(dp.config_params(), section):
             errors.append(
                 ConfigFieldError(

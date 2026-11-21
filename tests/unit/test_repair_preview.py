@@ -3,7 +3,8 @@ import numpy as np
 import pytest
 
 pytest.importorskip("PySide6")
-from PySide6.QtCore import QPoint, QRect, Qt, QTimer
+from PySide6.QtCore import QPoint, QPointF, QRect, Qt, QTimer
+from PySide6.QtGui import QWheelEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QWidgetAction
 
@@ -130,6 +131,37 @@ def test_late_old_file_or_recipe_cannot_replace_new_selection(app, window, tmp_p
     assert window._waveform._samplerate != first.samplerate
 
 
+def test_gated_preview_during_project_switch_releases_old_audio_and_plot(app, window, tmp_path, monkeypatch):
+    from threading import Event
+    from sessionprepgui.waveform.compute import WaveformLoadWorker
+
+    first = _open_track(window, tmp_path, "Old.wav")
+    _wait(app, window)
+    assert window._repair_preview.audition is not None
+    entered, release = Event(), Event()
+    run = WaveformLoadWorker.run
+
+    def gated(worker):
+        entered.set()
+        if release.wait(5):
+            run(worker)
+
+    monkeypatch.setattr(WaveformLoadWorker, "run", gated)
+    window._wf_panel.source_selector.buttons[1].click()
+    try:
+        assert entered.wait(3)
+        fresh = tmp_path / "new-project"
+        fresh.mkdir()
+        window._restore_session_state({"source_dir": str(fresh), "tracks": []})
+    finally:
+        release.set()
+    _wait(app, window)
+    assert not window._waveform._channels and window._current_track is None
+    assert window._repair_preview.track is not first
+    assert window._repair_preview.audition is None and not window._repair_preview.cache
+    assert not window._wf_panel.play_btn.isEnabled()
+
+
 def test_changed_repair_choice_immediately_withholds_old_audio_and_retry_replans(app, window, tmp_path, monkeypatch):
     track = _open_track(window, tmp_path, "Replan.wav")
     _wait(app, window)
@@ -217,6 +249,78 @@ def test_track_layout_seek_pauses_at_the_clicked_sample(app, window, streams):
     finally:
         for stream in streams:
             stream.active = False
+
+
+@pytest.mark.parametrize("analysis", [False, True], ids=["track-layout", "analysis"])
+@pytest.mark.parametrize("mode", ["waveform", "spectrogram"])
+def test_plot_gestures_follow_known_samples_and_clamp_to_visible_edges(app, window, streams, analysis, mode, tmp_path):
+    import soundfile as sf
+    from sessionpreplib.audio import load_track
+    from sessionpreplib.models import SessionContext
+
+    total = 12000
+    panel = window._wf_panel if analysis else window._topo_wf_panel
+    window._phase_tabs.setCurrentIndex(int(analysis))
+    panel.set_content_available(True)
+    panel.set_expanded(True)
+    wave = panel.waveform
+    wave.setFixedWidth(400)
+    audio = np.zeros((total, 2))
+    impulses = [240, 6000, 11760]
+    audio[impulses, 0] = [.5, -.25, .125]
+    audio[impulses, 1] = [-.125, .25, -.5]
+    path = tmp_path / "Gestures.wav"
+    sf.write(path, audio, 8000, subtype="PCM_24")
+    track = load_track(str(path))
+    if analysis:
+        window._session = SessionContext([track], {})
+        window._show_track_detail(track)
+        _wait(app, window)
+    wave.set_audio(track.audio_data if track.audio_data is not None else sf.read(path)[0], 8000)
+    wave.set_display_mode(mode)
+    app.processEvents()
+    left, width = wave._draw_area()
+    clicked = []
+    wave.position_clicked.connect(clicked.append)
+
+    def wheel(point, modifiers, delta):
+        event = QWheelEvent(QPointF(point), QPointF(wave.mapToGlobal(point)), QPoint(),
+                            QPoint(0, delta), Qt.NoButton, modifiers, Qt.ScrollUpdate, False)
+        QApplication.sendEvent(wave, event)
+        assert event.isAccepted()
+
+    def assert_zoom(point, anchor, span):
+        start, end = wave._view_start, wave._view_end
+        assert 0 <= start < end <= total and end - start == span
+        indicated = start + (point.x() - left) * span / width
+        assert abs(anchor - indicated) <= total / width + 2
+
+    for target in impulses:
+        wave.zoom_fit()
+        point = QPoint(left + round(width * target / total), max(5, wave.height() // 3))
+        QTest.mousePress(wave, Qt.LeftButton, pos=point)
+        QTest.mouseMove(wave, QPoint(point.x(), point.y() + 2))
+        QTest.mouseRelease(wave, Qt.LeftButton, pos=point)
+        assert abs(clicked[-1] - target) <= total / width
+        assert (wave._view_start, wave._view_end) == (0, total)
+        wheel(point, Qt.ControlModifier, 120)
+        assert_zoom(point, target, 8000)
+        QTest.keyClick(wave, Qt.Key_R)
+        assert_zoom(point, target, 5333)
+        QTest.keyClick(wave, Qt.Key_T)
+        assert_zoom(point, target, 7999)
+        for delta, end in [(120, total), (-120, 7999)]:
+            for _ in range(14):
+                wheel(point, Qt.ShiftModifier, delta)
+            assert wave._view_end == end
+    # The axis margins are outside the plotted range. A seek there must
+    # resolve to the nearest visible sample, even when zoomed and scrolled.
+    wheel(point, Qt.ShiftModifier, 120)
+    start, end = wave._view_start, wave._view_end
+    QTest.mouseClick(wave, Qt.LeftButton, pos=QPoint(0, 20))
+    QTest.mouseClick(wave, Qt.LeftButton, pos=QPoint(wave.width() - 1, 20))
+    assert clicked[-2:] == [start, end - 1]
+    assert streams == [] and window._worker is None
 
 
 @pytest.mark.parametrize("corrected_spectrogram", [False, True], ids=["original-waveform", "corrected-spectrogram"])

@@ -7,6 +7,7 @@ it in-place.  No Qt, no UI — only data transforms.
 from __future__ import annotations
 
 import os
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from sessionpreplib.topology import (
@@ -499,11 +500,11 @@ def move_channel(
         return
 
     # 1) Extract routes targeting from_ch
-    extracted: list[tuple[str, int]] = []  # (input_filename, source_ch)
+    extracted: list[tuple[str, ChannelRoute]] = []
     for src in from_entry.sources:
         for route in src.routes:
             if route.target_channel == from_ch:
-                extracted.append((src.input_filename, route.source_channel))
+                extracted.append((src.input_filename, route))
 
     # 2) Remove the channel from the source entry
     remove_channel(topo, from_filename, from_ch)
@@ -522,18 +523,19 @@ def move_channel(
     to_entry.output_channels += 1
 
     # 4) Wire extracted routes to the new slot
-    for inp_fn, src_ch in extracted:
+    for inp_fn, route in extracted:
+        moved = replace(route, target_channel=to_ch)
         existing_src = None
         for src in to_entry.sources:
             if src.input_filename == inp_fn:
                 existing_src = src
                 break
         if existing_src:
-            existing_src.routes.append(ChannelRoute(src_ch, to_ch))
+            existing_src.routes.append(moved)
         else:
             to_entry.sources.append(TopologySource(
                 input_filename=inp_fn,
-                routes=[ChannelRoute(src_ch, to_ch)],
+                routes=[moved],
             ))
 
 

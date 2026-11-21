@@ -359,7 +359,7 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
     def _cancel_worker(self, worker_attr: str) -> None:
         """Safely detach and cancel a background worker to avoid QThread GC destruction."""
         worker = getattr(self, worker_attr, None)
-        if isinstance(worker, Phase1AnalyzeWorker):
+        if isinstance(worker, (Phase1AnalyzeWorker, AnalyzeWorker)):
             setattr(self, worker_attr, None)
             worker.cancel()
             if not worker.isRunning():
@@ -406,6 +406,13 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
     def _clear_workspace(self, *, keep_session_config: bool = False):
         """Clear the UI and reset session state."""
         self._on_stop()
+        # Finish the old layout transaction before another project can
+        # reuse its output directory. Ignore its queued progress and result.
+        layout_worker = self._topo_apply_worker
+        if layout_worker is not None:
+            self._topo_apply_worker = None
+            layout_worker.cancel()
+            layout_worker.wait()
         self._cancel_worker("_p1_worker")
         self._cancel_worker("_worker")
         self._cancel_worker("_prepare_worker")
@@ -753,7 +760,7 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
 
         self._restore_session_state(data)
 
-    def _restore_session_state(self, data: dict):
+    def _restore_session_state(self, data: dict) -> bool:
         """Restore session state from a dictionary."""
         source_dir = data["source_dir"]
         if not os.path.isdir(source_dir):
@@ -762,7 +769,7 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
                 f"The session's audio directory no longer exists:\n\n{source_dir}\n\n"
                 "Please move the files back or open the directory manually.",
             )
-            return
+            return False
 
         # ── Reset UI (same as _on_open_path but without auto-analyze) ────────
         self._clear_workspace()
@@ -992,6 +999,7 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
                           or (analysis_changed and self._repair_settings_can_apply(t, flat))]
             if unverified:
                 self._queue_repair_plan(unverified, verification_only=True)
+        return True
 
     # ── Analyze ──────────────────────────────────────────────────────────
 
@@ -1050,31 +1058,38 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
 
         config = self._flat_config()
         config["_source_dir"] = self._source_dir
-        if self._active_daw_processor:
-            config["_fader_ceiling_db"] = self._active_daw_processor.fader_ceiling_db
 
         self._worker = AnalyzeWorker(analyze_dir, config,
                                      recursive=self._recursive_scan, track_settings=track_settings)
+        self._worker.setParent(self)
+        self._worker.finished.connect(self._worker.deleteLater)
+        if self._topology_dir and self._topo_topology is not None:
+            self._worker.layout_files = [entry.output_filename for entry in self._topo_topology.entries
+                                         if entry.output_channels and entry.sources]
         self._worker.interrupted_repairs = interrupted_repairs
         self._worker.progress.connect(self._on_worker_progress)
         self._worker.progress_value.connect(self._on_worker_progress_value)
         self._worker.track_analyzed.connect(self._on_track_analyzed)
         self._worker.track_planned.connect(self._on_track_planned)
-        self._worker.finished.connect(self._on_analyze_done)
-        self._worker.error.connect(self._on_analyze_error)
+        self._worker.completed.connect(self._on_analyze_done)
+        self._worker.error.connect(self._on_phase2_error)
         self._worker.start()
 
-    @Slot(str)
-    def _on_worker_progress(self, message: str):
-        self._progress_message(message)
+    @Slot(object, str)
+    def _on_worker_progress(self, worker, message: str):
+        if worker is self._worker:
+            self._progress_message(message)
 
-    @Slot(int, int)
-    def _on_worker_progress_value(self, current: int, total: int):
-        self._progress_value(current, total)
+    @Slot(object, int, int)
+    def _on_worker_progress_value(self, worker, current: int, total: int):
+        if worker is self._worker:
+            self._progress_value(current, total)
 
-    @Slot(str, object)
-    def _on_track_analyzed(self, filename: str, track):
+    @Slot(object, str, object)
+    def _on_track_analyzed(self, worker, filename: str, track):
         """Update the severity column for a track after detectors complete."""
+        if worker is not self._worker:
+            return
         row = self._find_table_row(filename)
         if row < 0:
             return
@@ -1088,9 +1103,11 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         self._track_table.setItem(row, 2, item)
         self._track_table.setCellWidget(row, 2, lbl)
 
-    @Slot(str, object)
-    def _on_track_planned(self, filename: str, track):
+    @Slot(object, str, object)
+    def _on_track_planned(self, worker, filename: str, track):
         """Update classification and gain columns after processors complete."""
+        if worker is not self._worker:
+            return
         row = self._find_table_row(filename)
         if row < 0:
             return
@@ -1185,8 +1202,10 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
 
         self._auto_fit_group_column()
 
-    @Slot(object, object)
-    def _on_analyze_done(self, session, summary):
+    @Slot(object, object, object)
+    def _on_analyze_done(self, worker, session, summary):
+        if worker is not self._worker:
+            return
         # Preserve Phase 1 topology in GUI attribute (already set).
         # Do NOT carry it onto the analysis session — Prepare must see
         # topology=None so it builds a default passthrough from the
@@ -1208,9 +1227,9 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         self._summary = summary
         self._analyze_action.setEnabled(True)
         self._track_table.setVisible(True)
-        if self._worker is not None:
+        if not self._worker.isRunning():
             self._worker.deleteLater()
-            self._worker = None
+        self._worker = None
 
         if not self._session_groups:
             # First analysis — load from Default group preset
@@ -1398,7 +1417,11 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         if worker is not None and worker.isRunning():
             worker.prioritize(source_key)
 
-    @Slot(str)
+    @Slot(object, str)
+    def _on_phase2_error(self, worker, message: str):
+        if worker is self._worker:
+            self._on_analyze_error(message)
+
     def _on_analyze_error(self, message: str):
         self._analyze_action.setEnabled(True)
         self._track_table.setVisible(True)
@@ -1409,7 +1432,8 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
             self._repair_plan_pending.update(pending)
             self._repair_plan_anchors.update(anchors)
             self._repair_plan_revalidate.update(sources)
-            self._worker.deleteLater()
+            if not self._worker.isRunning():
+                self._worker.deleteLater()
             self._worker = None
 
         from ..helpers import esc
@@ -1616,13 +1640,15 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         self._prepare_worker.completed.connect(self._on_prepare_done, Qt.QueuedConnection)
         self._prepare_worker.start()
 
-    @Slot(str)
-    def _on_prepare_progress(self, message: str):
-        self._progress_message(message)
+    @Slot(object, str)
+    def _on_prepare_progress(self, worker, message: str):
+        if worker is self._prepare_worker:
+            self._progress_message(message)
 
-    @Slot(int, int)
-    def _on_prepare_progress_value(self, current: int, total: int):
-        self._progress_value(current, total)
+    @Slot(object, int, int)
+    def _on_prepare_progress_value(self, worker, current: int, total: int):
+        if worker is self._prepare_worker:
+            self._progress_value(current, total)
 
     @Slot(object)
     def _on_prepare_done(self, worker):
@@ -1630,6 +1656,7 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
             return
         worker.wait()
         if worker.failure:
+            self._session.prepare_state = "stale"
             self._on_prepare_error(worker.failure)
             return
         had_recovery = bool(self._session.config.get("_prepare_errors") or self._session.config.get("_output_gain_adjustments"))
@@ -1743,6 +1770,8 @@ class AnalysisMixin:  # pylint: disable=too-few-public-methods
         self._analyze_action.setEnabled(not self._batch_filenames)
         self._save_session_action.setEnabled(not self._repair_plan_pending)
         self._update_daw_lifecycle_buttons()
+        self._update_prepare_button()
+        self._update_use_processed_action()
         self._progress_fail(message)
         self._status_bar.showMessage(f"Prepare failed: {message}")
         if self._repair_plan_pending:

@@ -1,0 +1,30 @@
+name: Check fresh installs and DSP performance
+'on': workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  runtime:
+    runs-on: [self-hosted, Linux, X64, jammy, docker]
+    concurrency:
+      group: sessionprep-x64-host
+      cancel-in-progress: false
+      queue: max
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        fetch-depth: 0
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      with:
+        python-version: '3.13'
+    - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990
+      with:
+        enable-cache: false
+    - name: Verify CLI wheel and GUI source launcher outside the checkout
+      shell: bash
+      run: |
+        set -euo pipefail
+        version=$(uv run --frozen --no-default-groups python -c 'from sessionpreplib import __version__; print(__version__)')
+        uv run --frozen --no-default-groups python packaging/github/smoke.py fresh --version "$version"
+    - name: Measure gain planning and detector work
+      shell: bash
+      run: uv run --frozen --no-default-groups python tests/benchmark_gain_planning.py

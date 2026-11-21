@@ -305,12 +305,12 @@ class Phase1AnalyzeWorker(QThread):
 class AnalyzeWorker(QThread):
     """Runs pipeline analysis in a background thread."""
 
-    progress = Signal(str)                # descriptive text
-    progress_value = Signal(int, int)     # (current_step, total_steps)
-    track_analyzed = Signal(str, object)  # (filename, track) after detectors
-    track_planned = Signal(str, object)   # (filename, track) after processors
-    finished = Signal(object, object)     # (session, diagnostic_summary)
-    error = Signal(str)
+    progress = Signal(object, str)                # descriptive text
+    progress_value = Signal(object, int, int)     # (current_step, total_steps)
+    track_analyzed = Signal(object, str, object)  # (filename, track) after detectors
+    track_planned = Signal(object, str, object)   # (filename, track) after processors
+    completed = Signal(object, object, object)     # (session, diagnostic_summary)
+    error = Signal(object, str)
 
     def __init__(self, source_dir: str, config: dict, recursive: bool = False, track_settings=None):
         super().__init__()
@@ -318,6 +318,7 @@ class AnalyzeWorker(QThread):
         self.config = config
         self.recursive = recursive
         self.track_settings = track_settings or {}
+        self.layout_files = None
         self._event_bus = EventBus()
         self._is_cancelled = False
 
@@ -329,19 +330,19 @@ class AnalyzeWorker(QThread):
         try:
             event_bus = self._event_bus
 
-            self.progress.emit("Loading session\u2026")
+            self.progress.emit(self, "Loading session\u2026")
             session = load_session(self.source_dir, self.config, event_bus=event_bus,
-                                  recursive=self.recursive)
+                                   recursive=self.recursive, filenames=self.layout_files)
             for track in session.tracks:
                 _gui_source_samples(track.audio_data)
                 for key, value in self.track_settings.get(track.filename, {}).items():
                     setattr(track, key, value)
 
             if not session.tracks:
-                self.error.emit("No audio files found in directory.")
+                self.error.emit(self, "No audio files found in directory.")
                 return
 
-            self.progress.emit("Building pipeline\u2026")
+            self.progress.emit(self, "Building pipeline\u2026")
             detectors = default_detectors()
             processors = default_processors()
             pipeline = Pipeline(
@@ -375,29 +376,29 @@ class AnalyzeWorker(QThread):
                 with self._step_lock:
                     self._step += 1
                     step = self._step
-                self.progress.emit(f"Analyzing {filename} \u2014 {detector_id}")
-                self.progress_value.emit(step, self._total)
+                self.progress.emit(self, f"Analyzing {filename} \u2014 {detector_id}")
+                self.progress_value.emit(self, step, self._total)
 
             def on_session_detector_complete(detector_id, **_kw):
                 with self._step_lock:
                     self._step += 1
                     step = self._step
-                self.progress.emit(f"Session detector \u2014 {detector_id}")
-                self.progress_value.emit(step, self._total)
+                self.progress.emit(self, f"Session detector \u2014 {detector_id}")
+                self.progress_value.emit(self, step, self._total)
 
             def on_track_analyze_complete(filename, **_kw):
                 track = track_map.get(filename)
                 if track:
-                    self.track_analyzed.emit(filename, track)
+                    self.track_analyzed.emit(self, filename, track)
 
             def on_track_plan_complete(filename, **_kw):
                 with self._step_lock:
                     self._step += 1
                     step = self._step
-                self.progress_value.emit(step, self._total)
+                self.progress_value.emit(self, step, self._total)
                 track = track_map.get(filename)
                 if track:
-                    self.track_planned.emit(filename, track)
+                    self.track_planned.emit(self, filename, track)
 
             event_bus.subscribe("detector.complete", on_detector_complete)
             event_bus.subscribe("session_detector.complete", on_session_detector_complete)
@@ -405,12 +406,12 @@ class AnalyzeWorker(QThread):
             event_bus.subscribe("track.plan_complete", on_track_plan_complete)
 
             # Phase 2: Analyze (per-track detectors run in parallel)
-            self.progress.emit("Analyzing Content\u2026")
-            self.progress_value.emit(0, self._total)
+            self.progress.emit(self, "Analyzing Content\u2026")
+            self.progress_value.emit(self, 0, self._total)
             session = pipeline.analyze_phase2(session)
 
             # Phase 2: Plan (per-track processors run in parallel)
-            self.progress.emit("Checking track repairs and planning gains\u2026")
+            self.progress.emit(self, "Checking track repairs and planning gains\u2026")
             session = pipeline.plan(session, preserve_selections={
                 name for name, settings in self.track_settings.items() if "processor_skip" in settings})
 
@@ -418,13 +419,13 @@ class AnalyzeWorker(QThread):
             with self._step_lock:
                 self._step += 1
                 step = self._step
-            self.progress.emit("Building summary\u2026")
-            self.progress_value.emit(step, self._total)
+            self.progress.emit(self, "Building summary\u2026")
+            self.progress_value.emit(self, step, self._total)
             summary = build_diagnostic_summary(session, remaining=True)
 
-            self.finished.emit(session, summary)
+            self.completed.emit(self, session, summary)
         except Exception as e:
-            self.error.emit(str(e))
+            self.error.emit(self, str(e))
 
 
 class AudioLoadWorker(QThread):
@@ -765,8 +766,8 @@ class RepairPlanWorker(QThread):
 class PrepareWorker(QThread):
     """Runs Pipeline.prepare() off the main thread with progress."""
 
-    progress = Signal(str)              # status text
-    progress_value = Signal(int, int)   # (current, total)
+    progress = Signal(object, str)              # status text
+    progress_value = Signal(object, int, int)   # (current, total)
     track_prepared = Signal(str)        # filename
     prepare_finished = Signal()         # renamed: avoid shadowing QThread.finished
     error = Signal(str)
@@ -807,13 +808,14 @@ class PrepareWorker(QThread):
             current.processed_filepath = frozen.processed_filepath
             current.applied_processors = frozen.applied_processors
             current.prepared_file_signature = frozen.prepared_file_signature
+            current.prepared_file_revision = frozen.prepared_file_revision
             current.prepared_fader_db = frozen.prepared_fader_db
 
     def _on_progress(self, current: int, total: int, message: str):
         if self.isInterruptionRequested():
             raise InterruptedError("Prepare cancelled")
-        self.progress.emit(message)
-        self.progress_value.emit(current, total)
+        self.progress.emit(self, message)
+        self.progress_value.emit(self, current, total)
 
     def run(self):
         try:
@@ -846,10 +848,10 @@ class TopologyApplyWorker(QThread):
     No audio processors are applied — that is Phase 2's job.
     """
 
-    progress = Signal(str)
-    progress_value = Signal(int, int)
-    apply_finished = Signal()
-    error = Signal(str)
+    progress = Signal(object, str)
+    progress_value = Signal(object, int, int)
+    apply_finished = Signal(object)
+    error = Signal(object, str)
 
     def __init__(self, session, output_dir: str, source_dir: str | None = None,
                  peaks_dir: str | None = None, *, source_tracks=None):
@@ -865,11 +867,15 @@ class TopologyApplyWorker(QThread):
         self._is_cancelled = True
 
     def run(self):
+        staging = None
         try:
             import os
             from pathlib import Path
             import soundfile as sf
+            from tempfile import TemporaryDirectory
             from sessionpreplib.audio import load_track, AUDIO_EXTENSIONS
+            from sessionpreplib.layout_files import publish_layout
+            from sessionpreplib.repairs import check_output_headroom
             from sessionpreplib.repair_plan import check_source_signature
             from sessionpreplib.topology import resolve_entry_audio
             from sessionpreplib.models import TrackContext
@@ -877,7 +883,7 @@ class TopologyApplyWorker(QThread):
             session = self._session
             topology = session.topology
             if topology is None:
-                self.error.emit("No topology defined.")
+                self.error.emit(self, "No topology defined.")
                 return
 
             output_dir = self._output_dir
@@ -904,15 +910,17 @@ class TopologyApplyWorker(QThread):
             sources: dict[str, TrackContext] = {}
             for step, filename in enumerate(sorted(needed_sources)):
                 if self._is_cancelled:
-                    return
+                    raise InterruptedError("Layout apply cancelled")
 
                 log.debug("Apply topology: loading source '%s' (%d/%d)", filename, step + 1, total)
-                self.progress.emit(f"Loading {filename}")
-                self.progress_value.emit(step, total)
+                self.progress.emit(self, f"Loading {filename}")
+                self.progress_value.emit(self, step, total)
                 track = track_map.get(filename)
                 if source_root is None and track is None:
                     raise ValueError(f"Missing source: {filename}")
                 path = (source_root / filename if source_root is not None else Path(track.filepath)).resolve()
+                if source_root is not None and (Path(filename).is_absolute() or not path.is_relative_to(source_root)):
+                    raise ValueError(f"{filename}: the layout source is outside the project directory.")
                 if path.is_relative_to(output_path):
                     raise ValueError(f"{filename}: the original source is inside the layout output folder.")
                 if source_root is not None and track is not None and Path(track.filepath).resolve() != path:
@@ -945,35 +953,25 @@ class TopologyApplyWorker(QThread):
                                              f"is unavailable ({entry.output_channels} channels).")
 
             if self._is_cancelled:
-                return
-            if os.path.isdir(output_dir):
-                for dirpath, _dirnames, filenames in os.walk(output_dir, topdown=False):
-                    for fname in filenames:
-                        if os.path.splitext(fname)[1].lower() in AUDIO_EXTENSIONS:
-                            try:
-                                os.unlink(os.path.join(dirpath, fname))
-                            except OSError:
-                                pass
-                    if dirpath != output_dir:
-                        try:
-                            os.rmdir(dirpath)
-                        except OSError:
-                            pass
+                raise InterruptedError("Layout apply cancelled")
             os.makedirs(output_dir, exist_ok=True)
+            staging = TemporaryDirectory(dir=output_path, prefix=".sp-layout-")
+            stage = Path(staging.name)
 
             # Phase B: Resolve topology + write output files (no peak building)
             output_tracks = []
+            destinations = set()
             errors = []
             written_files: list[tuple[str, str, int]] = []  # (output_filename, dst_path, sr)
             base_step = n_sources
             for idx, entry in enumerate(topology.entries):
                 if self._is_cancelled:
-                    return
+                    raise InterruptedError("Layout apply cancelled")
 
                 step = base_step + idx
                 log.debug("Apply topology: writing '%s' (%d/%d)", entry.output_filename, step + 1, total)
-                self.progress.emit(f"Writing {entry.output_filename}")
-                self.progress_value.emit(step, total)
+                self.progress.emit(self, f"Writing {entry.output_filename}")
+                self.progress_value.emit(self, step, total)
 
                 # Skip entries with no channels (e.g. all channels moved elsewhere)
                 if entry.output_channels < 1 or not entry.sources:
@@ -984,9 +982,19 @@ class TopologyApplyWorker(QThread):
                     src_track = sources[entry.sources[0].input_filename]
                     sr = src_track.samplerate
 
-                    dst = os.path.join(output_dir, entry.output_filename)
-                    os.makedirs(os.path.dirname(dst), exist_ok=True)
-                    sf.write(dst, resolved, sr, subtype=src_track.subtype)
+                    name = Path(entry.output_filename)
+                    dst = output_path / name
+                    if (name.is_absolute() or name.drive or ".." in name.parts
+                            or name.suffix.lower() not in AUDIO_EXTENSIONS
+                            or not dst.resolve().is_relative_to(output_path) or dst.is_symlink()
+                            or dst.resolve() in destinations):
+                        raise ValueError(f"Invalid or duplicate layout destination: {name}")
+                    destinations.add(dst.resolve())
+                    check_output_headroom(resolved, src_track.subtype)
+                    temporary = stage / name
+                    temporary.parent.mkdir(parents=True, exist_ok=True)
+                    sf.write(temporary, resolved, sr, subtype=src_track.subtype)
+                    dst = str(dst)
                     written_files.append((entry.output_filename, dst, sr))
 
                     n_samples = resolved.shape[0]
@@ -1009,6 +1017,11 @@ class TopologyApplyWorker(QThread):
             # Free source audio memory before peak building
             source_audio.clear()
             sources.clear()
+            if self._is_cancelled:
+                raise InterruptedError("Layout apply cancelled")
+            if errors:
+                raise ValueError("\n".join(f"{name}: {error}" for name, error in errors))
+            publish_layout(output_path, stage, output_tracks, [*session.tracks, *session.output_tracks])
 
             # Phase C: Build peak caches (re-reading from just-written files)
             if self._peaks_dir:
@@ -1019,12 +1032,12 @@ class TopologyApplyWorker(QThread):
                 peak_base_step = n_sources + n_entries
                 for idx, (out_fn, dst, sr) in enumerate(written_files):
                     if self._is_cancelled:
-                        return
+                        break  # Audio is committed. Only disposable peaks remain.
 
                     step = peak_base_step + idx
                     log.debug("Apply topology: building peaks '%s' (%d/%d)", out_fn, step + 1, total)
-                    self.progress.emit(f"Building peaks for {out_fn}")
-                    self.progress_value.emit(step, total)
+                    self.progress.emit(self, f"Building peaks for {out_fn}")
+                    self.progress_value.emit(self, step, total)
 
                     try:
                         pp = peaks_path_for(self._peaks_dir, os.path.abspath(dst))
@@ -1049,14 +1062,18 @@ class TopologyApplyWorker(QThread):
                     except Exception as e:
                         log.debug("Failed to build/save peak cache for '%s' -> %s: %s", out_fn, pp, e)
 
-            self.progress_value.emit(total, total)
+            self.progress_value.emit(self, total, total)
 
             session.output_tracks = output_tracks
+            session.prepare_state = "none"
             session.config["_topology_apply_errors"] = errors
-            self.apply_finished.emit()
+            self.apply_finished.emit(self)
 
         except Exception as e:
-            self.error.emit(str(e))
+            self.error.emit(self, str(e))
+        finally:
+            if staging is not None:
+                staging.cleanup()
 
 
 class BatchReanalyzeWorker(QThread):

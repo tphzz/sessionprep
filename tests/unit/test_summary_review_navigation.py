@@ -30,7 +30,7 @@ def window(qapp, monkeypatch):
     monkeypatch.setattr(mainwindow, "save_config", lambda *args: None)
     monkeypatch.setattr(mainwindow.SessionPrepWindow, "_configure_daw_processors",
                         lambda self: setattr(self, "_daw_processors", []))
-    monkeypatch.setattr(report, "read_chunks", lambda path: ("WAVE", []))
+    monkeypatch.setattr(report, "chunk_sizes", lambda path: [])
     owner = mainwindow.SessionPrepWindow()
     # No audio jobs, devices or DAW services are involved in this navigation test.
     monkeypatch.setattr(owner, "_load_waveform", lambda track: None)

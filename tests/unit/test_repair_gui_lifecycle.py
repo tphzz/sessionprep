@@ -35,10 +35,10 @@ def test_analysis_names_repair_work_while_the_planner_is_running(tmp_path, monke
     sf.write(tmp_path / "Tone.wav", np.zeros(4000), 8000)
     worker = AnalyzeWorker(str(tmp_path), {"bimodal_normalize_enabled": normalize, "dc_offset_enabled": False})
     messages, during_scan, counts, planned, errors = [], [], [], [], []
-    worker.progress.connect(messages.append, Qt.DirectConnection)
-    worker.progress_value.connect(lambda done, total: counts.append((done, total)), Qt.DirectConnection)
-    worker.track_planned.connect(lambda name, track: planned.append((counts[-1][0], track)), Qt.DirectConnection)
-    worker.error.connect(errors.append, Qt.DirectConnection)
+    worker.progress.connect(lambda job, message: messages.append(message), Qt.DirectConnection)
+    worker.progress_value.connect(lambda job, done, total: counts.append((done, total)), Qt.DirectConnection)
+    worker.track_planned.connect(lambda job, name, track: planned.append((counts[-1][0], track)), Qt.DirectConnection)
+    worker.error.connect(lambda job, error: errors.append(error), Qt.DirectConnection)
     plan = pipeline_module.plan_repairs
 
     def record_current_step(track, config, verification):
@@ -175,7 +175,7 @@ def test_failed_reanalysis_returns_to_findings_when_the_track_is_reselected(proj
     monkeypatch.setattr(AnalyzeWorker, "start", lambda self: None)
     window._on_analyze()
     assert editor.track is None and window._file_report.report_track is None
-    window._worker.error.emit("Analysis interrupted")
+    window._worker.error.emit(window._worker, "Analysis interrupted")
     window._select_row(window._find_table_row(track.filename))
     assert window._file_report.report_track is track
     assert window._file_review.currentWidget() is window._file_report_pane

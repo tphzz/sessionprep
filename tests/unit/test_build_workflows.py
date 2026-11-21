@@ -46,6 +46,25 @@ def test_only_all_platforms_can_publish():
                 assert job.get("permissions", {}).get("contents") != "write"
 
 
+def test_check_job_collects_offline_integration_without_live_hardware():
+    checks = load("90-build-checks.yml")["jobs"]["checks"]["steps"]
+    command, = [line for step in checks for line in step.get("run", "").splitlines() if " pytest " in line]
+    import shlex
+    arguments = shlex.split(command)
+    assert arguments[arguments.index("-m") + 1] == "not ptsl_live"
+    assert not any(arg.startswith("tests/") for arg in arguments)
+    assert "-rs" in arguments and any(arg.startswith("--durations=") for arg in arguments)
+
+
+@pytest.mark.parametrize("workflow", ["91-build-platform.yml", "92-build-macos.yml"])
+def test_native_smoke_runs_on_packaged_payload_before_artifact_upload(workflow):
+    _, builds = native_build_steps(workflow)
+    assert builds
+    for step in builds:
+        script = step["run"]
+        assert script.index("build.py compile") < script.index("build.py package") < script.index("smoke.py native")
+
+
 def test_resource_locks_are_shared_and_never_cancel_running_work():
     for name in ("90-build-checks.yml", "91-build-platform.yml", "92-build-macos.yml", "93-windows-bundle.yml"):
         for job in load(name)["jobs"].values():

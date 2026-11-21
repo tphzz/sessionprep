@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
 )
 
 from sessionpreplib.config import classify_structured_config_change, resolve_session_config
+from sessionpreplib.gain_staging import apply_group_gains
 
 from ..controls import FormActionButton
 from ..prefs.param_form import _argb_to_qcolor
@@ -194,6 +195,7 @@ class GroupsMixin:  # pylint: disable=too-few-public-methods
         # pylint: disable=too-many-positional-arguments
         """Populate one row in the session-local groups table."""
         name_item = QTableWidgetItem(name)
+        name_item.setData(Qt.UserRole, name)
         self._groups_tab_table.setItem(row, 0, name_item)
 
         # Color picker button with grid popup
@@ -336,7 +338,20 @@ class GroupsMixin:  # pylint: disable=too-few-public-methods
             self._groups_tab_table.blockSignals(True)
             item.setText(self._unique_session_group_name(name))
             self._groups_tab_table.blockSignals(False)
+        old_name = item.data(Qt.UserRole)
+        new_name = item.text().strip()
+        if old_name != new_name:
+            self._groups_tab_table.blockSignals(True)
+            item.setData(Qt.UserRole, new_name)
+            self._groups_tab_table.blockSignals(False)
+            if old_name and self._session:
+                for members in (self._session.tracks, self._session.output_tracks,
+                                self._session.transfer_manifest, self._session.base_transfer_manifest):
+                    for member in members:
+                        if member.group == old_name:
+                            member.group = new_name or None
         self._sync_session_groups()
+        self._populate_setup_table()
 
     def _validate_groups_tab_pattern(self, row: int):
         """Validate the match pattern cell and set visual indicator.
@@ -894,11 +909,15 @@ class GroupsMixin:  # pylint: disable=too-few-public-methods
         gcm = self._group_color_map()
         grm = self._group_rank_map()
         glm = self._gain_linked_map()
+        tracks = {track.filename: track for track in self._session.tracks} if self._session else {}
+        sorting = self._track_table.isSortingEnabled()
+        self._track_table.setSortingEnabled(False)
         for row in range(self._track_table.rowCount()):
             w = self._track_table.cellWidget(row, 6)
             if isinstance(w, BatchComboBox):
                 # Read clean group name via UserRole
-                old_group = w.currentData(Qt.UserRole)
+                track = tracks.get(w.property("track_filename"))
+                old_group = track.group if track else None
                 w.blockSignals(True)
                 w.clear()
                 w.setIconSize(QSize(16, 16))
@@ -924,13 +943,8 @@ class GroupsMixin:  # pylint: disable=too-few-public-methods
                 if not restored:
                     w.setCurrentIndex(0)  # (None)
                     # Also clear the track's group assignment
-                    fname = w.property("track_filename")
-                    if fname and self._session:
-                        track = next(
-                            (t for t in self._session.tracks
-                             if t.filename == fname), None)
-                        if track:
-                            track.group = None
+                    if track:
+                        track.group = None
                 w.blockSignals(False)
                 # Update sort key, display text + row color
                 gname = w.currentData(Qt.UserRole)
@@ -941,108 +955,28 @@ class GroupsMixin:  # pylint: disable=too-few-public-methods
                     sort_item.setText(w.currentText())
                 self._apply_row_group_color(row, gname, gcm)
 
+        self._track_table.setSortingEnabled(sorting)
         self._auto_fit_group_column()
         self._apply_linked_group_levels()
 
     # ── Linked group levels ──────────────────────────────────────────────
 
     def _apply_linked_group_levels(self):
-        """Apply group levels for gain-linked groups and update fader offsets.
-
-        1. Restore every track's ``gain_db`` to its ``original_gain_db``.
-        2. For gain-linked groups, set all members to the group minimum.
-        3. Recompute ``fader_offset`` using the stored anchor offset.
-        4. Update the gain spin-boxes and the Session Setup table.
-        """
+        """Recompute shared gains and faders, then refresh their table cells."""
         if not self._session or not self._session.processors:
             return
 
         previous = [(pr, pr.gain_db, pr.data.get("fader_offset", 0.0))
                     for t in self._session.tracks for pr in t.processor_results.values()]
-        glm = self._gain_linked_map()
-        linked_names = {name for name, linked in glm.items() if linked}
-
-        for proc in self._session.processors:
-            pid = proc.id
-            # 1. Restore originals
-            for track in self._session.tracks:
-                if track.status != "OK":
-                    continue
-                pr = track.processor_results.get(pid)
-                if pr is None or pr.error or pr.classification in ("Skip", "Silent") or pid in track.processor_skip:
-                    continue
-                if "original_gain_db" not in pr.data:
-                    pr.data["original_gain_db"] = pr.gain_db
-                pr.gain_db = pr.data["original_gain_db"]
-
-            # 2. Apply group levels for linked groups
-            by_group: dict[str, list] = {}
-            for track in self._session.tracks:
-                if track.status != "OK" or track.group is None:
-                    continue
-                pr = track.processor_results.get(pid)
-                if pr is None or pr.error or pr.classification in ("Skip", "Silent") or pid in track.processor_skip:
-                    continue
-                by_group.setdefault(track.group, []).append(track)
-
-            for gname, members in by_group.items():
-                if gname not in linked_names:
-                    continue
-                orig = [m.processor_results[pid].data["original_gain_db"]
-                        for m in members]
-                group_gain = min(orig) if orig else 0.0
-                for m in members:
-                    m.processor_results[pid].gain_db = float(group_gain)
-
-            # 3. Recompute fader offsets with headroom rebalancing
-            valid = []
-            for track in self._session.tracks:
-                if track.status != "OK":
-                    continue
-                pr = track.processor_results.get(pid)
-                if pr is None:
-                    continue
-                pr.data.pop("fader_rebalance_shift", None)
-                if pr.error or pr.classification in ("Skip", "Silent") or pid in track.processor_skip:
-                    pr.data["fader_offset"] = 0.0
-                else:
-                    pr.data["fader_offset"] = -float(pr.gain_db)
-                    valid.append(track)
-
-            # Headroom rebalancing
-            ceiling = self._session.config.get("_fader_ceiling_db", 12.0)
-            headroom = self._session.config.get("fader_headroom_db", 8.0)
-            max_allowed = ceiling - headroom
-            rebalance_shift = 0.0
-            if headroom > 0.0 and valid:
-                fader_offsets = [
-                    t.processor_results[pid].data.get("fader_offset", 0.0)
-                    for t in valid
-                ]
-                max_fader = max(fader_offsets)
-                if max_fader > max_allowed:
-                    rebalance_shift = max_fader - max_allowed
-                    for track in valid:
-                        pr = track.processor_results.get(pid)
-                        if pr:
-                            pr.data["fader_offset"] -= rebalance_shift
-                            pr.data["fader_rebalance_shift"] = rebalance_shift
-            self._session.config[f"_fader_rebalance_{pid}"] = rebalance_shift
-
-            # Anchor-track adjustment
-            anchor_offset = self._session.config.get(
-                f"_anchor_offset_{pid}", 0.0)
-            if anchor_offset != 0.0:
-                for track in valid:
-                    pr = track.processor_results.get(pid)
-                    if pr:
-                        pr.data["fader_offset"] = pr.data.get("fader_offset", 0.0) - anchor_offset
-
+        apply_group_gains(
+            self._session, linked_groups={name for name, linked in self._gain_linked_map().items() if linked},
+            headroom_db=self._session.config.get("fader_headroom_db", 8.0),
+            anchor=self._session.config.get("anchor"),
+        )
         if any(pr.gain_db != gain or pr.data.get("fader_offset", 0.0) != fader
                for pr, gain, fader in previous):
             self._mark_prepare_stale()
 
-        # 4. Update UI
         self._track_table.setSortingEnabled(False)
         for row in range(self._track_table.rowCount()):
             fname_item = self._track_table.item(row, 0)

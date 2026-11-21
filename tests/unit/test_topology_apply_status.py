@@ -2,7 +2,7 @@
 import pytest
 
 pytest.importorskip("PySide6")
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QThread, Signal
 from PySide6.QtWidgets import QApplication
 
 from qt_helpers import dispose_window
@@ -18,11 +18,11 @@ def qapp():
     return app
 
 
-class _FakeApplyWorker(QObject):
-    progress = Signal(str)
-    progress_value = Signal(int, int)
-    apply_finished = Signal()
-    error = Signal(str)
+class _FakeApplyWorker(QThread):
+    progress = Signal(object, str)
+    progress_value = Signal(object, int, int)
+    apply_finished = Signal(object)
+    error = Signal(object, str)
 
     def __init__(self, *args, **kwargs):
         super().__init__()
@@ -59,5 +59,6 @@ def test_failed_apply_leaves_no_stale_toolbar_message(qapp, window, monkeypatch)
     monkeypatch.setattr(window, "_progress_fail", lambda message: None)
     window._topo_status_label.setText("6 input → 6 output tracks")
     window._on_topo_apply()
-    window._on_topo_apply_error("disk full")
+    worker = window._topo_apply_worker
+    worker.error.emit(worker, "disk full")
     assert window._topo_status_label.text() == "6 input → 6 output tracks"

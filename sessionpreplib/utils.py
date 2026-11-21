@@ -3,6 +3,8 @@ from __future__ import annotations
 import fnmatch
 from typing import Any
 
+GROUP_OVERLAP_PREFIX = "Group overlap:"
+
 
 def protools_sort_key(filename: str) -> str:
     """
@@ -104,7 +106,7 @@ def assign_groups(
                     g["members"].append(fname)
                 else:
                     warnings.append(
-                        f"Group overlap: {fname} matches '{g['name']}' "
+                        f"{GROUP_OVERLAP_PREFIX} {fname} matches '{g['name']}' "
                         f"but is already assigned to '{matched_group}'"
                     )
         if matched_group is not None:

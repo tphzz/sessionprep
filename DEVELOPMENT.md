@@ -258,9 +258,12 @@ also supported. An invalid explicit path fails immediately. Run
 available to the current account before building.
 
 The dev-only PyYAML dependency supports semantic workflow tests. Before any
-platform starts building, the checks job runs the full unit suite and reports
-its 15 slowest test phases. Reproduce it with
-`uv run --frozen pytest tests/unit --durations=15`.
+platform starts building, the checks job runs the non-live suite, including
+offline integration tests, and reports skips and the 15 slowest test phases.
+Reproduce it with `uv run --frozen --all-extras pytest -m "not ptsl_live" --durations=15 -rs`.
+Each platform also exercises the compiled executables after packaging and before upload.
+The manual **Check fresh installs and DSP performance** job tests isolated
+wheel and source installs and records timing and work counts separately.
 GUI tests that own a main window or Preferences dialog use
 `dispose_window` from `tests/unit/qt_helpers.py` at teardown. Closing a Qt
 window can leave its children alive for later application-wide style changes.
@@ -1055,6 +1058,8 @@ Whole-track repairs form a pre-normalization stage. `repair_plan.plan_repairs` c
 
 `Pipeline.prepare` validates routed output samples and replaces each file atomically. The prepared track records its actual fader offset, routed source path and file signatures. DAW adapters resolve the media and fader together through `resolve_transfer_audio`. CLI text and JSON reports derive delivered gain from the current execution's successful write receipts.
 
+Track Layout stages the complete set of files before publishing them. Its directory receipt identifies the last published file contents across project opens. Apply checks existing targets and coordinates publication with a directory lock. The next analysis uses the committed layout's filenames. Prepare publishes per output and marks an interrupted or partial batch stale. Ordinary cleanup requires a matching revision before retiring a prior render.
+
 ### 7.1 Abstract Base Class
 
 Defined in `sessionpreplib/processor.py`.
@@ -1125,14 +1130,16 @@ sorting by priority.
 
 ### 7.5 Group Levelling
 
-Implemented as a post-processing step in `Pipeline._apply_group_levels()`.
-After all processors run, grouped tracks receive the minimum gain of the group.
+After individual plans finish, `sessionpreplib.gain_staging.apply_group_gains()`
+assigns the minimum eligible individual gain to each member of a linked group.
+Library planning and desktop group edits both call it. The individual gains
+remain available when a member leaves the group or the group is unlinked.
 
 ### 7.6 Fader Offsets
 
-Implemented in `Pipeline._compute_fader_offsets()`. Calculates inverse of gain,
-applies headroom rebalancing and optional anchor adjustment. Stored in
-`ProcessorResult.data["fader_offset"]`.
+The same calculation records each eligible inverse gain in
+`ProcessorResult.data["fader_offset"]`. Bypassed, failed and silent results
+are excluded from the group minimum, headroom calculation and anchor selection.
 
 **Headroom rebalancing:** Ensures no fader exceeds `ceiling - headroom`.
 The ceiling is set per-DAW processor via `_fader_ceiling_db` (e.g. +6 dB for
@@ -1140,7 +1147,9 @@ DAWproject, +12 dB for Pro Tools). The headroom margin is configured via
 `fader_headroom_db` (default 8 dB). If the highest fader offset exceeds
 `ceiling - headroom`, all fader offsets are shifted down uniformly by the
 excess amount. The shift is stored in `ProcessorResult.data["fader_rebalance_shift"]`
-and logged via `dbg()` when `SP_LOG_LEVEL=DEBUG` is active.
+and logged when `SP_LOG_LEVEL=DEBUG` is active. A named anchor then shifts
+all eligible faders together to put its first matching track at 0 dB.
+This final adjustment can place another track above the host's fader ceiling.
 
 ### 7.7 Registration
 
@@ -1343,19 +1352,11 @@ processor dropdown (e.g. "DAWproject – MyTemplate").
 |------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `check_connectivity()` | Validates template file exists and is a valid ZIP; returns `(True, "Template OK")` or failure message.                                                                                                                                                                                                                                                                                               |
 | `fetch(session)`       | Loads the template's folder track hierarchy into `session.daw_state`. Populates the GUI folder tree for drag-and-drop assignment.                                                                                                                                                                                                                                                                    |
-| `transfer(session)`    | Loads template project, creates new audio tracks with clips in the arrangement, sets fader volumes and group colors, writes the result to `<output_folder>/<template_name>.dawproject`. When bimodal normalization is enabled and files are not processed, expression gain (clip gain) is written as automation `Points` nested inside a `Lanes` within the `Clip` (sibling of the `Audio` element). |
+| `transfer(session)` | Adds assigned audio tracks and sample-zero clips to the template. Streams embedded resources into the destination archive and rebases relative external references. |
 
-**Gain application logic:**
+The optional GUI extra installs the DAWproject model library from its pinned source archive. The adapter uses the original template XML for existing tracks, routing and metadata. It serializes new tracks and lanes with the model library and publishes the complete ZIP atomically. An export from the batch queue requires a new output path at publication time.
 
-- `fader_db` → mapped to track channel volume (linear)
-- `clip_gain_db` → expression gain automation (`Points` with `ExpressionType.GAIN`)
-- Both are only set when bimodal normalization is enabled, the track is not
-  silent/skipped, and the processor is not in `track.processor_skip`
-- `clip_gain_db` is set only when the track's actual audio file is the
-  original (not a processed/baked file)
-- When `clip_gain_db != 0`, `Clip.content` is set to a `Lanes([Audio, Points])`
-  instead of `Audio` directly, matching the structure Bitwig writes for
-  per-clip gain automation
+Original audio uses unity channel volume. Prepared audio references the rendered file and uses the fader frozen with that file, converted from dB to linear gain. The audio clip starts at zero and runs for the recorded duration in seconds.
 
 **Config refresh:** Both `_do_daw_transfer` and `_on_prepare` in the GUI
 refresh `session.config` from the live session config widgets before starting
@@ -1437,8 +1438,7 @@ Output goes to stderr with timestamps and caller class names.
 - **analyze:** per-detector per-track timing, per-track total, phase total
   with per-track average
 - **plan:** per-processor per-track timing, per-track total, phase total
-  with per-track average, group levelling time, fader offset time (including
-  rebalance shift if applied)
+  with per-track average and the fader rebalance shift when applied
 - **transfer (DAWproject):** per-track gain decision trace (`bn_enabled`,
   `actually_processed`, `has_pr`, `classification`, `skip`, `gain_db`,
   `fader_offset` → final `fader_db`, `clip_gain_db`)
@@ -1479,9 +1479,8 @@ large).
 **Worker count:** `max_workers` defaults to `min(os.cpu_count(), 8)`, capped
 at the number of tracks.
 
-`plan()` internally calls:
-- `_apply_group_levels()` — grouped tracks get minimum gain
-- `_compute_fader_offsets()` — inverse gain + anchor adjustment
+`plan()` calls `apply_group_gains()` for group minima, inverse gains,
+headroom rebalancing and the optional named anchor.
 
 ### 9.7 `load_session()` Helper
 
@@ -1520,9 +1519,11 @@ class SessionQueue:
     def run_all(self, pipeline_factory, event_bus, on_complete) -> list[SessionJob]
 ```
 
-`run_next()` creates a fresh pipeline per job via `pipeline_factory(config)`,
-loads the session, runs analyze -> plan -> (optionally execute), stores
-`SessionResult`. Emits `job.start` and `job.complete` events.
+Each job captures its configuration when added. `run_next()` creates a fresh
+pipeline from that configuration, loads the audio, analyzes both phases, plans
+and optionally executes. It emits `job.start` and `job.complete`. A track,
+detector or write failure marks the job failed. Its `SessionResult` retains
+the per-track outcomes, and `run_all()` continues with the next pending job.
 
 ---
 
@@ -2318,7 +2319,10 @@ Session files store `session_config_overrides` as optional metadata alongside
 the resolved `session_config` snapshot. Interactive reopen resolves inherited
 fields again. When reading a legacy snapshot, saved values that differ from
 the selected preset become overrides. Queued transfers use the resolved
-snapshot captured at enqueue time.
+snapshot captured at enqueue time. Loading a saved batch validates the entire
+list before replacing or appending items. A transfer saved while running
+reopens as Failed with an interruption message and can be retried. File
+exports check for an existing destination before starting a queued transfer.
 
 **Lifecycle:**
 

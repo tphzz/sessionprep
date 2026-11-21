@@ -24,6 +24,24 @@ def test_manifest_binds_bytes_configuration_and_commit(tmp_path):
         ci.verify_manifest(tmp_path, "win-x64", "0.3.5", "a" * 40, False)
 
 
+@pytest.mark.parametrize("arch", ["arm64", "x64"])
+def test_compiled_smoke_selects_only_the_shipped_entry_points(tmp_path, arch):
+    import plistlib
+    import runpy
+
+    paths = runpy.run_path(str(ROOT / "packaging/github/smoke.py"))["native_executables"]
+    contents = tmp_path / "SessionPrep.app/Contents"
+    contents.mkdir(parents=True)
+    (contents / "Info.plist").write_bytes(plistlib.dumps({"CFBundleExecutable": "SessionPrep"}))
+    assert paths(tmp_path, f"macos-{arch}") == (None, contents / "MacOS/SessionPrep")
+    merged = tmp_path / "sessionprep.dist"
+    assert paths(tmp_path, f"linux-{arch}") == (
+        merged / f"sessionprep-linux-{arch}", merged / f"sessionprep-gui-linux-{arch}")
+    assert paths(tmp_path, f"win-{arch}") == (
+        merged / f"sessionprep-win-{arch}.exe",
+        tmp_path / "sessionprep-gui.dist" / f"sessionprep-gui-win-{arch}.exe")
+
+
 def test_manifest_rejects_unlisted_files(tmp_path):
     (tmp_path / "package.deb").write_bytes(b"payload")
     ci.write_manifest(tmp_path, "linux-x64", "0.3.5", "a" * 40, False)

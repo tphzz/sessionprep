@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import datetime
+import os
 from typing import Any, Callable
 from uuid import uuid4
 
@@ -14,7 +16,7 @@ class SessionQueue:
 
     def __init__(self, default_config: dict[str, Any] | None = None):
         self._jobs: list[SessionJob] = []
-        self._default_config: dict[str, Any] = default_config or {}
+        self._default_config: dict[str, Any] = deepcopy(default_config or {})
 
     def add(
         self,
@@ -27,7 +29,9 @@ class SessionQueue:
         Enqueue a session. Config is merged over defaults
         (default < per-job overrides).
         """
-        merged = {**self._default_config, **(config or {})}
+        if label and any(job.job_id == label for job in self._jobs):
+            raise ValueError(f"Duplicate job ID: {label}")
+        merged = deepcopy({**self._default_config, **(config or {})})
         job = SessionJob(
             job_id=label or str(uuid4()),
             source_dir=source_dir,
@@ -90,15 +94,18 @@ class SessionQueue:
             event_bus.emit("job.start", job_id=job.job_id)
 
         try:
+            if not os.path.isdir(job.source_dir):
+                raise ValueError(f"Input directory does not exist: {job.source_dir}")
             pipeline = pipeline_factory(job.config)
             session = load_session(job.source_dir, job.config, event_bus=event_bus)
-            pipeline.analyze(session)
+            if not session.tracks:
+                raise ValueError(f"No audio files found in {job.source_dir}")
+            job.result = SessionResult(session=session)
+            pipeline.analyze_phase1(session)
+            pipeline.analyze_phase2(session)
             pipeline.plan(session)
 
-            daw_commands = []
-
             if job.config.get("execute"):
-                import os
                 source_dir = job.source_dir
                 if job.config.get("overwrite"):
                     output_dir = source_dir
@@ -109,11 +116,12 @@ class SessionQueue:
                     output_dir = os.path.join(source_dir, output_folder)
                     pipeline.execute(session, output_dir)
 
-            job.result = SessionResult(
-                session=session,
-                daw_commands=daw_commands,
-            )
-            job.status = JobStatus.COMPLETED
+            errors = _job_errors(session)
+            if errors:
+                job.status = JobStatus.FAILED
+                job.error = "\n".join(errors)
+            else:
+                job.status = JobStatus.COMPLETED
         except Exception as e:
             job.status = JobStatus.FAILED
             job.error = str(e)
@@ -141,3 +149,21 @@ class SessionQueue:
                 if on_complete:
                     on_complete(job)
         return completed
+
+
+def _job_errors(session: SessionContext) -> list[str]:
+    """Collect operational failures while keeping successful sibling results."""
+    errors = list(session.config.get("_execute_errors", []))
+    for track in session.tracks:
+        if track.status != "OK":
+            errors.append((track.filename, track.status))
+        if message := track._cache.get("repair_error"):
+            errors.append((track.filename, message))
+        for result in (*track.detector_results.values(), *track.processor_results.values()):
+            if result.error:
+                errors.append((track.filename, result.error))
+    for detector in session.detectors:
+        for result in session.config.get(f"_session_det_{detector.id}", []):
+            if result.error:
+                errors.append((detector.id, result.error))
+    return [f"{name}: {message}" for name, message in dict.fromkeys(errors)]

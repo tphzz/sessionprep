@@ -160,6 +160,8 @@ def run_nuitka(target_key, clean=False, *, debug=False, build_version=None, low_
 
     for module in target.get("nuitka_include_modules", []):
         cmd.append(f"--include-module={module}")
+    for package in target.get("nuitka_include_packages", []):
+        cmd.append(f"--include-package={package}")
 
     for module in NUITKA_BYTECODE_MODULES_BY_PLATFORM.get(get_platform_suffix(), ()):
         cmd.append(f"--noinclude-custom-mode={module}:bytecode")

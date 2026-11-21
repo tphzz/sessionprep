@@ -329,6 +329,8 @@ class ProToolsDawProcessor(DawProcessor):
         engine = None
         temp_session_name = None
         temp_session_path = None
+        temp_closed = False
+        close_error = None
         try:
             if progress_cb:
                 progress_cb(10, 100, "Connecting to Pro Tools...")
@@ -360,8 +362,9 @@ class ProToolsDawProcessor(DawProcessor):
             import uuid
 
             temp_session_name = f"SessionPrep_Temp_{uuid.uuid4().hex[:8]}"
-            temp_session_path = os.path.join(
-                self._temp_dir, temp_session_name, f"{temp_session_name}.ptx")
+            project_folder = os.path.join(self._temp_dir, temp_session_name)
+            if os.path.lexists(project_folder):
+                raise FileExistsError(f"The temporary project folder already exists: {project_folder}")
 
             if progress_cb:
                 progress_cb(
@@ -383,6 +386,7 @@ class ProToolsDawProcessor(DawProcessor):
                 self._instance_name,
                 timeout=self._template_create_timeout,
             )
+            temp_session_path = os.path.join(project_folder, f"{temp_session_name}.ptx")
             dbg(f"Temporary Pro Tools session created: {temp_session_name!r}")
 
             if progress_cb:
@@ -435,45 +439,23 @@ class ProToolsDawProcessor(DawProcessor):
             if progress_cb:
                 progress_cb(90, 100, "Cleaning up temporary session...")
 
-            # Preserve existing assignments where folder IDs still match
-            pt_state = session.daw_state.get(self.id, {})
-            old_assignments: dict[str, str] = pt_state.get("assignments", {})
-            valid_ids = {f["id"] for f in folders}
-            assignments = {
-                fname: fid for fname, fid in old_assignments.items() if fid in valid_ids
-            }
-
-            session.daw_state[self.id] = {
-                "folders": folders,
-                "assignments": assignments,
-            }
-
-            # Write cache
-            if current_mtime is not None:
-                cache_data[cache_key] = {"mtime": current_mtime, "folders": folders}
-                try:
-                    cache_file.parent.mkdir(parents=True, exist_ok=True)
-                    with open(cache_file, "w", encoding="utf-8") as f:
-                        json.dump(cache_data, f, indent=2, ensure_ascii=False)
-                    dbg(f"Wrote Pro Tools template cache: {str(cache_file)!r}")
-                except Exception as e:
-                    log.debug(f"Failed to write template cache: {e}")
-                    dbg(f"Failed to write Pro Tools template cache: {e}")
-
-            if progress_cb:
-                progress_cb(100, 100, "Fetch complete")
-
         except Exception:
             dbg("Pro Tools fetch failed; propagating exception")
             raise
         finally:
             if engine is not None:
-                if temp_session_path and os.path.isfile(temp_session_path):
+                if temp_session_path:
                     try:
                         if ptslh.session_matches_path(engine, temp_session_path):
                             dbg(f"Closing temporary Pro Tools session: {temp_session_name!r}")
                             ptslh.close_session(engine)
+                            if ptslh.is_session_open(engine):
+                                raise RuntimeError("Pro Tools still reports an open session after CloseSession.")
+                            temp_closed = True
+                        else:
+                            raise RuntimeError("Pro Tools switched sessions before Fetch could close its temporary project.")
                     except Exception as e:
+                        close_error = e
                         log.debug(f"Failed to close temp session: {e}")
                         dbg(f"Failed to close temporary Pro Tools session: {e}")
                 try:
@@ -482,7 +464,7 @@ class ProToolsDawProcessor(DawProcessor):
                 except Exception:
                     pass
 
-            if temp_session_name:
+            if temp_closed:
                 # Defensive deletion of the temporary session folder
                 target_dir = os.path.join(self._temp_dir, temp_session_name)
                 # Extreme safety checks to ensure we only delete what we created:
@@ -513,6 +495,37 @@ class ProToolsDawProcessor(DawProcessor):
                         except Exception:
                             pass
                         time.sleep(0.5)
+
+        if close_error is not None:
+            raise RuntimeError(f"Failed to close the temporary Pro Tools session: {close_error}") from close_error
+
+        # Preserve existing assignments where folder IDs still match
+        pt_state = session.daw_state.get(self.id, {})
+        old_assignments: dict[str, str] = pt_state.get("assignments", {})
+        valid_ids = {f["id"] for f in folders}
+        assignments = {
+            fname: fid for fname, fid in old_assignments.items() if fid in valid_ids
+        }
+
+        session.daw_state[self.id] = {
+            "folders": folders,
+            "assignments": assignments,
+        }
+
+        # Write cache
+        if current_mtime is not None:
+            cache_data[cache_key] = {"mtime": current_mtime, "folders": folders}
+            try:
+                cache_file.parent.mkdir(parents=True, exist_ok=True)
+                with open(cache_file, "w", encoding="utf-8") as f:
+                    json.dump(cache_data, f, indent=2, ensure_ascii=False)
+                dbg(f"Wrote Pro Tools template cache: {str(cache_file)!r}")
+            except Exception as e:
+                log.debug(f"Failed to write template cache: {e}")
+                dbg(f"Failed to write Pro Tools template cache: {e}")
+
+        if progress_cb:
+            progress_cb(100, 100, "Fetch complete")
 
         return session
 
@@ -899,8 +912,11 @@ class ProToolsDawProcessor(DawProcessor):
             # ── 6. Save & Close ──────────────────────────────────
 
             if batch_job_id:
-                ptslh.complete_batch_job(engine, batch_job_id)
-                batch_job_id = None
+                try:
+                    ptslh.complete_batch_job(engine, batch_job_id)
+                    batch_job_id = None
+                except Exception as exc:
+                    record("complete_batch", error=str(exc))
 
         except Exception as exc:
             operation = "transfer" if created_session_path else "create_session"

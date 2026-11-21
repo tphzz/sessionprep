@@ -62,7 +62,7 @@ def test_custom_fragments_remain_available_and_suppression_is_respected(monkeypa
 
 def test_interaction_reuses_metadata_and_custom_renderer(qapp, monkeypatch):
     calls = []
-    monkeypatch.setattr(report, "read_chunks", lambda path: (calls.append(path) or ("WAVE", [])))
+    monkeypatch.setattr(report, "chunk_sizes", lambda path: (calls.append(path) or []))
     session, current = session_with_findings()
     browser = ReportBrowser({})
     browser.present_track(current, session)

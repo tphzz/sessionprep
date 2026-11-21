@@ -122,6 +122,7 @@ def discover_track(filepath: str) -> TrackContext:
         subtype=info.subtype,
         duration_sec=info.duration,
         source_file_signature=(stat.st_size, stat.st_mtime_ns),
+        source_file_revision=file_revision(filepath, stat, allow_digest=False),
     )
 
 

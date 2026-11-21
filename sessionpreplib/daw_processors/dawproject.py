@@ -5,14 +5,77 @@ from __future__ import annotations
 import logging
 import math
 import os
+from pathlib import Path, PureWindowsPath
+import shutil
+from threading import RLock
+from functools import wraps
 import zipfile
 from typing import Any
 
 from ..daw_processor import DawProcessor, resolve_transfer_audio
+from ..file_io import atomic_writer
 from ..models import DawCommand, DawCommandResult, SessionContext
 
 
 log = logging.getLogger(__name__)
+_model_registry_lock = RLock()
+
+
+def _with_model_registry(method):
+    """The file-format library shares its object IDs across project instances."""
+    @wraps(method)
+    def locked(*args, **kwargs):
+        with _model_registry_lock:
+            return method(*args, **kwargs)
+    return locked
+
+
+def _save_template(source, root, output_path, project, additions, replace_existing):
+    """Append new tracks to the original XML, retaining template assets and routing."""
+    from lxml import etree
+
+    template = Path(source.filename)
+    with atomic_writer(output_path, binary=True, replace_existing=replace_existing) as stream:
+        # Relative external files in the template are relative to its original directory.
+        for item in root.iterfind(".//*[@path]"):
+            path = item.get("path")
+            if (item.get("external") in ("true", "1") and path and "://" not in path
+                    and not Path(path).is_absolute() and not PureWindowsPath(path).is_absolute()):
+                item.set("path", (template.parent / path).resolve().as_posix())
+
+        folders = {}
+
+        def index_tracks(elements, tracks):
+            for element, track in zip(elements, tracks, strict=True):
+                folders[track.id] = element
+                index_tracks(element.findall("Track"), track.tracks)
+
+        index_tracks(root.findall("Structure/Track"), (t for t in project.structure if hasattr(t, "tracks")))
+        arrangement = root.find("Arrangement")
+        if arrangement is None:
+            arrangement = etree.Element("Arrangement")
+            root.insert(root.index(root.find("Structure")) + 1, arrangement)
+        lanes = arrangement.find("Lanes")
+        if lanes is None:
+            lanes = etree.Element("Lanes", timeUnit="seconds")
+            arrangement.insert(0, lanes)
+        for folder, track, lane in additions:
+            element = folders[folder.id]
+            if folder.channel is not None:
+                element.find("Channel").set("id", folder.channel.id)
+            element.append(track.to_xml())
+            lanes.append(lane.to_xml())
+
+        with zipfile.ZipFile(stream, "w", allowZip64=True) as archive:
+            archive.comment = source.comment
+            archive.writestr("project.xml", etree.tostring(root, xml_declaration=True, encoding="UTF-8"))
+            if "metadata.xml" not in source.namelist():
+                archive.writestr("metadata.xml", "<MetaData/>")
+            for member in source.infolist():
+                if member.filename == "project.xml":
+                    continue
+                with source.open(member) as old, archive.open(member, "w") as new:
+                    shutil.copyfileobj(old, new)
 
 
 def _db_to_linear(db: float) -> float:
@@ -124,6 +187,7 @@ class DawProjectDawProcessor(DawProcessor):
             return False, "Template file is not a valid ZIP archive."
         return True, f"Template OK: {os.path.basename(self._template_path)}"
 
+    @_with_model_registry
     def fetch(
         self,
         session: SessionContext,
@@ -137,7 +201,7 @@ class DawProjectDawProcessor(DawProcessor):
         except ImportError as exc:
             raise RuntimeError(
                 "dawproject package not installed. "
-                "Install with: pip install dawproject"
+                "Install SessionPrep with its gui extra."
             ) from exc
 
         Referenceable.reset_id()
@@ -238,6 +302,7 @@ class DawProjectDawProcessor(DawProcessor):
         )
         return path if path else None
 
+    @_with_model_registry
     def transfer(
         self,
         session: SessionContext,
@@ -245,14 +310,11 @@ class DawProjectDawProcessor(DawProcessor):
         progress_cb=None,
         close_when_done: bool = True,
     ) -> list[DawCommandResult]:
+        if not session.daw_state.get(self.id, {}).get("assignments"):
+            return []
         try:
-            from dawproject import (
-                Arrangement, Audio, AutomationTarget, Channel,
-                Clips, ContentType, DawProject, ExpressionType,
-                FileReference, Lanes, MetaData, MixerRole, Points,
-                RealParameter, RealPoint, Referenceable, TimeUnit,
-                Track, Unit, Utility,
-            )
+            from dawproject import Project, Referenceable
+            from lxml import etree
         except ImportError:
             return [DawCommandResult(
                 command=DawCommand("transfer", "", {}),
@@ -260,29 +322,32 @@ class DawProjectDawProcessor(DawProcessor):
                 error="dawproject package not installed",
             )]
 
+        try:
+            template = zipfile.ZipFile(self._template_path)
+        except (OSError, zipfile.BadZipFile) as exc:
+            return [DawCommandResult(DawCommand("load_template", "", {}), False, str(exc))]
+        with template:
+            try:
+                root = etree.fromstring(template.read("project.xml"))
+                Referenceable.reset_id()
+                project = Project.from_xml(root)
+                # The template may contain device or automation IDs that the
+                # library does not deserialize. Reserve those IDs as well.
+                reserved = (n[2:] for n in root.xpath("//@id") if n.startswith("id") and n[2:].isdecimal())
+                Referenceable.ID = max(Referenceable.ID, max(map(int, reserved), default=-1) + 1)
+            except Exception as exc:
+                return [DawCommandResult(DawCommand("load_template", "", {}), False, f"Failed to load template: {exc}")]
+            return self._add_tracks(session, output_path, progress_cb, template, root, project)
+
+    def _add_tracks(self, session, output_path, progress_cb, template, root, project):
+        from dawproject import Audio, ContentType, FileReference, Lanes, MixerRole, TimeUnit, Utility
+
         dp_state = session.daw_state.get(self.id, {})
         assignments: dict[str, str] = dp_state.get("assignments", {})
         daw_folders = dp_state.get("folders", [])
         track_order = dp_state.get("track_order", {})
 
-        if not assignments:
-            return []
-
         results: list[DawCommandResult] = []
-
-        # ── Ensure output directory exists ────────────────────────
-        out_dir = os.path.dirname(output_path)
-        if out_dir:
-            os.makedirs(out_dir, exist_ok=True)
-
-        # ── Load template ─────────────────────────────────────────
-        Referenceable.reset_id()
-        try:
-            project = DawProject.load_project(self._template_path)
-        except Exception as e:
-            return [DawCommandResult(
-                command=DawCommand("load_template", "", {}),
-                success=False, error=f"Failed to load template: {e}")]
 
         # Build folder ID → Track object lookup from the loaded project
         folder_track_map: dict[str, Any] = {}
@@ -300,7 +365,7 @@ class DawProjectDawProcessor(DawProcessor):
         seen: set[str] = set()
         for fid, ordered_names in track_order.items():
             for eid in ordered_names:
-                if eid in assignments and assignments[eid] == fid:
+                if eid not in seen and assignments.get(eid) == fid:
                     work.append((eid, fid))
                     seen.add(eid)
         for eid, fid in sorted(assignments.items()):
@@ -311,12 +376,7 @@ class DawProjectDawProcessor(DawProcessor):
         if progress_cb:
             progress_cb(0, total, "Building DAWproject\u2026")
 
-        # ── Ensure arrangement exists ─────────────────────────────
-        if project.arrangement is None:
-            project.arrangement = Arrangement(
-                lanes=Lanes(time_unit=TimeUnit.SECONDS))
-        if project.arrangement.lanes is None:
-            project.arrangement.lanes = Lanes(time_unit=TimeUnit.SECONDS)
+        additions = []
 
         # ── Create tracks and clips ─────────────────────────────
         for step, (eid, fid) in enumerate(work):
@@ -328,7 +388,7 @@ class DawProjectDawProcessor(DawProcessor):
                 if entry else None
             )
 
-            if not folder_track or not entry or not out_tc:
+            if not folder_track or not folder_dict or not entry or not out_tc:
                 results.append(DawCommandResult(
                     command=DawCommand("add_track", eid,
                                        {"folder_id": fid}),
@@ -368,12 +428,6 @@ class DawProjectDawProcessor(DawProcessor):
             if folder_track.channel is not None:
                 new_track.channel.destination = folder_track.channel
 
-            # Add to folder's children
-            folder_track.tracks.append(new_track)
-
-            # Also add to project.structure top-level if not already
-            # (some DAWs expect all tracks at the structure level)
-
             # Create audio clip in arrangement
             audio = Audio(
                 time_unit=TimeUnit.SECONDS,
@@ -399,7 +453,7 @@ class DawProjectDawProcessor(DawProcessor):
                 time_unit=TimeUnit.SECONDS,
                 lanes=lane_contents,
             )
-            project.arrangement.lanes.lanes.append(track_lane)
+            additions.append((folder_track, new_track, track_lane))
 
             results.append(DawCommandResult(
                 command=DawCommand("add_track", eid,
@@ -417,17 +471,21 @@ class DawProjectDawProcessor(DawProcessor):
 
         # ── Save ──────────────────────────────────────────────────
         try:
-            metadata = DawProject.load_metadata(self._template_path)
-        except Exception:
-            metadata = MetaData()
-
-        try:
-            DawProject.save(project, metadata, {}, output_path)
+            path = Path(output_path)
+            if path.resolve() == Path(template.filename).resolve():
+                raise ValueError("Choose a different output path to preserve the DAWproject template.")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            _save_template(template, root, path, project, additions,
+                           replace_existing=not session.config.get("_batch_transfer", False))
             results.append(DawCommandResult(
                 command=DawCommand("save_project", output_path, {}),
                 success=True))
             log.info("DAWproject saved to %s", output_path)
         except Exception as e:
+            for result in results:
+                if result.success:
+                    result.success = False
+                    result.error = "Track could not be published because the project save failed."
             results.append(DawCommandResult(
                 command=DawCommand("save_project", output_path, {}),
                 success=False, error=f"Failed to save: {e}"))

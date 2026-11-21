@@ -105,6 +105,7 @@ jobs:
         if [[ "$DEBUG_BUILD" == "true" ]]; then build_args+=(--debug); fi
         uv run --frozen python packaging/github/build.py compile "${build_args[@]}"
         uv run --frozen python packaging/github/build.py package "${build_args[@]}" --output artifacts
+        uv run --frozen python packaging/github/smoke.py native --platform "$BUILD_PLATFORM" --version "$BUILD_VERSION"
     - name: Upload platform artifacts
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
       with:

@@ -8,7 +8,11 @@ the Python standard library.
 from __future__ import annotations
 
 import struct
+from collections.abc import Iterator
 from dataclasses import dataclass
+from typing import BinaryIO
+
+from .file_io import atomic_writer
 
 
 @dataclass
@@ -35,119 +39,66 @@ STANDARD_CHUNKS: frozenset[str] = frozenset({
 })
 
 
+def _container_header(stream: BinaryIO) -> tuple[str, str, int]:
+    header = stream.read(12)
+    if len(header) != 12:
+        raise ValueError("Truncated WAV/AIFF container header")
+    kind, form = header[:4], header[8:]
+    if kind == b"RIFF" and form == b"WAVE":
+        size_format = "<I"
+    elif kind == b"FORM" and form in (b"AIFF", b"AIFC"):
+        size_format = ">I"
+    else:
+        raise ValueError(f"Not a recognised WAV/AIFF container: {kind!r} / {form!r}")
+
+    end = struct.unpack(size_format, header[4:8])[0] + 8
+    if end < 12 or end > stream.seek(0, 2):
+        raise ValueError("Invalid WAV/AIFF container length")
+    return form.decode("ascii"), size_format, end
+
+
+def _chunk_headers(stream: BinaryIO, size_format: str, end: int) -> Iterator[tuple[str, int]]:
+    """Yield ID and size with the stream positioned at each payload."""
+    pos = 12
+    while pos < end:
+        stream.seek(pos)
+        header = stream.read(8)
+        if pos + 8 > end or len(header) != 8:
+            raise ValueError("Truncated WAV/AIFF chunk header")
+        name = header[:4].decode("ascii", errors="replace")
+        size = struct.unpack(size_format, header[4:])[0]
+        pos += 8 + size
+        if pos > end:
+            raise ValueError(f"Truncated {name!r} chunk payload")
+        yield name, size
+        # An odd payload is padded before the next header. Some PCM writers
+        # omit the final pad and declare a container ending at the last sample.
+        pos += size % 2
+
+
+def chunk_sizes(filepath: str) -> list[tuple[str, int]]:
+    """Read ordered chunk IDs and payload sizes without loading PCM or metadata."""
+    with open(filepath, "rb") as stream:
+        _, size_format, end = _container_header(stream)
+        return list(_chunk_headers(stream, size_format, end))
+
+
 def chunk_ids(filepath: str) -> list[str]:
-    """Return the chunk ID strings found in a WAV or AIFF file.
-
-    This is a lightweight scan that only reads chunk headers (8 bytes
-    each) and seeks past the payload data.  No chunk data is loaded
-    into memory, making it suitable for bulk scanning during session
-    loading.
-
-    Parameters
-    ----------
-    filepath : str
-        Path to a WAV (``.wav``) or AIFF (``.aif`` / ``.aiff``) file.
-
-    Returns
-    -------
-    list[str]
-        Ordered list of chunk IDs as they appear in the file.
-
-    Raises
-    ------
-    ValueError
-        If the file is not a recognised RIFF or IFF container.
-    """
-    ids: list[str] = []
-    with open(filepath, "rb") as f:
-        header = f.read(12)
-        if len(header) < 12:
-            return ids
-
-        container_id = header[:4]
-        form_type = header[8:12]
-
-        if container_id == b"RIFF" and form_type == b"WAVE":
-            size_fmt = "<I"  # little-endian
-        elif container_id == b"FORM" and form_type in (b"AIFF", b"AIFC"):
-            size_fmt = ">I"  # big-endian
-        else:
-            raise ValueError(
-                f"Not a recognised WAV/AIFF container: "
-                f"{container_id!r} / {form_type!r}"
-            )
-
-        container_end = struct.unpack(size_fmt, header[4:8])[0] + 8
-        pos = 12
-
-        while pos + 8 <= container_end:
-            f.seek(pos)
-            chunk_header = f.read(8)
-            if len(chunk_header) < 8:
-                break
-            chunk_id = chunk_header[:4].decode("ascii", errors="replace")
-            chunk_size = struct.unpack(size_fmt, chunk_header[4:8])[0]
-            ids.append(chunk_id)
-            # Advance past chunk data; chunks are padded to even boundaries
-            pos += 8 + chunk_size
-            if chunk_size % 2:
-                pos += 1
-
-    return ids
+    """Return chunk IDs in file order without reading the payloads."""
+    return [name for name, _ in chunk_sizes(filepath)]
 
 
 def read_chunks(filepath: str) -> tuple[str, list[AudioChunk]]:
-    """Read all chunks from a WAV or AIFF file, including payload data.
-
-    Parameters
-    ----------
-    filepath : str
-        Path to the audio file.
-
-    Returns
-    -------
-    tuple[str, list[AudioChunk]]
-        ``(container_format, chunks)`` where *container_format* is one
-        of ``"WAVE"``, ``"AIFF"``, or ``"AIFC"``.
-    """
+    """Read a complete WAVE, AIFF or AIFC container, including chunk payloads."""
     chunks: list[AudioChunk] = []
-    with open(filepath, "rb") as f:
-        header = f.read(12)
-        if len(header) < 12:
-            return ("WAVE", chunks)
-
-        container_id = header[:4]
-        form_type = header[8:12]
-
-        if container_id == b"RIFF" and form_type == b"WAVE":
-            size_fmt = "<I"
-            container = "WAVE"
-        elif container_id == b"FORM" and form_type in (b"AIFF", b"AIFC"):
-            size_fmt = ">I"
-            container = form_type.decode("ascii")
-        else:
-            raise ValueError(
-                f"Not a recognised WAV/AIFF container: "
-                f"{container_id!r} / {form_type!r}"
-            )
-
-        container_end = struct.unpack(size_fmt, header[4:8])[0] + 8
-        pos = 12
-
-        while pos + 8 <= container_end:
-            f.seek(pos)
-            chunk_header = f.read(8)
-            if len(chunk_header) < 8:
-                break
-            chunk_id = chunk_header[:4].decode("ascii", errors="replace")
-            chunk_size = struct.unpack(size_fmt, chunk_header[4:8])[0]
-            data = f.read(chunk_size)
-            chunks.append(AudioChunk(id=chunk_id, size=chunk_size, data=data))
-            pos += 8 + chunk_size
-            if chunk_size % 2:
-                pos += 1
-
-    return (container, chunks)
+    with open(filepath, "rb") as stream:
+        container, size_format, end = _container_header(stream)
+        for name, size in _chunk_headers(stream, size_format, end):
+            data = stream.read(size)
+            if len(data) != size:
+                raise ValueError(f"Truncated {name!r} chunk payload")
+            chunks.append(AudioChunk(id=name, size=size, data=data))
+    return container, chunks
 
 
 def write_chunks(
@@ -186,7 +137,7 @@ def write_chunks(
         if len(ch.data) % 2:
             data_size += 1
 
-    with open(filepath, "wb") as f:
+    with atomic_writer(filepath, binary=True) as f:
         f.write(container_id)
         f.write(struct.pack(size_fmt, data_size))
         f.write(form_type)
@@ -215,8 +166,8 @@ def remove_chunks(
     src : str
         Source audio file path.
     dst : str
-        Destination audio file path (may be the same as *src* but this
-        is discouraged — write to a temp file first for safety).
+        Destination audio file path. An in-place edit replaces the source only
+        after the complete edited container has been written successfully.
     remove_ids : set[str]
         Chunk IDs to strip (e.g. ``{"iXML", "JUNK"}``).
     """
@@ -251,42 +202,12 @@ def _read_bext_originator(filepath: str) -> str | None:
         bytes   0–255: Description (256 bytes)
         bytes 256–287: Originator (32 bytes ASCII)
     """
-    with open(filepath, "rb") as f:
-        header = f.read(12)
-        if len(header) < 12:
-            return None
-
-        container_id = header[:4]
-        form_type = header[8:12]
-
-        if container_id == b"RIFF" and form_type == b"WAVE":
-            size_fmt = "<I"
-        elif container_id == b"FORM" and form_type in (b"AIFF", b"AIFC"):
-            size_fmt = ">I"
-        else:
-            return None
-
-        container_end = struct.unpack(size_fmt, header[4:8])[0] + 8
-        pos = 12
-
-        while pos + 8 <= container_end:
-            f.seek(pos)
-            chunk_header = f.read(8)
-            if len(chunk_header) < 8:
-                break
-            chunk_id = chunk_header[:4]
-            chunk_size = struct.unpack(size_fmt, chunk_header[4:8])[0]
-
-            if chunk_id == b"bext" and chunk_size >= 288:
-                # Skip 256-byte description, read 32-byte originator
-                f.seek(pos + 8 + 256)
-                originator = f.read(32)
-                return originator.decode("ascii", errors="replace").strip("\x00").strip()
-
-            pos += 8 + chunk_size
-            if chunk_size % 2:
-                pos += 1
-
+    with open(filepath, "rb") as stream:
+        _, size_format, end = _container_header(stream)
+        for name, size in _chunk_headers(stream, size_format, end):
+            if name == "bext" and size >= 288:
+                stream.seek(256, 1)
+                return stream.read(32).decode("ascii", errors="replace").strip("\x00").strip()
     return None
 
 
@@ -316,7 +237,7 @@ def detect_origin(
             originator = _read_bext_originator(filepath)
             if originator:
                 return originator
-        except OSError:
+        except (OSError, ValueError):
             pass
 
     return None

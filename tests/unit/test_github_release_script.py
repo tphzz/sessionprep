@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import runpy
 import shlex
 import os
 import shutil
@@ -270,20 +272,46 @@ def test_release_script_replaces_branch_drafts_and_uploads_to_new_release_id(tmp
     prior = [owned_release(101), owned_release(102),
              dict(id=103, draft=True, tag_name="1.2.3", body="another branch")]
     state, environment = write_release_server(tmp_path, prior)
-    artifact_root = tmp_path / "artifacts"
-    artifact_root.mkdir()
-    (artifact_root / "example-1.2.3+build.pkg").write_bytes(b"pkg")
-    (artifact_root / "example-1.2.3.dmg").write_bytes(b"dmg")
-    allowlist = write_allowlist(tmp_path / "allowlist.txt", "example-*")
-    result = run_script(tmp_path, *publish_args(tmp_path, artifact_root, allowlist), extra_env=environment)
+    build = runpy.run_path(str(ROOT / "packaging/github/build.py"))
+    version = "1.2.3+build"
+    sources = tmp_path / "platforms"
+    expected = {}
+    for platform in ("linux-x64", "linux-arm64", "macos-arm64", "macos-x64",
+                     "win-x64", "win-arm64", "win-universal"):
+        directory = sources / f"sessionprep-{platform}-release"
+        directory.mkdir(parents=True)
+        suffixes = {"linux": ("tar.gz", "rpm", "deb"), "macos": ("dmg",),
+                    "win": ("exe",)}[platform.split("-")[0]]
+        for suffix in suffixes:
+            member = directory / f"sessionprep-{version}-{platform}.{suffix}"
+            member.write_bytes(hashlib.sha256(member.name.encode()).digest())
+        build["write_manifest"](directory, platform, version, "deadbeef", False)
+        if platform not in ("win-x64", "win-arm64"):
+            expected.update(json.loads((directory / "build-manifest.json").read_text())["files"])
+    collected = tmp_path / "collected"
+    build["collect"](sources, collected, version, "deadbeef")
+    allowlist = write_allowlist(tmp_path / "allowlist.txt", "sessionprep-*")
+    result = run_script(tmp_path, *publish_args(tmp_path, collected, allowlist), extra_env=environment)
     assert result.returncode == 0, result.stderr + result.stdout
     final = json.loads(state.read_text())
     assert final["deleted"] == [101, 102]
     assert final["releases"]["999"]["draft"] is True
     assert final["releases"]["999"]["prerelease"] is True
     assert final["releases"]["999"]["tag_name"].startswith("branch-build-feature-release-test-")
-    assert {a["name"] for a in final["assets"]} == {"example-1.2.3+build.pkg", "example-1.2.3.dmg"}
     assert "Draft release ready: id=999" in result.stdout
+    assert len(expected) == 9
+    assert {a["name"]: a["digest"].removeprefix("sha256:") for a in final["assets"]} == expected
+
+
+def test_equal_size_substitution_keeps_the_prior_branch_draft(tmp_path):
+    state, environment = write_release_server(tmp_path, [owned_release(101)],
+                                              upload_events=[{"status": 201, "substitute": True}])
+    artifacts, allowlist = publication_fixture(tmp_path)
+    result = run_script(tmp_path, *publish_args(tmp_path, artifacts, allowlist), extra_env=environment)
+    assert result.returncode != 0
+    final = json.loads(state.read_text())
+    assert "101" in final["releases"] and "999" not in final["releases"]
+    assert "digest" in result.stderr.lower()
 
 
 @pytest.mark.parametrize(
@@ -444,7 +472,7 @@ def write_release_server(tmp_path, releases, **settings):
     state.write_text(json.dumps(dict(releases={str(r["id"]):r for r in releases}, deleted=[], assets=[],
                                      upload_attempts=[], deleted_assets=[], **settings)))
     server=tmp_path/"api-server.py"
-    server.write_text(r"""import json,sys,re
+    server.write_text(r"""import hashlib,json,sys,re
 from pathlib import Path
 from urllib.parse import urlparse,parse_qs
 state=Path(sys.argv[1]); tool=sys.argv[2]; args=sys.argv[3:]
@@ -466,8 +494,11 @@ if tool=='curl':
     status=event.get('status', 201)
     asset_state=event.get('state', 'uploaded' if status == 201 else None)
     if asset_state:
-        size=event.get('size', 0 if asset_state == 'starter' else Path(source).stat().st_size)
+        payload=Path(source).read_bytes()
+        if event.get('substitute'): payload=bytes(byte ^ 1 for byte in payload)
+        size=event.get('size', 0 if asset_state == 'starter' else len(payload))
         data['assets'].append(dict(id=2000+len(data['upload_attempts']), name=name, size=size, state=asset_state,
+                                   digest='sha256:'+hashlib.sha256(payload).hexdigest(),
                                    visible_after=event.get('visible_after', 0)))
     if event.get('publish_draft'):
         data['releases']['999']['draft']=False

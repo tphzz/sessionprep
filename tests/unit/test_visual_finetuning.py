@@ -209,7 +209,7 @@ def _normalized_session(classification="Sustained", method="RMS → -16 dB", **d
 
 
 def test_summary_and_file_rows_use_four_pixel_padding_and_32_px_lines(monkeypatch):
-    monkeypatch.setattr(report, "read_chunks", lambda path: ("WAVE", []))
+    monkeypatch.setattr(report, "chunk_sizes", lambda path: [])
     summary = {"problems": [{"title": "Clipping", "hint": None, "items": ["Kick.wav"]}],
                "attention": [], "information": [], "clean": [],
                "clean_count": 0, "total_ok": 1, "overview": {}}
@@ -228,7 +228,7 @@ def test_summary_and_file_rows_use_four_pixel_padding_and_32_px_lines(monkeypatc
 
 
 def test_file_title_and_sections_use_shared_roles(monkeypatch):
-    monkeypatch.setattr(report, "read_chunks", lambda path: ("WAVE", []))
+    monkeypatch.setattr(report, "chunk_sizes", lambda path: [])
     _processor, track, session = _normalized_session()
     data = prepare_track_report(track, session)
     html = render_prepared_track_report(data)
@@ -241,7 +241,7 @@ def test_file_title_and_sections_use_shared_roles(monkeypatch):
 def test_report_browser_keeps_heading_roles_and_finding_body_size(qapp, monkeypatch):
     from sessionprepgui.detail.browser import ReportBrowser
 
-    monkeypatch.setattr(report, "read_chunks", lambda path: ("WAVE", []))
+    monkeypatch.setattr(report, "chunk_sizes", lambda path: [])
     _processor, track, session = _normalized_session()
     browser = ReportBrowser({})
     browser.present_track(track, session)
@@ -271,7 +271,7 @@ def test_normalization_names_the_chosen_measure_in_text():
     for value in ("&minus;15.0 dBFS", "&minus;6.0 dBFS", "+9.0 dB", "&minus;21.0 dBFS", "&minus;16.0 dBFS", "+5.0 dB"):
         assert value in html
     assert "background-color:#2d2d2d" in html  # findings-table header band
-    assert "Fader rebalanced: +2.0 dB shift &rarr; fader offset &minus;3.0 dB" in html
+    assert "Fader rebalanced: &minus;2.0 dB shift &rarr; fader offset &minus;3.0 dB" in html
     assert "#cc8844" not in html and "#44cc44" not in html
     assert 'color:#44cccc; font-weight:600;">Chosen' in html
 
@@ -304,7 +304,7 @@ def test_compact_normalization_uses_percentage_columns_and_note_under_measure(mo
     assert 'table width="100%"' in html
     assert 'width="30%"' in html and 'width="150"' not in html
     assert re.search(r"Peak<br><span[^>]*>Chosen &middot; limiting", html)
-    monkeypatch.setattr(report, "read_chunks", lambda path: ("WAVE", []))
+    monkeypatch.setattr(report, "chunk_sizes", lambda path: [])
     _processor, track, session = _normalized_session(method="Peak Limited")
     data = prepare_track_report(track, session)
     assert 'width="100%"' in data["header_compact"] and 'width="100%"' not in data["header"]
@@ -346,7 +346,7 @@ def test_legacy_processor_without_compact_keeps_the_file_report(monkeypatch):
         def render_html(self, result, track=None, *, verbose=False):  # pre-compact signature
             return "<div>LEGACY</div>"
 
-    monkeypatch.setattr(report, "read_chunks", lambda path: ("WAVE", []))
+    monkeypatch.setattr(report, "chunk_sizes", lambda path: [])
     processor = Legacy()
     processor.configure({})
     assert isinstance(processor, AudioProcessor)
@@ -357,7 +357,7 @@ def test_legacy_processor_without_compact_keeps_the_file_report(monkeypatch):
 
 
 def test_group_line_uses_metadata_role(monkeypatch):
-    monkeypatch.setattr(report, "read_chunks", lambda path: ("WAVE", []))
+    monkeypatch.setattr(report, "chunk_sizes", lambda path: [])
     _processor, track, session = _normalized_session()
     track.group = "Vox"
     data = prepare_track_report(track, session)
@@ -366,7 +366,7 @@ def test_group_line_uses_metadata_role(monkeypatch):
 
 def test_section_tables_carry_the_heading_gap(monkeypatch):
     # Qt drops a heading's bottom margin before a table, so tables carry 8 px.
-    monkeypatch.setattr(report, "read_chunks", lambda path: ("WAVE", []))
+    monkeypatch.setattr(report, "chunk_sizes", lambda path: [])
     summary = {"problems": [{"title": "Clipping", "hint": None, "items": ["Kick.wav"]}],
                "attention": [], "information": [], "clean": [],
                "clean_count": 0, "total_ok": 1, "overview": {}}
@@ -380,7 +380,7 @@ def test_section_tables_carry_the_heading_gap(monkeypatch):
 def test_report_browser_gap_below_findings_heading(qapp, monkeypatch):
     from sessionprepgui.detail.browser import ReportBrowser
 
-    monkeypatch.setattr(report, "read_chunks", lambda path: ("WAVE", []))
+    monkeypatch.setattr(report, "chunk_sizes", lambda path: [])
     _processor, track, session = _normalized_session()
     browser = ReportBrowser({})
     browser.resize(1000, 700)
@@ -395,7 +395,7 @@ def test_report_browser_gap_below_findings_heading(qapp, monkeypatch):
 
 
 def test_sample_ranges_stay_together_and_compact_details_align(monkeypatch):
-    monkeypatch.setattr(report, "read_chunks", lambda path: ("WAVE", []))
+    monkeypatch.setattr(report, "chunk_sizes", lambda path: [])
     _processor, track, session = _normalized_session()
     track.detector_results["clipping"].data["ranges"] = [(1000, 1004, 0)]
     data = prepare_track_report(track, session)
@@ -435,7 +435,7 @@ def test_large_report_fonts_switch_to_compact_instead_of_scrolling(qapp, monkeyp
     from PySide6.QtGui import QFont
     from sessionprepgui.detail.browser import ReportBrowser
 
-    monkeypatch.setattr(report, "read_chunks", lambda path: ("WAVE", []))
+    monkeypatch.setattr(report, "chunk_sizes", lambda path: [])
     _processor, track, session = _normalized_session(method="Peak Limited")
     browser = ReportBrowser({})
     browser.resize(900, 600)
@@ -463,7 +463,7 @@ def test_large_report_fonts_switch_to_compact_instead_of_scrolling(qapp, monkeyp
 def test_normal_report_font_keeps_the_wide_layout_at_900_px(qapp, monkeypatch):
     from sessionprepgui.detail.browser import ReportBrowser
 
-    monkeypatch.setattr(report, "read_chunks", lambda path: ("WAVE", []))
+    monkeypatch.setattr(report, "chunk_sizes", lambda path: [])
     _processor, track, session = _normalized_session()
     browser = ReportBrowser({})
     browser.resize(900, 600)

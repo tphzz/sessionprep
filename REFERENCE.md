@@ -395,6 +395,12 @@ The anchor is then used to:
 In execute mode (`-x/--execute`), based on the analysis, SessionPrep writes a
 COPY of your audio to a `processed/` folder.
 
+With `--overwrite` and a backup directory, keep each backup WAV together with
+its adjacent `.sessionprep-backup.json` file. The receipt lets later runs verify the
+first-generation copy and the current source. An older backup with identical
+bytes can be adopted. If the files differ and there is no receipt, choose a
+fresh backup directory to preserve both versions.
+
 It applies a specific gain amount to put tracks into a predictable starting
 range (default `--target_rms -18` for sustained material or `--target_peak -6`
 for transient material). This primarily affects the level feeding the first
@@ -428,6 +434,15 @@ When several normalized sources share an output, they must share a DAW fader off
 
 The script calculates the inverse fader offsets for the gain applied in Stage C.
 Applying those offsets restores the producer's rough-mix balance exactly.
+
+Linked tracks use the lowest individual gain among the active members.
+Headroom can shift all eligible faders down together. A named anchor then
+shifts them together again so the first matching active track reads 0 dB.
+This anchor takes priority over the headroom target. Other faders can end
+up above the DAW's maximum when the anchor requires a large upward shift.
+Changing a group recalculates these offsets from its current members.
+In the normalization comparison, targets and measurements use the same
+selected dBFS convention. Switching the display convention preserves the audio gain.
 
 Example:
   - Input: A quiet synth pad (-24 dB).

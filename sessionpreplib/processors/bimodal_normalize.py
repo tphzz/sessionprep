@@ -189,11 +189,11 @@ class BimodalNormalizeProcessor(AudioProcessor):
         rms_active = not is_transient and not is_peak_limited
 
         if is_peak_limited:
-            method = f"Peak (limited) &rarr; {minus(f'{tgt_peak:.1f}')} dBFS"
+            method = f"Peak (limited) &rarr; {fmt_abs(tgt_peak)} dBFS"
         elif is_transient:
-            method = f"Peak &rarr; {minus(f'{tgt_peak:.1f}')} dBFS"
+            method = f"Peak &rarr; {fmt_abs(tgt_peak)} dBFS"
         else:
-            method = f"RMS &rarr; {minus(f'{tgt_rms:.1f}')} dBFS"
+            method = f"RMS &rarr; {fmt_abs(tgt_rms)} dBFS"
 
         # --- Summary line ---
         html = (
@@ -225,9 +225,9 @@ class BimodalNormalizeProcessor(AudioProcessor):
                 f'<td{width} style="{cell} white-space:nowrap; color:{text};{weight}">{value}</td>'
                 for value, width in zip(values, width_attrs))
 
-        peak_values = (f"{fmt_abs(det_peak)} dBFS", f"{minus(f'{tgt_peak:.1f}')} dBFS",
+        peak_values = (f"{fmt_abs(det_peak)} dBFS", f"{fmt_abs(tgt_peak)} dBFS",
                        f"{fmt_rel(gain_for_peak)} dB")
-        rms_values = (f"{fmt_abs(det_rms)} dBFS", f"{minus(f'{tgt_rms:.1f}')} dBFS",
+        rms_values = (f"{fmt_abs(det_rms)} dBFS", f"{fmt_abs(tgt_rms)} dBFS",
                       f"{fmt_rel(gain_for_rms)} dB")
         if narrow:
             header = (f'<td style="{head}">Measure<br>'
@@ -277,7 +277,7 @@ class BimodalNormalizeProcessor(AudioProcessor):
             fader_off = d.get("fader_offset", 0.0)
             html += (
                 f'<div style="margin-top:8px; color:{metadata};">'
-                f'Fader rebalanced: {minus(f"{rebalance:+.1f}")} dB shift'
+                f'Fader rebalanced: {fmt_rel(-rebalance)} dB shift'
                 f' &rarr; fader offset {minus(f"{fader_off:+.1f}")} dB'
                 f'</div>'
             )

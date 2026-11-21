@@ -43,6 +43,59 @@ def run_cli(directory, *args):
                           env=env, capture_output=True, encoding="utf-8", timeout=60)
 
 
+@pytest.mark.parametrize("interruption", ["encoder", "cancel"])
+def test_partial_prepare_rejects_transfer_until_retry(tmp_path, monkeypatch, interruption):
+    import sessionpreplib.pipeline as pipeline_module
+
+    signal = np.array([0.25, -0.125, 0.5])
+    tracks = [source_track(tmp_path, name, signal * level) for name, level in [("A.wav", 1), ("B.wav", 0.5)]]
+    config = {"_use_processed": True}
+    pipeline = Pipeline([], [], config)
+    session = SessionContext(tracks, config)
+    dest = tmp_path / "prepared"
+    pipeline.prepare(session, str(dest))
+    assert session.prepare_state == "ready"
+    originals = {Path(t.filepath): Path(t.filepath).read_bytes() for t in tracks}
+    prior = {t.filename: (dest / t.filename).read_bytes() for t in tracks}
+    sentinel = dest / "unowned.wav"
+    sentinel.write_bytes(b"keep this")
+    for track in tracks:
+        track.manual_gain_db = -6.020599913279624
+    write = pipeline_module._write_atomic
+
+    def fail_encoder(path, *args, **kwargs):
+        if path.name == "B.wav":
+            raise OSError("encoder stopped")
+        return write(path, *args, **kwargs)
+
+    def cancel_before_second(_step, _total, label):
+        if label == "Writing B.wav":
+            raise InterruptedError("cancelled between outputs")
+
+    if interruption == "encoder":
+        with monkeypatch.context() as fault:
+            fault.setattr(pipeline_module, "_write_atomic", fail_encoder)
+            pipeline.prepare(session, str(dest))
+        assert session.config["_prepared_files"] == ["A.wav"]
+        assert session.config["_prepare_errors"] == [("B.wav", "encoder stopped")]
+    else:
+        with pytest.raises(InterruptedError):
+            pipeline.prepare(session, str(dest), progress_cb=cancel_before_second)
+    assert session.prepare_state == "stale"
+    for output in session.output_tracks:
+        with pytest.raises(ValueError, match="out of date"):
+            resolve_transfer_audio(session, output)
+    assert (dest / "A.wav").read_bytes() != prior["A.wav"]
+    assert (dest / "B.wav").read_bytes() == prior["B.wav"]
+    pipeline.prepare(session, str(dest))
+    assert session.prepare_state == "ready"
+    for track, level in zip(session.output_tracks, [1, 0.5], strict=True):
+        published = resolve_transfer_audio(session, track)
+        np.testing.assert_array_equal(sf.read(published.filepath)[0], signal * level * 0.5)
+    assert sentinel.read_bytes() == b"keep this"
+    assert {path: path.read_bytes() for path in originals} == originals
+
+
 def test_default_plan_uses_existing_gain_and_audio_even_for_flagged_material(tmp_path):
     rate = 96000
     time = np.arange(2 * rate) / rate
