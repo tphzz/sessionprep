@@ -2,13 +2,14 @@
 from dataclasses import asdict, replace
 import os
 from pathlib import Path
+import time
 
 import numpy as np
 import pytest
 import soundfile as sf
 from scipy.signal import periodogram
 
-from sessionpreplib.audio import load_track
+from sessionpreplib.audio import file_revision, load_track
 from sessionpreplib.detector import TrackDetector
 from sessionpreplib.detectors import ClippingDetector, default_detectors
 from sessionpreplib.models import DetectorResult, SessionContext, Severity
@@ -16,6 +17,22 @@ from sessionpreplib.pipeline import Pipeline
 from sessionpreplib.processors import default_processors
 from sessionpreplib.repairs import RepairRecipe, render_corrected
 from sessionpreplib.topology import TopologyEntry, TopologyMapping, TopologySource, extract_channel
+
+
+def _rewrite_same_stamp(path: Path, write_fn) -> None:
+    """Rewrite *path* in place with identical mtime after its filesystem revision tick advances."""
+    stat = path.stat()
+    before_rev = file_revision(str(path), stat)
+    deadline = time.monotonic() + 1.0
+    while True:
+        write_fn()
+        os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+        updated = path.stat()
+        if file_revision(str(path), updated) != before_rev:
+            assert (updated.st_size, updated.st_mtime_ns) == (stat.st_size, stat.st_mtime_ns)
+            return
+        assert time.monotonic() < deadline, f"file_revision did not advance for {path}"
+        time.sleep(0.005)
 
 
 def _plan(tmp_path, audio, rate, choices, *, config=None, manual_gain_db=None):
@@ -192,11 +209,7 @@ def test_changed_samples_cannot_reuse_either_sources_peak_reading(tmp_path, chan
 
     if change == "same-stat-file-replacement":
         path = Path(track.filepath)
-        stat = path.stat()
-        sf.write(path, audio * 0.1, rate, subtype="DOUBLE")
-        os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
-        updated = path.stat()
-        assert (updated.st_size, updated.st_mtime_ns) == (stat.st_size, stat.st_mtime_ns)
+        _rewrite_same_stamp(path, lambda: sf.write(path, audio * 0.1, rate, subtype="DOUBLE"))
         track.audio_data = None
     else:
         track.audio_data *= 0.1
@@ -222,11 +235,10 @@ def test_prepare_rejects_source_replaced_between_signature_check_and_read(tmp_pa
     source = 0.2 * np.sin(2 * np.pi * 440 * np.arange(rate) / rate)
     track = _plan(tmp_path, source, rate, {"dc_remove": True})
     track.audio_data = None
-    stat = Path(track.filepath).stat()
 
     def replace_then_load(path):
-        sf.write(path, 4 * source, rate, subtype="DOUBLE")
-        os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+        target = Path(path)
+        _rewrite_same_stamp(target, lambda: sf.write(target, 4 * source, rate, subtype="DOUBLE"))
         return load_track(path)
 
     monkeypatch.setattr("sessionpreplib.repair_plan.load_track", replace_then_load)

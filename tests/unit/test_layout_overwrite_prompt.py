@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import replace
 import os
 from pathlib import Path
+import time
 
 import numpy as np
 from PySide6.QtCore import QSizeF, Qt
@@ -40,6 +41,18 @@ def _write_wav(path: Path, value: float, *, channels: int = 1, sr: int = 48000) 
     path.parent.mkdir(parents=True, exist_ok=True)
     data = np.full((256, channels) if channels > 1 else 256, value, dtype=np.float64)
     sf.write(path, data, sr, subtype="PCM_24")
+
+
+def _rewrite_past_revision_tick(path: Path, write_fn) -> None:
+    """Rewrite *path* in place until its filesystem revision advances past a coarse clock tick."""
+    before_rev = file_revision(str(path), path.stat())
+    deadline = time.monotonic() + 1.0
+    while True:
+        write_fn()
+        if file_revision(str(path), path.stat()) != before_rev:
+            return
+        assert time.monotonic() < deadline, f"file_revision did not advance for {path}"
+        time.sleep(0.005)
 
 
 def _wait_until(qapp, predicate, *, timeout_ms: int = 5000) -> None:
@@ -100,7 +113,7 @@ def test_publish_refuses_if_confirmed_unverified_file_changed_before_commit(tmp_
     confirmed = find_unverified_layout_files(layout, ["01_Kick.wav"], [])
 
     # Simulate external edit while user is deciding or worker is rendering
-    _write_wav(existing, 0.625, sr=44100)
+    _rewrite_past_revision_tick(existing, lambda: _write_wav(existing, 0.625, sr=44100))
     modified_bytes = existing.read_bytes()
 
     _write_wav(stage / "01_Kick.wav", 0.5)
@@ -467,8 +480,9 @@ def test_gui_overwrite_refuses_if_file_changes_while_prompt_is_open(
         _wait_until(qapp, lambda: window.status_prompt.is_active)
 
         # Modify the conflicting file externally while the prompt is open
-        _write_wav(layout_dir / "01_Kick.wav", 0.65, sr=44100)
-        modified_bytes = (layout_dir / "01_Kick.wav").read_bytes()
+        target = layout_dir / "01_Kick.wav"
+        _rewrite_past_revision_tick(target, lambda: _write_wav(target, 0.65, sr=44100))
+        modified_bytes = target.read_bytes()
 
         window.status_prompt.widget.accept_btn.click()
         _wait_until(qapp, lambda: window.topology_controller.apply_worker is None)

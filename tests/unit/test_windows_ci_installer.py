@@ -1,6 +1,7 @@
 import importlib.util
 import json
 from pathlib import Path
+import sys
 import zipfile
 
 import pytest
@@ -45,6 +46,8 @@ def test_pe_machine_check_distinguishes_x64_and_arm64(tmp_path):
 
 @pytest.mark.parametrize("architecture", ["x64", "arm64", "universal"])
 def test_inno_compiles_native_and_adaptive_definitions(tmp_path, architecture):
+    if sys.platform != "win32":
+        pytest.skip("Inno Setup compiler is only available on Windows")
     try:
         installer.resolve_iscc()
     except ValueError as error:

@@ -1,6 +1,7 @@
 """Regression coverage for repair source identity, encoding and output retirement."""
 import math
 import os
+import time
 from dataclasses import replace
 
 import numpy as np
@@ -8,11 +9,27 @@ import pytest
 import soundfile as sf
 
 from sessionpreplib import repair_plan
-from sessionpreplib.audio import load_track
+from sessionpreplib.audio import file_revision, load_track
 from sessionpreplib.models import SessionContext
 from sessionpreplib.pipeline import Pipeline
 from sessionpreplib.repairs import OutputHeadroomError, RepairRecipe, check_output_headroom
 from sessionpreplib.topology import ChannelRoute, TopologyEntry, TopologySource, build_default_topology
+
+
+def _rewrite_same_stamp(path, write_fn):
+    """Rewrite *path* in place with identical mtime after its filesystem revision tick advances."""
+    stamp = path.stat()
+    before_rev = file_revision(str(path), stamp)
+    deadline = time.monotonic() + 1.0
+    while True:
+        write_fn()
+        os.utime(path, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+        after = path.stat()
+        if file_revision(str(path), after) != before_rev:
+            assert after.st_size == stamp.st_size
+            return
+        assert time.monotonic() < deadline, f"file_revision did not advance for {path}"
+        time.sleep(0.005)
 
 
 def source_session(tmp_path, subtype="PCM_16"):
@@ -288,10 +305,10 @@ def test_retire_only_an_owned_unchanged_output(tmp_path, state):
     if state == "replaced":
         sf.write(retired, [0.25, -0.125], 48000, subtype="PCM_16")
     elif state == "same_stamp":
-        stamp = retired.stat()
-        sf.write(retired, -track.audio_data, track.samplerate, subtype=track.subtype)
-        os.utime(retired, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
-        assert retired.stat().st_size == stamp.st_size
+        _rewrite_same_stamp(
+            retired,
+            lambda: sf.write(retired, -track.audio_data, track.samplerate, subtype=track.subtype),
+        )
     elif state == "unverified":
         session.output_tracks[0].prepared_file_signature = None
     elif state == "input":
@@ -326,11 +343,9 @@ def test_transfer_rejects_same_length_substitution_after_reopen(tmp_path, prepar
     media = load_session(str(project))["output_tracks"][0]
     session.config["_use_processed"] = prepared
     path = Path(resolve_transfer_audio(session, media).filepath)
-    stamp = path.stat()
     samples, sr = sf.read(path)
-    sf.write(path, -samples, sr, subtype=sf.info(path).subtype)
-    os.utime(path, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
-    assert path.stat().st_size == stamp.st_size
+    subtype = sf.info(path).subtype
+    _rewrite_same_stamp(path, lambda: sf.write(path, -samples, sr, subtype=subtype))
     with pytest.raises(ValueError, match="changed"):
         resolve_transfer_audio(session, media)
     pipeline.prepare(session, str(output))
