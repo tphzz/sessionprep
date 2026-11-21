@@ -13,11 +13,11 @@ from typing import Any, Protocol, runtime_checkable
 from collections.abc import Callable
 
 from PySide6.QtCore import QEvent, QPoint, QRect, QSize, Qt, Signal
-from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap
+from PySide6.QtGui import QIcon, QPainter, QPixmap
 
 from ..controls import FormActionButton, FormBrowseButton, FormDoubleSpinBox, FormSpinBox
 from ..icons import icon
-from ..theme import CONTENT_INSET
+from ..theme import CONTENT_INSET, argb_to_qcolor as _argb_to_qcolor
 from PySide6.QtWidgets import (
     QAbstractSpinBox,
     QCheckBox,
@@ -70,14 +70,6 @@ class PathPickerMode(enum.Enum):
 # ---------------------------------------------------------------------------
 # ARGB / color helpers
 # ---------------------------------------------------------------------------
-
-def _argb_to_qcolor(argb: str) -> QColor:
-    """Parse a ``#AARRGGBB`` hex string into a QColor."""
-    s = argb.lstrip("#")
-    if len(s) == 8:
-        a, r, g, b = int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16), int(s[6:8], 16)
-        return QColor(r, g, b, a)
-    return QColor(argb)
 
 
 def _color_swatch_icon(argb: str, size: int = 16) -> QIcon:

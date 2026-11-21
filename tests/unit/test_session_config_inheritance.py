@@ -93,7 +93,7 @@ def window(qapp, app_config, monkeypatch):
 def _open_project(window, config, tmp_path, preset="Default", *, tracks=()):
     source = tmp_path / "audio"
     source.mkdir()
-    window.lifecycle_controller.restore_session_state({
+    window.persistence_controller.restore_session_state({
         "source_dir": str(source),
         "active_config_preset": preset,
         "session_config": copy.deepcopy(config["config_presets"][preset]),
@@ -114,9 +114,15 @@ def project(window, app_config, tmp_path):
 @pytest.fixture
 def phase_work(window, monkeypatch):
     requests = []
-    monkeypatch.setattr(window.lifecycle_controller, "reanalyze_topology", lambda: requests.append("layout"))
-    monkeypatch.setattr(window.lifecycle_controller, "analyze", lambda: requests.append("analysis"))
-    monkeypatch.setattr(window.lifecycle_controller, "prepare", lambda: requests.append("prepare"))
+    window.config_controller.reanalyze_phase1_requested.disconnect(
+        window.persistence_controller.reanalyze_topology
+    )
+    window.config_controller.reanalyze_phase1_requested.connect(lambda: requests.append("layout"))
+    window.config_controller.reanalyze_phase2_requested.disconnect(window.analysis_controller.analyze)
+    window.config_controller.reanalyze_phase2_requested.connect(lambda: requests.append("analysis"))
+    monkeypatch.setattr(window.persistence_controller, "reanalyze_topology", lambda: requests.append("layout"))
+    monkeypatch.setattr(window.analysis_controller, "analyze", lambda: requests.append("analysis"))
+    monkeypatch.setattr(window.analysis_controller, "prepare", lambda: requests.append("prepare"))
     return requests
 
 
@@ -327,7 +333,7 @@ def test_mixed_preferences_save_refreshes_summary_and_transfer_without_reanalysi
     )
     _open_project(window, app_config, tmp_path, tracks=[track])
     clean_finding = "No digital clipping detected"
-    assert clean_finding not in window._summary_view.toPlainText()
+    assert clean_finding not in window.phase2_page.summary_view.toPlainText()
     new_dir = str(tmp_path / "protools-updated")
 
     def edit(dialog):
@@ -337,7 +343,7 @@ def test_mixed_preferences_save_refreshes_summary_and_transfer_without_reanalysi
 
     _save_preferences(window, monkeypatch, edit)
 
-    assert clean_finding in window._summary_view.toPlainText()
+    assert clean_finding in window.phase2_page.summary_view.toPlainText()
     assert window.state.flat_config()["window"] == 800
     assert window.state.active_daw_processor.project_dir == new_dir
     assert phase_work == []
@@ -383,7 +389,7 @@ def test_phase2_port_reset_uses_the_selected_project_preset(
     if equal_override:
         port.setValue(32416)
 
-    state = window.lifecycle_controller.capture_session_state()
+    state = window.persistence_controller.capture_session_state()
     saved_overrides = state["session_config_overrides"]
     assert saved_overrides[f"{PRO_TOOLS}.protools_port"] == port.value()
 
@@ -391,7 +397,7 @@ def test_phase2_port_reset_uses_the_selected_project_preset(
     daws_tree_item = window.config_controller.session_dirty_items["_daw_processors"]
     assert daw_tree_item.icon(1).isNull() == equal_override
     assert daws_tree_item.icon(1).isNull() == equal_override
-    assert is_tab_marked(window._detail_tabs, _TAB_SESSION) == (not equal_override)
+    assert is_tab_marked(window.phase2_page.detail_tabs, _TAB_SESSION) == (not equal_override)
 
     observed_ports = []
 
@@ -419,8 +425,8 @@ def test_phase2_port_reset_uses_the_selected_project_preset(
     assert "32416" in port.toolTip()
     assert daw_tree_item.icon(1).isNull()
     assert daws_tree_item.icon(1).isNull()
-    assert not is_tab_marked(window._detail_tabs, _TAB_SESSION)
-    assert window.lifecycle_controller.capture_session_state()["session_config_overrides"] == {}
+    assert not is_tab_marked(window.phase2_page.detail_tabs, _TAB_SESSION)
+    assert window.persistence_controller.capture_session_state()["session_config_overrides"] == {}
 
     def update_preset(dialog):
         dialog._cfg_panel._combo.setCurrentText(NAMED_PRESET)
@@ -485,7 +491,7 @@ def test_space_activates_the_focused_field_reset(qapp, project, key, label):
     else:
         editor.set_value("C:/override")
     project._phase_tabs.setCurrentIndex(1)
-    project._detail_tabs.setCurrentIndex(_TAB_SESSION)
+    project.phase2_page.detail_tabs.setCurrentIndex(_TAB_SESSION)
     project.config_controller.session_tree.setCurrentItem(project.config_controller.session_dirty_items[PRO_TOOLS])
     reset = _reset_button(project.config_controller.session_stack.currentWidget(), label)
     project.show()
@@ -522,12 +528,12 @@ def test_phase2_project_directory_reset_follows_preset_on_reopen_and_switch(
     assert studio_dir in unescape(reset.toolTip())
     assert temporary_path.value() == custom_temp
     assert not window.config_controller.session_dirty_items[PRO_TOOLS].icon(1).isNull()
-    assert is_tab_marked(window._detail_tabs, _TAB_SESSION)
+    assert is_tab_marked(window.phase2_page.detail_tabs, _TAB_SESSION)
 
     session_path = str(tmp_path / "reset.spsession")
     monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *args: (session_path, ""))
     monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *args: (session_path, ""))
-    window.lifecycle_controller.save_session_dialog()
+    window.persistence_controller.save_session_dialog()
     state = load_session(session_path)
     assert state["active_config_preset"] == NAMED_PRESET
     assert state["session_config_overrides"] == {f"{PRO_TOOLS}.protools_temp_dir": custom_temp}
@@ -547,7 +553,7 @@ def test_phase2_project_directory_reset_follows_preset_on_reopen_and_switch(
     assert window.state.active_daw_processor.project_dir == updated_dir
     assert updated_dir in unescape(reset.toolTip())
 
-    window.lifecycle_controller.load_session_dialog()
+    window.persistence_controller.load_session_dialog()
     assert window.config_controller.config_preset_combo.currentText() == NAMED_PRESET
     assert path.value() == updated_dir
     assert window.state.active_daw_processor.project_dir == updated_dir
@@ -582,7 +588,7 @@ def test_phase2_temporary_directory_reset_refreshes_the_phase3_fetch_path(
     with pytest.raises(RuntimeError) as error:
         window.state.active_daw_processor.fetch(window.state.session)
     assert preset_path in str(error.value)
-    assert not is_tab_marked(window._detail_tabs, _TAB_SESSION)
+    assert not is_tab_marked(window.phase2_page.detail_tabs, _TAB_SESSION)
     assert window.state.session.prepare_state == "ready"
     assert phase_work == []
 
@@ -599,13 +605,13 @@ def test_phase2_presentation_reset_uses_the_current_presets_value(
     checkbox = _field(project.config_controller.session_widgets, page, field)
     assert checkbox.isChecked()
     checkbox.setChecked(False)
-    assert is_tab_marked(project._detail_tabs, _TAB_SESSION)
+    assert is_tab_marked(project.phase2_page.detail_tabs, _TAB_SESSION)
 
     _reset_button(checkbox.parentWidget(), "Show clean detector results").click()
 
     assert checkbox.isChecked()
     assert project.detail_controller.show_clean
-    assert not is_tab_marked(project._detail_tabs, _TAB_SESSION)
+    assert not is_tab_marked(project.phase2_page.detail_tabs, _TAB_SESSION)
     assert project.state.session.prepare_state == "ready"
     assert phase_work == []
 
@@ -699,7 +705,7 @@ def test_reopened_session_resolves_untouched_fields_against_current_preset(
     session_path = str(tmp_path / "mix.spsession")
     monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *args: (session_path, ""))
     monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *args: (session_path, ""))
-    project.lifecycle_controller.save_session_dialog()
+    project.persistence_controller.save_session_dialog()
     snapshot = load_session(session_path)["session_config"]
     assert snapshot["daw_processors"]["protools"]["protools_port"] == 31416
 
@@ -710,7 +716,7 @@ def test_reopened_session_resolves_untouched_fields_against_current_preset(
         _field(dialog._cfg_widgets, PRO_TOOLS, "protools_project_dir").set_value(updated_dir)
 
     _save_preferences(project, monkeypatch, edit)
-    project.lifecycle_controller.load_session_dialog()
+    project.persistence_controller.load_session_dialog()
 
     expected_port = 31416 if explicit_port else 33416
     assert port.value() == expected_port

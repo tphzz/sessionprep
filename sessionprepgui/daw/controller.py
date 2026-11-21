@@ -14,6 +14,7 @@ import uuid
 from PySide6.QtCore import QObject, QThread, Qt, QUrl, Signal, Slot
 from PySide6.QtGui import QColor, QDesktopServices, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import QFileDialog, QMenu, QMessageBox, QTreeWidgetItem
+from shiboken6 import isValid
 
 from sessionpreplib.config import flatten_structured_config
 from sessionpreplib.daw_processors import create_runtime_daw_processors
@@ -24,6 +25,7 @@ from ..controls import set_action_busy
 from ..shell import MainWindowShell
 from ..state import WorkspaceState
 from ..theme import COLORS, PT_DEFAULT_COLORS
+from ..tracks.group_utils import group_color_map, normalize_session_groups, tint_group_color
 from ..tracks.table_widgets import _PHASE_SETUP, _SETUP_RIGHT_PLACEHOLDER, _SETUP_RIGHT_TREE
 from .page import DawSetupPage
 
@@ -34,32 +36,24 @@ class DawTransferController(QObject):
     """Owns Phase 3 (DAW Transfer) page, workers, folder tree, and assignments."""
 
     transfer_finished = Signal(bool, str)
+    setup_table_refresh_requested = Signal()
+    clear_workspace_requested = Signal()
 
     def __init__(
         self,
         state: WorkspaceState,
         shell: MainWindowShell,
         *,
-        on_populate_setup_table: Callable[[], None],
-        on_group_color_map: Callable[[], dict[str, str]],
-        on_tint_group_color: Callable[[str | None, dict[str, str] | None], Any],
-        on_normalize_groups: Callable[[list[dict[str, Any]]], list[dict[str, Any]]],
         on_capture_session_state: Callable[[], dict[str, Any]],
         on_enqueue_batch_item: Callable[[Any], bool],
-        on_clear_workspace: Callable[[], None],
         on_is_prepare_running: Callable[[], bool],
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
         self._state = state
         self._shell = shell
-        self._on_populate_setup_table = on_populate_setup_table
-        self._on_group_color_map = on_group_color_map
-        self._on_tint_group_color = on_tint_group_color
-        self._on_normalize_groups = on_normalize_groups
         self._on_capture_session_state = on_capture_session_state
         self._on_enqueue_batch_item = on_enqueue_batch_item
-        self._on_clear_workspace = on_clear_workspace
         self._on_is_prepare_running = on_is_prepare_running
 
         self.check_worker: DawCheckWorker | None = None
@@ -94,6 +88,10 @@ class DawTransferController(QObject):
 
     # ── Lifecycle & workspace clearing ───────────────────────────────────
 
+    @Slot(bool)
+    def set_setup_table_populating(self, value: bool) -> None:
+        self.setup_table_populating = value
+
     def clear_workspace(self) -> None:
         set_action_busy(self.page.transfer_action, False)
         self.page.use_processed_cb.setChecked(False)
@@ -105,7 +103,7 @@ class DawTransferController(QObject):
 
     def has_running_workers(self) -> bool:
         for kind in (DawCheckWorker, DawFetchWorker, DawTransferWorker):
-            if any(w.isRunning() for w in self.findChildren(kind)):
+            if any(isValid(w) and w.isRunning() for w in self.findChildren(kind)):
                 return True
         return False
 
@@ -113,7 +111,7 @@ class DawTransferController(QObject):
         self.pending_after_check = None
         for attr in ("check_worker", "fetch_worker", "transfer_worker"):
             worker = getattr(self, attr, None)
-            if isinstance(worker, QThread) and worker.isRunning():
+            if isinstance(worker, QThread) and isValid(worker) and worker.isRunning():
                 worker.requestInterruption()
                 worker.wait()
             setattr(self, attr, None)
@@ -202,7 +200,7 @@ class DawTransferController(QObject):
             or active_id != getattr(self._state.active_daw_processor, "id", None)
         ):
             self.populate_folder_tree()
-            self._on_populate_setup_table()
+            self.setup_table_refresh_requested.emit()
         self.page.daw_check_label.setText("")
         self.update_lifecycle_buttons()
 
@@ -373,7 +371,7 @@ class DawTransferController(QObject):
                 self._state.session.daw_state[processor.id] = session.daw_state[processor.id]
             self.populate_folder_tree()
             self.page.right_stack.setCurrentIndex(_SETUP_RIGHT_TREE)
-            self._on_populate_setup_table()
+            self.setup_table_refresh_requested.emit()
             self._shell.progress_finish(message)
             self._shell.show_status(message)
         else:
@@ -495,14 +493,14 @@ class DawTransferController(QObject):
             session_state=self._on_capture_session_state(),
         )
         if self._on_enqueue_batch_item(item):
-            self._on_clear_workspace()
+            self.clear_workspace_requested.emit()
             self._shell.show_status("Session added to batch queue.")
 
     def _transfer_config(self, session: SessionContext) -> dict[str, Any]:
         config = {**session.config, **self._state.flat_config()}
         config["gui"] = {
             **config.get("gui", {}),
-            "groups": self._on_normalize_groups(self._state.session_groups),
+            "groups": normalize_session_groups(self._state.config, self._state.session_groups),
             "colors": deepcopy(self._state.config.get("colors", PT_DEFAULT_COLORS)),
         }
         config["_source_dir"] = self._state.source_dir
@@ -588,7 +586,7 @@ class DawTransferController(QObject):
         folder_tracks = _build_folder_tracks_map(
             dp_state.get("assignments", {}), dp_state.get("track_order", {})
         )
-        gcm = self._on_group_color_map()
+        gcm = group_color_map(self._state)
         track_map = {t.filename: t for t in session.output_tracks}
         entry_map = {e.entry_id: e for e in session.transfer_manifest}
         routing_icon = _folder_icon(COLORS["information"])
@@ -658,7 +656,7 @@ class DawTransferController(QObject):
         out_fn = te.output_filename if te else fname
         tc = track_map.get(out_fn)
         if tc and tc.group:
-            tint = self._on_tint_group_color(tc.group, gcm)
+            tint = tint_group_color(self._state, tc.group, gcm)
             if tint:
                 track_item.setBackground(0, tint)
 
@@ -695,7 +693,7 @@ class DawTransferController(QObject):
                 order.insert(insert_index + i, fname)
 
         self.populate_folder_tree()
-        self._on_populate_setup_table()
+        self.setup_table_refresh_requested.emit()
         self.update_lifecycle_buttons()
 
     @Slot(list)
@@ -716,7 +714,7 @@ class DawTransferController(QObject):
                 except ValueError:
                     pass
         self.populate_folder_tree()
-        self._on_populate_setup_table()
+        self.setup_table_refresh_requested.emit()
         self.update_lifecycle_buttons()
 
     @Slot()
@@ -747,7 +745,7 @@ class DawTransferController(QObject):
         assignments.clear()
         track_order.clear()
         self.populate_folder_tree()
-        self._on_populate_setup_table()
+        self.setup_table_refresh_requested.emit()
         self.update_lifecycle_buttons()
         self._shell.show_status("All DAW folder assignments cleared.")
 
@@ -857,7 +855,7 @@ class DawTransferController(QObject):
             group=source.group,
         )
         manifest.insert(source_idx + 1, new_entry)
-        self._on_populate_setup_table()
+        self.setup_table_refresh_requested.emit()
         self.populate_folder_tree()
         self._shell.show_status(f"Duplicated → '{new_entry.daw_track_name}'")
 
@@ -897,7 +895,7 @@ class DawTransferController(QObject):
         else:
             return
         self.prune_assignments_to_manifest()
-        self._on_populate_setup_table()
+        self.setup_table_refresh_requested.emit()
         self.populate_folder_tree()
         self.update_lifecycle_buttons()
         self._shell.show_status("DAW track list reset.")
@@ -930,7 +928,7 @@ class DawTransferController(QObject):
             if entry.entry_id == entry_id:
                 if entry.entry_id != entry.output_filename:
                     del manifest[i]
-                    self._on_populate_setup_table()
+                    self.setup_table_refresh_requested.emit()
                     self._shell.show_status(f"Removed duplicate '{entry.daw_track_name}'")
                 break
 

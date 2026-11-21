@@ -6,10 +6,10 @@ from collections.abc import Callable
 import copy
 import os
 import re
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from PySide6.QtCore import QObject, QSize, Qt, Signal, Slot
-from PySide6.QtGui import QBrush, QColor, QIcon, QPixmap
+from PySide6.QtGui import QBrush, QColor, QIcon
 from PySide6.QtWidgets import (
     QCheckBox,
     QDoubleSpinBox,
@@ -22,19 +22,21 @@ from PySide6.QtWidgets import (
 
 from sessionpreplib.gain_staging import apply_group_gains
 
-from ..prefs.param_form import _argb_to_qcolor
 from ..settings import build_defaults
 from ..shell import MainWindowShell
 from ..state import WorkspaceState
-from ..theme import COLORS, PT_DEFAULT_COLORS, normalize_color_name
+from ..theme import COLORS, PT_DEFAULT_COLORS
 from ..widgets import BatchComboBox, ColorPickerButton, TableCellComboBox
+from . import group_utils
 from .groups_tab import GroupsTabWidget
-from .table_widgets import _SortableItem, _TAB_GROUPS
+from .table_widgets import TrackCol, _SortableItem, _TAB_GROUPS
+
+if TYPE_CHECKING:
+    from PySide6.QtWidgets import QTabWidget
+    from .table_widgets import _DraggableTrackTable
 
 _GROUP_DIRTY_BG = QColor("#3a3121")
-_TINT_FACTOR = 0.15
-_GROUP_NONE_LABEL = "(None)"
-_LINK_INDICATOR = " 🔗"
+_GROUP_NONE_LABEL = group_utils.GROUP_NONE_LABEL
 
 
 def match_track_to_group(filename: str, groups: list[dict[str, Any]]) -> str | None:
@@ -67,20 +69,20 @@ class GroupsController(QObject):
     """Owns the session-local Groups tab, track group combos, auto-group, and linked gains."""
 
     groups_modified = Signal()
+    setup_table_refresh_requested = Signal()
+    file_tab_refresh_requested = Signal(object)
+    prepare_stale_requested = Signal()
+    detail_tab_dirty_changed = Signal(int, str, bool)
+    auto_fit_requested = Signal()
 
     def __init__(
         self,
         state: WorkspaceState,
         shell: MainWindowShell,
         *,
-        track_table: Any,
-        detail_tabs: Any = None,
+        track_table: _DraggableTrackTable,
+        detail_tabs: QTabWidget | None = None,
         on_find_table_row: Callable[[str], int] | None = None,
-        on_populate_setup_table: Callable[[], None] | None = None,
-        on_refresh_file_tab: Callable[[Any], None] | None = None,
-        on_mark_prepare_stale: Callable[[], None] | None = None,
-        on_set_detail_tab_dirty: Callable[[int, str, bool], None] | None = None,
-        on_auto_fit_track_table: Callable[[], None] | None = None,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
@@ -89,11 +91,6 @@ class GroupsController(QObject):
         self._track_table = track_table
         self._detail_tabs = detail_tabs
         self._on_find_table_row = on_find_table_row
-        self._on_populate_setup_table = on_populate_setup_table
-        self._on_refresh_file_tab = on_refresh_file_tab
-        self._on_mark_prepare_stale = on_mark_prepare_stale
-        self._on_set_detail_tab_dirty = on_set_detail_tab_dirty
-        self._on_auto_fit_track_table = on_auto_fit_track_table
 
         self.page = GroupsTabWidget()
         self.populate_group_preset_combo()
@@ -132,39 +129,19 @@ class GroupsController(QObject):
         combo.blockSignals(False)
 
     def color_names_from_config(self) -> list[str]:
-        colors = self._state.config.get("colors", PT_DEFAULT_COLORS)
-        return [c["name"] for c in colors if c.get("name")]
+        return group_utils.color_names_from_config(self._state.config)
 
     def color_argb_by_name(self, name: str) -> str | None:
-        colors = self._state.config.get("colors", PT_DEFAULT_COLORS)
-        normalized = normalize_color_name(name, colors)
-        for palette in (colors, PT_DEFAULT_COLORS):
-            for entry in palette:
-                if entry.get("name") == normalized:
-                    return entry.get("argb")
-        return None
+        return group_utils.color_argb_by_name(self._state.config, name)
 
     @staticmethod
     def color_swatch_icon(argb: str, size: int = 16) -> QIcon:
-        pm = QPixmap(size, size)
-        pm.fill(_argb_to_qcolor(argb))
-        return QIcon(pm)
+        return group_utils.color_swatch_icon(argb, size)
 
     def tint_group_color(
         self, group_name: str | None, gcm: dict[str, str] | None = None
     ) -> QColor | None:
-        color_map = self.group_color_map() if gcm is None else gcm
-        argb = color_map.get(group_name) if group_name else None
-        if not argb:
-            return None
-        qc = _argb_to_qcolor(argb)
-        alpha = (qc.alpha() / 255.0) * _TINT_FACTOR
-        bg_r, bg_g, bg_b = 0x1E, 0x1E, 0x1E
-        return QColor(
-            int(qc.red() * alpha + bg_r * (1 - alpha)),
-            int(qc.green() * alpha + bg_g * (1 - alpha)),
-            int(qc.blue() * alpha + bg_b * (1 - alpha)),
-        )
+        return group_utils.tint_group_color(self._state, group_name, gcm)
 
     def apply_row_group_color(
         self,
@@ -174,47 +151,27 @@ class GroupsController(QObject):
         table: Any = None,
     ) -> None:
         target = self._track_table if table is None else table
-        target.apply_row_color(row, self.tint_group_color(group_name, gcm))
+        group_utils.apply_row_group_color(target, self._state, row, group_name, gcm)
 
     def normalize_session_groups(self, groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        colors = self._state.config.get("colors", PT_DEFAULT_COLORS)
-        normalized: list[dict[str, Any]] = []
-        for group in groups:
-            name = str(group.get("name", "")).strip()
-            if not name:
-                continue
-            normalized.append({
-                "name": name,
-                "color": normalize_color_name(group.get("color", ""), colors),
-                "gain_linked": bool(group.get("gain_linked", False)),
-                "daw_target": group.get("daw_target", ""),
-                "match_method": group.get("match_method", "contains"),
-                "match_pattern": group.get("match_pattern", ""),
-            })
-        return normalized
+        return group_utils.normalize_session_groups(self._state.config, groups)
 
     # ── Group lookup maps ────────────────────────────────────────────────
 
     def group_combo_items(self) -> list[str]:
-        return [_GROUP_NONE_LABEL] + [g["name"] for g in self._state.session_groups]
+        return group_utils.group_combo_items(self._state)
 
     def gain_linked_map(self) -> dict[str, bool]:
-        return {g["name"]: g.get("gain_linked", False) for g in self._state.session_groups}
+        return group_utils.gain_linked_map(self._state)
 
     def group_display_name(self, name: str, glm: dict[str, bool] | None = None) -> str:
-        linked_map = self.gain_linked_map() if glm is None else glm
-        return name + _LINK_INDICATOR if linked_map.get(name, False) else name
+        return group_utils.group_display_name(self._state, name, glm)
 
     def group_rank_map(self) -> dict[str, int]:
-        return {g["name"]: i for i, g in enumerate(self._state.session_groups)}
+        return group_utils.group_rank_map(self._state)
 
     def group_color_map(self) -> dict[str, str]:
-        result: dict[str, str] = {}
-        for g in self._state.session_groups:
-            argb = self.color_argb_by_name(g.get("color", ""))
-            if argb:
-                result[g["name"]] = argb
-        return result
+        return group_utils.group_color_map(self._state)
 
     # ── Groups tab row operations ────────────────────────────────────────
 
@@ -256,8 +213,9 @@ class GroupsController(QObject):
         mi = match_combo.findText(match_method)
         if mi >= 0:
             match_combo.setCurrentIndex(mi)
-        match_combo.setProperty("_row", row)
-        match_combo.currentTextChanged.connect(lambda _t, r=row: self._validate_pattern(r))
+        match_combo.currentTextChanged.connect(
+            lambda _t, combo=match_combo: self._validate_pattern_for_combo(combo)
+        )
         match_combo.currentTextChanged.connect(lambda *_: self.sync_session_groups())
         table.setCellWidget(row, 4, match_combo)
 
@@ -343,8 +301,13 @@ class GroupsController(QObject):
                         if member.group == old_name:
                             member.group = new_name or None
         self.sync_session_groups()
-        if self._on_populate_setup_table is not None:
-            self._on_populate_setup_table()
+
+    def _validate_pattern_for_combo(self, combo: QWidget) -> None:
+        table = self.page.table
+        for row in range(table.rowCount()):
+            if table.cellWidget(row, 4) is combo:
+                self._validate_pattern(row)
+                return
 
     def _validate_pattern(self, row: int) -> None:
         table = self.page.table
@@ -446,8 +409,6 @@ class GroupsController(QObject):
         self._state.session_groups = new_groups
         self.populate_groups_tab()
         self.refresh_group_combos()
-        if self._on_populate_setup_table is not None:
-            self._on_populate_setup_table()
         self.refresh_dirty_indicators()
 
     @Slot(str)
@@ -518,8 +479,7 @@ class GroupsController(QObject):
                     self._set_cell_dirty(row, col, col in dirty_cells.get(row, set()))
         finally:
             table.blockSignals(False)
-        if self._on_set_detail_tab_dirty is not None:
-            self._on_set_detail_tab_dirty(_TAB_GROUPS, "Groups", self.groups_tab_is_dirty())
+        self.detail_tab_dirty_changed.emit(_TAB_GROUPS, "Groups", self.groups_tab_is_dirty())
 
     def _set_cell_dirty(self, row: int, col: int, dirty: bool) -> None:
         table = self.page.table
@@ -560,8 +520,6 @@ class GroupsController(QObject):
         assigned = self._apply_auto_group_matches(ok_tracks)
         self.auto_fit_group_column()
         self.apply_linked_group_levels()
-        if self._on_populate_setup_table is not None:
-            self._on_populate_setup_table()
         self._shell.show_status(f"Auto-Group: assigned {assigned} of {len(ok_tracks)} tracks")
 
     def _apply_auto_group_matches(self, ok_tracks: list[Any]) -> int:
@@ -589,15 +547,15 @@ class GroupsController(QObject):
         grm: dict[str, int],
         gcm: dict[str, str],
     ) -> None:
-        w = self._track_table.cellWidget(row, 6)
+        w = self._track_table.cellWidget(row, TrackCol.GROUP)
         if isinstance(w, BatchComboBox):
             w.blockSignals(True)
             _select_combo_group(w, group_name)
             w.blockSignals(False)
         display = self.group_display_name(group_name, glm) if group_name else _GROUP_NONE_LABEL
         rank = grm.get(group_name, len(grm)) if group_name else len(grm)
-        sort_item = self._track_table.item(row, 6)
-        if sort_item:
+        sort_item = self._track_table.item(row, TrackCol.GROUP)
+        if isinstance(sort_item, _SortableItem):
             sort_item.setText(display)
             sort_item._sort_key = rank
         self.apply_row_group_color(row, group_name, gcm)
@@ -624,7 +582,7 @@ class GroupsController(QObject):
         display = self.group_display_name(track.group, glm) if track.group else _GROUP_NONE_LABEL
         grm = self.group_rank_map()
         rank = grm.get(track.group, len(grm)) if track.group else len(grm)
-        self._track_table.setItem(row, 6, _SortableItem(display, rank))
+        self._track_table.setItem(row, TrackCol.GROUP, _SortableItem(display, rank))
 
         combo = BatchComboBox()
         self._populate_group_combo_widget(combo, glm, self.group_color_map())
@@ -634,7 +592,7 @@ class GroupsController(QObject):
         combo.setProperty("track_filename", track.filename)
         combo.setStyleSheet(f"QComboBox {{ color: {COLORS['text']}; }}")
         combo.textActivated.connect(lambda text, c=combo: self.on_group_changed(text, c))
-        self._track_table.setCellWidget(row, 6, combo)
+        self._track_table.setCellWidget(row, TrackCol.GROUP, combo)
 
     def on_group_changed(self, text: str, combo: Any = None) -> None:
         if combo is None:
@@ -660,8 +618,8 @@ class GroupsController(QObject):
             rank = grm.get(new_group, len(grm)) if new_group else len(grm)
             row = self._on_find_table_row(fname) if self._on_find_table_row else -1
             if row >= 0:
-                sort_item = self._track_table.item(row, 6)
-                if sort_item:
+                sort_item = self._track_table.item(row, TrackCol.GROUP)
+                if isinstance(sort_item, _SortableItem):
                     sort_item.setText(text)
                     sort_item._sort_key = rank
                 self.apply_row_group_color(row, new_group)
@@ -685,13 +643,13 @@ class GroupsController(QObject):
             bt.group = new_group
             row = self._on_find_table_row(bfname) if self._on_find_table_row else -1
             if row >= 0:
-                w = self._track_table.cellWidget(row, 6)
+                w = self._track_table.cellWidget(row, TrackCol.GROUP)
                 if isinstance(w, BatchComboBox):
                     w.blockSignals(True)
                     _select_combo_group(w, new_group)
                     w.blockSignals(False)
-                sort_item = self._track_table.item(row, 6)
-                if sort_item:
+                sort_item = self._track_table.item(row, TrackCol.GROUP)
+                if isinstance(sort_item, _SortableItem):
                     sort_item.setText(display)
                     sort_item._sort_key = rank
                 self.apply_row_group_color(row, new_group, gcm)
@@ -706,7 +664,7 @@ class GroupsController(QObject):
         sorting = self._track_table.isSortingEnabled()
         self._track_table.setSortingEnabled(False)
         for row in range(self._track_table.rowCount()):
-            w = self._track_table.cellWidget(row, 6)
+            w = self._track_table.cellWidget(row, TrackCol.GROUP)
             if not isinstance(w, BatchComboBox):
                 continue
             track = tracks.get(w.property("track_filename"))
@@ -720,8 +678,8 @@ class GroupsController(QObject):
                     track.group = None
             w.blockSignals(False)
             gname = w.currentData(Qt.ItemDataRole.UserRole)
-            sort_item = self._track_table.item(row, 6)
-            if sort_item:
+            sort_item = self._track_table.item(row, TrackCol.GROUP)
+            if isinstance(sort_item, _SortableItem):
                 sort_item._sort_key = grm.get(gname, len(grm)) if gname else len(grm)
                 sort_item.setText(w.currentText())
             self.apply_row_group_color(row, gname, gcm)
@@ -730,62 +688,57 @@ class GroupsController(QObject):
         self.apply_linked_group_levels()
 
     def auto_fit_group_column(self) -> None:
-        if self._on_auto_fit_track_table is not None:
-            self._on_auto_fit_track_table()
+        self.auto_fit_requested.emit()
 
     # ── Linked group levels ──────────────────────────────────────────────
 
+    @Slot()
     def apply_linked_group_levels(self) -> None:
         session = self._state.session
-        if not session or not session.processors:
+        if not session:
             return
-        previous = [
-            (pr, pr.gain_db, pr.data.get("fader_offset", 0.0))
-            for t in session.tracks
-            for pr in t.processor_results.values()
-        ]
-        apply_group_gains(
-            session,
-            linked_groups={name for name, linked in self.gain_linked_map().items() if linked},
-            headroom_db=session.config.get("fader_headroom_db", 8.0),
-            anchor=session.config.get("anchor"),
-        )
-        if any(
-            pr.gain_db != gain or pr.data.get("fader_offset", 0.0) != fader
-            for pr, gain, fader in previous
-        ):
-            if self._on_mark_prepare_stale is not None:
-                self._on_mark_prepare_stale()
+        if session.processors:
+            previous = [
+                (pr, pr.gain_db, pr.data.get("fader_offset", 0.0))
+                for t in session.tracks
+                for pr in t.processor_results.values()
+            ]
+            apply_group_gains(
+                session,
+                linked_groups={name for name, linked in self.gain_linked_map().items() if linked},
+                headroom_db=session.config.get("fader_headroom_db", 8.0),
+                anchor=session.config.get("anchor"),
+            )
+            if any(
+                pr.gain_db != gain or pr.data.get("fader_offset", 0.0) != fader
+                for pr, gain, fader in previous
+            ):
+                self.prepare_stale_requested.emit()
 
-        self._track_table.setSortingEnabled(False)
-        for row in range(self._track_table.rowCount()):
-            fname_item = self._track_table.item(row, 0)
-            if not fname_item:
-                continue
-            track = next((t for t in session.tracks if t.filename == fname_item.text()), None)
-            if not track or track.status != "OK":
-                continue
-            pr = next(iter(track.processor_results.values()), None)
-            if not pr:
-                continue
-            spin = self._track_table.cellWidget(row, 4)
-            if isinstance(spin, QDoubleSpinBox):
-                spin.blockSignals(True)
-                spin.setValue(pr.gain_db)
-                spin.blockSignals(False)
-            gain_sort = self._track_table.item(row, 4)
-            if gain_sort:
-                gain_sort.setText(f"{pr.gain_db:+.1f}")
-                gain_sort._sort_key = pr.gain_db
-        self._track_table.setSortingEnabled(True)
-        if self._on_populate_setup_table is not None:
-            self._on_populate_setup_table()
-        if (
-            self._state.current_track
-            and self._state.current_track.status == "OK"
-            and self._on_refresh_file_tab is not None
-        ):
-            self._on_refresh_file_tab(self._state.current_track)
+            self._track_table.setSortingEnabled(False)
+            for row in range(self._track_table.rowCount()):
+                fname_item = self._track_table.item(row, TrackCol.FILE)
+                if not fname_item:
+                    continue
+                track = next((t for t in session.tracks if t.filename == fname_item.text()), None)
+                if not track or track.status != "OK":
+                    continue
+                pr = next(iter(track.processor_results.values()), None)
+                if not pr:
+                    continue
+                spin = self._track_table.cellWidget(row, TrackCol.GAIN)
+                if isinstance(spin, QDoubleSpinBox):
+                    spin.blockSignals(True)
+                    spin.setValue(pr.gain_db)
+                    spin.blockSignals(False)
+                gain_sort = self._track_table.item(row, TrackCol.GAIN)
+                if isinstance(gain_sort, _SortableItem):
+                    gain_sort.setText(f"{pr.gain_db:+.1f}")
+                    gain_sort._sort_key = pr.gain_db
+            self._track_table.setSortingEnabled(True)
+        self.setup_table_refresh_requested.emit()
+        if self._state.current_track and self._state.current_track.status == "OK":
+            self.file_tab_refresh_requested.emit(self._state.current_track)
 
 
 def _select_combo_group(combo: BatchComboBox, group_name: str | None) -> bool:

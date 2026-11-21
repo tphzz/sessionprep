@@ -178,7 +178,7 @@ class GroupsTableWidget(QWidget):
         if mi >= 0:
             match_combo.setCurrentIndex(mi)
         match_combo.currentTextChanged.connect(
-            lambda _text, r=row: self._validate_pattern_cell(r))
+            lambda _text, combo=match_combo: self._validate_pattern_for_combo(combo))
         match_combo.currentTextChanged.connect(
             lambda *_: self.groups_changed.emit())
         self._table.setCellWidget(row, 4, match_combo)
@@ -186,6 +186,12 @@ class GroupsTableWidget(QWidget):
         pattern_item = QTableWidgetItem(match_pattern)
         self._table.setItem(row, 5, pattern_item)
         self._validate_pattern_cell(row)
+
+    def _validate_pattern_for_combo(self, combo: QWidget) -> None:
+        for row in range(self._table.rowCount()):
+            if self._table.cellWidget(row, 4) is combo:
+                self._validate_pattern_cell(row)
+                return
 
     def _read_groups(self) -> list[dict]:
         groups: list[dict] = []

@@ -4,15 +4,16 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Callable
 import subprocess
 import sys
 import time
-from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from PySide6.QtCore import QObject, QThread, QTimer, Qt, QUrl, Signal, Slot
 from PySide6.QtGui import QAction, QDesktopServices
+from shiboken6 import isValid
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QMenu,
@@ -36,6 +37,9 @@ from . import operations as ops
 from .dialogs import add_output_tracks_dialog
 from .page import TopologyPage
 
+if TYPE_CHECKING:
+    from ..detail.playback import PlaybackController
+
 log = logging.getLogger(__name__)
 
 
@@ -46,21 +50,20 @@ class TopologyController(QObject):
     reanalyze_requested = Signal()
     topology_edited = Signal()
     layout_applied = Signal(str)  # output_dir
+    peak_prioritize_requested = Signal(str)  # source_key
 
     def __init__(
         self,
         state: WorkspaceState,
         shell: MainWindowShell,
-        playback: Any,
+        playback: PlaybackController,
         *,
-        on_prioritize_peak: Callable[[str], None] | None = None,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
         self._state = state
         self._shell = shell
         self._playback = playback
-        self._on_prioritize_peak = on_prioritize_peak
 
         self.page = TopologyPage(recursive_scan=state.recursive_scan)
         self._shell.register_phase_progress_layout(_PHASE_TOPOLOGY, self.page.main_layout)
@@ -77,6 +80,9 @@ class TopologyController(QObject):
 
         # Owned worker handles & preview cache
         self.apply_worker: Any = None
+        self._pending_overwrite: tuple[str, dict[str, str]] | None = None
+        self._overwrite_prompt_gen: int = 0
+        self._apply_worker_gen: int = 0
         self.pending_sources: list[Any] = []
         self.audio_worker: Any = None
         self.wf_worker: Any = None
@@ -127,13 +133,35 @@ class TopologyController(QObject):
 
     # ── Lifecycle & workspace clearing ───────────────────────────────────
 
+    def dismiss_overwrite_prompt(
+        self, *, status_message: str | None = None, restore_focus: bool = False
+    ) -> None:
+        """Clear any pending unverified-layout overwrite prompt and invalidate in-flight checks."""
+        self._overwrite_prompt_gen += 1
+        self._pending_overwrite = None
+        self._shell.dismiss_status_prompt(
+            status_message=status_message,
+            restore_focus=restore_focus,
+        )
+
     def clear_workspace(self) -> None:
         """Stop in-flight layout/preview workers and reset Phase 1 UI."""
+        self.dismiss_overwrite_prompt()
         if self.apply_worker is not None:
-            worker = self.apply_worker
+            worker: Any = self.apply_worker
             self.apply_worker = None
-            worker.cancel()
-            worker.wait()
+            if isinstance(worker, QObject) and isValid(worker):
+                try:
+                    worker.disconnect(self)
+                except RuntimeError:
+                    pass
+                w_any: Any = worker
+                w_any.cancel()
+                w_any.finished.connect(w_any.deleteLater)
+                if not w_any.isRunning():
+                    w_any.deleteLater()
+            elif hasattr(worker, "cancel"):
+                worker.cancel()
         set_action_busy(self.page.apply_action, False)
         self.begin_waveform_request("none")
         self.cancel_preview_workers()
@@ -152,7 +180,7 @@ class TopologyController(QObject):
     def dispose(self) -> None:
         """Stop all Phase 1 background threads cleanly before window close."""
         self.cancel_preview_workers()
-        if isinstance(self.apply_worker, QThread) and self.apply_worker.isRunning():
+        if isinstance(self.apply_worker, QThread) and isValid(self.apply_worker) and self.apply_worker.isRunning():
             cancel_apply = getattr(self.apply_worker, "cancel", None)
             if callable(cancel_apply):
                 cancel_apply()
@@ -161,7 +189,7 @@ class TopologyController(QObject):
             self.apply_worker.wait()
         self.apply_worker = None
         for worker in self.findChildren(QThread):
-            if worker.isRunning():
+            if isValid(worker) and worker.isRunning():
                 cancel_fn = getattr(worker, "cancel", None)
                 if callable(cancel_fn):
                     cancel_fn()
@@ -197,10 +225,11 @@ class TopologyController(QObject):
         n_in = sum(1 for t in self._state.topo_source_tracks if t.status == "OK")
         n_out = len(self._state.topo_topology.entries) if self._state.topo_topology else 0
         self.page.status_label.setText(f"{n_in} input \u2192 {n_out} output tracks")
-        self.page.apply_action.setEnabled(n_out > 0)
+        self.page.apply_action.setEnabled(n_out > 0 and self.apply_worker is None)
 
     def notify_topology_changed(self) -> None:
         """Refresh UI and invalidate downstream phases after a topology edit."""
+        self.dismiss_overwrite_prompt()
         self.populate()
         if self._state.topology_dir is not None:
             self._state.topology_dir = None
@@ -224,25 +253,35 @@ class TopologyController(QObject):
 
     # ── Apply topology ───────────────────────────────────────────────────
 
+    def _layout_output_dir(self) -> tuple[str, str]:
+        assert self._state.source_dir is not None
+        app_cfg = self._state.config.get("app", {})
+        output_folder = app_cfg.get("phase1_output_folder", "sp_01_tracklayout")
+        output_dir = os.path.join(self._state.source_dir, output_folder)
+        peaks_dir = os.path.join(output_dir, app_cfg.get("peak_cache_folder", "sp_peaks"))
+        return output_dir, peaks_dir
+
     @Slot()
     def apply_topology(self) -> None:
         """Write channel-rerouted files to the track layout output folder."""
         if not self._state.session or not self._state.source_dir or self.apply_worker is not None:
             return
+        self.dismiss_overwrite_prompt()
+        self._start_apply_worker(allowed_unverified=None)
+
+    def _start_apply_worker(self, *, allowed_unverified: dict[str, str] | None) -> None:
+        assert self._state.session is not None and self._state.source_dir is not None
         n_entries = len(self._state.topo_topology.entries) if self._state.topo_topology else 0
         log.info("Apply topology: %d entries", n_entries)
 
         from ..analysis.worker import TopologyApplyWorker
 
-        app_cfg = self._state.config.get("app", {})
-        output_folder = app_cfg.get("phase1_output_folder", "sp_01_tracklayout")
-        output_dir = os.path.join(self._state.source_dir, output_folder)
-        peaks_dir = os.path.join(output_dir, app_cfg.get("peak_cache_folder", "sp_peaks"))
-
+        output_dir, peaks_dir = self._layout_output_dir()
         set_action_busy(self.page.apply_action, True, "Applying…")
         self.page.apply_action.setEnabled(False)
         self.page.reset_action.setEnabled(False)
         self._shell.progress_start("Applying topology\u2026")
+        self._apply_worker_gen = self._overwrite_prompt_gen
 
         self._state.session.topology = self._state.topo_topology
         worker = TopologyApplyWorker(
@@ -251,15 +290,81 @@ class TopologyController(QObject):
             source_dir=self._state.source_dir,
             peaks_dir=peaks_dir,
             source_tracks=self._state.topo_source_tracks,
+            allowed_unverified=allowed_unverified,
+            prompt_on_unverified=allowed_unverified is None,
         )
         worker.setParent(self)
         worker.finished.connect(worker.deleteLater)
         worker.progress.connect(self._on_apply_progress)
         worker.progress_value.connect(self._on_apply_progress_value)
+        worker.overwrite_confirmation_required.connect(self._on_overwrite_confirmation_required)
         worker.apply_finished.connect(self._on_apply_done)
         worker.error.connect(self._on_apply_error)
         self.apply_worker = worker
         worker.start()
+
+    @Slot(object, str, object)
+    def _on_overwrite_confirmation_required(
+        self, worker: Any, output_dir: str, unverified: Any
+    ) -> None:
+        if worker is not self.apply_worker:
+            return
+        worker.wait()
+        self.apply_worker = None
+        set_action_busy(self.page.apply_action, False)
+        self.page.apply_action.setEnabled(True)
+        self.page.reset_action.setEnabled(not self.pending_sources)
+        self._shell.clear_progress()
+
+        unverified_map = dict(unverified)
+        if (
+            not unverified_map
+            or self._apply_worker_gen != self._overwrite_prompt_gen
+            or self._shell.current_phase() != _PHASE_TOPOLOGY
+            or not self._state.source_dir
+        ):
+            return
+        current_dir, _peaks_dir = self._layout_output_dir()
+        if os.path.realpath(current_dir) != os.path.realpath(output_dir):
+            return
+        self._pending_overwrite = (output_dir, unverified_map)
+        prefix, highlight, suffix, tooltip, accept_desc = _format_unverified_prompt(
+            output_dir, unverified_map
+        )
+        apply_btn = self.page.toolbar.widgetForAction(self.page.apply_action)
+        self._shell.show_status_prompt(
+            prefix,
+            highlight,
+            suffix,
+            tooltip=tooltip,
+            on_accept=self._confirm_overwrite_apply,
+            on_cancel=self._cancel_overwrite_apply,
+            accept_label="Overwrite",
+            cancel_label="Cancel",
+            accept_description=accept_desc,
+            cancel_description="Cancel Apply and leave existing layout files untouched",
+            return_focus_widget=apply_btn,
+        )
+
+    def _confirm_overwrite_apply(self) -> None:
+        pending = self._pending_overwrite
+        self._pending_overwrite = None
+        if (
+            pending is None
+            or not self._state.session
+            or not self._state.source_dir
+            or self.apply_worker is not None
+        ):
+            return
+        output_dir, _peaks_dir = self._layout_output_dir()
+        if os.path.realpath(output_dir) != os.path.realpath(pending[0]):
+            self._shell.show_status("Layout output directory changed — click Apply to re-check.")
+            return
+        self._start_apply_worker(allowed_unverified=pending[1])
+
+    def _cancel_overwrite_apply(self) -> None:
+        self._pending_overwrite = None
+        self._shell.show_status("Apply cancelled — existing layout files were left untouched.")
 
     @Slot(object, str)
     def _on_apply_progress(self, worker: Any, message: str) -> None:
@@ -536,17 +641,19 @@ class TopologyController(QObject):
         """Cancel all in-flight Phase 1 topology preview workers."""
         for attr in ("audio_worker", "wf_worker", "resolve_worker", "multi_worker"):
             worker = getattr(self, attr, None)
-            if worker is not None:
-                cancel_fn = getattr(worker, "cancel", None)
-                if callable(cancel_fn):
-                    cancel_fn()
-                finished = getattr(worker, "finished", None)
-                if finished is not None:
+            setattr(self, attr, None)
+            if worker is None or (isinstance(worker, QObject) and not isValid(worker)):
+                continue
+            cancel_fn = getattr(worker, "cancel", None)
+            if callable(cancel_fn):
+                cancel_fn()
+            for sig_name in ("completed", "error", "failed"):
+                sig = getattr(worker, sig_name, None)
+                if sig is not None:
                     try:
-                        finished.disconnect()
+                        sig.disconnect()
                     except RuntimeError:
                         pass
-                setattr(self, attr, None)
 
     def begin_waveform_request(
         self,
@@ -625,8 +732,8 @@ class TopologyController(QObject):
             )
         else:
             self.page.wf_panel.waveform.set_loading(True)
-            if key and self._on_prioritize_peak is not None:
-                self._on_prioritize_peak(key)
+            if key:
+                self.peak_prioritize_requested.emit(key)
 
         self.page.wf_panel.play_btn.setEnabled(False)
         log.debug("[Trace] load_input_waveform setup for '%s': %.2f ms", filename, (time.perf_counter() - t0) * 1000)
@@ -635,8 +742,9 @@ class TopologyController(QObject):
 
         worker = AudioLoadWorker(track, parent=self)
         self.audio_worker = worker
-        worker.finished.connect(lambda t, fp=track.filepath, rid=request_id: self._on_audio_loaded(t, fp, rid))
+        worker.completed.connect(lambda t, fp=track.filepath, rid=request_id: self._on_audio_loaded(t, fp, rid))
         worker.error.connect(lambda msg, rid=request_id: self._on_audio_error(msg, rid))
+        worker.finished.connect(worker.deleteLater)
         worker.start()
 
     def _on_audio_loaded(self, track: Any, filepath: str, request_id: int | None = None) -> None:
@@ -700,8 +808,9 @@ class TopologyController(QObject):
 
         worker = TopoAudioResolveWorker(entry, self._state.source_dir, parent=self)
         self.resolve_worker = worker
-        worker.finished.connect(lambda audio, sr, rid=request_id: self._on_resolve_done(audio, sr, rid))
+        worker.completed.connect(lambda audio, sr, rid=request_id: self._on_resolve_done(audio, sr, rid))
         worker.error.connect(lambda msg, rid=request_id: self._on_resolve_error(msg, rid))
+        worker.finished.connect(worker.deleteLater)
         worker.start()
 
     def _on_resolve_done(self, audio_data: Any, samplerate: int, request_id: int | None = None) -> None:
@@ -748,12 +857,13 @@ class TopologyController(QObject):
 
         worker = TopoMultiAudioWorker(items, side, self._state.source_dir or "", parent=self)
         self.multi_worker = worker
-        worker.finished.connect(
+        worker.completed.connect(
             lambda display, playback, sr, labels, rid=request_id: self.on_multi_done(
                 display, playback, sr, labels, rid
             )
         )
         worker.error.connect(lambda msg, rid=request_id: self._on_multi_error(msg, rid))
+        worker.finished.connect(worker.deleteLater)
         worker.start()
 
     def on_multi_done(
@@ -802,7 +912,9 @@ class TopologyController(QObject):
             self.page.wf_panel.setVisible(True)
         self.page.wf_panel.waveform.set_loading(True)
         self.pending_labels = labels
+        self._cancel_wf_worker()
 
+        rid = self.wf_request_id if request_id is None else request_id
         wf = self.page.wf_panel.waveform
         worker = WaveformLoadWorker(
             audio_data,
@@ -813,8 +925,33 @@ class TopologyController(QObject):
             parent=self,
         )
         self.wf_worker = worker
-        worker.finished.connect(lambda result, rid=request_id: self._on_wf_loaded(result, rid))
+        worker.completed.connect(lambda result, r=rid: self._on_wf_loaded(result, r))
+        worker.failed.connect(lambda msg, r=rid: self._on_wf_error(msg, r))
+        worker.finished.connect(worker.deleteLater)
         worker.start()
+
+    def _cancel_wf_worker(self) -> None:
+        worker = self.wf_worker
+        self.wf_worker = None
+        if worker is None or (isinstance(worker, QObject) and not isValid(worker)):
+            return
+        cancel_fn = getattr(worker, "cancel", None)
+        if callable(cancel_fn):
+            cancel_fn()
+        for sig_name in ("completed", "failed"):
+            sig = getattr(worker, sig_name, None)
+            if sig is not None:
+                try:
+                    sig.disconnect()
+                except RuntimeError:
+                    pass
+
+    def _on_wf_error(self, message: str, request_id: int | None = None) -> None:
+        if not self.is_current_waveform_request(request_id):
+            return
+        self.wf_worker = None
+        self.page.wf_panel.waveform.set_loading(False)
+        self._shell.show_status(f"Waveform error: {message}")
 
     def _on_wf_loaded(self, result: dict[str, Any], request_id: int | None = None) -> None:
         if not self.is_current_waveform_request(request_id):
@@ -826,8 +963,8 @@ class TopologyController(QObject):
         key = self.wf_peak_path
         if key in self._state.peak_cache:
             wf.set_peak_data(self._state.peak_cache[key])
-        elif key and self._on_prioritize_peak is not None:
-            self._on_prioritize_peak(key)
+        elif key:
+            self.peak_prioritize_requested.emit(key)
         self.page.wf_panel.update_play_mode_channels(len(result["channels"]), labels=self.pending_labels)
         self.page.wf_panel.play_btn.setEnabled(True)
         self.update_time_label(0)
@@ -967,3 +1104,35 @@ def _collect_multi_output_specs(
         if entry:
             items.append((entry, os.path.splitext(out_fn)[0], sorted(channels)))
     return items
+
+
+def _format_unverified_prompt(
+    output_dir: str, unverified: dict[str, str]
+) -> tuple[str, str, str, str, str]:
+    """Build unified status-bar prompt parts, tooltip, and accessible description."""
+    folder = os.path.basename(os.path.normpath(output_dir)) or output_dir
+    names = sorted(unverified.keys())
+    first = names[0]
+    count = len(names)
+    if count == 1:
+        prefix = f"1 existing file in {folder}/ could not be verified ("
+        suffix = "). Overwrite it?"
+        accept_desc = f"Overwrite 1 unverified file ({first}) in {folder}/"
+    else:
+        prefix = f"{count} existing files in {folder}/ could not be verified (first: "
+        suffix = "). Overwrite them?"
+        accept_desc = f"Overwrite {count} unverified files in {folder}/"
+
+    shown = names[:20]
+    lines = [
+        f"Folder: {output_dir}",
+        (
+            "These target files were not recorded in .sessionprep-layout.json or changed on disk. "
+            "Only the listed target files will be overwritten; unrelated files in that folder "
+            "will not be touched."
+        ),
+        *(f"\u2022 {name}" for name in shown),
+    ]
+    if count > len(shown):
+        lines.append(f"\u2026 and {count - len(shown)} more")
+    return prefix, first, suffix, "\n".join(lines), accept_desc

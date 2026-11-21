@@ -164,9 +164,12 @@ def _job_errors(session: SessionContext) -> list[str]:
             errors.append((track.filename, track.status))
         if message := track._cache.get("repair_error"):
             errors.append((track.filename, message))
-        for result in (*track.detector_results.values(), *track.processor_results.values()):
-            if result.error:
-                errors.append((track.filename, result.error))
+        for det_res in track.detector_results.values():
+            if det_res.error:
+                errors.append((track.filename, det_res.error))
+        for proc_res in track.processor_results.values():
+            if proc_res.error:
+                errors.append((track.filename, proc_res.error))
     for detector in session.detectors:
         det_results = session.session_detector_results.get(
             detector.id, session.config.get(f"_session_det_{detector.id}", [])

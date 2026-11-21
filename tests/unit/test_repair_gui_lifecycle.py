@@ -66,11 +66,11 @@ def wait_for(condition, seconds=8):
 
 def idle(window):
     try:
-        wait_for(lambda: window.lifecycle_controller.prepare_worker is None and window.lifecycle_controller.repair_plan_worker is None
-                 and not window.lifecycle_controller.repair_plan_pending)
+        wait_for(lambda: window.analysis_controller.prepare_worker is None and window.analysis_controller.repair_plan_worker is None
+                 and not window.analysis_controller.repair_plan_pending)
     except AssertionError:
-        worker = window.lifecycle_controller.repair_plan_worker or window.lifecycle_controller.prepare_worker
-        pytest.fail(f"Pending {window.lifecycle_controller.repair_plan_pending}, worker {worker}, "
+        worker = window.analysis_controller.repair_plan_worker or window.analysis_controller.prepare_worker
+        pytest.fail(f"Pending {window.analysis_controller.repair_plan_pending}, worker {worker}, "
                     f"finished {worker and worker.isFinished()}, error {getattr(worker, 'failure', None)}")
 
 
@@ -103,7 +103,7 @@ def project(app, tmp_path, monkeypatch, request):
     pipeline.analyze_phase2(session)
     pipeline.plan(session)
     pipeline.prepare(session, str(source / config["app"]["phase2_output_folder"]))
-    window.lifecycle_controller.restore_session_state({
+    window.persistence_controller.restore_session_state({
         "source_dir": str(source), "active_config_preset": "Default", "session_config": preset,
         "session_config_overrides": {}, "tracks": tracks, "output_tracks": session.output_tracks,
         "prepare_state": "ready", "transfer_manifest": session.transfer_manifest,
@@ -134,12 +134,12 @@ def save_dc_preference(window, monkeypatch, value):
 
 
 def open_editor(window, track):
-    button = window._track_table.cellWidget(window.track_table_controller.find_table_row(track.filename), 7)
+    button = window.phase2_page.track_table.cellWidget(window.track_table_controller.find_table_row(track.filename), 7)
     action, = [a for a in button.menu().actions() if a.text() == "Track repairs…"]
     assert action.isVisible()
     action.trigger()
-    assert window._repair_editor.track is track
-    return window._repair_editor
+    assert window.phase2_page.repair_editor.track is track
+    return window.phase2_page.repair_editor
 
 
 def test_processing_cell_focus_and_back_keep_the_active_audition(project, monkeypatch):
@@ -148,24 +148,24 @@ def test_processing_cell_focus_and_back_keep_the_active_audition(project, monkey
     window.activateWindow()
     track = window.state.session.tracks[0]
     row = window.track_table_controller.find_table_row(track.filename)
-    window._track_table.setCurrentCell(row, 0)
+    window.phase2_page.track_table.setCurrentCell(row, 0)
     window.detail_controller.show_track_detail(track)
-    wait_for(lambda: window._repair_preview.displayed)
+    wait_for(lambda: window.repair_preview.displayed)
     loads = []
     stops = []
     monkeypatch.setattr(window.detail_controller, "load_waveform", loads.append)
     monkeypatch.setattr(window.detail_controller, "stop", lambda: stops.append(True))
-    button = window._track_table.cellWidget(row, 7)
+    button = window.phase2_page.track_table.cellWidget(row, 7)
     button.setFocus()
     QApplication.processEvents()
-    assert window._track_table.currentColumn() == 7
+    assert window.phase2_page.track_table.currentColumn() == 7
     editor = open_editor(window, track)
     editor.back_button.click()
     QApplication.processEvents()
     assert button.hasFocus() and not loads and not stops
     track.status = "Read error"
-    window.lifecycle_controller.set_track_repair_choice(track, "dc_remove", True)
-    assert not track.repair_overrides and window.lifecycle_controller.repair_plan_worker is None
+    window.analysis_controller.set_track_repair_choice(track, "dc_remove", True)
+    assert not track.repair_overrides and window.analysis_controller.repair_plan_worker is None
 
 
 def test_failed_reanalysis_returns_to_findings_when_the_track_is_reselected(project, monkeypatch):
@@ -173,12 +173,12 @@ def test_failed_reanalysis_returns_to_findings_when_the_track_is_reselected(proj
     track = window.state.session.tracks[0]
     editor = open_editor(window, track)
     monkeypatch.setattr(AnalyzeWorker, "start", lambda self: None)
-    window.lifecycle_controller.analyze()
-    assert editor.track is None and window._file_report.report_track is None
-    window.lifecycle_controller.analyze_worker.error.emit(window.lifecycle_controller.analyze_worker, "Analysis interrupted")
+    window.analysis_controller.analyze()
+    assert editor.track is None and window.phase2_page.file_report.report_track is None
+    window.analysis_controller.analyze_worker.error.emit(window.analysis_controller.analyze_worker, "Analysis interrupted")
     window.track_table_controller.select_row(window.track_table_controller.find_table_row(track.filename))
-    assert window._file_report.report_track is track
-    assert window._file_review.currentWidget() is window._file_report_pane
+    assert window.phase2_page.file_report.report_track is track
+    assert window.phase2_page.file_review.currentWidget() is window.phase2_page.file_report_pane
 
 
 @pytest.mark.parametrize(("adjustment", "expected"), [
@@ -196,7 +196,7 @@ def test_adjust_gain_uses_the_verified_target_or_an_older_saved_reduction(
         return QDialog.Rejected
 
     monkeypatch.setattr(QDialog, "exec", cancel)
-    project.lifecycle_controller.adjust_failed_output_gain(track)
+    project.analysis_controller.adjust_failed_output_gain(track)
 
 
 def test_project_and_track_inherit_explicit_values_and_reopen(project, tmp_path, monkeypatch):
@@ -208,7 +208,7 @@ def test_project_and_track_inherit_explicit_values_and_reopen(project, tmp_path,
     idle(window)
     save_dc_preference(window, monkeypatch, True)
     assert not field.isChecked() and not first.repair_recipe.active
-    assert window.lifecycle_controller.capture_session_state()["session_config_overrides"] == {
+    assert window.persistence_controller.capture_session_state()["session_config_overrides"] == {
         "processors.corrective.repair_auto_dc": False,
     }
 
@@ -217,7 +217,7 @@ def test_project_and_track_inherit_explicit_values_and_reopen(project, tmp_path,
     reset.click()
     idle(window)
     assert field.isChecked() and all(t.repair_recipe.dc_remove for t in (first, second))
-    assert window.lifecycle_controller.capture_session_state()["session_config_overrides"] == {}
+    assert window.persistence_controller.capture_session_state()["session_config_overrides"] == {}
     editor = open_editor(window, first)
     choice = editor.rows["dc_remove"].choice
     choice.setCurrentIndex(choice.findData(True))
@@ -227,11 +227,11 @@ def test_project_and_track_inherit_explicit_values_and_reopen(project, tmp_path,
 
     saved = tmp_path / "values.spsession"
     monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *args: (str(saved), ""))
-    window.lifecycle_controller.save_session_dialog()
+    window.persistence_controller.save_session_dialog()
     assert load_session(str(saved))["tracks"][0].repair_overrides == {"dc_remove": True}
     save_dc_preference(window, monkeypatch, False)
     monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *args: (str(saved), ""))
-    window.lifecycle_controller.load_session_dialog()
+    window.persistence_controller.load_session_dialog()
     idle(window)
     first, second = window.state.session.tracks
     assert not dc_checkbox(window.config_controller.session_widgets).isChecked()
@@ -263,7 +263,7 @@ def test_rapid_edits_only_publish_the_latest_queued_recipe(project, monkeypatch)
     try:
         row.choice.setCurrentIndex(row.choice.findData(True))
         wait_for(entered.is_set)
-        assert not window._save_session_action.isEnabled() and not window._prepare_action.isEnabled()
+        assert not window._save_session_action.isEnabled() and not window.phase2_page.prepare_action.isEnabled()
         row.choice.setCurrentIndex(row.choice.findData(False))
         dc.choice.setCurrentIndex(dc.choice.findData(True))
     finally:
@@ -272,7 +272,7 @@ def test_rapid_edits_only_publish_the_latest_queued_recipe(project, monkeypatch)
     assert track.repair_recipe == RepairRecipe(dc_remove=True)
     assert track.repair_overrides == {"low_cut": False, "dc_remove": True}
     assert window.state.session.prepare_state == "stale"
-    assert window._save_session_action.isEnabled() and window._prepare_action.isEnabled()
+    assert window._save_session_action.isEnabled() and window.phase2_page.prepare_action.isEnabled()
 
 
 def test_switching_project_detaches_a_completed_plan_before_it_can_publish(project, tmp_path, monkeypatch):
@@ -314,8 +314,8 @@ def test_switching_project_detaches_a_completed_plan_before_it_can_publish(proje
         choice = open_editor(window, old_source).rows["dc_remove"].choice
         choice.setCurrentIndex(choice.findData(True))
         wait_for(ready.is_set)
-        assert window.lifecycle_controller.repair_plan_worker.tracks[0].repair_recipe.dc_remove
-        window.lifecycle_controller.load_session_dialog()
+        assert window.analysis_controller.repair_plan_worker.tracks[0].repair_recipe.dc_remove
+        window.persistence_controller.load_session_dialog()
         assert window.state.session.project_name == "Another project"
         assert not finished.is_set()
         current, = window.state.session.tracks
@@ -329,7 +329,7 @@ def test_switching_project_detaches_a_completed_plan_before_it_can_publish(proje
         release.set()
         if ready.is_set():
             wait_for(finished.is_set)
-    wait_for(lambda: not getattr(window.lifecycle_controller, "_zombie_workers", set()))
+    wait_for(lambda: not getattr(window.analysis_controller, "_zombie_workers", set()))
     QApplication.processEvents()
     assert window.state.session.tracks[0] is current
     assert current.repair_overrides == {"low_cut": True} and current.repair_recipe == RepairRecipe(low_cut_hz=10)
@@ -352,7 +352,7 @@ def test_edit_while_preparing_requires_a_new_render_before_transfer(project, mon
             worker.error.emit("Test worker timed out")
 
     monkeypatch.setattr(PrepareWorker, "run", gated)
-    window._prepare_action.trigger()
+    window.phase2_page.prepare_action.trigger()
     try:
         wait_for(entered.is_set)
         row.choice.setCurrentIndex(row.choice.findData(True))
@@ -368,7 +368,7 @@ def test_edit_while_preparing_requires_a_new_render_before_transfer(project, mon
     with pytest.raises(ValueError, match="out of date"):
         resolve_transfer_audio(session, output)
 
-    window._prepare_action.trigger()
+    window.phase2_page.prepare_action.trigger()
     idle(window)
     assert session.prepare_state == "ready"
     output = next(t for t in session.output_tracks if t.filename == track.filename)
@@ -398,20 +398,20 @@ def test_gain_changed_during_output_write_requires_a_new_prepare(project, monkey
         return write(destination, audio, sample_rate, subtype)
 
     monkeypatch.setattr(pipeline_module, "_write_atomic", hold_first_write)
-    window._prepare_action.trigger()
+    window.phase2_page.prepare_action.trigger()
     try:
         wait_for(ready.is_set)
-        assert not window._analyze_action.isEnabled() and not window._save_session_action.isEnabled()
-        window.lifecycle_controller.analyze()
-        assert window.lifecycle_controller.analyze_worker is None and window.state.session is session
-        gain = window._track_table.cellWidget(window.track_table_controller.find_table_row(track.filename), 4)
+        assert not window.phase2_page.analyze_action.isEnabled() and not window._save_session_action.isEnabled()
+        window.analysis_controller.analyze()
+        assert window.analysis_controller.analyze_worker is None and window.state.session is session
+        gain = window.phase2_page.track_table.cellWidget(window.track_table_controller.find_table_row(track.filename), 4)
         assert gain.isEnabled()
         gain.setValue(-12.0)
         assert track.manual_gain_db == -12.0
     finally:
         release.set()
     idle(window)
-    assert window._analyze_action.isEnabled() and window._save_session_action.isEnabled()
+    assert window.phase2_page.analyze_action.isEnabled() and window._save_session_action.isEnabled()
     output = next(t for t in session.output_tracks if t.filename == track.filename)
     wet = render_corrected(track.audio_data, track.samplerate, track.repair_recipe)
     np.testing.assert_allclose(sf.read(output.processed_filepath)[0], wet * 10 ** (previous_gain / 20), atol=2**-15)
@@ -420,7 +420,7 @@ def test_gain_changed_during_output_write_requires_a_new_prepare(project, monkey
     with pytest.raises(ValueError, match="out of date"):
         resolve_transfer_audio(session, output)
 
-    window._prepare_action.trigger()
+    window.phase2_page.prepare_action.trigger()
     idle(window)
     assert session.prepare_state == "ready"
     output = next(t for t in session.output_tracks if t.filename == track.filename)
@@ -459,14 +459,14 @@ def test_pcm_error_manual_dialog_cancel_apply_and_retry(project, monkeypatch):
 
     monkeypatch.setattr(QMessageBox, "exec", choose_adjust)
     monkeypatch.setattr(QDialog, "exec", choose_gain)
-    window._prepare_action.trigger()
+    window.phase2_page.prepare_action.trigger()
     idle(window)
     assert track.manual_gain_db is None and path.read_bytes() == original_wet
-    window._prepare_action.trigger()
+    window.phase2_page.prepare_action.trigger()
     idle(window)
     assert len(proposed) == 2 and proposed[0] == proposed[1] < 0
     assert track.manual_gain_db == proposed[1] and path.read_bytes() == original_wet
-    window._prepare_action.trigger()
+    window.phase2_page.prepare_action.trigger()
     idle(window)
     session = window.state.session
     assert session.prepare_state == "ready" and not session.config["_prepare_errors"]

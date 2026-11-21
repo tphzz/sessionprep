@@ -42,13 +42,13 @@ def project(tmp_path, monkeypatch):
     monkeypatch.setattr(TopologyApplyWorker, "start", TopologyApplyWorker.run)
     monkeypatch.setattr(AnalyzeWorker, "start", AnalyzeWorker.run)
     window = SessionPrepWindow()
-    monkeypatch.setattr(window.lifecycle_controller, "start_peak_build", lambda *_args: None)
+    monkeypatch.setattr(window.persistence_controller, "start_peak_build", lambda *_args: None)
     try:
-        window.lifecycle_controller.load_directory(str(folder))
+        window.persistence_controller.load_directory(str(folder))
         assert scans == [["Keys.wav"]]
         yield window, folder, scans
     finally:
-        window._batch_dock.clear_all()
+        window.batch_controller.dock.clear_all()
         dispose_window(window)
         app.processEvents()
 
@@ -67,7 +67,7 @@ def test_apply_and_reanalyze_preserve_unowned_audio_without_analyzing_it(project
     _write_source(sentinel, duplicate=False)
     original = sentinel.read_bytes()
     window.topology_controller.apply_topology()
-    window.lifecycle_controller.analyze()
+    window.analysis_controller.analyze()
     assert [track.filename for track in window.state.session.tracks] == ["Keys.wav"]
     assert sentinel.read_bytes() == original
 
@@ -82,17 +82,17 @@ def test_desktop_save_error_preserves_previous_document_and_retry(project, tmp_p
     messages = []
     monkeypatch.setattr(QMessageBox, "critical", lambda _, title, msg: messages.append((title, msg)))
     if batch:
-        item = BatchItem("a", "Before", "dawproject", "DAWproject", "", window.lifecycle_controller.capture_session_state())
-        window._batch_dock.add_item(item)
-        save = window._on_save_batch_queue
+        item = BatchItem("a", "Before", "dawproject", "DAWproject", "", window.persistence_controller.capture_session_state())
+        window.batch_controller.dock.add_item(item)
+        save = window.batch_controller.save_queue
     else:
         window.daw_controller.page.project_name_edit.setText("Before")
-        save = window.lifecycle_controller.save_session_dialog
+        save = window.persistence_controller.save_session_dialog
     save()
     previous = path.read_bytes()
     if batch:
-        window._batch_dock.add_item(BatchItem("b", "After", "dawproject", "DAWproject", "",
-                                              window.lifecycle_controller.capture_session_state()))
+        window.batch_controller.dock.add_item(BatchItem("b", "After", "dawproject", "DAWproject", "",
+                                              window.persistence_controller.capture_session_state()))
     else:
         window.daw_controller.page.project_name_edit.setText("After")
 
@@ -120,12 +120,12 @@ def test_saved_layout_and_source_finding_are_independent(project, tmp_path, appl
     if applied:
         window.topology_controller.apply_topology()
         assert window.state.session.tracks[0].channels == 1
-    state = window.lifecycle_controller.capture_session_state()
+    state = window.persistence_controller.capture_session_state()
     if legacy:
         state.pop("phase1_sources", None)
     path = str(tmp_path / "session.spsession")
     save_session(path, state)
-    window.lifecycle_controller.restore_session_state(load_session(path))
+    window.persistence_controller.restore_session_state(load_session(path))
     # Old projects can still use their saved Phase 2/3 results immediately.
     assert len(scans) == 1
     window._phase_tabs.setCurrentIndex(0)
@@ -146,9 +146,9 @@ def test_saved_layout_and_source_finding_are_independent(project, tmp_path, appl
 def test_source_replacement_invalidates_only_its_saved_evidence(project, tmp_path):
     window, folder, scans = project
     _write_source(folder / "Vox.wav")
-    window.lifecycle_controller.load_directory(str(folder))
+    window.persistence_controller.load_directory(str(folder))
     path = str(tmp_path / "session.spsession")
-    save_session(path, window.lifecycle_controller.capture_session_state())
+    save_session(path, window.persistence_controller.capture_session_state())
     source = folder / "Keys.wav"
     old = source.stat()
     replacement = tmp_path / "replacement.wav"
@@ -158,7 +158,7 @@ def test_source_replacement_invalidates_only_its_saved_evidence(project, tmp_pat
     assert source.stat().st_size == old.st_size
 
     scans.clear()
-    window.lifecycle_controller.restore_session_state(load_session(path))
+    window.persistence_controller.restore_session_state(load_session(path))
     window._phase_tabs.setCurrentIndex(0)
     assert scans == [["Keys.wav"]]
     # Preserve the saved layout until the user explicitly requests new defaults.
@@ -174,16 +174,16 @@ def test_measurement_uses_the_epsilon_in_effect_at_scan_time(project, tmp_path, 
     window, folder, scans = project
     left = np.tile([0.25, -0.25], 2400)
     sf.write(folder / "Keys.wav", np.column_stack((left, left + 0.000005)), 48000, subtype="DOUBLE")
-    window.lifecycle_controller.load_directory(str(folder))
+    window.persistence_controller.load_directory(str(folder))
     assert window.state.topo_source_tracks[0].detector_results["dual_mono"].data["dual_mono"]
     preset = window.state.config["config_presets"]["Default"]["detectors"]["dual_mono"]
     if changed_before_save:
         preset["dual_mono_eps"] = 1e-7
     path = str(tmp_path / "session.spsession")
-    save_session(path, window.lifecycle_controller.capture_session_state())
+    save_session(path, window.persistence_controller.capture_session_state())
     preset["dual_mono_eps"] = 1e-7
     scans.clear()
-    window.lifecycle_controller.restore_session_state(load_session(path))
+    window.persistence_controller.restore_session_state(load_session(path))
     window._phase_tabs.setCurrentIndex(0)
     assert scans == [["Keys.wav"]]
     window.topology_controller.page.reset_action.trigger()
@@ -196,15 +196,15 @@ def test_finished_scan_of_previous_folder_cannot_replace_current_scan(project, t
     second.mkdir()
     _write_source(second / "Different.wav", duplicate=False)
     monkeypatch.setattr(Phase1AnalyzeWorker, "start", lambda worker: None)
-    window.lifecycle_controller.load_directory(str(first))
-    old = window.lifecycle_controller.p1_worker
+    window.persistence_controller.load_directory(str(first))
+    old = window.analysis_controller.p1_worker
     QThread.start(old)
     assert old.wait(10_000)
     # Its completion is queued on the GUI thread when the user opens another folder.
-    window.lifecycle_controller.load_directory(str(second))
-    current = window.lifecycle_controller.p1_worker
+    window.persistence_controller.load_directory(str(second))
+    current = window.analysis_controller.p1_worker
     QApplication.processEvents()
-    assert window.lifecycle_controller.p1_worker is current
+    assert window.analysis_controller.p1_worker is current
     assert [t.filename for t in window.state.session.tracks] == ["Different.wav"]
     assert window.state.topo_topology is None
     current.run()
@@ -216,17 +216,17 @@ def test_format_findings_follow_full_input_set_when_membership_changes(project, 
     window, folder, scans = project
     sf.write(folder / "A.wav", [0.25, -0.25], 44_100, subtype="PCM_24")
     _write_source(folder / "B.wav")
-    window.lifecycle_controller.load_directory(str(folder))
+    window.persistence_controller.load_directory(str(folder))
     initial = {t.filename: t.detector_results["format_consistency"] for t in window.state.topo_source_tracks}
     assert initial["A.wav"].data["expected_sr"] == 48_000
     path = str(tmp_path / "session.spsession")
-    save_session(path, window.lifecycle_controller.capture_session_state())
+    save_session(path, window.persistence_controller.capture_session_state())
     if change == "replace":
         sf.write(folder / "Keys.wav", [0.25, -0.25], 44_100, subtype="PCM_24")
     else:
         (folder / "Keys.wav").unlink()
     scans.clear()
-    window.lifecycle_controller.restore_session_state(load_session(path))
+    window.persistence_controller.restore_session_state(load_session(path))
     window._phase_tabs.setCurrentIndex(0)
     results = {t.filename: t.detector_results["format_consistency"] for t in window.state.topo_source_tracks}
     assert results["B.wav"].data["expected_sr"] == 44_100

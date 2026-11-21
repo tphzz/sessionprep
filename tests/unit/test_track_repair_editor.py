@@ -358,7 +358,7 @@ def test_processing_menu_opens_same_editor_and_restores_focus_without_normalizat
         playback=None,
         on_find_table_row=table_ctrl.find_table_row,
     )
-    table_ctrl._on_open_track_repairs = detail_ctrl.open_track_repairs
+    table_ctrl.track_repairs_requested.connect(detail_ctrl.open_track_repairs)
     table_ctrl.create_processing_button(0, track)
     pane.processingFocusRequested.connect(detail_ctrl.focus_processing_menu)
     window = QWidget()

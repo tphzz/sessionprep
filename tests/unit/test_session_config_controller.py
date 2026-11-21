@@ -41,11 +41,8 @@ def test_session_config_controller_tracks_overrides_and_revert(_font_app):
     state.session = SessionContext(tracks=[], config={})
     shell = _StubShell()
     stale_calls: list[bool] = []
-    ctrl = SessionConfigController(
-        state,
-        shell,
-        on_mark_prepare_stale=lambda: stale_calls.append(True),
-    )
+    ctrl = SessionConfigController(state, shell)
+    ctrl.prepare_stale_requested.connect(lambda: stale_calls.append(True))
     try:
         assert ctrl.session_config_dirty_keys() == set()
         ctrl.on_session_config_value_changed("analysis.window", 250)
@@ -68,11 +65,8 @@ def test_session_config_controller_routes_daw_only_change_without_reanalysis(_fo
     state.session = SessionContext(tracks=[], config={})
     shell = _StubShell()
     daw_refreshed: list[bool] = []
-    ctrl = SessionConfigController(
-        state,
-        shell,
-        on_refresh_daw_from_config=lambda: daw_refreshed.append(True),
-    )
+    ctrl = SessionConfigController(state, shell)
+    ctrl.daw_refresh_requested.connect(lambda: daw_refreshed.append(True))
     try:
         ctrl.on_session_config_value_changed("daw_processors.protools.protools_project_dir", "/tmp/pt")
         assert daw_refreshed == [True]

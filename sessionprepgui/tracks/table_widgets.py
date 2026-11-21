@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from enum import IntEnum
 import json
 import os
 
@@ -18,6 +19,20 @@ from ..theme import COLORS, CONTENT_INSET
 from ..widgets import BatchEditTableWidget
 
 # ── Constants ────────────────────────────────────────────────────────────────
+
+
+class TrackCol(IntEnum):
+    """Column indices for the Phase 2 track table."""
+
+    FILE = 0
+    CHANNELS = 1
+    ANALYSIS = 2
+    CLASSIFICATION = 3
+    GAIN = 4
+    ANCHOR = 5
+    GROUP = 6
+    PROCESSING = 7
+
 
 _TAB_SUMMARY = 0
 _TAB_FILE = 1

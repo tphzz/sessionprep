@@ -503,12 +503,18 @@ sessionprepgui/                  # GUI package (PySide6)
     helpers.py                   # esc(), track_analysis_label() (severity counts), fmt_time(), severity maps
     state.py                     # WorkspaceState — shared cross-phase session, config, topology, DAW & peak state
     shell.py                     # MainWindowShell Protocol — narrow shell surface for controllers
+    progress.py                  # ProgressCoordinator — per-phase ProgressPanel widgets & active ownership
     mainwindow.py                # SessionPrepWindow (QMainWindow) + main() — thin composition shell (zero mixins)
     analysis/
         config_controller.py     # SessionConfigController — Phase 2 Config tab, overrides, presets, impact routing
-        lifecycle_controller.py  # SessionLifecycleController — open/save/load, Phase 1/2 analysis, peaks, repairs, Prepare
-        worker.py                # QThread workers: AnalyzeWorker, RepairPlanWorker, PrepareWorker,
-                                 #   DawCheckWorker, DawFetchWorker, DawTransferWorker
+        analysis_controller.py   # AnalysisPrepareController — Phase 1/2 analysis, repair planning, Prepare, gain recovery
+        persistence_controller.py # SessionPersistenceController — open/save/load .spsession, clear, peak cache builds
+        worker.py                # QThread workers: Phase1AnalyzeWorker, AnalyzeWorker, RepairPlanWorker, PrepareWorker,
+                                 #   TopologyApplyWorker, DawCheckWorker, DawFetchWorker, DawTransferWorker
+    batch/
+        controller.py            # BatchQueueController — owns BatchManager, BatchQueueDock, .spbatch I/O & close deferral
+        manager.py               # BatchManager — queued DAW transfer execution and session rehydration
+        panel.py                 # BatchQueueDock & BatchItem — batch queue dock UI and data model
     daw/
         page.py                  # DawSetupPage — Phase 3 DAW Transfer widgets
         controller.py            # DawTransferController — DAW selection, fetch, transfer, folder tree, assignments
@@ -541,10 +547,12 @@ sessionprepgui/                  # GUI package (PySide6)
     session/
         io.py                    # Session save/load (.spsession JSON) — serialises analysis state
     tracks/
+        group_utils.py           # Pure stateless helpers for group colors, row tinting, normalization & lookup maps
+        phase2_page.py           # Phase2Page — Phase 2 toolbar, track table, detail tabs, review & waveform container
         table_controller.py      # TrackTableController — Phase 2 & Phase 3 track tables, cell widgets, batch edits
         groups_tab.py            # GroupsTabWidget — Phase 2 Groups tab widget
         groups_controller.py     # GroupsController — group rules, auto-group, linked gains, preset sync
-        table_widgets.py         # Track table widget classes
+        table_widgets.py         # TrackCol enum and track table widget classes
     waveform/
         __init__.py              # Re-exports WaveformWidget, WaveformLoadWorker, SPECTROGRAM_COLORMAPS
         compute.py               # Colormaps, spectral view preparation, QThread workers
@@ -1949,8 +1957,11 @@ separator.
 | `log.py`                  | `dbg(msg)` — lightweight debug logging to stderr, gated by `SP_LOG_LEVEL=DEBUG`. Timestamped output with caller class name. Used by `pipeline.py`, `dawproject.py`, and other modules via conditional import.                                                                                                                                                                                   |
 | `state.py`                | `WorkspaceState` — shared cross-phase desktop state (session, summary, source/topology paths, config/presets/overrides, groups, DAW bindings, peak cache) |
 | `shell.py`                | `MainWindowShell` — typing `Protocol` exposing the narrow shell surface (status bar, progress panel, phase tabs, dialog parent, batch mode) to controllers |
+| `progress.py`             | `ProgressCoordinator` — per-phase `ProgressPanel` coordinator and foreground/background progress ownership |
+| `batch/controller.py`     | `BatchQueueController` — owns `BatchManager`, `BatchQueueDock`, `.spbatch` save/load, and batch shutdown deferral |
 | `analysis/config_controller.py` | `SessionConfigController` — Phase 2 Config tab, preset switching, session overrides, dirty markers, and `ConfigChangeImpact` routing |
-| `analysis/lifecycle_controller.py` | `SessionLifecycleController` — open/save/load `.spsession`, Phase 1/2 analysis workers, peak-cache build, repair planning, and Prepare execution |
+| `analysis/analysis_controller.py` | `AnalysisPrepareController` — Phase 1/2 analysis workers, repair-plan coalescing, Prepare execution, and output-gain recovery dialog |
+| `analysis/persistence_controller.py` | `SessionPersistenceController` — folder opening, `.spsession` save/load/restore, workspace reset, and background peak-cache builds |
 | `analysis/worker.py` | Background workers for analysis, per-track and batch repair planning, Prepare, DAW connectivity, folder discovery and transfer. |
 | `daw/page.py`             | `DawSetupPage` — Phase 3 DAW Transfer toolbar, setup table, folder tree, and project name controls |
 | `daw/controller.py`       | `DawTransferController` — DAW processor selection, check/fetch/transfer/sync, folder tree, drag-and-drop track assignment, Track Name inline editing, duplication with `-[N]` naming |
@@ -1964,10 +1975,12 @@ separator.
 | `detail/playback.py`      | `PlaybackController` — sounddevice OutputStream lifecycle, QTimer cursor updates, signal-based API |
 | `detail/report.py`        | HTML rendering: `render_summary_html()`, `render_fader_table_html()`, `render_track_detail_html()` |
 | `session/io.py`           | Session save/load — serialises full analysis state (detector + processor results, user edits, recursive_scan flag) to `.spsession` JSON without re-running analysis. Versioned format (v4) with forward-compatible migrations. |
+| `tracks/group_utils.py`   | Pure stateless helpers for session group colors, row tinting, normalization, and gain-link/rank lookup maps |
+| `tracks/phase2_page.py`   | `Phase2Page` — Phase 2 toolbar, track table, detail tabs, file review, and waveform panel container |
 | `tracks/table_controller.py` | `TrackTableController` — Phase 2 & Phase 3 track tables, cell editors, sorting, and `Alt+Shift` batch edits |
 | `tracks/groups_tab.py`    | `GroupsTabWidget` — Phase 2 Groups tab preset selector, rule table, and buttons |
 | `tracks/groups_controller.py` | `GroupsController` — group rules, auto-group matching, linked gains, dirty markers, and preset sync |
-| `tracks/table_widgets.py` | Track table widget classes (custom cell widgets, batch-edit base classes)                                                                                                                                                                                                                                                                                                                     |
+| `tracks/table_widgets.py` | `TrackCol` enum and track table widget classes (custom cell widgets, batch-edit base classes) |
 | `waveform/__init__.py`    | Re-exports `WaveformWidget`, `WaveformLoadWorker`, `SPECTROGRAM_COLORMAPS`                                                                                                                                                                                                                                                                                                                    |
 | `waveform/compute.py`     | Colormaps (magma/viridis/grayscale LUTs), spectral view preparation, `WaveformLoadWorker` QThread, `PeakBuildWorker` (batch peak cache builder using thread pool)                                                                                                                                                                                                                      |
 | `waveform/peakcache.py`   | Pre-computed peak mipmap cache: `PeakData`, `MipLevel`, `build_peaks()`, `save_peaks()`, `load_peaks()`, `query_peaks_fast()`. Binary `.peaks` file format (`SPK1`) with staleness detection via source file mtime                                                                                                                                                                            |
@@ -1984,22 +1997,23 @@ separator.
 | `prefs/page_groups.py`    | `GroupsPage` — named group presets using `NamedPresetPanel` + `GroupsTableWidget` with `load`/`commit` interface.                                                                                                                                                                                                                                                                             |
 | `prefs/dialog.py`         | `PreferencesDialog` — thin ~270-line orchestrator wiring all pages, managing config presets via `NamedPresetPanel`, and handling save with validation.                                                                                                                                                                                                                                        |
 | `prefs/param_widgets.py`  | Backward-compatible re-export shim — all public names forward to `param_form.py` / `config_pages.py`.                                                                                                                                                                                                                                                                                         |
-| `mainwindow.py`           | `SessionPrepWindow` (`QMainWindow`, zero mixins) — thin composition shell owning menus, global progress panel, phase tabs, `BatchQueueDock`, Preferences/Tools launchers, `WorkspaceState`, and the 7 phase controllers |
+| `mainwindow.py`           | `SessionPrepWindow` (`QMainWindow`, zero mixins) — thin composition shell owning menus, phase tabs, Preferences/Tools launchers, `WorkspaceState`, `ProgressCoordinator`, `Phase2Page`, and the 9 focused controllers wired via Qt signals |
 
 ### 18.3 Dependency Direction
 
 ```
 settings (leaf) <--  state / mainwindow
 theme (leaf)  <--  helpers  <--  detail/report  <--  detail/controller <-- mainwindow
-widgets (leaf) <--  tracks/  <-----------------------------------------------+
-shell (Protocol) <-- controllers (topology, daw, detail, tracks, analysis) --+
-                     waveform/    <------------------------------------------+
-                     session/     <------------------------------------------+
-                     prefs/       <------------------------------------------+
+widgets (leaf) <--  tracks/ (group_utils, phase2_page, ...) <---------------+
+shell (Protocol) <-- controllers (topology, daw, detail, tracks, analysis,  |
+                                  batch, progress) -------------------------+
+                     waveform/    <-----------------------------------------+
+                     session/     <-----------------------------------------+
+                     prefs/       <-----------------------------------------+
 ```
 
 No circular imports. `settings`, `theme`, `helpers`, `widgets`, `state`, and `shell` are decoupled foundations. `prefs/` reads `ParamSpec` metadata from detectors and processors.
-`SessionPrepWindow` composes `WorkspaceState` and the 7 focused `QObject` controllers (`TopologyController`, `DawTransferController`, `TrackDetailController`, `TrackTableController`, `GroupsController`, `SessionConfigController`, `SessionLifecycleController`) with zero mixin inheritance.
+`SessionPrepWindow` composes `WorkspaceState`, `ProgressCoordinator`, `Phase2Page`, and the focused `QObject` controllers (`TopologyController`, `DawTransferController`, `TrackDetailController`, `TrackTableController`, `GroupsController`, `SessionConfigController`, `AnalysisPrepareController`, `SessionPersistenceController`, `BatchQueueController`) with zero mixin inheritance and centralized Qt signal wiring.
 
 ### 18.4 Key Design Decisions
 
@@ -2399,8 +2413,9 @@ Four mip levels at 256, 1024, 4096, and 16384 samples/bin. A 5-minute stereo
 
 - `settings.py` — `peak_cache_folder` default (`"sp_peaks"`), added to
   `skip_folders` so the cache directory is not scanned as audio content.
-- `analysis/lifecycle_controller.py` — `start_peak_build()` triggered from
-  `_on_phase1_done()` and `_on_analyze_done()`. Maintains `state.peak_cache` dict
+- `analysis/persistence_controller.py` — `start_peak_build()` triggered via
+  `AnalysisPrepareController.peak_build_requested` after Phase 1/2 completion
+  and during session restore. Maintains `state.peak_cache` dict
   (normalized absolute source path → `PeakData`). Reopening queues original
   inputs and routed files in one job. Queued deliveries identify their job
   explicitly. Worker cleanup runs in `clear_workspace()`.

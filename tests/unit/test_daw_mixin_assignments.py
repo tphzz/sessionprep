@@ -47,14 +47,12 @@ def _make_harness():
     ctrl = DawTransferController(
         state,
         shell,
-        on_populate_setup_table=lambda: counters.__setitem__("setup_table", counters["setup_table"] + 1),
-        on_group_color_map=lambda: {},
-        on_tint_group_color=lambda _g, _m=None: None,
-        on_normalize_groups=lambda g: g,
         on_capture_session_state=lambda: {},
         on_enqueue_batch_item=lambda _i: True,
-        on_clear_workspace=lambda: None,
         on_is_prepare_running=lambda: False,
+    )
+    ctrl.setup_table_refresh_requested.connect(
+        lambda: counters.__setitem__("setup_table", counters["setup_table"] + 1)
     )
     state.active_daw_processor = SimpleNamespace(id="protools_0", name="Pro Tools", enabled=True)
     state.session = SessionContext(

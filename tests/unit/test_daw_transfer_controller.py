@@ -77,14 +77,15 @@ def _make_controller(state: WorkspaceState, shell: _StubShell):
     ctrl = DawTransferController(
         state,
         shell,
-        on_populate_setup_table=lambda: calls.__setitem__("setup_table", calls["setup_table"] + 1),
-        on_group_color_map=lambda: {},
-        on_tint_group_color=lambda _g, _m=None: None,
-        on_normalize_groups=lambda g: g,
         on_capture_session_state=lambda: {"captured": True},
         on_enqueue_batch_item=lambda item: (calls["enqueued"].append(item), True)[1],
-        on_clear_workspace=lambda: calls.__setitem__("cleared", calls["cleared"] + 1),
         on_is_prepare_running=lambda: False,
+    )
+    ctrl.setup_table_refresh_requested.connect(
+        lambda: calls.__setitem__("setup_table", calls["setup_table"] + 1)
+    )
+    ctrl.clear_workspace_requested.connect(
+        lambda: calls.__setitem__("cleared", calls["cleared"] + 1)
     )
     return ctrl, calls
 

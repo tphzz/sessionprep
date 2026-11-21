@@ -78,14 +78,14 @@ def window(qapp, monkeypatch):
     session = SessionContext(tracks, {}, detectors=[detector], processors=processors)
     owner.state.session = session
     owner.state.summary = build_diagnostic_summary(session)
-    with QSignalBlocker(owner._track_table):
-        owner._track_table.setRowCount(len(tracks))
+    with QSignalBlocker(owner.phase2_page.track_table):
+        owner.phase2_page.track_table.setRowCount(len(tracks))
         for row, current in enumerate(tracks):
-            owner._track_table.setItem(row, 0, QTableWidgetItem(current.filename))
+            owner.phase2_page.track_table.setItem(row, 0, QTableWidgetItem(current.filename))
         owner.track_table_controller.populate_table(session)
     owner.detail_controller.render_summary()
-    for index in range(owner._detail_tabs.count()):
-        owner._detail_tabs.setTabEnabled(index, True)
+    for index in range(owner.phase2_page.detail_tabs.count()):
+        owner.phase2_page.detail_tabs.setTabEnabled(index, True)
     owner._phase_tabs.setTabEnabled(1, True)
     owner._phase_tabs.setCurrentIndex(1)
     owner.resize(1600, 900)
@@ -96,9 +96,9 @@ def window(qapp, monkeypatch):
 
 
 def _show_tab(qapp, owner, index):
-    owner._detail_tabs.setCurrentIndex(index)
+    owner.phase2_page.detail_tabs.setCurrentIndex(index)
     _settle(qapp, owner)
-    return owner._detail_tabs.currentWidget()
+    return owner.phase2_page.detail_tabs.currentWidget()
 
 
 def _root_margins(browser):
@@ -118,42 +118,42 @@ def _first_text_origin(browser, page):
 def test_summary_and_file_reports_inset_text_on_every_side(qapp, window):
     owner, tracks = window
     summary_page = _show_tab(qapp, owner, _TAB_SUMMARY)
-    assert _root_margins(owner._summary_view) == (REPORT_INSET,) * 4
-    summary_origin = _first_text_origin(owner._summary_view, summary_page)
+    assert _root_margins(owner.phase2_page.summary_view) == (REPORT_INSET,) * 4
+    summary_origin = _first_text_origin(owner.phase2_page.summary_view, summary_page)
 
-    owner._detail_tabs.setTabEnabled(_TAB_FILE, True)
-    owner._file_report.present_track(tracks[0], owner.state.session)
+    owner.phase2_page.detail_tabs.setTabEnabled(_TAB_FILE, True)
+    owner.phase2_page.file_report.present_track(tracks[0], owner.state.session)
     file_page = _show_tab(qapp, owner, _TAB_FILE)
-    assert _root_margins(owner._file_report) == (REPORT_INSET,) * 4
-    file_origin = _first_text_origin(owner._file_report, file_page)
+    assert _root_margins(owner.phase2_page.file_report) == (REPORT_INSET,) * 4
+    file_origin = _first_text_origin(owner.phase2_page.file_report, file_page)
 
     # The report widgets are flush with the tab page; only their text is inset.
-    assert owner._summary_view is summary_page
-    assert owner._file_report.mapTo(file_page, QPoint(0, 0)) == QPoint(0, 0)
-    for browser, page in ((owner._summary_view, summary_page),
-                          (owner._file_report, file_page)):
+    assert owner.phase2_page.summary_view is summary_page
+    assert owner.phase2_page.file_report.mapTo(file_page, QPoint(0, 0)) == QPoint(0, 0)
+    for browser, page in ((owner.phase2_page.summary_view, summary_page),
+                          (owner.phase2_page.file_report, file_page)):
         frame = browser.frameWidth()
         assert browser.viewport().mapTo(page, QPoint(0, 0)) == QPoint(frame, frame)
-    frame = owner._summary_view.frameWidth()
+    frame = owner.phase2_page.summary_view.frameWidth()
     assert summary_origin == (frame + REPORT_INSET,) * 2
     assert file_origin == (frame + REPORT_INSET,) * 2
 
 
 def test_report_message_path_keeps_the_same_inset(qapp, window):
     owner, _tracks = window
-    owner._summary_view.setHtml(owner._wrap_html(
+    owner.phase2_page.summary_view.setHtml(owner._wrap_html(
         '<div style="font-weight:bold;">Analysis Error</div><div>Message</div>'))
     page = _show_tab(qapp, owner, _TAB_SUMMARY)
-    frame = owner._summary_view.frameWidth()
-    assert _root_margins(owner._summary_view) == (REPORT_INSET,) * 4
-    assert _first_text_origin(owner._summary_view, page) == (frame + REPORT_INSET,) * 2
+    frame = owner.phase2_page.summary_view.frameWidth()
+    assert _root_margins(owner.phase2_page.summary_view) == (REPORT_INSET,) * 4
+    assert _first_text_origin(owner.phase2_page.summary_view, page) == (frame + REPORT_INSET,) * 2
 
 
 def test_report_header_minimum_width_follows_the_shared_inset(qapp, window, monkeypatch):
     import sessionprepgui.detail.browser as browser_module
 
     owner, tracks = window
-    browser = owner._file_report
+    browser = owner.phase2_page.file_report
     browser.present_track(tracks[0], owner.state.session)
     minimum = browser.minimum_header_width()
     browser._minimum_header_cache = None
@@ -187,9 +187,9 @@ def test_groups_and_config_pages_inset_every_edge(qapp, window, tab):
 
 def test_waveform_preview_stays_full_width_in_file_tab(qapp, window):
     owner, tracks = window
-    owner._file_report.present_track(tracks[0], owner.state.session)
+    owner.phase2_page.file_report.present_track(tracks[0], owner.state.session)
     page = _show_tab(qapp, owner, _TAB_FILE)
-    panel = owner._wf_panel
+    panel = owner.phase2_page.wf_panel
     assert panel.mapTo(page, QPoint(0, 0)).x() == 0
     assert panel.width() == page.width()
 
@@ -391,30 +391,30 @@ def _assert_flush_track_table(splitter, table):
 
 def test_phase2_table_and_detail_tabs_start_at_the_toolbar(qapp, window):
     owner, _tracks = window
-    owner._track_table.setRowCount(80)
+    owner.phase2_page.track_table.setRowCount(80)
     _settle(qapp, owner)
-    splitter = owner._main_splitter
+    splitter = owner.phase2_page.main_splitter
     page = owner._phase_tabs.currentWidget()
-    assert splitter.mapTo(page, QPoint()).y() == owner._analysis_toolbar.geometry().bottom() + 1
-    _assert_flush_track_table(splitter, owner._track_table)
-    tab_bar = owner._detail_tabs.tabBar()
+    assert splitter.mapTo(page, QPoint()).y() == owner.phase2_page.toolbar.geometry().bottom() + 1
+    _assert_flush_track_table(splitter, owner.phase2_page.track_table)
+    tab_bar = owner.phase2_page.detail_tabs.tabBar()
     assert tab_bar.mapTo(splitter, QPoint()) == QPoint(splitter.widget(1).x(), 0)
     assert tab_bar.width() == splitter.widget(1).width()
 
 
 def test_phase2_keeps_the_split_while_reanalysis_hides_the_table(qapp, window):
     owner, _tracks = window
-    splitter = owner._main_splitter
+    splitter = owner.phase2_page.main_splitter
     detail_x = splitter.widget(1).x()
-    owner._track_table.hide()
+    owner.phase2_page.track_table.hide()
     _settle(qapp, owner)
     assert splitter.handle(1).isVisible()
     assert splitter.widget(1).x() == detail_x
 
-    owner._track_table.show()
+    owner.phase2_page.track_table.show()
     _settle(qapp, owner)
     assert splitter.widget(1).x() == detail_x
-    assert owner._track_table.mapTo(splitter, QPoint()) == QPoint()
+    assert owner.phase2_page.track_table.mapTo(splitter, QPoint()) == QPoint()
 
 
 @pytest.mark.parametrize("routing_visible", [False, True], ids=["offline", "routing"])
@@ -441,7 +441,7 @@ def test_transfer_table_is_flush_and_the_right_pane_keeps_insets(qapp, window, r
 
 def test_phase2_auto_fit_shows_every_column_with_the_scrollbar_visible(qapp, window):
     owner, _tracks = window
-    table = owner._track_table
+    table = owner.phase2_page.track_table
     owner.resize(2100, owner.height())
     table.setRowCount(80)
     _settle(qapp, owner)

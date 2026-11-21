@@ -8,6 +8,7 @@ import numpy as np
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QImage, QPainter, QPen
+from shiboken6 import isValid
 
 from ..theme import COLORS
 from .compute import (
@@ -72,10 +73,14 @@ class SpectrogramRenderer:
 
     def reset(self, samplerate: int = 44100):
         """Clear spec data on track unload.  Resets mel view to full range."""
-        if self._spec_recompute_worker is not None:
-            self._spec_recompute_worker.cancel()
-            self._spec_recompute_worker.finished.disconnect()
-            self._spec_recompute_worker = None
+        worker = self._spec_recompute_worker
+        self._spec_recompute_worker = None
+        if worker is not None and isValid(worker):
+            worker.cancel()
+            try:
+                worker.completed.disconnect()
+            except RuntimeError:
+                pass
         self._spec_db = None
         self._spec_image = None
         self._spec_image_data = None
@@ -218,10 +223,14 @@ class SpectrogramRenderer:
 
     def recompute(self, channels: list, sr: int, *, on_done, parent=None):
         """Launch background spectrogram recompute.  Calls on_done() when done."""
-        if self._spec_recompute_worker is not None:
-            self._spec_recompute_worker.cancel()
-            self._spec_recompute_worker.finished.disconnect()
-            self._spec_recompute_worker = None
+        prev = self._spec_recompute_worker
+        self._spec_recompute_worker = None
+        if prev is not None and isValid(prev):
+            prev.cancel()
+            try:
+                prev.completed.disconnect()
+            except RuntimeError:
+                pass
         self._spec_db = None
         self._spec_image = None
         self._spec_cache_key = ()
@@ -231,7 +240,8 @@ class SpectrogramRenderer:
             n_fft=self._spec_n_fft, window=self._spec_window,
             parent=parent,
         )
-        worker.finished.connect(self._on_spec_recomputed)
+        worker.completed.connect(self._on_spec_recomputed)
+        worker.finished.connect(worker.deleteLater)
         self._spec_recompute_worker = worker
         worker.start()
 

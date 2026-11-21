@@ -41,11 +41,11 @@ def _processing_outcomes(session: SessionContext) -> dict[str, dict[str, Any]]:
         error = failures.get(track.filename) or track._cache.get("repair_error")
         if track.status != "OK":
             error = error or track.status
-        if normalizing and result.error:
+        if normalizing and result is not None and result.error:
             error = error or result.error
         receipt = None if error else receipts.get(track.filename)
         evidence = receipt if receipt is not None else track.repair_measurements
-        planned_gain = result.gain_db if normalizing else (track.manual_gain_db or 0.0)
+        planned_gain = result.gain_db if normalizing and result is not None else (track.manual_gain_db or 0.0)
         outcomes[track.filename] = {
             "status": "failed" if error else "written" if receipt is not None else "planned",
             "error": error,
@@ -219,7 +219,8 @@ def save_json(
     source_dir = config.get("_source_dir", "")
     outcomes = _processing_outcomes(session)
 
-    data = {
+    tracks_data: list[dict[str, Any]] = []
+    data: dict[str, Any] = {
         "schema_version": "2.0",
         "session": {
             "timestamp": datetime.now().isoformat(),
@@ -235,7 +236,7 @@ def save_json(
                 "tail_hop_ms": config.get("tail_hop_ms", 10),
             }
         },
-        "tracks": []
+        "tracks": tracks_data,
     }
 
     sort_index = 0
@@ -249,7 +250,7 @@ def save_json(
         mono_loss_db = sc_r.data.get("mono_loss_db") if sc_r else None
         mono_warn = bool(sc_r.data.get("mono_warn")) if sc_r else False
 
-        data["tracks"].append({
+        tracks_data.append({
             "sort_index": sort_index,
             "filename": t.filename,
             "diagnostics": {

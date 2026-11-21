@@ -55,8 +55,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .prefs.param_form import _argb_to_qcolor
-from .theme import COLORS, CONTENT_INSET, normalize_color_name
+from .theme import COLORS, CONTENT_INSET, argb_to_qcolor as _argb_to_qcolor, normalize_color_name
 
 
 _SELECTION_COLOR = QColor(42, 109, 181, 160)  # semi-transparent blue

@@ -37,7 +37,7 @@ def _wait(predicate):
 
 
 def _idle(window):
-    _wait(lambda: window.lifecycle_controller.repair_plan_worker is None and not window.lifecycle_controller.repair_plan_pending)
+    _wait(lambda: window.analysis_controller.repair_plan_worker is None and not window.analysis_controller.repair_plan_pending)
 
 
 @pytest.fixture(scope="module")
@@ -81,15 +81,15 @@ def _save_fixture(window, folder, *, active):
 
 def _open(window, monkeypatch, project):
     monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *args: (str(project), ""))
-    window.lifecycle_controller.load_session_dialog()
+    window.persistence_controller.load_session_dialog()
     return window.state.session.tracks[0]
 
 
 def _edit(window, track, key, value):
     row = window.track_table_controller.find_table_row(track.filename)
-    processing = window._track_table.cellWidget(row, 7)
+    processing = window.phase2_page.track_table.cellWidget(row, 7)
     next(a for a in processing.menu().actions() if a.text() == "Track repairs…").trigger()
-    editor = window._repair_editor
+    editor = window.phase2_page.repair_editor
     assert editor.track is track
     choice = editor.rows[key].choice
     choice.setCurrentIndex(choice.findData(value))
@@ -155,13 +155,13 @@ def test_normal_repair_worker_publishes_verdict_and_file_navigation_reuses_it(wi
     assert calls and get_ident() not in calls
     verified_calls = list(calls)
     snapshot = track.corrected_analysis
-    window._repair_editor.back_button.click()
-    preview = window._repair_preview
+    window.phase2_page.repair_editor.back_button.click()
+    preview = window.repair_preview
     _wait(lambda: preview.displayed and preview.worker is None)
     for corrected in (True, False, True):
-        window._wf_panel.source_selector.buttons[int(corrected)].click()
+        window.phase2_page.wf_panel.source_selector.buttons[int(corrected)].click()
         _wait(lambda: not preview.pending and preview.worker is None)
-        assert window._wf_panel.corrected == corrected
+        assert window.phase2_page.wf_panel.corrected == corrected
         assert track.corrected_analysis is snapshot
     row = window.track_table_controller.find_table_row(track.filename)
     window.track_table_controller.select_row(row)
@@ -206,12 +206,12 @@ def test_interrupted_repair_finishes_if_full_reanalysis_fails(window, tmp_path, 
     with _hold_completed_plan(monkeypatch) as (ready, _):
         _edit(window, track, "dc_remove", enable)
         _wait(ready.is_set)
-        assert window._analyze_action.isEnabled()
-        window._analyze_action.trigger()
-        _wait(lambda: window.lifecycle_controller.analyze_worker is None)
+        assert window.phase2_page.analyze_action.isEnabled()
+        window.phase2_page.analyze_action.trigger()
+        _wait(lambda: window.analysis_controller.analyze_worker is None)
     _idle(window)
     assert window.state.session.tracks[0] is track
-    assert window._save_session_action.isEnabled() and window._prepare_action.isEnabled()
+    assert window._save_session_action.isEnabled() and window.phase2_page.prepare_action.isEnabled()
     assert "repair_verification_pending" not in track._cache
     assert track.repair_recipe.active == enable
     assert (track.corrected_analysis is not None) == enable
@@ -238,10 +238,10 @@ def test_file_retry_recovers_only_the_original_audio(window, tmp_path, monkeypat
         track.source_sample_digest = None
     stat = path.stat()
     os.utime(path, ns=(stat.st_atime_ns, previous[1] + 2_000_000_000))
-    window.lifecycle_controller.queue_repair_plan([track])
+    window.analysis_controller.queue_repair_plan([track])
     _idle(window)
     assert track._cache.get("repair_error") and track.source_file_signature == previous
-    window._file_report.verificationRetryRequested.emit()
+    window.phase2_page.file_report.verificationRetryRequested.emit()
     _idle(window)
     if restored == "same audio":
         assert not track._cache.get("repair_error") and track.corrected_analysis is not None

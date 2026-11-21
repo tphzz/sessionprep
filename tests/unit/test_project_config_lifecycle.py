@@ -50,8 +50,8 @@ def project(qapp, tmp_path, monkeypatch):
     _write_tone(source / "Tone.wav")
 
     window = SessionPrepWindow()
-    monkeypatch.setattr(window.lifecycle_controller, "start_peak_build", lambda *_args: None)
-    window.lifecycle_controller.restore_session_state({
+    monkeypatch.setattr(window.persistence_controller, "start_peak_build", lambda *_args: None)
+    window.persistence_controller.restore_session_state({
         "source_dir": str(source),
         "active_config_preset": "Studio",
         "session_config_overrides": {},
@@ -72,7 +72,7 @@ def _set_project_override(window, path):
 
 
 def _queued_state(window):
-    return deserialize_session_state(serialize_session_state(window.lifecycle_controller.capture_session_state()))
+    return deserialize_session_state(serialize_session_state(window.persistence_controller.capture_session_state()))
 
 
 def test_track_layout_rerun_uses_phase1_override_and_preserves_session_preset(
@@ -88,7 +88,7 @@ def test_track_layout_rerun_uses_phase1_override_and_preserves_session_preset(
         worker.run()
 
     monkeypatch.setattr(Phase1AnalyzeWorker, "start", run)
-    project.lifecycle_controller.reanalyze_topology()
+    project.persistence_controller.reanalyze_topology()
 
     assert read_at_analysis == [0.005]
     assert project.config_controller.config_preset_combo.currentText() == "Studio"
@@ -106,9 +106,9 @@ def test_opening_another_audio_folder_uses_app_preset_and_drops_previous_overrid
     for worker in (Phase1AnalyzeWorker, TopologyApplyWorker, AnalyzeWorker, PrepareWorker):
         monkeypatch.setattr(worker, "start", lambda instance: instance.run())
 
-    project.lifecycle_controller.load_directory(str(other))
+    project.persistence_controller.load_directory(str(other))
     project.topology_controller.apply_topology()
-    project.lifecycle_controller.prepare()
+    project.analysis_controller.prepare()
     QApplication.processEvents()
 
     assert project.state.session.prepare_state == "ready"
@@ -116,7 +116,7 @@ def test_opening_another_audio_folder_uses_app_preset_and_drops_previous_overrid
     assert project.config_controller.config_preset_combo.currentText() == "Default"
     assert project.state.active_daw_processor.project_dir == "Default Projects"
     assert project.state.active_daw_processor._temp_dir == "Default Scratch"
-    assert project.lifecycle_controller.capture_session_state()["session_config_overrides"] == {}
+    assert project.persistence_controller.capture_session_state()["session_config_overrides"] == {}
 
 
 def test_queued_transfer_uses_captured_defaults_and_interactive_reopen_resolves_latest(
@@ -126,9 +126,9 @@ def test_queued_transfer_uses_captured_defaults_and_interactive_reopen_resolves_
     studio = project.state.config["config_presets"]["Studio"]["daw_processors"]["protools"]
     studio.update(protools_project_dir="Latest Projects", protools_temp_dir="Latest Scratch")
 
-    queued = project._batch_manager._rehydrate_session(saved)
-    queued_processor = project._batch_manager._get_daw_processor("protools_0", queued.config)
-    project.lifecycle_controller.restore_session_state(saved)
+    queued = project.batch_controller.manager._rehydrate_session(saved)
+    queued_processor = project.batch_controller.manager._get_daw_processor("protools_0", queued.config)
+    project.persistence_controller.restore_session_state(saved)
 
     assert queued_processor.project_dir == "Studio Projects"
     assert queued_processor._temp_dir == "Studio Scratch"
@@ -145,7 +145,7 @@ def test_opening_prepared_session_reflects_changed_analysis_defaults_and_marks_a
         "target_rms"
     ] = -21.0
 
-    project.lifecycle_controller.restore_session_state(saved)
+    project.persistence_controller.restore_session_state(saved)
 
     assert project.state.flat_config()["target_rms"] == -21.0
     assert project.state.session.prepare_state == "stale"
@@ -156,11 +156,11 @@ def test_source_choice_survives_reopen_and_resets_between_projects(project):
     saved = _queued_state(project)
     for choice in (True, False, True):
         saved["use_processed"] = choice
-        project.lifecycle_controller.restore_session_state(saved)
+        project.persistence_controller.restore_session_state(saved)
         assert project.daw_controller.page.use_processed_cb.isChecked() is choice
         assert project.daw_controller._transfer_config(project.state.session)["_use_processed"] is choice
-        assert project._batch_manager._rehydrate_session(saved).config["_use_processed"] is choice
-    project.lifecycle_controller.clear_workspace()
+        assert project.batch_controller.manager._rehydrate_session(saved).config["_use_processed"] is choice
+    project.persistence_controller.clear_workspace()
     assert not project.daw_controller.page.use_processed_cb.isChecked()
 
 
@@ -169,7 +169,7 @@ def test_reopening_with_missing_preset_uses_default_and_preserves_explicit_value
     saved = _queued_state(project)
     del project.state.config["config_presets"]["Studio"]
 
-    project.lifecycle_controller.restore_session_state(saved)
+    project.persistence_controller.restore_session_state(saved)
 
     assert project.config_controller.config_preset_combo.currentText() == "Default"
     assert project.state.active_daw_processor.project_dir == "Session Projects"
@@ -184,7 +184,7 @@ def test_reopening_remaps_fetched_state_when_inherited_template_moves(project):
     ]
     templates.insert(0, {"group": "Mix", "name": "Alternative"})
 
-    project.lifecycle_controller.restore_session_state(saved)
+    project.persistence_controller.restore_session_state(saved)
 
     assert project.state.active_daw_processor.id == "protools_1"
     assert project.state.active_daw_processor.name.endswith(" / Stereo")

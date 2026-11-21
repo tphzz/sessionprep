@@ -1,4 +1,5 @@
-from .panel import BatchQueueDock, BatchItem
+from .controller import BatchQueueController
 from .manager import BatchManager
+from .panel import BatchItem, BatchQueueDock
 
-__all__ = ["BatchQueueDock", "BatchItem", "BatchManager"]
+__all__ = ["BatchItem", "BatchManager", "BatchQueueController", "BatchQueueDock"]

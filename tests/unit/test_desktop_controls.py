@@ -227,12 +227,12 @@ def test_primary_busy_is_cleared_when_workspace_cancels_worker(qapp, monkeypatch
     try:
         worker = MagicMock()
         worker.isRunning.return_value = False
-        window.lifecycle_controller.prepare_worker = worker
-        set_action_busy(window._prepare_action, True, "Preparing…")
-        window.lifecycle_controller.clear_workspace()
-        assert not window._prepare_action.property("primaryBusy")
-        window._prepare_action.setEnabled(True)
-        assert window._prepare_action.isEnabled()
+        window.analysis_controller.prepare_worker = worker
+        set_action_busy(window.phase2_page.prepare_action, True, "Preparing…")
+        window.persistence_controller.clear_workspace()
+        assert not window.phase2_page.prepare_action.property("primaryBusy")
+        window.phase2_page.prepare_action.setEnabled(True)
+        assert window.phase2_page.prepare_action.isEnabled()
     finally:
         dispose_window(window)
 

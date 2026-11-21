@@ -21,6 +21,7 @@ def qapp():
 class _FakeApplyWorker(QThread):
     progress = Signal(object, str)
     progress_value = Signal(object, int, int)
+    overwrite_confirmation_required = Signal(object, str, object)
     apply_finished = Signal(object)
     error = Signal(object, str)
 
@@ -48,7 +49,7 @@ def window(qapp, monkeypatch):
 
 def test_apply_keeps_the_toolbar_summary_and_uses_the_progress_strip(qapp, window, monkeypatch):
     started = []
-    monkeypatch.setattr(window, "_progress_start", lambda message: started.append(message))
+    monkeypatch.setattr(window, "progress_start", lambda message, **kw: started.append(message))
     window.topology_controller.page.status_label.setText("6 input → 6 output tracks")
     window.topology_controller.apply_topology()
     assert window.topology_controller.page.status_label.text() == "6 input → 6 output tracks"
@@ -56,8 +57,8 @@ def test_apply_keeps_the_toolbar_summary_and_uses_the_progress_strip(qapp, windo
 
 
 def test_failed_apply_leaves_no_stale_toolbar_message(qapp, window, monkeypatch):
-    monkeypatch.setattr(window, "_progress_start", lambda message: None)
-    monkeypatch.setattr(window, "_progress_fail", lambda message: None)
+    monkeypatch.setattr(window, "progress_start", lambda message, **kw: None)
+    monkeypatch.setattr(window, "progress_fail", lambda message: None)
     window.topology_controller.page.status_label.setText("6 input → 6 output tracks")
     window.topology_controller.apply_topology()
     worker = window.topology_controller.apply_worker

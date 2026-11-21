@@ -56,19 +56,19 @@ def _wait(app, window):
     import time
     limit = time.monotonic() + 8
     app.processEvents()
-    while (window._repair_preview.worker is not None or window.lifecycle_controller.repair_plan_worker is not None) and time.monotonic() < limit:
+    while (window.repair_preview.worker is not None or window.analysis_controller.repair_plan_worker is not None) and time.monotonic() < limit:
         app.processEvents()
         time.sleep(.005)
-    assert window._repair_preview.worker is None
-    assert window.lifecycle_controller.repair_plan_worker is None
+    assert window.repair_preview.worker is None
+    assert window.analysis_controller.repair_plan_worker is None
 
 
 def test_real_file_panel_retains_zoom_cursor_and_native_spectral_scales(app, window, tmp_path):
     track = _open_track(window, tmp_path, "Stereo synth.wav")
-    panel = window._wf_panel
+    panel = window.phase2_page.wf_panel
     wave = panel.waveform
     _wait(app, window)
-    assert window._repair_preview.audition is not None, panel.preview_message.text()
+    assert window.repair_preview.audition is not None, panel.preview_message.text()
     wave.set_cursor(4096)
     wave.zoom_in()
     view = (wave._view_start, wave._view_end, wave._vscale)
@@ -99,21 +99,21 @@ def test_replaced_source_does_not_play_cached_material_and_retry_recovers(app, w
     path = tmp_path / "Recover.wav"
     _open_track(window, tmp_path, path.name)
     _wait(app, window)
-    wave = window._wf_panel.waveform
+    wave = window.phase2_page.wf_panel.waveform
     wave.set_cursor(7654)
     wave.zoom_in()
     original_view = (wave._view_start, wave._view_end, wave._vscale)
     original_stat = path.stat()
     os.utime(path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns + 1_000_000_000))
-    window._wf_panel.source_selector.buttons[1].click()
+    window.phase2_page.wf_panel.source_selector.buttons[1].click()
     _wait(app, window)
-    panel = window._wf_panel
+    panel = window.phase2_page.wf_panel
     assert panel.preview_retry_button.isVisible() and not panel.play_btn.isEnabled()
-    assert window._repair_preview.audition is None and not panel.waveform._channels
+    assert window.repair_preview.audition is None and not panel.waveform._channels
     os.utime(path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
     panel.preview_retry_button.click()
     _wait(app, window)
-    assert window._repair_preview.audition is not None and panel.waveform._corrected
+    assert window.repair_preview.audition is not None and panel.waveform._corrected
     assert panel.play_btn.isEnabled() and not panel.preview_retry_button.isVisible()
     assert wave._cursor_sample == 7654
     assert (wave._view_start, wave._view_end, wave._vscale) == original_view
@@ -126,10 +126,10 @@ def test_late_old_file_or_recipe_cannot_replace_new_selection(app, window, tmp_p
     second.repair_recipe = RepairRecipe(dc_remove=True)
     window.detail_controller.refresh_repair_preview(second)
     _wait(app, window)
-    assert window._repair_preview.track is second and window._repair_preview.recipe == second.repair_recipe
-    assert window._repair_preview.audition.sample_rate == 32000
-    assert not window._wf_panel.band_actions["high"].isEnabled()
-    assert window._wf_panel.waveform._samplerate != first.samplerate
+    assert window.repair_preview.track is second and window.repair_preview.recipe == second.repair_recipe
+    assert window.repair_preview.audition.sample_rate == 32000
+    assert not window.phase2_page.wf_panel.band_actions["high"].isEnabled()
+    assert window.phase2_page.wf_panel.waveform._samplerate != first.samplerate
 
 
 def test_gated_preview_during_project_switch_releases_old_audio_and_plot(app, window, tmp_path, monkeypatch):
@@ -138,7 +138,7 @@ def test_gated_preview_during_project_switch_releases_old_audio_and_plot(app, wi
 
     first = _open_track(window, tmp_path, "Old.wav")
     _wait(app, window)
-    assert window._repair_preview.audition is not None
+    assert window.repair_preview.audition is not None
     entered, release = Event(), Event()
     run = WaveformLoadWorker.run
 
@@ -148,37 +148,37 @@ def test_gated_preview_during_project_switch_releases_old_audio_and_plot(app, wi
             run(worker)
 
     monkeypatch.setattr(WaveformLoadWorker, "run", gated)
-    window._wf_panel.source_selector.buttons[1].click()
+    window.phase2_page.wf_panel.source_selector.buttons[1].click()
     try:
         assert entered.wait(3)
         fresh = tmp_path / "new-project"
         fresh.mkdir()
-        window.lifecycle_controller.restore_session_state({"source_dir": str(fresh), "tracks": []})
+        window.persistence_controller.restore_session_state({"source_dir": str(fresh), "tracks": []})
     finally:
         release.set()
     _wait(app, window)
-    assert not window._wf_panel.waveform._channels and window.state.current_track is None
-    assert window._repair_preview.track is not first
-    assert window._repair_preview.audition is None and not window._repair_preview.cache
-    assert not window._wf_panel.play_btn.isEnabled()
+    assert not window.phase2_page.wf_panel.waveform._channels and window.state.current_track is None
+    assert window.repair_preview.track is not first
+    assert window.repair_preview.audition is None and not window.repair_preview.cache
+    assert not window.phase2_page.wf_panel.play_btn.isEnabled()
 
 
 def test_changed_repair_choice_immediately_withholds_old_audio_and_retry_replans(app, window, tmp_path, monkeypatch):
     track = _open_track(window, tmp_path, "Replan.wav")
     _wait(app, window)
-    panel = window._wf_panel
+    panel = window.phase2_page.wf_panel
     panel.source_selector.buttons[1].click()
     _wait(app, window)
-    window.lifecycle_controller.repair_plan_pending.add(track.filename)
-    window._repair_preview.request()
-    assert window._repair_preview.audition is None
+    window.analysis_controller.repair_plan_pending.add(track.filename)
+    window.repair_preview.request()
+    assert window.repair_preview.audition is None
     assert not panel.play_btn.isEnabled() and panel.preview_message.text() == "Updating repair preview…"
-    window.lifecycle_controller.repair_plan_pending.clear()
+    window.analysis_controller.repair_plan_pending.clear()
     track._cache["repair_error"] = "Source unavailable while planning"
     window.detail_controller.refresh_repair_preview(track)
     _wait(app, window)
     retries = []
-    monkeypatch.setattr(window.lifecycle_controller, "queue_repair_plan",
+    monkeypatch.setattr(window.analysis_controller, "queue_repair_plan",
                         lambda tracks, *, revalidate_source: retries.append((tracks, revalidate_source)))
     panel.preview_retry_button.click()
     assert retries == [([track], True)] and panel.corrected
@@ -188,11 +188,11 @@ def test_play_checks_disk_identity_after_render_and_cannot_start_stale_material(
     track = _open_track(window, tmp_path, "Missing.wav")
     _wait(app, window)
     (tmp_path / track.filename).unlink()
-    window._wf_panel.play_btn.click()
+    window.phase2_page.wf_panel.play_btn.click()
     _wait(app, window)
     assert not streams
-    assert window._wf_panel.preview_retry_button.isVisible()
-    assert "Restore the source" in window._wf_panel.preview_message.text()
+    assert window.phase2_page.wf_panel.preview_retry_button.isVisible()
+    assert "Restore the source" in window.phase2_page.wf_panel.preview_message.text()
 
 
 @pytest.mark.parametrize("analysis", [False, True], ids=["track-layout", "file"])
@@ -200,7 +200,7 @@ def test_click_moves_cursor_without_repainting_the_cached_plot(app, window, anal
     if analysis:
         _open_track(window, tmp_path, "Click.wav")
         _wait(app, window)
-        panel = window._wf_panel
+        panel = window.phase2_page.wf_panel
     else:
         window._phase_tabs.setCurrentIndex(0)
         panel = window.topology_controller.page.wf_panel
@@ -260,7 +260,7 @@ def test_plot_gestures_follow_known_samples_and_clamp_to_visible_edges(app, wind
     from sessionpreplib.models import SessionContext
 
     total = 12000
-    panel = window._wf_panel if analysis else window.topology_controller.page.wf_panel
+    panel = window.phase2_page.wf_panel if analysis else window.topology_controller.page.wf_panel
     window._phase_tabs.setCurrentIndex(int(analysis))
     panel.set_content_available(True)
     panel.set_expanded(True)
@@ -321,7 +321,7 @@ def test_plot_gestures_follow_known_samples_and_clamp_to_visible_edges(app, wind
     QTest.mouseClick(wave, Qt.LeftButton, pos=QPoint(0, 20))
     QTest.mouseClick(wave, Qt.LeftButton, pos=QPoint(wave.width() - 1, 20))
     assert clicked[-2:] == [start, end - 1]
-    assert streams == [] and window.lifecycle_controller.analyze_worker is None
+    assert streams == [] and window.analysis_controller.analyze_worker is None
 
 
 @pytest.mark.parametrize("corrected_spectrogram", [False, True], ids=["original-waveform", "corrected-spectrogram"])
@@ -332,7 +332,7 @@ def test_play_and_seek_keep_the_displayed_plot_during_source_validation(
 
     _open_track(window, tmp_path, "Seek.wav")
     _wait(app, window)
-    panel, waveform = window._wf_panel, window._wf_panel.waveform
+    panel, waveform = window.phase2_page.wf_panel, window.phase2_page.wf_panel.waveform
     panel.set_expanded(True)
     if corrected_spectrogram:
         panel.source_selector.buttons[1].click()
@@ -398,7 +398,7 @@ def test_pending_seek_can_be_stopped_during_file_validation(app, window, tmp_pat
 
     _open_track(window, tmp_path, "CancelSeek.wav")
     _wait(app, window)
-    panel = window._wf_panel
+    panel = window.phase2_page.wf_panel
     panel.set_expanded(True)
     panel.play_btn.click()
     _wait(app, window)
@@ -413,13 +413,13 @@ def test_pending_seek_can_be_stopped_during_file_validation(app, window, tmp_pat
     monkeypatch.setattr(compute, "source_for_render", delayed_validation)
     try:
         QTest.mouseClick(panel.waveform, Qt.LeftButton, pos=panel.waveform.rect().center())
-        assert window._repair_preview.pending_play is not None
+        assert window.repair_preview.pending_play is not None
         assert panel.stop_btn.isEnabled() and not panel.play_btn.isEnabled()
         if shortcut:
             window._space_shortcut.activated.emit()
         else:
             panel.stop_btn.click()
-        assert window._repair_preview.pending_play is None
+        assert window.repair_preview.pending_play is None
         resume.set()
         _wait(app, window)
         assert not window._playback.is_playing
@@ -437,7 +437,7 @@ def test_playing_source_switch_does_not_wait_for_waveform_computation(app, windo
     from sessionprepgui.waveform.compute import WaveformLoadWorker
     _open_track(window, tmp_path, "Audition.wav")
     _wait(app, window)
-    window._wf_panel.play_btn.click()
+    window.phase2_page.wf_panel.play_btn.click()
     _wait(app, window)
     assert window._playback.is_playing
     resume = Event()
@@ -449,12 +449,12 @@ def test_playing_source_switch_does_not_wait_for_waveform_computation(app, windo
 
     monkeypatch.setattr(WaveformLoadWorker, "_compute", delayed_render)
     try:
-        window._wf_panel.source_selector.buttons[1].click()
+        window.phase2_page.wf_panel.source_selector.buttons[1].click()
         until = time.monotonic() + 1.5
         while not window._playback._monitor.selected and time.monotonic() < until:
             app.processEvents()
             time.sleep(.005)
-        assert window._playback._monitor.selected and window._repair_preview.worker is not None
+        assert window._playback._monitor.selected and window.repair_preview.worker is not None
         assert len(streams) == 1
     finally:
         resume.set()
@@ -678,7 +678,7 @@ def _worker_spectra(track, band):
                                     preview_track=track, audition=pair, corrected=corrected,
                                     band=band, spec_n_fft=512)
         results, errors = [], []
-        worker.finished.connect(results.append)
+        worker.completed.connect(results.append)
         worker.failed.connect(errors.append)
         worker.run()
         assert not errors and len(results) == 1, errors

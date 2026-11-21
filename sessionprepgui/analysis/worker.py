@@ -13,7 +13,6 @@ from PySide6.QtCore import QThread, Signal
 
 from sessionpreplib.audio import SourceChangedError
 from sessionpreplib.daw_processor import DawProcessor
-from sessionpreplib.detector import TrackDetector
 from sessionpreplib.pipeline import Pipeline, load_session
 from sessionpreplib.detectors import default_detectors
 from sessionpreplib.processors import default_processors
@@ -182,11 +181,11 @@ class Phase1AnalyzeWorker(QThread):
     progress = Signal(str)                # descriptive text
     progress_value = Signal(int, int)     # (current_step, total_steps)
     track_analyzed = Signal(str, object)  # (filename, track) after detectors
-    finished = Signal(object)             # (session)
+    completed = Signal(object)            # (session)
     error = Signal(str)
 
-    def __init__(self, session_context: object, config: dict):
-        super().__init__()
+    def __init__(self, session_context: object, config: dict, parent=None):
+        super().__init__(parent)
         self.session_context = session_context
         self.config = config
         self._event_bus = EventBus()
@@ -284,7 +283,7 @@ class Phase1AnalyzeWorker(QThread):
             self.progress.emit("Validating Layout\u2026")
             self.progress_value.emit(0, self._total)
             session = pipeline.analyze_phase1(session)
-            self.finished.emit(session)
+            self.completed.emit(session)
         except Exception as e:
             self.error.emit(str(e))
 
@@ -299,8 +298,8 @@ class AnalyzeWorker(QThread):
     completed = Signal(object, object, object)     # (session, diagnostic_summary)
     error = Signal(object, str)
 
-    def __init__(self, source_dir: str, config: dict, recursive: bool = False, track_settings=None):
-        super().__init__()
+    def __init__(self, source_dir: str, config: dict, recursive: bool = False, track_settings=None, parent=None):
+        super().__init__(parent)
         self.source_dir = source_dir
         self.config = config
         self.recursive = recursive
@@ -415,11 +414,11 @@ class AudioLoadWorker(QThread):
     """Load audio data from disk for a single track (no analysis).
 
     Used when a session is loaded from file and ``track.audio_data`` is
-    ``None`` but the source file still exists on disk.  Emits ``finished``
+    ``None`` but the source file still exists on disk.  Emits ``completed``
     with the populated track on success, or ``error`` with a message.
     """
 
-    finished = Signal(object)   # track with audio_data populated
+    completed = Signal(object)  # track with audio_data populated
     error = Signal(str)
 
     def __init__(self, track, parent=None):
@@ -449,7 +448,7 @@ class AudioLoadWorker(QThread):
                         and track.source_file_signature != decoded.source_file_signature)):
                 raise SourceChangedError(f"{track.filename} has changed since analysis. Reanalyze this source.")
             _adopt_decoded_source(track, decoded)
-            self.finished.emit(track)
+            self.completed.emit(track)
         except Exception as exc:
             self.error.emit(str(exc))
 
@@ -457,10 +456,10 @@ class AudioLoadWorker(QThread):
 class TopoAudioResolveWorker(QThread):
     """Load source audio and resolve a TopologyEntry off the UI thread.
 
-    Emits ``finished`` with ``(audio_ndarray, samplerate)`` on success.
+    Emits ``completed`` with ``(audio_ndarray, samplerate)`` on success.
     """
 
-    finished = Signal(object, int)  # (audio_data, samplerate)
+    completed = Signal(object, int)  # (audio_data, samplerate)
     error = Signal(str)
 
     def __init__(self, entry, source_dir: str, parent=None):
@@ -493,7 +492,7 @@ class TopoAudioResolveWorker(QThread):
                 return
 
             resolved = resolve_entry_audio(self._entry, track_audio)
-            self.finished.emit(resolved, sr)
+            self.completed.emit(resolved, sr)
         except Exception as exc:
             self.error.emit(str(exc))
 
@@ -501,12 +500,12 @@ class TopoAudioResolveWorker(QThread):
 class TopoMultiAudioWorker(QThread):
     """Load multiple tracks and produce stacked display + downmixed playback.
 
-    Emits ``finished(display_audio, playback_audio, samplerate, labels)``
+    Emits ``completed(display_audio, playback_audio, samplerate, labels)``
     where *display_audio* has all tracks' channels concatenated and
     *playback_audio* is summed by channel position.
     """
 
-    finished = Signal(object, object, int, list)  # display, playback, sr, labels
+    completed = Signal(object, object, int, list)  # display, playback, sr, labels
     error = Signal(str)
 
     def __init__(self, items: list, side: str, source_dir: str, parent=None):
@@ -535,7 +534,7 @@ class TopoMultiAudioWorker(QThread):
         import os
         import soundfile as sf
 
-        required_files = set()
+        required_files: set[str] = set()
         if self._side == "input":
             required_files.update(item[0] for item in self._items)
         else:
@@ -663,7 +662,7 @@ class TopoMultiAudioWorker(QThread):
                 (time.perf_counter() - t0) * 1000,
                 (time.perf_counter() - t_process) * 1000,
             )
-            self.finished.emit(display_audio, playback, sr, labels)
+            self.completed.emit(display_audio, playback, sr, labels)
         except Exception as exc:
             import traceback
 
@@ -720,13 +719,12 @@ class PrepareWorker(QThread):
 
     progress = Signal(object, str)              # status text
     progress_value = Signal(object, int, int)   # (current, total)
-    track_prepared = Signal(str)        # filename
     prepare_finished = Signal()         # renamed: avoid shadowing QThread.finished
     error = Signal(str)
     completed = Signal(object)
 
-    def __init__(self, session, processors, output_dir: str):
-        super().__init__()
+    def __init__(self, session, processors, output_dir: str, parent=None):
+        super().__init__(parent)
         self.owner = session
         self.outdated = False
         self.failure = ""
@@ -802,17 +800,22 @@ class TopologyApplyWorker(QThread):
 
     progress = Signal(object, str)
     progress_value = Signal(object, int, int)
+    overwrite_confirmation_required = Signal(object, str, object)
     apply_finished = Signal(object)
     error = Signal(object, str)
 
     def __init__(self, session, output_dir: str, source_dir: str | None = None,
-                 peaks_dir: str | None = None, *, source_tracks=None):
-        super().__init__()
+                 peaks_dir: str | None = None, *, source_tracks=None,
+                 allowed_unverified: dict[str, str] | None = None,
+                 prompt_on_unverified: bool = False, parent=None):
+        super().__init__(parent)
         self._session = session
         self._output_dir = output_dir
         self._source_dir = source_dir
         self._source_tracks = source_tracks
         self._peaks_dir = peaks_dir
+        self._allowed_unverified = dict(allowed_unverified) if allowed_unverified is not None else None
+        self._prompt_on_unverified = prompt_on_unverified
         self._is_cancelled = False
 
     def cancel(self):
@@ -950,6 +953,7 @@ class TopologyApplyWorker(QThread):
             log.debug("Apply topology: building peaks '%s' (%d/%d)", out_fn, step + 1, total)
             self.progress.emit(self, f"Building peaks for {out_fn}")
             self.progress_value.emit(self, step, total)
+            assert self._peaks_dir is not None
             pp = peaks_path_for(self._peaks_dir, os.path.abspath(dst))
             try:
                 mtime = get_source_mtime(dst)
@@ -969,12 +973,72 @@ class TopologyApplyWorker(QThread):
             except Exception as e:
                 log.debug("Failed to build/save peak cache for '%s' -> %s: %s", out_fn, pp, e)
 
+    def _preflight_unverified(self, topology, output_path, previous) -> dict[str, str]:
+        from pathlib import Path
+        from sessionpreplib.audio import AUDIO_EXTENSIONS
+        from sessionpreplib.layout_files import find_unverified_layout_files
+
+        destinations: set[Path] = set()
+        target_names: list[str] = []
+        for entry in topology.entries:
+            if entry.output_channels < 1 or not entry.sources:
+                continue
+            name = Path(entry.output_filename)
+            dst = output_path / name
+            if (
+                name.is_absolute()
+                or name.drive
+                or ".." in name.parts
+                or name.suffix.lower() not in AUDIO_EXTENSIONS
+                or not dst.resolve().is_relative_to(output_path)
+                or dst.is_symlink()
+                or dst.resolve() in destinations
+            ):
+                raise ValueError(f"Invalid or duplicate layout destination: {name}")
+            destinations.add(dst.resolve())
+            target_names.append(entry.output_filename)
+        unverified = find_unverified_layout_files(output_path, target_names, previous)
+        if self._allowed_unverified is None:
+            return unverified
+        return {
+            rel: rev
+            for rel, rev in unverified.items()
+            if self._allowed_unverified.get(rel) != rev
+        }
+
+    def _stage_and_publish(
+        self, topology, output_path, sources, source_audio, previous, n_sources, total
+    ):
+        import os
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+        from sessionpreplib.layout_files import publish_layout
+
+        os.makedirs(self._output_dir, exist_ok=True)
+        with TemporaryDirectory(dir=output_path, prefix=".sp-layout-") as staging_dir:
+            stage = Path(staging_dir)
+            output_tracks, written_files, errors = self._stage_topology_entries(
+                topology, output_path, stage, sources, source_audio, n_sources, total
+            )
+            source_audio.clear()
+            sources.clear()
+            if self._is_cancelled:
+                raise InterruptedError("Layout apply cancelled")
+            if errors:
+                raise ValueError("\n".join(f"{name}: {error}" for name, error in errors))
+            publish_layout(
+                output_path,
+                stage,
+                output_tracks,
+                previous,
+                allowed_unverified=self._allowed_unverified,
+            )
+        return output_tracks, written_files, errors
+
     def run(self):
         try:
-            import os
             from pathlib import Path
-            from tempfile import TemporaryDirectory
-            from sessionpreplib.layout_files import publish_layout
+            from sessionpreplib.layout_files import UnverifiedLayoutFilesError
 
             session = self._session
             topology = session.topology
@@ -986,6 +1050,17 @@ class TopologyApplyWorker(QThread):
             source_root = Path(self._source_dir).resolve() if self._source_dir else None
             if source_root is not None and source_root.is_relative_to(output_path):
                 raise ValueError("The layout output folder must be separate from the source folder.")
+
+            previous = [*session.tracks, *session.output_tracks]
+            self.progress.emit(self, "Checking output directory\u2026")
+            unverified = self._preflight_unverified(topology, output_path, previous)
+            if self._is_cancelled:
+                raise InterruptedError("Layout apply cancelled")
+            if unverified:
+                if self._prompt_on_unverified:
+                    self.overwrite_confirmation_required.emit(self, str(output_path), unverified)
+                    return
+                raise UnverifiedLayoutFilesError(output_path, unverified)
 
             tracks = self._source_tracks if self._source_tracks is not None else session.tracks
             track_map = {t.filename: t for t in tracks if t.status == "OK"}
@@ -1005,20 +1080,9 @@ class TopologyApplyWorker(QThread):
             if self._is_cancelled:
                 raise InterruptedError("Layout apply cancelled")
 
-            os.makedirs(self._output_dir, exist_ok=True)
-            with TemporaryDirectory(dir=output_path, prefix=".sp-layout-") as staging_dir:
-                stage = Path(staging_dir)
-                output_tracks, written_files, errors = self._stage_topology_entries(
-                    topology, output_path, stage, sources, source_audio, n_sources, total
-                )
-                source_audio.clear()
-                sources.clear()
-                if self._is_cancelled:
-                    raise InterruptedError("Layout apply cancelled")
-                if errors:
-                    raise ValueError("\n".join(f"{name}: {error}" for name, error in errors))
-                publish_layout(output_path, stage, output_tracks, [*session.tracks, *session.output_tracks])
-
+            output_tracks, written_files, errors = self._stage_and_publish(
+                topology, output_path, sources, source_audio, previous, n_sources, total
+            )
             if self._peaks_dir:
                 self._build_layout_peaks(written_files, n_sources + n_entries, total)
 
@@ -1029,70 +1093,3 @@ class TopologyApplyWorker(QThread):
             self.apply_finished.emit(self)
         except Exception as e:
             self.error.emit(self, str(e))
-
-
-class BatchReanalyzeWorker(QThread):
-    """Re-run detectors and/or processors for a subset of tracks.
-
-    Used by the batch-edit workflow: after the user applies a change
-    (e.g. RMS anchor override) to multiple tracks at once, this worker
-    performs the heavy re-analysis in the background so the GUI stays
-    responsive.
-
-    Parameters
-    ----------
-    tracks:
-        The tracks to re-analyze.
-    detectors:
-        Configured detector instances (from ``session.detectors``).
-    processors:
-        Configured processor instances (from ``session.processors``).
-    run_detectors:
-        If ``True`` (default), re-run track-level detectors before
-        processors.  Set to ``False`` for lightweight changes that
-        only need processor re-calculation (e.g. classification override).
-    """
-
-    progress = Signal(str)
-    progress_value = Signal(int, int)     # (current, total)
-    track_done = Signal(str)              # filename
-    batch_finished = Signal()             # renamed to avoid QThread.finished collision
-    error = Signal(str)
-
-    def __init__(self, tracks, detectors, processors,
-                 run_detectors: bool = True):
-        super().__init__()
-        self._tracks = list(tracks)
-        self._detectors = detectors
-        self._processors = processors
-        self._run_detectors = run_detectors
-
-    def run(self):
-        try:
-            total = len(self._tracks)
-            for i, track in enumerate(self._tracks):
-                self.progress.emit(f"Re-analyzing {track.filename}\u2026")
-                self.progress_value.emit(i, total)
-
-                if self._run_detectors:
-                    for det in self._detectors:
-                        if isinstance(det, TrackDetector):
-                            try:
-                                result = det.analyze(track)
-                                track.detector_results[det.id] = result
-                            except Exception:
-                                pass
-
-                for proc in self._processors:
-                    try:
-                        result = proc.process(track)
-                        track.processor_results[proc.id] = result
-                    except Exception:
-                        pass
-
-                self.track_done.emit(track.filename)
-
-            self.progress_value.emit(total, total)
-            self.batch_finished.emit()
-        except Exception as e:
-            self.error.emit(str(e))

@@ -20,12 +20,50 @@ class _StubShell:
     def __init__(self) -> None:
         self.parent_widget = QWidget()
         self.status_messages: list[str] = []
+        self.status_prompts: list[dict[str, object]] = []
+        self.prompt_dismissals: int = 0
         self.progress_events: list[tuple[str, object]] = []
         self.enabled_phases: dict[int, bool] = {}
         self.switched_phases: list[int] = []
 
     def show_status(self, message: str) -> None:
         self.status_messages.append(message)
+
+    def show_status_prompt(
+        self,
+        prefix: str,
+        highlight: str,
+        suffix: str,
+        *,
+        tooltip: str,
+        on_accept,
+        on_cancel=None,
+        accept_label: str = "Overwrite",
+        cancel_label: str = "Cancel",
+        accept_description: str = "",
+        cancel_description: str = "",
+        return_focus_widget=None,
+    ) -> None:
+        self.status_prompts.append(
+            {
+                "text": f"{prefix}{highlight}{suffix}",
+                "tooltip": tooltip,
+                "on_accept": on_accept,
+                "on_cancel": on_cancel,
+                "accept_label": accept_label,
+                "cancel_label": cancel_label,
+                "accept_description": accept_description,
+                "cancel_description": cancel_description,
+                "return_focus_widget": return_focus_widget,
+            }
+        )
+
+    def dismiss_status_prompt(
+        self, *, status_message: str | None = None, restore_focus: bool = False
+    ) -> None:
+        self.prompt_dismissals += 1
+        if status_message is not None:
+            self.status_messages.append(status_message)
 
     def progress_start(self, text: str, *, owner=None) -> None:
         self.progress_events.append(("start", text))
@@ -165,6 +203,67 @@ def test_topology_controller_apply_error_recovers_ui(_font_app, tmp_path):
         assert ctrl.page.apply_action.isEnabled()
         assert ("fail", "disk full") in shell.progress_events
         assert "Apply topology error: disk full" in shell.status_messages
+    finally:
+        ctrl.dispose()
+        ctrl.page.deleteLater()
+        shell.parent_widget.deleteLater()
+        _font_app.processEvents()
+
+
+def test_topology_controller_preview_workers_delete_later_after_completion(_font_app, tmp_path):
+    from PySide6.QtCore import QThread
+    from sessionprepgui.analysis.worker import AudioLoadWorker
+
+    wav = tmp_path / "kick.wav"
+    sf.write(wav, np.sin(np.linspace(0, 10, 4800)), 48000)
+    track = load_track(str(wav))
+    track.filename = "kick.wav"
+    track.audio_data = None
+
+    state = WorkspaceState(config=build_defaults())
+    state.source_dir = str(tmp_path)
+    state.topo_source_tracks = [track]
+    state.session = SessionContext(tracks=[track], config={})
+
+    shell = _StubShell()
+    ctrl = TopologyController(state, shell, _StubPlayback())
+    try:
+        ctrl.load_input_waveform("kick.wav")
+        worker = ctrl.audio_worker
+        assert isinstance(worker, AudioLoadWorker)
+        assert worker.wait(5000)
+        for _ in range(10):
+            _font_app.processEvents()
+        if ctrl.wf_worker is not None:
+            assert ctrl.wf_worker.wait(5000)
+            for _ in range(10):
+                _font_app.processEvents()
+        # Finished workers must be deleted via QThread.finished -> deleteLater(),
+        # not retained as dead QThread children holding PCM buffers.
+        assert ctrl.findChildren(QThread) == []
+    finally:
+        ctrl.dispose()
+        ctrl.page.deleteLater()
+        shell.parent_widget.deleteLater()
+        _font_app.processEvents()
+
+
+def test_topology_controller_waveform_failed_clears_worker_and_loading(_font_app):
+    state = WorkspaceState(config=build_defaults())
+    shell = _StubShell()
+    ctrl = TopologyController(state, shell, _StubPlayback())
+    try:
+        rid = ctrl.begin_waveform_request("input-file", description="bad.wav")
+        bad_audio = np.full(1024, np.nan, dtype=np.float64)
+        ctrl.show_waveform(bad_audio, 48000, request_id=rid)
+        worker = ctrl.wf_worker
+        assert worker is not None
+        assert worker.wait(5000)
+        for _ in range(10):
+            _font_app.processEvents()
+        assert ctrl.wf_worker is None
+        assert not ctrl.page.wf_panel.waveform.is_loading
+        assert any("Waveform error:" in msg for msg in shell.status_messages)
     finally:
         ctrl.dispose()
         ctrl.page.deleteLater()

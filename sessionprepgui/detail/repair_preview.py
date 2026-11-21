@@ -2,26 +2,35 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from PySide6.QtCore import QObject, Qt, Slot
+from PySide6.QtCore import QObject, Qt, Signal, Slot
+from shiboken6 import isValid
 
 from sessionpreplib.audio import get_window_samples
 from ..state import WorkspaceState
 from ..waveform.compute import WaveformLoadWorker
 
+if TYPE_CHECKING:
+    from ..waveform.panel import WaveformPanel
+    from .browser import ReportBrowser
+    from .controller import TrackDetailController
+    from .playback import PlaybackController
+
 
 class RepairPreview(QObject):
+    revalidate_repair_requested = Signal(object)  # TrackContext
+    invalid_source_detected = Signal(object)      # TrackContext
+
     def __init__(
         self,
         state: WorkspaceState,
-        panel: Any,
-        file_report: Any,
-        playback: Any,
+        panel: WaveformPanel,
+        file_report: ReportBrowser,
+        playback: PlaybackController,
         *,
-        get_detail_ctrl: Callable[[], Any],
-        get_lifecycle_ctrl: Callable[[], Any],
-        get_table_ctrl: Callable[[], Any],
+        get_detail_ctrl: Callable[[], TrackDetailController],
+        is_track_repair_pending: Callable[[str], bool],
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
@@ -30,8 +39,7 @@ class RepairPreview(QObject):
         self._file_report = file_report
         self._playback = playback
         self._get_detail_ctrl = get_detail_ctrl
-        self._get_lifecycle_ctrl = get_lifecycle_ctrl
-        self._get_table_ctrl = get_table_ctrl
+        self._is_track_repair_pending = is_track_repair_pending
         self.track: Any = None
         self.recipe: Any = None
         self.audition: Any = None
@@ -111,7 +119,7 @@ class RepairPreview(QObject):
     def retry(self) -> None:
         if self.track is self._state.current_track and self.track is not None:
             if self.track._cache.get("repair_error"):
-                self._get_lifecycle_ctrl().queue_repair_plan([self.track], revalidate_source=True)
+                self.revalidate_repair_requested.emit(self.track)
             else:
                 self.select(self.track, refresh=True)
 
@@ -127,11 +135,7 @@ class RepairPreview(QObject):
         current = self._state.current_track
         if track is None or current is None or track is not current:
             return
-        lifecycle = self._get_lifecycle_ctrl()
-        plan = lifecycle.repair_plan_worker
-        if current.filename in lifecycle.repair_plan_pending or (
-            plan and any(t.filename == current.filename for t in plan.tracks)
-        ):
+        if self._is_track_repair_pending(current.filename):
             self.planning()
             return
         self.generation += 1
@@ -175,7 +179,7 @@ class RepairPreview(QObject):
         worker.generation = self.generation
         worker.key = key
         worker.source_ready.connect(self._source_ready, Qt.ConnectionType.QueuedConnection)
-        worker.finished.connect(self._ready, Qt.ConnectionType.QueuedConnection)
+        worker.completed.connect(self._ready, Qt.ConnectionType.QueuedConnection)
         worker.failed.connect(self._failed, Qt.ConnectionType.QueuedConnection)
         worker.settled.connect(self._settled, Qt.ConnectionType.QueuedConnection)
         worker.start()
@@ -238,8 +242,6 @@ class RepairPreview(QObject):
         if not self._current(worker):
             return
         detail_ctrl = self._get_detail_ctrl()
-        lifecycle = self._get_lifecycle_ctrl()
-        table = self._get_table_ctrl()
         self.audition = None
         self.pending_play = None
         self.cache.clear()
@@ -253,12 +255,7 @@ class RepairPreview(QObject):
         if worker.invalid_source and (self.track.repair_recipe.active or self.track.corrected_analysis):
             self.track.corrected_analysis = None
             self.track._cache["repair_error"] = detail
-            lifecycle.mark_prepare_stale()
-            table.refresh_file_tab(self.track)
-            detail_ctrl.refresh_track_repair_editor(self.track)
-            table.update_track_row(self.track.filename)
-            detail_ctrl.refresh_verified_summary()
-            lifecycle.update_prepare_button()
+            self.invalid_source_detected.emit(self.track)
 
     @Slot()
     def _settled(self) -> None:
@@ -273,5 +270,7 @@ class RepairPreview(QObject):
 
     def close(self) -> None:
         self.clear_material()
-        if self.worker is not None:
-            self.worker.wait()
+        worker = self.worker
+        self.worker = None
+        if worker is not None and (not isinstance(worker, QObject) or isValid(worker)):
+            worker.wait()

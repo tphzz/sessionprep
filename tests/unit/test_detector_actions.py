@@ -364,9 +364,9 @@ def test_real_refresh_callers_keep_suppressed_custom_labels_out(host, monkeypatc
             host._state,
             SimpleNamespace(),
             track_table=None,
-            on_refresh_file_report=host._refresh_file_report,
-            on_refresh_waveform_issues=host._refresh_waveform_issues,
         )
+        table_ctrl.file_report_refresh_requested.connect(host._refresh_file_report)
+        table_ctrl.waveform_issues_refresh_requested.connect(host._refresh_waveform_issues)
         table_ctrl.refresh_file_tab(host._current_track)
     else:
         for detector in host._session.detectors:
@@ -376,11 +376,9 @@ def test_real_refresh_callers_keep_suppressed_custom_labels_out(host, monkeypatc
         config_ctrl = SessionConfigController(
             host._state,
             SimpleNamespace(),
-            on_render_summary=lambda: None,
-            on_refresh_analysis_column=lambda: None,
-            on_refresh_file_report=host._refresh_file_report,
-            on_refresh_waveform_issues=host._refresh_waveform_issues,
         )
+        config_ctrl.file_report_refresh_requested.connect(host._refresh_file_report)
+        config_ctrl.waveform_issues_refresh_requested.connect(host._refresh_waveform_issues)
         config_ctrl.refresh_presentation()
     assert [action.data() for action in host._overlay_menu.actions()] == ["subsonic-region"]
     assert {issue.label for issue in host._waveform._issues} == {"subsonic-region"}

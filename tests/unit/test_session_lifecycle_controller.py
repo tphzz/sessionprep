@@ -1,4 +1,4 @@
-"""Isolated unit tests for SessionLifecycleController (Phase 1/2 lifecycle & workers)."""
+"""Isolated unit tests for SessionPersistenceController & AnalysisPrepareController."""
 
 from __future__ import annotations
 
@@ -10,7 +10,8 @@ from PySide6.QtGui import QAction
 from PySide6.QtWidgets import QStackedWidget, QTabWidget, QWidget
 
 from sessionpreplib.models import SessionContext, TrackContext
-from sessionprepgui.analysis.lifecycle_controller import SessionLifecycleController
+from sessionprepgui.analysis.analysis_controller import AnalysisPrepareController
+from sessionprepgui.analysis.persistence_controller import SessionPersistenceController
 from sessionprepgui.settings import build_defaults
 from sessionprepgui.state import WorkspaceState
 from sessionprepgui.tracks.table_widgets import _DraggableTrackTable
@@ -68,7 +69,7 @@ class _StubShell:
         self.titles.append(title)
 
 
-def _make_controller(state: WorkspaceState, shell: _StubShell):
+def _make_controllers(state: WorkspaceState, shell: _StubShell):
     table = _DraggableTrackTable()
     table.setColumnCount(8)
     tabs = QTabWidget()
@@ -81,6 +82,16 @@ def _make_controller(state: WorkspaceState, shell: _StubShell):
     prepare_act = QAction("Prepare")
     save_act = QAction("Save")
 
+    phase2_page = SimpleNamespace(
+        track_table=table,
+        summary_view=SimpleNamespace(setHtml=lambda h: None, clear=lambda: None),
+        file_report=SimpleNamespace(clear=lambda: None),
+        detail_tabs=tabs,
+        right_stack=stack,
+        analyze_action=analyze_act,
+        auto_group_action=auto_grp_act,
+        prepare_action=prepare_act,
+    )
     topology_ctrl = SimpleNamespace(
         clear_workspace=lambda: None,
         populate=lambda: None,
@@ -117,6 +128,7 @@ def _make_controller(state: WorkspaceState, shell: _StubShell):
     )
     table_ctrl = SimpleNamespace(
         batch_filenames=set(),
+        rebuild_track_table_rows=lambda tracks: None,
         populate_table=lambda s: None,
         populate_setup_table=lambda: None,
         auto_fit_track_table=lambda: None,
@@ -138,118 +150,133 @@ def _make_controller(state: WorkspaceState, shell: _StubShell):
         refresh_phase2_dirty_indicators=lambda: None,
         init_session_config=lambda: None,
     )
-    summary_view = SimpleNamespace(setHtml=lambda h: None, clear=lambda: None)
-    file_report = SimpleNamespace(clear=lambda: None)
 
-    ctrl = SessionLifecycleController(
+    analysis = AnalysisPrepareController(
         state,
         shell,
+        phase2_page=phase2_page,
+        topology_ctrl=topology_ctrl,
+        detail_ctrl=detail_ctrl,
+        table_ctrl=table_ctrl,
+        groups_ctrl=groups_ctrl,
+        config_ctrl=config_ctrl,
+        get_project_name=lambda: daw_ctrl.page.project_name_edit.text().strip(),
+    )
+    persistence = SessionPersistenceController(
+        state,
+        shell,
+        phase2_page=phase2_page,
         topology_ctrl=topology_ctrl,
         daw_ctrl=daw_ctrl,
         detail_ctrl=detail_ctrl,
         table_ctrl=table_ctrl,
         groups_ctrl=groups_ctrl,
         config_ctrl=config_ctrl,
-        track_table=table,
-        summary_view=summary_view,
-        file_report=file_report,
-        detail_tabs=tabs,
-        right_stack=stack,
-        analyze_action=analyze_act,
-        auto_group_action=auto_grp_act,
-        prepare_action=prepare_act,
         save_session_action=save_act,
+        on_is_save_blocked=analysis.is_save_blocked,
     )
-    return ctrl, [table, stack, daw_ctrl.page.right_stack, shell.parent_widget]
+    persistence.workspace_clearing.connect(analysis.cancel_all_workers)
+    return persistence, analysis, phase2_page, [table, stack, daw_ctrl.page.right_stack, shell.parent_widget]
 
 
-def test_lifecycle_controller_capture_and_mark_prepare_stale(_font_app, tmp_path):
+def test_persistence_and_analysis_capture_and_mark_prepare_stale(_font_app, tmp_path):
     state = WorkspaceState(config=build_defaults())
     shell = _StubShell()
-    ctrl, widgets = _make_controller(state, shell)
+    persistence, analysis, phase2, widgets = _make_controllers(state, shell)
     try:
         track = TrackContext("kick.wav", str(tmp_path / "kick.wav"), None, 48000, 1, 48000, "24-bit", "PCM_24", 1.0)
         state.source_dir = str(tmp_path)
         state.session = SessionContext([track], {}, prepare_state="ready")
 
-        captured = ctrl.capture_session_state()
+        captured = persistence.capture_session_state()
         assert captured["source_dir"] == str(tmp_path)
         assert captured["project_name"] == "MySong"
         assert captured["prepare_state"] == "ready"
 
-        ctrl.mark_prepare_stale()
+        analysis.mark_prepare_stale()
         assert state.session.prepare_state == "stale"
-        assert ctrl._prepare_action.text() == "Prepare (!)"
+        assert phase2.prepare_action.text() == "Prepare (!)"
     finally:
-        ctrl.dispose()
+        analysis.dispose()
+        persistence.dispose()
+        analysis.deleteLater()
+        persistence.deleteLater()
         for w in widgets:
             w.deleteLater()
         _font_app.processEvents()
 
 
-def test_lifecycle_controller_clear_workspace_resets_state_and_empty_dir_status(_font_app, tmp_path):
+def test_persistence_clear_workspace_resets_state_and_empty_dir_status(_font_app, tmp_path):
     state = WorkspaceState(config=build_defaults())
     shell = _StubShell()
-    ctrl, widgets = _make_controller(state, shell)
+    persistence, analysis, phase2, widgets = _make_controllers(state, shell)
     try:
-        ctrl.load_directory(str(tmp_path))
+        persistence.load_directory(str(tmp_path))
         assert f"No readable audio files in {tmp_path}" in shell.status_messages[-1]
-        assert not ctrl._analyze_action.isEnabled()
+        assert not phase2.analyze_action.isEnabled()
 
         wav = tmp_path / "bass.wav"
         sf.write(wav, np.zeros(4800), 48000)
-        tracks = ctrl._discover_source_tracks(str(tmp_path), recursive=False)
+        tracks = persistence.discover_source_tracks(str(tmp_path), recursive=False)
         assert [t.filename for t in tracks] == ["bass.wav"]
     finally:
-        ctrl.dispose()
+        analysis.dispose()
+        persistence.dispose()
+        analysis.deleteLater()
+        persistence.deleteLater()
         for w in widgets:
             w.deleteLater()
         _font_app.processEvents()
 
 
-def test_repair_plan_worker_progress_value_matches_lifecycle_slot(_font_app, tmp_path):
+def test_repair_plan_worker_progress_value_matches_analysis_slot(_font_app, tmp_path):
     from sessionprepgui.analysis.worker import RepairPlanWorker
 
     state = WorkspaceState(config=build_defaults())
     shell = _StubShell()
-    ctrl, widgets = _make_controller(state, shell)
+    persistence, analysis, _phase2, widgets = _make_controllers(state, shell)
     try:
         wav = tmp_path / "snare.wav"
         sf.write(wav, np.zeros(4800), 48000)
         track = TrackContext("snare.wav", str(wav), np.zeros(4800), 48000, 1, 4800, "16-bit", "PCM_16", 0.1)
         session = SessionContext([track], state.flat_config())
-        worker = RepairPlanWorker(session, [track], state.flat_config(), parent=ctrl)
-        ctrl.repair_plan_worker = worker
-        worker.progress_value.connect(ctrl._on_worker_progress_value)
+        worker = RepairPlanWorker(session, [track], state.flat_config(), parent=analysis)
+        analysis.repair_plan_worker = worker
+        worker.progress_value.connect(analysis._on_worker_progress_value)
         worker._on_planned()
         _font_app.processEvents()
         assert ("value", (1, 1)) in shell.progress_events
-        ctrl.repair_plan_worker = None
+        analysis.repair_plan_worker = None
     finally:
-        ctrl.dispose()
+        analysis.dispose()
+        persistence.dispose()
+        analysis.deleteLater()
+        persistence.deleteLater()
         for w in widgets:
             w.deleteLater()
         _font_app.processEvents()
 
 
-def test_lifecycle_controller_parents_peak_worker_and_drains_zombies_on_dispose(_font_app, tmp_path):
+def test_persistence_parents_peak_worker_and_drains_on_dispose(_font_app, tmp_path):
     state = WorkspaceState(config=build_defaults())
     shell = _StubShell()
-    ctrl, widgets = _make_controller(state, shell)
+    persistence, analysis, _phase2, widgets = _make_controllers(state, shell)
     try:
         wav = tmp_path / "pad.wav"
         sf.write(wav, np.zeros(4800), 48000)
         track = TrackContext("pad.wav", str(wav), None, 48000, 1, 4800, "16-bit", "PCM_16", 0.1)
-        ctrl.start_peak_build([track], str(tmp_path))
-        worker = ctrl.peak_build_worker
+        persistence.start_peak_build([track], str(tmp_path))
+        worker = persistence.peak_build_worker
         assert worker is not None
-        assert worker.parent() is ctrl
-        ctrl.cancel_worker("peak_build_worker")
-        ctrl.dispose()
-        assert not ctrl._zombie_workers
+        assert worker.parent() is persistence
+        persistence.cancel_peak_worker()
+        persistence.dispose()
         assert not worker.isRunning()
     finally:
-        ctrl.dispose()
+        analysis.dispose()
+        persistence.dispose()
+        analysis.deleteLater()
+        persistence.deleteLater()
         for w in widgets:
             w.deleteLater()
         _font_app.processEvents()

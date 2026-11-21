@@ -31,7 +31,7 @@ class BatchManager(QObject):
     batch_progress_message = Signal(str)
 
     def __init__(self, main_window: Any):
-        super().__init__()
+        super().__init__(main_window if isinstance(main_window, QObject) else None)
         self._main_window = main_window
         self._queue: list[BatchItem] = []
         self._current_index: int = 0
@@ -200,6 +200,16 @@ class BatchManager(QObject):
         self._current_session = None
         self.finished.emit()
 
+    def _main_config(self) -> dict[str, Any]:
+        mw = self._main_window
+        if mw is None:
+            return {}
+        state = getattr(mw, "state", None)
+        if state is not None and isinstance(getattr(state, "config", None), dict):
+            return state.config
+        cfg = getattr(mw, "_config", None)
+        return cfg if isinstance(cfg, dict) else {}
+
     def _rehydrate_session(self, state_dict: dict[str, Any]) -> SessionContext:
         """Create a SessionContext instance from the captured dictionary state."""
         from sessionpreplib.models import SessionContext
@@ -210,7 +220,8 @@ class BatchManager(QObject):
 
         tracks = state_dict.get("tracks", [])
         source_dir = state_dict.get("source_dir", "")
-        app_config = getattr(self._main_window, "_config", {}).get("app", {})
+        main_config = self._main_config()
+        app_config = main_config.get("app", {})
         restore_layout_sources(state_dict, app_config.get("phase1_output_folder", "sp_01_tracklayout"))
 
         flat_config = dict(default_config())
@@ -234,14 +245,9 @@ class BatchManager(QObject):
         # (This matches what _do_daw_transfer does before calling the worker)
         flat_config.setdefault("gui", {})["groups"] = state_dict.get("session_groups", [])
 
-        # Colors must come from the global config. The manager receives the main window reference,
-        # so we can fetch the active global colors from it.
+        # Colors come from the active global config via main_window.state.config.
         from sessionprepgui.theme import PT_DEFAULT_COLORS
-        if self._main_window and hasattr(self._main_window, "_config"):
-            colors = self._main_window._config.get("colors", PT_DEFAULT_COLORS)
-        else:
-            colors = PT_DEFAULT_COLORS
-        flat_config["gui"]["colors"] = colors
+        flat_config["gui"]["colors"] = main_config.get("colors", PT_DEFAULT_COLORS)
 
         flat_config["_source_dir"] = source_dir
         flat_config["_use_processed"] = state_dict.get("use_processed", False)

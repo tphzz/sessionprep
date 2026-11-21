@@ -57,14 +57,14 @@ def window(qapp, monkeypatch):
     session = SessionContext(tracks, {}, detectors=[detector], processors=processors)
     owner.state.session = session
     owner.state.summary = build_diagnostic_summary(session)
-    with QSignalBlocker(owner._track_table):
-        owner._track_table.setRowCount(len(tracks))
+    with QSignalBlocker(owner.phase2_page.track_table):
+        owner.phase2_page.track_table.setRowCount(len(tracks))
         for row, current in enumerate(tracks):
-            owner._track_table.setItem(row, 0, QTableWidgetItem(current.filename))
+            owner.phase2_page.track_table.setItem(row, 0, QTableWidgetItem(current.filename))
         owner.track_table_controller.populate_table(session)
     owner.detail_controller.render_summary()
-    for index in range(owner._detail_tabs.count()):
-        owner._detail_tabs.setTabEnabled(index, True)
+    for index in range(owner.phase2_page.detail_tabs.count()):
+        owner.phase2_page.detail_tabs.setTabEnabled(index, True)
     owner._phase_tabs.setTabEnabled(1, True)
     owner._phase_tabs.setCurrentIndex(1)
     owner.resize(1600, 900)
@@ -78,9 +78,9 @@ def window(qapp, monkeypatch):
 def review(owner, target, method):
     href = "report-review:" + quote(target.filename, safe="")
     if method == "direct":
-        owner._summary_view.activate_report_link(QUrl(href))
+        owner.phase2_page.summary_view.activate_report_link(QUrl(href))
         return
-    browser = owner._summary_view
+    browser = owner.phase2_page.summary_view
     cursor = browser._anchor_cursor(href=href)
     assert cursor is not None
     browser.setTextCursor(cursor)
@@ -96,23 +96,23 @@ def review(owner, target, method):
 
 
 def assert_file_visible(owner, target):
-    assert owner._detail_tabs.currentIndex() == 1
-    assert owner._detail_tabs.currentWidget() is owner._file_splitter
-    assert owner._file_splitter.isVisibleTo(owner)
-    assert owner._file_report.isVisibleTo(owner)
-    assert not owner._summary_view.isVisibleTo(owner)
+    assert owner.phase2_page.detail_tabs.currentIndex() == 1
+    assert owner.phase2_page.detail_tabs.currentWidget() is owner.phase2_page.file_splitter
+    assert owner.phase2_page.file_splitter.isVisibleTo(owner)
+    assert owner.phase2_page.file_report.isVisibleTo(owner)
+    assert not owner.phase2_page.summary_view.isVisibleTo(owner)
     assert owner.state.current_track is target
-    assert owner._file_report.track_filename == target.filename
-    assert owner._file_report.toPlainText().startswith(target.filename)
-    assert owner._track_table.currentItem().row() == owner.track_table_controller.find_table_row(target.filename)
+    assert owner.phase2_page.file_report.track_filename == target.filename
+    assert owner.phase2_page.file_report.toPlainText().startswith(target.filename)
+    assert owner.phase2_page.track_table.currentItem().row() == owner.track_table_controller.find_table_row(target.filename)
 
 
 @pytest.mark.parametrize("method", ["direct", "mouse", "keyboard"])
 def test_repeated_summary_review_switches_the_visible_pane(qapp, window, method):
     owner, tracks = window
     for cycle in range(8):
-        owner._detail_tabs.setCurrentIndex(0)
-        owner._track_table.sortItems(0, Qt.DescendingOrder if cycle % 2 else Qt.AscendingOrder)
+        owner.phase2_page.detail_tabs.setCurrentIndex(0)
+        owner.phase2_page.track_table.sortItems(0, Qt.DescendingOrder if cycle % 2 else Qt.AscendingOrder)
         qapp.processEvents()
         target = tracks[1 if cycle % 2 == 0 else 0]
         review(owner, target, method)
@@ -125,33 +125,33 @@ def test_repeated_summary_review_switches_the_visible_pane(qapp, window, method)
 @pytest.mark.parametrize("order", [Qt.AscendingOrder, Qt.DescendingOrder])
 def test_leaving_file_does_not_reenter_it_on_focus_restoration(qapp, window, destination, order):
     owner, tracks = window
-    owner._track_table.sortItems(0, order)
+    owner.phase2_page.track_table.sortItems(0, order)
     review(owner, tracks[1], "direct")
     qapp.processEvents()
     assert_file_visible(owner, tracks[1])
-    owner._file_report.setFocus()
-    owner._detail_tabs.setCurrentIndex(destination)
+    owner.phase2_page.file_report.setFocus()
+    owner.phase2_page.detail_tabs.setCurrentIndex(destination)
     qapp.processEvents()
-    assert owner._detail_tabs.currentIndex() == destination
-    assert owner._detail_tabs.currentWidget() is owner._detail_tabs.widget(destination)
-    assert owner._detail_tabs.widget(destination).isVisibleTo(owner)
-    assert not owner._file_splitter.isVisibleTo(owner)
-    current_row = owner._track_table.currentRow()
-    assert owner._track_table.item(current_row, 0).text() == tracks[1].filename
-    assert owner._track_table.batch_selected_keys() == {tracks[1].filename}
-    owner._detail_tabs.setCurrentIndex(1)
+    assert owner.phase2_page.detail_tabs.currentIndex() == destination
+    assert owner.phase2_page.detail_tabs.currentWidget() is owner.phase2_page.detail_tabs.widget(destination)
+    assert owner.phase2_page.detail_tabs.widget(destination).isVisibleTo(owner)
+    assert not owner.phase2_page.file_splitter.isVisibleTo(owner)
+    current_row = owner.phase2_page.track_table.currentRow()
+    assert owner.phase2_page.track_table.item(current_row, 0).text() == tracks[1].filename
+    assert owner.phase2_page.track_table.batch_selected_keys() == {tracks[1].filename}
+    owner.phase2_page.detail_tabs.setCurrentIndex(1)
     qapp.processEvents()
     assert_file_visible(owner, tracks[1])
 
 
 def test_table_keyboard_row_navigation_still_opens_file(qapp, window):
     owner, tracks = window
-    owner._detail_tabs.setCurrentIndex(0)
-    owner._track_table.sortItems(0, Qt.AscendingOrder)
-    with QSignalBlocker(owner._track_table):
-        owner._track_table.setCurrentCell(0, 0)
-    owner._track_table.setFocus()
-    QTest.keyClick(owner._track_table, Qt.Key_Down)
+    owner.phase2_page.detail_tabs.setCurrentIndex(0)
+    owner.phase2_page.track_table.sortItems(0, Qt.AscendingOrder)
+    with QSignalBlocker(owner.phase2_page.track_table):
+        owner.phase2_page.track_table.setCurrentCell(0, 0)
+    owner.phase2_page.track_table.setFocus()
+    QTest.keyClick(owner.phase2_page.track_table, Qt.Key_Down)
     qapp.processEvents()
     assert_file_visible(owner, tracks[1])
 
@@ -160,26 +160,26 @@ def test_table_keyboard_row_navigation_still_opens_file(qapp, window):
 def test_tab_departure_preserves_multiple_selected_rows_and_current_track(qapp, window):
     owner, tracks = window
     review(owner, tracks[1], "direct")
-    table = owner._track_table
+    table = owner.phase2_page.track_table
     with QSignalBlocker(table):
         table.selectionModel().select(
             table.model().index(owner.track_table_controller.find_table_row(tracks[0].filename), 0),
             QItemSelectionModel.Select | QItemSelectionModel.Rows)
-    owner._file_report.setFocus()
-    owner._detail_tabs.setCurrentIndex(0)
+    owner.phase2_page.file_report.setFocus()
+    owner.phase2_page.detail_tabs.setCurrentIndex(0)
     qapp.processEvents()
     assert table.batch_selected_keys() == {current.filename for current in tracks}
     assert table.item(table.currentRow(), 0).text() == tracks[1].filename
-    owner._detail_tabs.setCurrentIndex(1)
+    owner.phase2_page.detail_tabs.setCurrentIndex(1)
     qapp.processEvents()
     assert_file_visible(owner, tracks[1])
 
 
 def test_review_enables_file_before_switching_to_its_content(qapp, window):
     owner, tracks = window
-    owner._detail_tabs.setCurrentIndex(0)
-    owner._detail_tabs.setTabEnabled(1, False)
+    owner.phase2_page.detail_tabs.setCurrentIndex(0)
+    owner.phase2_page.detail_tabs.setTabEnabled(1, False)
     review(owner, tracks[1], "mouse")
     qapp.processEvents()
-    assert owner._detail_tabs.isTabEnabled(1)
+    assert owner.phase2_page.detail_tabs.isTabEnabled(1)
     assert_file_visible(owner, tracks[1])

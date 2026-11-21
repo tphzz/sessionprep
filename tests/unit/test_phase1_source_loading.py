@@ -29,7 +29,7 @@ def _analyze(tracks):
     errors = []
     completed = []
     worker.error.connect(errors.append)
-    worker.finished.connect(completed.append)
+    worker.completed.connect(completed.append)
     worker.run()
     assert errors == []
     assert completed == [session]

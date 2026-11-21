@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from PySide6.QtCore import QObject, Signal, Slot
 from PySide6.QtWidgets import (
@@ -44,53 +44,43 @@ from ..tracks.table_widgets import (
     _TAB_GROUPS,
     _TAB_SESSION,
 )
+from .analysis_controller import repair_settings_can_apply
+
+if TYPE_CHECKING:
+    from PySide6.QtWidgets import QTabWidget
 
 
 class SessionConfigController(QObject):
     """Owns Phase 2 Config tab, per-session overrides, preset switching, and impact routing."""
 
     config_impact_applied = Signal(object)  # ConfigChangeImpact
+    daw_refresh_requested = Signal()
+    prepare_stale_requested = Signal()
+    repair_plan_requested = Signal(object)  # list[TrackContext]
+    reanalyze_phase1_requested = Signal()
+    reanalyze_phase2_requested = Signal()
+    groups_dirty_refresh_requested = Signal()
+    processing_column_refresh_requested = Signal()
+    analysis_column_refresh_requested = Signal()
+    summary_render_requested = Signal()
+    file_report_refresh_requested = Signal(object)  # TrackContext
+    waveform_issues_refresh_requested = Signal()
+    waveform_colormap_changed = Signal(str)
 
     def __init__(
         self,
         state: WorkspaceState,
         shell: MainWindowShell,
         *,
-        detail_tabs: Any = None,
-        on_refresh_daw_from_config: Callable[[], None] | None = None,
-        on_mark_prepare_stale: Callable[[], None] | None = None,
-        on_queue_repair_plan: Callable[..., None] | None = None,
-        on_repair_settings_can_apply: Callable[[Any, dict[str, Any]], bool] | None = None,
+        detail_tabs: QTabWidget | None = None,
         on_is_repair_pending_or_running: Callable[[], bool] | None = None,
-        on_reanalyze_phase1: Callable[[], None] | None = None,
-        on_reanalyze_phase2: Callable[[], None] | None = None,
-        on_refresh_groups_dirty: Callable[[], None] | None = None,
-        on_refresh_processing_column: Callable[[], None] | None = None,
-        on_refresh_analysis_column: Callable[[], None] | None = None,
-        on_render_summary: Callable[[], None] | None = None,
-        on_refresh_file_report: Callable[[Any], None] | None = None,
-        on_refresh_waveform_issues: Callable[[], None] | None = None,
-        on_set_waveform_colormap: Callable[[str], None] | None = None,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
         self._state = state
         self._shell = shell
         self._detail_tabs = detail_tabs
-        self._on_refresh_daw_from_config = on_refresh_daw_from_config
-        self._on_mark_prepare_stale = on_mark_prepare_stale
-        self._on_queue_repair_plan = on_queue_repair_plan
-        self._on_repair_settings_can_apply = on_repair_settings_can_apply
         self._on_is_repair_pending_or_running = on_is_repair_pending_or_running
-        self._on_reanalyze_phase1 = on_reanalyze_phase1
-        self._on_reanalyze_phase2 = on_reanalyze_phase2
-        self._on_refresh_groups_dirty = on_refresh_groups_dirty
-        self._on_refresh_processing_column = on_refresh_processing_column
-        self._on_refresh_analysis_column = on_refresh_analysis_column
-        self._on_render_summary = on_render_summary
-        self._on_refresh_file_report = on_refresh_file_report
-        self._on_refresh_waveform_issues = on_refresh_waveform_issues
-        self._on_set_waveform_colormap = on_set_waveform_colormap
 
         self.session_widgets: dict[str, list[tuple[str, QWidget]]] = {}
         self.session_page_index: dict[int, int] = {}
@@ -388,48 +378,43 @@ class SessionConfigController(QObject):
     def apply_config_change_impact(self, impact: ConfigChangeImpact) -> None:
         reanalyzing = impact.requires_phase1 or impact.requires_phase2
         self.refresh_effective_config(impact, reanalyzing=reanalyzing)
-        if impact.requires_phase1 and self._on_reanalyze_phase1 is not None:
-            self._on_reanalyze_phase1()
-        elif impact.requires_phase2 and self._on_reanalyze_phase2 is not None:
-            self._on_reanalyze_phase2()
+        if impact.requires_phase1:
+            self.reanalyze_phase1_requested.emit()
+        elif impact.requires_phase2:
+            self.reanalyze_phase2_requested.emit()
         elif not (impact.presentation_keys and self._state.session):
             self.refresh_config_changed_display()
         self.config_impact_applied.emit(impact)
 
     def refresh_effective_config(self, impact: ConfigChangeImpact, *, reanalyzing: bool = False) -> None:
-        if impact.daw_keys and self._on_refresh_daw_from_config is not None:
-            self._on_refresh_daw_from_config()
+        if impact.daw_keys:
+            self.daw_refresh_requested.emit()
         if any(key.startswith("processors.") and key.endswith("_enabled") for key in impact.phase2_keys):
             self.refresh_enabled_processors()
-        if (impact.requires_phase1 or impact.requires_phase2) and self._on_mark_prepare_stale is not None:
-            self._on_mark_prepare_stale()
+        if impact.requires_phase1 or impact.requires_phase2:
+            self.prepare_stale_requested.emit()
         session = self._state.session
         if session and self._shell.is_phase_enabled(_PHASE_ANALYSIS) and not reanalyzing:
-            if impact.repair_keys and self._on_queue_repair_plan is not None:
-                self._on_queue_repair_plan(session.tracks)
-            elif (
-                (impact.requires_phase1 or impact.requires_phase2)
-                and self._on_queue_repair_plan is not None
-                and self._on_repair_settings_can_apply is not None
-            ):
+            if impact.repair_keys:
+                self.repair_plan_requested.emit(session.tracks)
+            elif impact.requires_phase1 or impact.requires_phase2:
                 flat = self._state.flat_config()
                 tracks = [
                     t for t in session.tracks
-                    if t.repair_recipe.active or self._on_repair_settings_can_apply(t, flat)
+                    if t.repair_recipe.active or repair_settings_can_apply(t, flat)
                 ]
                 if tracks:
-                    self._on_queue_repair_plan(tracks)
+                    self.repair_plan_requested.emit(tracks)
         if impact.presentation_keys and session:
             self.refresh_presentation()
 
     def refresh_config_changed_display(self) -> None:
-        if self._state.session and self._on_render_summary is not None:
-            self._on_render_summary()
+        if self._state.session:
+            self.summary_render_requested.emit()
         cmap = self._state.config.get("app", {}).get("spectrogram_colormap", "magma")
-        if self._on_set_waveform_colormap is not None:
-            self._on_set_waveform_colormap(cmap)
-        if self._state.current_track and self._on_refresh_file_report is not None:
-            self._on_refresh_file_report(self._state.current_track)
+        self.waveform_colormap_changed.emit(cmap)
+        if self._state.current_track:
+            self.file_report_refresh_requested.emit(self._state.current_track)
 
     def refresh_enabled_processors(self) -> None:
         session = self._state.session
@@ -443,8 +428,7 @@ class SessionConfigController(QObject):
                 new_processors.append(proc)
         new_processors.sort(key=lambda p: p.priority)
         session.processors = new_processors
-        if self._on_refresh_processing_column is not None:
-            self._on_refresh_processing_column()
+        self.processing_column_refresh_requested.emit()
 
     def refresh_presentation(self) -> None:
         session = self._state.session
@@ -454,18 +438,13 @@ class SessionConfigController(QObject):
         for det in session.detectors:
             det.configure(flat)
         self._state.summary = build_diagnostic_summary(session, remaining=True)
-        if self._on_render_summary is not None:
-            self._on_render_summary()
-        if self._on_refresh_analysis_column is not None:
-            self._on_refresh_analysis_column()
+        self.summary_render_requested.emit()
+        self.analysis_column_refresh_requested.emit()
         if self._state.current_track:
-            if self._on_refresh_file_report is not None:
-                self._on_refresh_file_report(self._state.current_track)
-            if self._on_refresh_waveform_issues is not None:
-                self._on_refresh_waveform_issues()
+            self.file_report_refresh_requested.emit(self._state.current_track)
+            self.waveform_issues_refresh_requested.emit()
         cmap = self._state.config.get("app", {}).get("spectrogram_colormap", "magma")
-        if self._on_set_waveform_colormap is not None:
-            self._on_set_waveform_colormap(cmap)
+        self.waveform_colormap_changed.emit(cmap)
 
     # ── Dirty indicators ─────────────────────────────────────────────────
 
@@ -478,13 +457,13 @@ class SessionConfigController(QObject):
         kind = "group preset" if index == _TAB_GROUPS else "preset"
         return f"Changed from {kind} \u201c{name}\u201d" if name else f"Changed from {kind}"
 
+    @Slot(int, str, bool)
     def set_detail_tab_dirty(self, index: int, _label: str, dirty: bool) -> None:
         if self._detail_tabs is not None:
             set_tab_marker(self._detail_tabs, index, dirty, self.phase2_change_tooltip(index))
 
     def refresh_phase2_dirty_indicators(self) -> None:
-        if self._on_refresh_groups_dirty is not None:
-            self._on_refresh_groups_dirty()
+        self.groups_dirty_refresh_requested.emit()
         self.refresh_dirty_indicators()
 
     def refresh_dirty_indicators(self) -> None:

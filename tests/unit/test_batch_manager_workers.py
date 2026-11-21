@@ -275,11 +275,11 @@ def _quit_after_current_batch_item():
         patch.setattr(protools, "check_ptsl_connectivity", check_connection)
         patch.setattr(protools.ProToolsDawProcessor, "transfer", transfer)
         window = WindowWithCloseEvents()
-        dock = window._batch_dock
+        dock = window.batch_controller.dock
         for item in (first, active, next_item):
             assert dock.add_item(item)
         completed = []
-        window._batch_manager.finished.connect(lambda: completed.append(True))
+        window.batch_controller.manager.finished.connect(lambda: completed.append(True))
 
         try:
             dock._run_btn.click()
@@ -388,3 +388,47 @@ def test_run_batch_continues_after_connection_and_transfer_failures(tmp_path):
 
 def test_confirmed_quit_waits_for_active_batch_item_without_starting_the_next(tmp_path):
     _run_isolated(_quit_after_current_batch_item, tmp_path)
+
+
+def test_batch_manager_parents_to_window_and_reads_state_config(_font_app, tmp_path, monkeypatch):
+    class _FakeWindow(QObject):
+        def __init__(self, cfg):
+            super().__init__()
+            self.state = SimpleNamespace(config=cfg)
+
+    custom_colors = [{"name": "Neon", "argb": "#ff00ff00"}]
+    cfg = {
+        "app": {"phase1_output_folder": "custom_phase1_out"},
+        "colors": custom_colors,
+    }
+    captured_folders: list[str] = []
+    monkeypatch.setattr(
+        batch,
+        "restore_layout_sources",
+        lambda state_dict, folder: captured_folders.append(folder) or None,
+    )
+    win = _FakeWindow(cfg)
+    manager = batch.BatchManager(win)
+    try:
+        assert manager.parent() is win
+        src_dir = tmp_path / "proj"
+        src_dir.mkdir()
+        item = BatchItem(
+            id="rehydrate_test",
+            project_name="Proj",
+            daw_processor_id="dawproject_0",
+            daw_processor_name="DAWproject",
+            output_path=str(tmp_path / "out.dawproject"),
+            session_state={
+                "project_name": "Proj",
+                "source_dir": str(src_dir),
+                "session_config": {},
+                "tracks": [],
+            },
+        )
+        session = manager._rehydrate_session(item.session_state)
+        assert session.config["gui"]["colors"] == custom_colors
+        assert captured_folders == ["custom_phase1_out"]
+    finally:
+        win.deleteLater()
+        _font_app.processEvents()

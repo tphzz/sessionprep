@@ -67,7 +67,7 @@ def phase3_project(qapp, messages, monkeypatch, tmp_path):
     source.mkdir()
     window = SessionPrepWindow()
     try:
-        window.lifecycle_controller.restore_session_state({
+        window.persistence_controller.restore_session_state({
             "source_dir": str(source),
             "active_config_preset": "Default",
             "session_config": preset,
@@ -347,15 +347,15 @@ def test_pending_create_cannot_transfer_after_leaving_the_original_project(
             monkeypatch.setattr(
                 QFileDialog, "getExistingDirectory", lambda *args: str(next_source),
             )
-            window.lifecycle_controller.open_directory_dialog()
+            window.persistence_controller.open_directory_dialog()
             assert window.state.session is None
         else:
-            replacement = window.lifecycle_controller.capture_session_state()
+            replacement = window.persistence_controller.capture_session_state()
             replacement.update(source_dir=str(next_source), project_name="Replacement")
             path = str(tmp_path / "replacement.spsession")
             save_session(path, replacement)
             monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *args: (path, ""))
-            window.lifecycle_controller.load_session_dialog()
+            window.persistence_controller.load_session_dialog()
             assert window.state.session is not original
             assert window.daw_controller.page.project_name_edit.text() == "Replacement"
 
@@ -448,11 +448,11 @@ def test_pending_fetch_does_not_write_folders_to_a_replaced_target(
                 0, 1).setText("Replacement"),
         )
     else:
-        replacement = window.lifecycle_controller.capture_session_state()
+        replacement = window.persistence_controller.capture_session_state()
         source = tmp_path / "new-audio"
         source.mkdir()
         replacement.update(source_dir=str(source), project_name="Replacement", daw_state={})
-        window.lifecycle_controller.restore_session_state(replacement)
+        window.persistence_controller.restore_session_state(replacement)
 
     pending.pop().run()
 

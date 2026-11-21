@@ -1,15 +1,18 @@
 """Analysis subpackage: session config/lifecycle controllers and background workers."""
 
+from .analysis_controller import AnalysisPrepareController, repair_settings_can_apply
 from .config_controller import SessionConfigController
-from .lifecycle_controller import SessionLifecycleController
+from .persistence_controller import SessionPersistenceController
 from .worker import (
     AudioLoadWorker, AnalyzeWorker, PrepareWorker,
-    BatchReanalyzeWorker, DawCheckWorker, DawFetchWorker, DawTransferWorker,
+    DawCheckWorker, DawFetchWorker, DawTransferWorker,
 )
 
 __all__ = [
+    "AnalysisPrepareController",
     "SessionConfigController",
-    "SessionLifecycleController",
+    "SessionPersistenceController",
+    "repair_settings_can_apply",
     "AudioLoadWorker", "AnalyzeWorker", "PrepareWorker",
-    "BatchReanalyzeWorker", "DawCheckWorker", "DawFetchWorker", "DawTransferWorker",
+    "DawCheckWorker", "DawFetchWorker", "DawTransferWorker",
 ]

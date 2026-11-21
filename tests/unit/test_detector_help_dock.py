@@ -370,11 +370,16 @@ def test_monitor_font_refresh_preserves_report_and_help_reading_positions(qapp, 
         def logicalDotsPerInch(self):
             return 96.0
 
+    from sessionprepgui.tracks.phase2_page import Phase2Page
+
     session, current = _session(50, long_help=True)
     pane.report.present_track(current, session)
-    owner = SimpleNamespace(_summary_view=None, _file_report=pane.report,
-                            _file_report_pane=pane)
-    SessionPrepWindow._refresh_report_browser_fonts(owner, Screen(1.0))
+    page_stub = SimpleNamespace(
+        summary_view=SimpleNamespace(refresh_font=lambda _s: None),
+        file_report=pane.report,
+        file_report_pane=pane,
+    )
+    Phase2Page.refresh_report_fonts(page_stub, Screen(1.0))
     _settle(qapp, pane)
     _read_at(pane.report, "d25")
     _activate(pane, "d25")
@@ -386,7 +391,7 @@ def test_monitor_font_refresh_preserves_report_and_help_reading_positions(qapp, 
     report_top = _link_top(pane.report, "d25")
 
     for scale in (2.0, 1.0):
-        SessionPrepWindow._refresh_report_browser_fonts(owner, Screen(scale))
+        Phase2Page.refresh_report_fonts(page_stub, Screen(scale))
         _settle(qapp, pane)
         assert abs(_link_top(pane.report, "d25") - report_top) <= 3
         assert abs(pane.help_browser.cursorRect(help_cursor).top() - help_top) <= 3

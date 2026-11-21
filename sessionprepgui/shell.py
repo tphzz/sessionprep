@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any, Protocol
 
 from PySide6.QtWidgets import QWidget
@@ -11,6 +12,26 @@ class MainWindowShell(Protocol):
     """Minimal surface that GUI controllers may call on the host window."""
 
     def show_status(self, message: str) -> None: ...
+
+    def show_status_prompt(
+        self,
+        prefix: str,
+        highlight: str,
+        suffix: str,
+        *,
+        tooltip: str,
+        on_accept: Callable[[], None],
+        on_cancel: Callable[[], None] | None = None,
+        accept_label: str = "Overwrite",
+        cancel_label: str = "Cancel",
+        accept_description: str = "",
+        cancel_description: str = "",
+        return_focus_widget: QWidget | None = None,
+    ) -> None: ...
+
+    def dismiss_status_prompt(
+        self, *, status_message: str | None = None, restore_focus: bool = False
+    ) -> None: ...
 
     def progress_start(self, text: str, *, owner: Any = None) -> None: ...
 

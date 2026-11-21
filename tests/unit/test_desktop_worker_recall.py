@@ -30,7 +30,7 @@ def test_pending_worker_results_after_project_open_or_close(tmp_path, monkeypatc
     path.write_text(json.dumps({"version": 7, "source_dir": str(new), "project_name": "New"}))
     monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *args: (str(path), ""))
     window = SessionPrepWindow()
-    window.lifecycle_controller.restore_session_state({"source_dir": str(old), "tracks": [load_track(str(old / "Old.wav"))]})
+    window.persistence_controller.restore_session_state({"source_dir": str(old), "tracks": [load_track(str(old / "Old.wav"))]})
     queued, release = Event(), Event()
     worker_class = {"analyze": AnalyzeWorker, "prepare": PrepareWorker, "apply": TopologyApplyWorker}[operation]
     cancel_method = "requestInterruption" if operation == "prepare" else "cancel"
@@ -51,11 +51,11 @@ def test_pending_worker_results_after_project_open_or_close(tmp_path, monkeypatc
     monkeypatch.setattr(worker_class, cancel_method, release_on_cancel)
     try:
         if operation == "analyze":
-            window.lifecycle_controller.analyze()
-            worker = window.lifecycle_controller.analyze_worker
+            window.analysis_controller.analyze()
+            worker = window.analysis_controller.analyze_worker
         elif operation == "prepare":
-            window.lifecycle_controller.prepare()
-            worker = window.lifecycle_controller.prepare_worker
+            window.analysis_controller.prepare()
+            worker = window.analysis_controller.prepare_worker
         else:
             window.state.topo_topology = build_default_topology(window.state.topo_source_tracks)
             window.topology_controller.apply_topology()
@@ -64,12 +64,12 @@ def test_pending_worker_results_after_project_open_or_close(tmp_path, monkeypatc
         # is busy. Switching projects happens before the event queue drains.
         assert queued.wait(6)
         if action == "open":
-            window.lifecycle_controller.load_session_dialog()
+            window.persistence_controller.load_session_dialog()
         else:
             assert window.close()
         fresh = window.state.session
         progress = []
-        monkeypatch.setattr(window, "_progress_message", progress.append)
+        monkeypatch.setattr(window, "progress_message", progress.append)
         release.set()
         assert worker.wait(3000)
         app.processEvents()
@@ -77,10 +77,10 @@ def test_pending_worker_results_after_project_open_or_close(tmp_path, monkeypatc
         assert "OLD PROJECT PROGRESS" not in progress
         if action == "open":
             assert fresh.project_name == "New" and not fresh.tracks and not fresh.output_tracks
-            assert window._track_table.rowCount() == 0
+            assert window.phase2_page.track_table.rowCount() == 0
             assert not window._phase_tabs.isTabEnabled(2)
         else:
-            assert not window._playback.is_playing and window.lifecycle_controller.analyze_worker is None
+            assert not window._playback.is_playing and window.analysis_controller.analyze_worker is None
     finally:
         release.set()
         dispose_window(window)

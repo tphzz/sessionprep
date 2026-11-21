@@ -53,7 +53,7 @@ def project(app, tmp_path, monkeypatch):
     pipeline = Pipeline(default_detectors(), default_processors(), config, max_workers=1)
     pipeline.analyze_phase2(session)
     pipeline.plan(session)
-    window.lifecycle_controller.restore_session_state({"source_dir": str(source), "tracks": tracks,
+    window.persistence_controller.restore_session_state({"source_dir": str(source), "tracks": tracks,
                                    "active_config_preset": "Default", "session_config_overrides": {}})
     try:
         yield window
@@ -63,14 +63,14 @@ def project(app, tmp_path, monkeypatch):
 
 def wait_for_edits(window):
     deadline = monotonic() + 8
-    while window.lifecycle_controller.repair_plan_worker is not None or window.lifecycle_controller.repair_plan_pending:
+    while window.analysis_controller.repair_plan_worker is not None or window.analysis_controller.repair_plan_pending:
         QApplication.processEvents()
         assert monotonic() < deadline, "The classification/anchor edit did not finish"
         sleep(0.005)
 
 
 def choose(window, source, column, value, *, batch=False):
-    combo = window._track_table.cellWidget(window.track_table_controller.find_table_row(source.filename), column)
+    combo = window.phase2_page.track_table.cellWidget(window.track_table_controller.find_table_row(source.filename), column)
     assert combo.findText(value) >= 0
     # These are the flags that the table combobox sets on an Alt+Shift press.
     combo.batch_mode = batch
@@ -116,15 +116,15 @@ def assert_plan(track, anchor, classification):
 def test_individual_edits_rehydrate_source_and_keep_original_anchor(project, tmp_path):
     window = project
     saved = tmp_path / "classifications.spsession"
-    save_session(str(saved), window.lifecycle_controller.capture_session_state())
+    save_session(str(saved), window.persistence_controller.capture_session_state())
     restored = load_session(str(saved))
     assert all(track.audio_data is None for track in restored["tracks"])
-    window.lifecycle_controller.restore_session_state(restored)
+    window.persistence_controller.restore_session_state(restored)
     first, other, _ = window.state.session.tracks
     assert first.repair_recipe.dc_remove and first.classification_override is None
     assert first.audio_data is None
     row = window.track_table_controller.find_table_row(first.filename)
-    displayed = window._track_table.cellWidget(row, 3).currentText()
+    displayed = window.phase2_page.track_table.cellWidget(row, 3).currentText()
     choose(window, first, 3, displayed)
     assert first.classification_override == displayed
     assert_plan(first, "p95", displayed)
@@ -142,15 +142,15 @@ def test_batch_edits_replan_each_selected_row_and_preserve_selection(project):
     window = project
     first, second, plain = window.state.session.tracks
     assert first.repair_recipe.dc_remove and second.repair_recipe.dc_remove and not plain.repair_recipe.active
-    window._track_table.restore_selection({first.filename, second.filename})
+    window.phase2_page.track_table.restore_selection({first.filename, second.filename})
     choose(window, first, 5, "P85", batch=True)
-    assert window._track_table.batch_selected_keys() == {first.filename, second.filename}
+    assert window.phase2_page.track_table.batch_selected_keys() == {first.filename, second.filename}
     assert (first.rms_anchor_override, second.rms_anchor_override, plain.rms_anchor_override) == ("p85", "p85", None)
     for track in (first, second):
         assert_plan(track, "p85", track.processor_results["bimodal_normalize"].classification)
-    window._track_table.restore_selection({first.filename, plain.filename})
+    window.phase2_page.track_table.restore_selection({first.filename, plain.filename})
     choose(window, first, 3, "Transient", batch=True)
-    assert window._track_table.batch_selected_keys() == {first.filename, plain.filename}
+    assert window.phase2_page.track_table.batch_selected_keys() == {first.filename, plain.filename}
     assert first.classification_override == plain.classification_override == "Transient"
     assert second.classification_override is None
     assert_plan(first, "p85", "Transient")
@@ -177,7 +177,7 @@ def test_single_plain_classification_and_bypass_update_linked_gain_and_faders(pr
     assert result.gain_db == pytest.approx(shared)
     assert result.data["fader_offset"] == pytest.approx(-shared)
 
-    button = window._track_table.cellWidget(window.track_table_controller.find_table_row(repaired.filename), 7)
+    button = window.phase2_page.track_table.cellWidget(window.track_table_controller.find_table_row(repaired.filename), 7)
     toggle = next(action for action in button.menu().actions() if action.data() == selected)
     toggle.setChecked(False)
     wait_for_edits(window)
@@ -221,14 +221,14 @@ def test_group_link_recomputes_named_anchor_after_edits_and_reopen(project, tmp_
     link.click()
 
     saved = tmp_path / "linked.spsession"
-    save_session(str(saved), window.lifecycle_controller.capture_session_state())
-    window.lifecycle_controller.restore_session_state(load_session(str(saved)))
+    save_session(str(saved), window.persistence_controller.capture_session_state())
+    window.persistence_controller.restore_session_state(load_session(str(saved)))
     check(window.state.session, [-2, -2, 1], [0, 0, -3])
     restored_anchor = window.state.session.tracks[0]
     choose(window, restored_anchor, 3, "Transient")
     assert restored_anchor.classification_override == "Transient"
     check(window.state.session, [-2, -2, 1], [0, 0, -3])
-    button = window._track_table.cellWidget(window.track_table_controller.find_table_row(restored_anchor.filename), 7)
+    button = window.phase2_page.track_table.cellWidget(window.track_table_controller.find_table_row(restored_anchor.filename), 7)
     toggle = next(action for action in button.menu().actions() if action.data() == "bimodal_normalize")
     toggle.setChecked(False)
     wait_for_edits(window)
@@ -252,8 +252,8 @@ def test_reopened_group_edit_uses_the_selected_template_fader_ceiling(project, t
     daw = next(dp for dp in window.state.daw_processors if dp.fader_ceiling_db == 6.0)
     window.daw_controller.populate_daw_combo(daw.id)
     saved = tmp_path / "headroom.spsession"
-    save_session(str(saved), window.lifecycle_controller.capture_session_state())
-    window.lifecycle_controller.restore_session_state(load_session(str(saved)))
+    save_session(str(saved), window.persistence_controller.capture_session_state())
+    window.persistence_controller.restore_session_state(load_session(str(saved)))
     assert window.state.active_daw_processor.id == daw.id
     # With 8 dB of headroom on a +6 dB console, the highest fader is -2 dB.
     for track, gain in zip(window.state.session.tracks, (-10.0, 0.0, 1.0)):

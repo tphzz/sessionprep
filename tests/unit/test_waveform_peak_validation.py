@@ -63,12 +63,12 @@ def test_window_finishes_peak_build_and_publishes_only_readable_files(qapp, wind
         if i < unreadable:
             path.write_bytes(b"invalid waveform")
 
-    window.lifecycle_controller.start_peak_build(tracks, str(tmp_path))
-    assert window.lifecycle_controller.peak_build_worker.wait(5000)
+    window.persistence_controller.start_peak_build(tracks, str(tmp_path))
+    assert window.persistence_controller.peak_build_worker.wait(5000)
     qapp.processEvents()
-    assert not window._progress_running
-    assert (window._progress_current, window._progress_total) == (2, 2)
-    assert window._progress_text == f"Peak cache built for {2 - unreadable} file(s)"
+    assert not window.progress_coordinator.running
+    assert (window.progress_coordinator.current, window.progress_coordinator.total) == (2, 2)
+    assert window.progress_coordinator.text == f"Peak cache built for {2 - unreadable} file(s)"
     assert sorted(float(p.levels[0].data.max()) for p in window.state.peak_cache.values()) == [
         (i + 1) / 4 for i in range(unreadable, 2)]
 
@@ -77,23 +77,23 @@ def test_window_keeps_readable_peaks_when_cache_folder_cannot_be_created(qapp, w
     path = tmp_path / "Bass.wav"
     sf.write(path, np.full(4096, .5), 48000, subtype="FLOAT")
     (tmp_path / "sp_peaks").write_text("existing file")
-    window.lifecycle_controller.start_peak_build([load_track(str(path))], str(tmp_path))
-    assert window.lifecycle_controller.peak_build_worker.wait(5000)
+    window.persistence_controller.start_peak_build([load_track(str(path))], str(tmp_path))
+    assert window.persistence_controller.peak_build_worker.wait(5000)
     qapp.processEvents()
-    assert window._progress_text == "Peak cache built for 1 file(s)"
+    assert window.progress_coordinator.text == "Peak cache built for 1 file(s)"
     assert next(iter(window.state.peak_cache.values())).levels[0].data.max() == .5
 
 
 def test_queued_peaks_cannot_finish_a_newer_foreground_operation(qapp, window, tmp_path):
     path = tmp_path / "Bass.wav"
     sf.write(path, np.full(4096, .5), 48000, subtype="FLOAT")
-    window.lifecycle_controller.start_peak_build([load_track(str(path))], str(tmp_path))
-    assert window.lifecycle_controller.peak_build_worker.wait(5000)
-    window._progress_start("Preparing…")
-    window._progress_value(1, 3)
+    window.persistence_controller.start_peak_build([load_track(str(path))], str(tmp_path))
+    assert window.persistence_controller.peak_build_worker.wait(5000)
+    window.progress_start("Preparing…")
+    window.progress_value(1, 3)
     qapp.processEvents()
-    assert window._progress_running and window._progress_text == "Preparing…"
-    assert (window._progress_current, window._progress_total) == (1, 3)
+    assert window.progress_coordinator.running and window.progress_coordinator.text == "Preparing…"
+    assert (window.progress_coordinator.current, window.progress_coordinator.total) == (1, 3)
     assert next(iter(window.state.peak_cache.values())).levels[0].data.max() == .5
 
 
@@ -101,13 +101,13 @@ def test_replacing_a_project_with_disk_caches_clears_its_unfinished_progress(qap
     path = tmp_path / "Bass.wav"
     sf.write(path, np.full(4096, .25), 48000, subtype="FLOAT")
     track = load_track(str(path))
-    window.lifecycle_controller.start_peak_build([track], str(tmp_path))
-    assert window.lifecycle_controller.peak_build_worker.wait(5000)
-    state = window.lifecycle_controller.capture_session_state()
+    window.persistence_controller.start_peak_build([track], str(tmp_path))
+    assert window.persistence_controller.peak_build_worker.wait(5000)
+    state = window.persistence_controller.capture_session_state()
     state.update(source_dir=str(tmp_path), tracks=[track])
-    window.lifecycle_controller.restore_session_state(state)
+    window.persistence_controller.restore_session_state(state)
     qapp.processEvents()
-    assert not window._progress_running
+    assert not window.progress_coordinator.running
     assert next(iter(window.state.peak_cache.values())).levels[0].data.max() == .25
 
 
@@ -151,7 +151,7 @@ def test_late_phase1_read_error_preserves_new_request(
     monkeypatch.setattr(worker_type, "run", fail_read)
     old = select()
     assert old.wait(5000)
-    window.lifecycle_controller.clear_workspace()
+    window.persistence_controller.clear_workspace()
     current = select()
     try:
         qapp.processEvents()
@@ -185,14 +185,14 @@ def test_reopened_project_displays_its_own_source_and_routed_peaks(
             save_peaks(build_peaks(audio, rate, get_source_mtime(str(path))),
                        peaks_path_for(str(folder / "sp_peaks"), name))
 
-    state = window.lifecycle_controller.capture_session_state()
+    state = window.persistence_controller.capture_session_state()
     state.update(source_dir=str(source), topology_dir=str(routed), topology_applied=True,
                  tracks=[load_track(str(routed / name))], topology=TopologyMapping([
                      TopologyEntry(name, 1, [TopologySource(name, [ChannelRoute(0, 0, .125)])])]))
     project = str(tmp_path / "routing.spsession")
     save_session(project, state)
-    window.lifecycle_controller.restore_session_state(load_session(project))
-    worker = window.lifecycle_controller.peak_build_worker
+    window.persistence_controller.restore_session_state(load_session(project))
+    worker = window.persistence_controller.peak_build_worker
     if worker is not None:
         assert worker.wait(5000)
         qapp.processEvents()
@@ -208,8 +208,8 @@ def test_reopened_project_displays_its_own_source_and_routed_peaks(
         assert np.max(renderer._peaks_cache[0][1]) == pytest.approx(expected)
 
     window.detail_controller.show_track_detail(window.state.session.tracks[0])
-    wait_until(qapp, lambda: window._repair_preview.displayed and window._repair_preview.worker is None)
-    check_envelope(window._wf_panel.waveform, .1)
+    wait_until(qapp, lambda: window.repair_preview.displayed and window.repair_preview.worker is None)
+    check_envelope(window.phase2_page.wf_panel.waveform, .1)
     window._phase_tabs.setCurrentIndex(0)
     window.topology_controller.load_input_waveform(name)
     wave = window.topology_controller.page.wf_panel.waveform
@@ -240,35 +240,35 @@ def test_reapplying_same_length_route_rebuilds_peaks_from_new_audio(qapp, tmp_pa
 def test_new_project_ignores_queued_peaks_and_progress_for_the_same_filename(
         qapp, window, tmp_path, dispatch_before_replacement, monkeypatch):
     finished = []
-    finish = window._progress_finish
+    finish = window.progress_finish
 
     def record_finish(message):
         finished.append(message)
         finish(message)
 
-    monkeypatch.setattr(window, "_progress_finish", record_finish)
+    monkeypatch.setattr(window, "progress_finish", record_finish)
 
     def start(folder_name, peak):
         folder = tmp_path / folder_name
         folder.mkdir()
         path = folder / "shared.wav"
         sf.write(path, np.full(4096, peak), 48000, subtype="FLOAT")
-        window.lifecycle_controller.start_peak_build([load_track(str(path))], str(folder))
-        return window.lifecycle_controller.peak_build_worker
+        window.persistence_controller.start_peak_build([load_track(str(path))], str(folder))
+        return window.persistence_controller.peak_build_worker
 
     old_worker = start("first", .75)
     # Finish the real worker while its GUI callbacks are still queued.
     assert old_worker.wait(5000)
-    window.lifecycle_controller.clear_workspace()
+    window.persistence_controller.clear_workspace()
     if dispatch_before_replacement:
         qapp.processEvents()
-        assert window.state.peak_cache == {} and finished == [] and not window._progress_running
+        assert window.state.peak_cache == {} and finished == [] and not window.progress_coordinator.running
 
     current_worker = start("second", .125)
     assert current_worker.wait(5000)
     # A second lookup in the same project may have no missing routed peaks.
-    window.lifecycle_controller.start_peak_build([], str(tmp_path / "second"))
-    assert window.lifecycle_controller.peak_build_worker is current_worker
+    window.persistence_controller.start_peak_build([], str(tmp_path / "second"))
+    assert window.persistence_controller.peak_build_worker is current_worker
     qapp.processEvents()
     assert finished == ["Peak cache built for 1 file(s)"]
     assert len(window.state.peak_cache) == 1

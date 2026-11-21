@@ -19,12 +19,14 @@ def qapp():
     return app
 
 
-def test_phase1_config_impact_routes_to_track_layout_reanalysis(qapp, monkeypatch):
+def test_phase1_config_impact_routes_to_track_layout_reanalysis(qapp):
     window = SessionPrepWindow()
     calls: list[str] = []
     ctrl = window.config_controller
-    monkeypatch.setattr(ctrl, "_on_reanalyze_phase1", lambda: calls.append("phase1"))
-    monkeypatch.setattr(ctrl, "_on_reanalyze_phase2", lambda: calls.append("phase2"))
+    ctrl.reanalyze_phase1_requested.disconnect(window.persistence_controller.reanalyze_topology)
+    ctrl.reanalyze_phase2_requested.disconnect(window.analysis_controller.analyze)
+    ctrl.reanalyze_phase1_requested.connect(lambda: calls.append("phase1"))
+    ctrl.reanalyze_phase2_requested.connect(lambda: calls.append("phase2"))
 
     try:
         ctrl.apply_config_change_impact(
@@ -38,12 +40,14 @@ def test_phase1_config_impact_routes_to_track_layout_reanalysis(qapp, monkeypatc
     assert calls == ["phase1"]
 
 
-def test_phase2_config_impact_routes_to_phase2_reanalysis(qapp, monkeypatch):
+def test_phase2_config_impact_routes_to_phase2_reanalysis(qapp):
     window = SessionPrepWindow()
     calls: list[str] = []
     ctrl = window.config_controller
-    monkeypatch.setattr(ctrl, "_on_reanalyze_phase1", lambda: calls.append("phase1"))
-    monkeypatch.setattr(ctrl, "_on_reanalyze_phase2", lambda: calls.append("phase2"))
+    ctrl.reanalyze_phase1_requested.disconnect(window.persistence_controller.reanalyze_topology)
+    ctrl.reanalyze_phase2_requested.disconnect(window.analysis_controller.analyze)
+    ctrl.reanalyze_phase1_requested.connect(lambda: calls.append("phase1"))
+    ctrl.reanalyze_phase2_requested.connect(lambda: calls.append("phase2"))
 
     try:
         ctrl.apply_config_change_impact(
@@ -57,12 +61,14 @@ def test_phase2_config_impact_routes_to_phase2_reanalysis(qapp, monkeypatch):
     assert calls == ["phase2"]
 
 
-def test_mixed_preset_change_refreshes_daw_before_analysis_rerun(qapp, monkeypatch):
+def test_mixed_preset_change_refreshes_daw_before_analysis_rerun(qapp):
     window = SessionPrepWindow()
     calls: list[str] = []
     ctrl = window.config_controller
-    monkeypatch.setattr(ctrl, "_on_reanalyze_phase2", lambda: calls.append("analysis"))
-    monkeypatch.setattr(ctrl, "_on_refresh_daw_from_config", lambda: calls.append("daw"))
+    ctrl.reanalyze_phase2_requested.disconnect(window.analysis_controller.analyze)
+    ctrl.daw_refresh_requested.disconnect(window._refresh_daw_processors_from_config)
+    ctrl.reanalyze_phase2_requested.connect(lambda: calls.append("analysis"))
+    ctrl.daw_refresh_requested.connect(lambda: calls.append("daw"))
 
     try:
         ctrl.apply_config_change_impact(
@@ -82,9 +88,12 @@ def test_daw_only_config_impact_refreshes_phase3_without_reanalysis(
     window = SessionPrepWindow()
     calls: list[str] = []
     ctrl = window.config_controller
-    monkeypatch.setattr(ctrl, "_on_reanalyze_phase1", lambda: calls.append("phase1"))
-    monkeypatch.setattr(ctrl, "_on_reanalyze_phase2", lambda: calls.append("phase2"))
-    monkeypatch.setattr(ctrl, "_on_refresh_daw_from_config", lambda: calls.append("daw"))
+    ctrl.reanalyze_phase1_requested.disconnect(window.persistence_controller.reanalyze_topology)
+    ctrl.reanalyze_phase2_requested.disconnect(window.analysis_controller.analyze)
+    ctrl.daw_refresh_requested.disconnect(window._refresh_daw_processors_from_config)
+    ctrl.reanalyze_phase1_requested.connect(lambda: calls.append("phase1"))
+    ctrl.reanalyze_phase2_requested.connect(lambda: calls.append("phase2"))
+    ctrl.daw_refresh_requested.connect(lambda: calls.append("daw"))
     monkeypatch.setattr(ctrl, "refresh_config_changed_display", lambda: calls.append("display"))
 
     try:

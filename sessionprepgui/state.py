@@ -31,7 +31,6 @@ class WorkspaceState(QObject):
     groups_changed = Signal()
     daw_processor_changed = Signal(object)    # DawProcessor | None
     overlays_changed = Signal(object)         # set[str]
-    busy_changed = Signal(bool, str)          # (is_busy, reason)
 
     def __init__(
         self,

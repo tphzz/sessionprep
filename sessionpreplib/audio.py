@@ -281,6 +281,7 @@ def get_rms_window_means(
     key = f"rms_window_means_{window_ms}_{stereo_mode}"
     if key not in track._cache:
         data = track.audio_data
+        assert data is not None
         samplerate = track.samplerate
 
         if data.ndim > 1 and data.shape[1] > 1:
@@ -490,8 +491,8 @@ def clipping_evidence(data: np.ndarray, threshold_count: int, max_ranges: int, *
     """Measure all channels but materialize only the requested number of overlay locations."""
     channels = data.T if data.ndim == 2 else (data,)
     total = 0
-    affected = []
-    ranges = []
+    affected: list[int] = []
+    ranges: list[tuple[int, int, int | None]] = []
     # The largest 8-bit PCM code decodes below the usual near-full-scale threshold.
     positive_limit = 127 / 128 if subtype in {"PCM_U8", "PCM_S8"} else 0.9999
     for ch, samples in enumerate(channels):
@@ -714,7 +715,7 @@ def windowed_stereo_correlation(
         return math.nan, 0.0, []
 
     whole = _stereo_readings(left[None, :], right[None, :])
-    results = []
+    results: list[tuple[int, int, float, float]] = []
     whole_corr, whole_loss = float(whole[0][0]), float(whole[1][0])
     if not include_windows:
         return whole_corr, whole_loss, results

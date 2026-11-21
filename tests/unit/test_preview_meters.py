@@ -80,7 +80,7 @@ def test_waveform_worker_marker_and_rendered_envelope_use_the_available_rms_wind
     stereo = np.column_stack([signal, np.zeros(frames)])
     worker = WaveformLoadWorker(stereo, rate, win, compute_spectrogram=False)
     ready = []
-    worker.finished.connect(ready.append)
+    worker.completed.connect(ready.append)
     worker.run()
     result, = ready
     expected = np.sqrt(np.mean(signal ** 2) / 2)
@@ -108,7 +108,7 @@ def test_unmeasurable_double_reaches_neither_preview_ready_nor_waveform_meters(c
     worker = WaveformLoadWorker(source, 48000, 128, preview_track=track if compare else None)
     ready, results, errors = [], [], []
     worker.source_ready.connect(lambda: ready.append(True))
-    worker.finished.connect(results.append)
+    worker.completed.connect(results.append)
     worker.failed.connect(errors.append)
     worker.run()
     assert errors and "finite range" in errors[0]
@@ -139,7 +139,7 @@ def test_high_worker_measures_both_physical_band_edges_at_pulled_rates(rate):
         samples = .25 * np.cos(2 * np.pi * frequency * t + .33)
         worker = WaveformLoadWorker(samples, rate, 256, band="high")
         results, errors = [], []
-        worker.finished.connect(results.append)
+        worker.completed.connect(results.append)
         worker.failed.connect(errors.append)
         worker.run()
         assert not errors
@@ -201,7 +201,7 @@ def test_exact_dc_and_nyquist_keep_their_one_sided_level_with_other_audio(band, 
     source = source.astype(np.float32)
     result, errors = [], []
     worker = WaveformLoadWorker(source, rate, 256, band=band)
-    worker.finished.connect(result.append)
+    worker.completed.connect(result.append)
     worker.failed.connect(errors.append)
     worker.run()
     assert not errors

@@ -41,7 +41,7 @@ def windows(tmp_path, monkeypatch):
 
     yield new_window
     for window in reversed(opened):
-        window._batch_dock.clear_all()
+        window.batch_controller.dock.clear_all()
         dispose_window(window)
     app.processEvents()
 
@@ -52,19 +52,19 @@ def test_disk_snapshot_of_running_batch_recovers_without_overwriting_existing_ex
     monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *a: (str(path), ""))
     monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *a: (str(path), ""))
     window = windows()
-    dock = window._batch_dock
+    dock = window.batch_controller.dock
     for name, status in [("Done", "Success"), ("Interrupted", "Pending"), ("Next", "Pending")]:
         dock.add_item(BatchItem.from_dict(record(tmp_path, name, status)))
     dock.update_item("id-Interrupted", "Running", "Transferring...")
-    window._on_save_batch_queue()
+    window.batch_controller.save_queue()
     assert json.loads(path.read_text())[1]["status"] == "Running"
 
     restored = windows()
-    restored._on_load_batch_queue()
-    queued = restored._batch_dock.get_pending_items()
+    restored.batch_controller.load_queue()
+    queued = restored.batch_controller.dock.get_pending_items()
     assert [j.project_name for j in queued] == ["Interrupted", "Next"]
     assert queued[0].status == "Failed" and "interrupt" in queued[0].result_text.lower()
-    manager = restored._batch_manager
+    manager = restored.batch_controller.manager
     config = manager._rehydrate_session(queued[0].session_state).config
     assert config["protools_temp_dir"] == str(tmp_path / "Interrupted")
     existing = Path(queued[0].output_path)
@@ -79,7 +79,7 @@ def test_disk_snapshot_of_running_batch_recovers_without_overwriting_existing_ex
     assert [s for _, s, _ in attempts] == ["Running", "Failed"]
     assert str(existing) in attempts[-1][-1]
     assert existing.read_bytes() == b"earlier export"
-    restored._on_save_batch_queue()
+    restored.batch_controller.save_queue()
     assert [row["status"] for row in json.loads(path.read_text())] == ["Success", "Failed", "Pending"]
 
     existing.rename(existing.with_suffix(".previous"))
@@ -101,7 +101,7 @@ def test_disk_snapshot_of_running_batch_recovers_without_overwriting_existing_ex
     timeout.timeout.connect(loop.quit)
     manager.finished.connect(loop.quit)
     timeout.start(5000)
-    restored._batch_dock._run_btn.click()
+    restored.batch_controller.dock._run_btn.click()
     if manager.is_running:
         loop.exec()
     assert timeout.isActive() and not manager.is_running
@@ -117,7 +117,7 @@ def test_disk_snapshot_of_running_batch_recovers_without_overwriting_existing_ex
 @pytest.mark.parametrize("problem", ["invalid row", "bad template", "repeated ID", "duplicate name"])
 def test_failed_queue_load_preserves_complete_queue_and_workspace(tmp_path, windows, monkeypatch, choice, problem):
     window = windows()
-    dock = window._batch_dock
+    dock = window.batch_controller.dock
     dock.add_item(BatchItem.from_dict(record(tmp_path, "Earlier")))
     rows = [record(tmp_path, name) for name in ("One", "Two", "Three")]
     if problem == "invalid row":
@@ -141,8 +141,9 @@ def test_failed_queue_load_preserves_complete_queue_and_workspace(tmp_path, wind
     for method in ("warning", "critical"):
         monkeypatch.setattr(QMessageBox, method, lambda _w, _t, message: messages.append(message))
     cleared = []
-    monkeypatch.setattr(window.lifecycle_controller, "clear_workspace", lambda: cleared.append(True))
-    window._on_load_batch_queue()
+    window.batch_controller.clear_workspace_requested.disconnect(window.persistence_controller.clear_workspace)
+    window.batch_controller.clear_workspace_requested.connect(lambda: cleared.append(True))
+    window.batch_controller.load_queue()
     assert dock.get_state() == original
     assert len(messages) == 1 and "2" in messages[0]
     assert not cleared
@@ -153,26 +154,26 @@ def test_edit_queued_session_with_missing_sources_keeps_item(tmp_path, windows, 
     row = record(tmp_path, "Offline")
     row["session_state"]["source_dir"] = str(tmp_path / "disconnected")
     item = BatchItem.from_dict(row)
-    window._batch_dock.add_item(item)
+    window.batch_controller.dock.add_item(item)
     messages = []
     monkeypatch.setattr(QMessageBox, "warning", lambda _w, _t, message: messages.append(message))
-    window._on_load_batch_item(item)
-    assert window._batch_dock.get_pending_items() == [item]
+    window.batch_controller.load_batch_item(item)
+    assert window.batch_controller.dock.get_pending_items() == [item]
     assert str(tmp_path / "disconnected") in messages[0]
-    window._batch_manager.start_single(item)
+    window.batch_controller.manager.start_single(item)
     assert item.status == "Failed"
     assert str(tmp_path / "disconnected") in item.result_text
 
 
 def test_dismissing_append_replace_prompt_keeps_current_queue(tmp_path, windows, monkeypatch):
     window = windows()
-    dock = window._batch_dock
+    dock = window.batch_controller.dock
     dock.add_item(BatchItem.from_dict(record(tmp_path, "Current")))
     queue = tmp_path / "import.spbatch"
     queue.write_text(json.dumps([record(tmp_path, "Imported")]))
     monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *a: (str(queue), ""))
     monkeypatch.setattr(QMessageBox, "exec", lambda box: box.reject())
-    window._on_load_batch_queue()
+    window.batch_controller.load_queue()
     assert [item.project_name for item in dock.get_pending_items()] == ["Current"]
 
 
@@ -215,7 +216,7 @@ def test_authored_project_reopens_with_pinned_directory_latest_default_and_saved
         protools_templates=[{"group": "Mix", "name": "Stereo"}])
     window.state.config["config_presets"]["Studio"] = preset
     monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *a: (str(path), ""))
-    window.lifecycle_controller.load_session_dialog()
+    window.persistence_controller.load_session_dialog()
     assert window.state.active_daw_processor.project_dir == "My projects"
     assert window.state.active_daw_processor._temp_dir == "New scratch"
     entry, = window.state.session.transfer_manifest
@@ -245,18 +246,18 @@ def test_rejected_session_load_preserves_open_workspace(tmp_path, windows, monke
     window = windows()
     original_folder = tmp_path / "original"
     original_folder.mkdir()
-    window.lifecycle_controller.restore_session_state({"source_dir": str(original_folder), "tracks": []})
+    window.persistence_controller.restore_session_state({"source_dir": str(original_folder), "tracks": []})
     before = window.state.session
     path = tmp_path / "broken.spsession"
     path.write_text(json.dumps({"version": CURRENT_VERSION, "source_dir": str(tmp_path), **invalid}))
     monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *a: (str(path), ""))
     messages = []
     monkeypatch.setattr(QMessageBox, "critical", lambda _w, _t, message: messages.append(message))
-    window.lifecycle_controller.load_session_dialog()
+    window.persistence_controller.load_session_dialog()
     assert messages and window.state.session is before and window.state.source_dir == str(original_folder)
     retained = tmp_path / "after-error.spsession"
     monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *a: (str(retained), ""))
-    window.lifecycle_controller.save_session_dialog()
+    window.persistence_controller.save_session_dialog()
     assert json.loads(retained.read_text())["source_dir"] == str(original_folder)
 
 

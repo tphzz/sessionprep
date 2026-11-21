@@ -112,7 +112,7 @@ class WaveformLoadWorker(QThread):
     so the main thread stays responsive.
     """
 
-    finished = Signal(object)  # emits a dict with all computed results
+    completed = Signal(object)  # emits a dict with all computed results
     source_ready = Signal()
     failed = Signal(str)
     settled = Signal()
@@ -167,7 +167,7 @@ class WaveformLoadWorker(QThread):
                 if not self._cancelled.is_set():
                     self.source_ready.emit()
                 if self._cached is not None:
-                    self.finished.emit(self._cached)
+                    self.completed.emit(self._cached)
                     return
                 self._audio_data = self.audition.corrected if self.corrected else self.audition.original
             if not self._cancelled.is_set():
@@ -282,7 +282,7 @@ class WaveformLoadWorker(QThread):
                 return
 
         log.debug("[Trace] WaveformLoadWorker TOTAL: %.2f ms", (time.perf_counter() - t_start) * 1000)
-        self.finished.emit({
+        self.completed.emit({
             "channels": channels,
             "samplerate": sr,
             "total_samples": total,
@@ -307,7 +307,7 @@ class WaveformLoadWorker(QThread):
 class SpectrogramRecomputeWorker(QThread):
     """Lightweight background thread to recompute the mel spectrogram."""
 
-    finished = Signal(object)  # emits np.ndarray | None
+    completed = Signal(object)  # emits np.ndarray | None
 
     def __init__(self, channels: list[np.ndarray], sr: int, *,
                  n_fft: int = _SPEC_N_FFT, window: str = "hann",
@@ -330,7 +330,7 @@ class SpectrogramRecomputeWorker(QThread):
         )
         if self._cancelled.is_set():
             return
-        self.finished.emit(result)
+        self.completed.emit(result)
 
 
 class PeakBuildWorker(QThread):

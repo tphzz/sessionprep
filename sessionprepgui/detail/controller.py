@@ -6,10 +6,11 @@ from collections.abc import Callable
 import logging
 import os
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from PySide6.QtCore import QObject, QSignalBlocker, QThread, QTimer, Qt, Slot
+from PySide6.QtCore import QObject, QSignalBlocker, QThread, QTimer, Qt, Signal, Slot
 from PySide6.QtGui import QAction
+from shiboken6 import isValid
 
 from sessionpreplib.audio import get_window_samples
 from sessionpreplib.rendering import build_diagnostic_summary
@@ -23,10 +24,21 @@ from ..analysis.worker import AudioLoadWorker
 from ..helpers import fmt_time
 from ..shell import MainWindowShell
 from ..state import WorkspaceState
-from ..tracks.table_widgets import _PHASE_TOPOLOGY, _TAB_FILE
+from ..tracks.table_widgets import TrackCol, _PHASE_TOPOLOGY, _TAB_FILE
 from ..waveform.compute import WaveformLoadWorker
 from ..waveform.peakcache import peak_source_key
 from .report import visualizable_issues
+
+if TYPE_CHECKING:
+    from PySide6.QtWidgets import QTabWidget
+    from ..topology.controller import TopologyController
+    from ..tracks.table_widgets import _DraggableTrackTable
+    from ..waveform.panel import WaveformPanel
+    from .browser import ReportBrowser
+    from .file_review import FileReviewPane
+    from .playback import PlaybackController
+    from .repair_editor import TrackRepairEditor
+    from .repair_preview import RepairPreview
 
 log = logging.getLogger(__name__)
 
@@ -48,24 +60,25 @@ def resolve_audition_results(track: Any, session: Any, *, corrected: bool) -> di
 class TrackDetailController(QObject):
     """Owns Phase 2 File detail view, summary rendering, waveform loading, overlays, and playback."""
 
+    repair_plan_requested = Signal(object, bool)  # (tracks, revalidate_source)
+    peak_prioritize_requested = Signal(str)       # source_key
+
     def __init__(
         self,
         state: WorkspaceState,
         shell: MainWindowShell,
         *,
-        summary_view: Any,
-        file_report: Any,
-        file_review: Any,
-        repair_editor: Any,
-        detail_tabs: Any,
-        track_table: Any,
-        wf_panel: Any,
-        playback: Any,
-        repair_preview: Any = None,
-        topology_ctrl: Any = None,
+        summary_view: ReportBrowser,
+        file_report: ReportBrowser,
+        file_review: FileReviewPane,
+        repair_editor: TrackRepairEditor,
+        detail_tabs: QTabWidget,
+        track_table: _DraggableTrackTable,
+        wf_panel: WaveformPanel,
+        playback: PlaybackController,
+        repair_preview: RepairPreview | None = None,
+        topology_ctrl: TopologyController | None = None,
         on_find_table_row: Callable[[str], int] | None = None,
-        on_queue_repair_plan: Callable[..., None] | None = None,
-        on_prioritize_peak: Callable[[str], None] | None = None,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
@@ -82,8 +95,6 @@ class TrackDetailController(QObject):
         self._repair_preview = repair_preview
         self._topology_ctrl = topology_ctrl
         self._on_find_table_row = on_find_table_row
-        self._on_queue_repair_plan = on_queue_repair_plan
-        self._on_prioritize_peak = on_prioritize_peak
 
         # Owned workers & generation state
         self.wf_worker: Any = None
@@ -94,14 +105,11 @@ class TrackDetailController(QObject):
         self._corrected_overlay_track: Any = None
         self._corrected_overlay_labels: set[str] = set()
 
-    def set_repair_preview(self, preview: Any) -> None:
-        self._repair_preview = preview
-
     def dispose(self) -> None:
         """Stop all detail waveform/audio load threads cleanly."""
         for attr in ("wf_worker", "audio_load_worker"):
             worker = getattr(self, attr, None)
-            if isinstance(worker, QThread) and worker.isRunning():
+            if isinstance(worker, QThread) and isValid(worker) and worker.isRunning():
                 cancel_fn = getattr(worker, "cancel", None)
                 if callable(cancel_fn):
                     cancel_fn()
@@ -109,6 +117,14 @@ class TrackDetailController(QObject):
                     worker.requestInterruption()
                 worker.wait()
             setattr(self, attr, None)
+        for worker in self.findChildren(QThread):
+            if isValid(worker) and worker.isRunning():
+                cancel_fn = getattr(worker, "cancel", None)
+                if callable(cancel_fn):
+                    cancel_fn()
+                else:
+                    worker.requestInterruption()
+                worker.wait()
 
     def clear_workspace(self) -> None:
         self.stop()
@@ -177,7 +193,7 @@ class TrackDetailController(QObject):
             if row < 0:
                 return
             with QSignalBlocker(self._track_table):
-                self._track_table.setCurrentCell(row, 7)
+                self._track_table.setCurrentCell(row, TrackCol.PROCESSING)
             self.show_track_detail(track)
         elif self._detail_tabs.currentIndex() != _TAB_FILE:
             self._detail_tabs.setCurrentIndex(_TAB_FILE)
@@ -190,9 +206,11 @@ class TrackDetailController(QObject):
 
     def focus_processing_menu(self, filename: str) -> None:
         row = self._on_find_table_row(filename) if self._on_find_table_row else -1
-        button = self._track_table.cellWidget(row, 7) if row >= 0 else None
+        button = self._track_table.cellWidget(row, TrackCol.PROCESSING) if row >= 0 else None
         if button is not None and button.isEnabled():
-            self._track_table.scrollToItem(self._track_table.item(row, 0))
+            file_item = self._track_table.item(row, TrackCol.FILE)
+            if file_item is not None:
+                self._track_table.scrollToItem(file_item)
             button.setFocus(Qt.FocusReason.OtherFocusReason)
         else:
             self._file_report.setFocus(Qt.FocusReason.OtherFocusReason)
@@ -206,11 +224,11 @@ class TrackDetailController(QObject):
         if track is None:
             return
         for row in range(self._track_table.rowCount()):
-            item = self._track_table.item(row, 0)
+            item = self._track_table.item(row, TrackCol.FILE)
             if item is not None and item.text() == filename:
                 with QSignalBlocker(self._track_table):
                     self._track_table.clearSelection()
-                    self._track_table.setCurrentCell(row, 0)
+                    self._track_table.setCurrentCell(row, TrackCol.FILE)
                     self._track_table.selectRow(row)
                 self._track_table.scrollToItem(item)
                 self.show_track_detail(track)
@@ -243,17 +261,19 @@ class TrackDetailController(QObject):
     def _cancel_load_workers(self) -> None:
         for attr in ("wf_worker", "audio_load_worker"):
             worker = getattr(self, attr, None)
-            if worker is not None:
-                cancel_fn = getattr(worker, "cancel", None)
-                if callable(cancel_fn):
-                    cancel_fn()
-                finished = getattr(worker, "finished", None)
-                if finished is not None:
+            setattr(self, attr, None)
+            if worker is None or (isinstance(worker, QObject) and not isValid(worker)):
+                continue
+            cancel_fn = getattr(worker, "cancel", None)
+            if callable(cancel_fn):
+                cancel_fn()
+            for sig_name in ("completed", "error", "failed"):
+                sig = getattr(worker, sig_name, None)
+                if sig is not None:
                     try:
-                        finished.disconnect()
+                        sig.disconnect()
                     except RuntimeError:
                         pass
-                setattr(self, attr, None)
 
     def _setup_waveform_preview_state(self, track: Any) -> None:
         key = peak_source_key(getattr(track, "filepath", None))
@@ -267,8 +287,8 @@ class TrackDetailController(QObject):
                 self.waveform_context_generation = self._file_report.context_generation
         else:
             self._wf_panel.waveform.set_loading(True)
-            if key and self._on_prioritize_peak is not None:
-                self._on_prioritize_peak(key)
+            if key:
+                self.peak_prioritize_requested.emit(key)
 
         self.refresh_waveform_issues()
         self.apply_pending_detector_visualization()
@@ -312,8 +332,9 @@ class TrackDetailController(QObject):
         ):
             worker = AudioLoadWorker(track, parent=self)
             self.audio_load_worker = worker
-            worker.finished.connect(lambda t, orig=track, w=worker: self.on_audio_loaded(t, orig, w))
+            worker.completed.connect(lambda t, orig=track, w=worker: self.on_audio_loaded(t, orig, w))
             worker.error.connect(lambda msg, orig=track, w=worker: self.on_audio_load_error(msg, orig, w))
+            worker.finished.connect(worker.deleteLater)
             worker.start()
             return
 
@@ -326,6 +347,19 @@ class TrackDetailController(QObject):
             self._set_waveform_unavailable()
 
     def start_wf_worker(self, track: Any) -> None:
+        prev = self.wf_worker
+        self.wf_worker = None
+        if prev is not None and (not isinstance(prev, QObject) or isValid(prev)):
+            cancel_fn = getattr(prev, "cancel", None)
+            if callable(cancel_fn):
+                cancel_fn()
+            for sig_name in ("completed", "failed"):
+                sig = getattr(prev, sig_name, None)
+                if sig is not None:
+                    try:
+                        sig.disconnect()
+                    except RuntimeError:
+                        pass
         win_ms = self._state.flat_config().get("window", 400)
         ws = get_window_samples(track, win_ms)
         wf = self._wf_panel.waveform
@@ -339,8 +373,19 @@ class TrackDetailController(QObject):
             parent=self,
         )
         self.wf_worker = worker
-        worker.finished.connect(lambda result, t=track, w=worker: self.on_waveform_loaded(result, t, w))
+        worker.completed.connect(lambda result, t=track, w=worker: self.on_waveform_loaded(result, t, w))
+        worker.failed.connect(lambda msg, t=track, w=worker: self._on_wf_error(msg, t, w))
+        worker.finished.connect(worker.deleteLater)
         worker.start()
+
+    def _on_wf_error(self, message: str, track: Any, worker: Any = None) -> None:
+        if worker is not None and worker is not self.wf_worker:
+            return
+        self.wf_worker = None
+        if self._state.current_track is not track:
+            return
+        self._set_waveform_unavailable()
+        self._shell.show_status(f"Waveform error: {message}")
 
     @Slot(str)
     def on_display_mode_changed(self, mode: str) -> None:
@@ -375,8 +420,8 @@ class TrackDetailController(QObject):
         if key and not result.get("corrected"):
             if key in self._state.peak_cache:
                 wf.set_peak_data(self._state.peak_cache[key])
-            elif self._on_prioritize_peak is not None:
-                self._on_prioritize_peak(key)
+            else:
+                self.peak_prioritize_requested.emit(key)
 
         if not preserve_view:
             cmap = self._state.config.get("app", {}).get("spectrogram_colormap", "magma")
@@ -561,11 +606,11 @@ class TrackDetailController(QObject):
 
     @Slot()
     def retry_detector_verification(self) -> None:
-        if self.visualization_context_is_current() and self._on_queue_repair_plan is not None:
+        if self.visualization_context_is_current():
             track = self._state.current_track
             assert track is not None
-            self._on_queue_repair_plan(
-                [track], revalidate_source=bool(track._cache.get("repair_error"))
+            self.repair_plan_requested.emit(
+                [track], bool(track._cache.get("repair_error"))
             )
 
     @Slot(str, bool)
@@ -711,7 +756,7 @@ class TrackDetailController(QObject):
         self.stop()
         start = self._wf_panel.waveform._cursor_sample
         mode, channel = self._wf_panel.play_mode
-        if audition is None:
+        if audition is None or preview is None:
             self._playback.play(track.audio_data, track.samplerate, start, mode=mode, channel=channel)
         else:
             preview.play(start, mode, channel)

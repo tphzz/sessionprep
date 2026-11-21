@@ -8,7 +8,7 @@ _NAMES = frozenset((
     "waveform", "fit", "zoom-in", "zoom-out", "scale-up", "scale-down",
     "play", "stop", "reset", "chevron-down", "chevron-right", "chevron-up",
     "plus", "minus", "refresh", "busy", "close",
-    "spin-up", "spin-down",
+    "spin-up", "spin-down", "warning",
 ))
 
 
@@ -19,7 +19,7 @@ def icon_path(name: str) -> Path:
     return Path(__file__).with_name("res") / f"ui-{name}.svg"
 
 
-@lru_cache(maxsize=17)
+@lru_cache(maxsize=24)
 def _cached_icon(name: str) -> QIcon:
     return QIcon(str(icon_path(name)))
 

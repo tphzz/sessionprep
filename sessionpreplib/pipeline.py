@@ -71,8 +71,8 @@ class Pipeline:
         # Configure all components
         for d in self.track_detectors:
             d.configure(self.config)
-        for d in self.session_detectors:
-            d.configure(self.config)
+        for sd in self.session_detectors:
+            sd.configure(self.config)
         self.repair_verification = RepairVerification(self.track_detectors, self.config)
 
         # Configure audio processors first, then filter to enabled only
@@ -371,6 +371,7 @@ class Pipeline:
 
     def _render_track(self, track: TrackContext) -> tuple[np.ndarray, np.ndarray, list[str]]:
         """Render a verified source, retaining the signal just before output gain."""
+        assert track.audio_data is not None
         corrected = render_corrected(track.audio_data, track.samplerate, track.repair_recipe)
         audio = corrected
         applied = track.repair_recipe.applied_ids()
@@ -532,7 +533,7 @@ class Pipeline:
                 stat = path.stat()
                 if ((stat.st_size, stat.st_mtime_ns) == obsolete.prepared_file_signature
                         and obsolete.prepared_file_revision is not None
-                        and file_revision(path, stat) == obsolete.prepared_file_revision):
+                        and file_revision(str(path), stat) == obsolete.prepared_file_revision):
                     path.unlink()
             except FileNotFoundError:
                 pass
@@ -753,7 +754,7 @@ def _passthrough_entry(entry, sources) -> bool:
 
 def _routed_fader(entry, sources, rendered, applied) -> float:
     """Return the single fader that can compensate all contributing channels."""
-    by_offset = {}
+    by_offset: dict[float, set[tuple[str, int]]] = {}
     for source in entry.sources:
         name = source.input_filename
         track = sources[name]
@@ -798,7 +799,7 @@ def _write_atomic(destination: Path, audio: np.ndarray, sample_rate: int,
             before_publish(path)
         os.replace(path, destination)
         stat = destination.stat()
-        return (stat.st_size, stat.st_mtime_ns), file_revision(destination, stat)
+        return (stat.st_size, stat.st_mtime_ns), file_revision(str(destination), stat)
     finally:
         path.unlink(missing_ok=True)
 

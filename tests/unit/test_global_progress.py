@@ -38,21 +38,21 @@ def _select_phase(window, phase_index):
 
 def _progress_layout_contains(window, phase_index):
     return (
-        window._phase_progress_layouts[phase_index].indexOf(
-            window._phase_progress_panels[phase_index]) >= 0
+        window.progress_coordinator.phase_layouts[phase_index].indexOf(
+            window.progress_coordinator.phase_panels[phase_index]) >= 0
     )
 
 
 def _progress_panel(window, phase_index):
-    return window._phase_progress_panels[phase_index]
+    return window.progress_coordinator.phase_panels[phase_index]
 
 
 def test_phase_progress_panels_exist_and_start_hidden(qapp):
     window = _window(qapp)
     try:
-        assert set(window._phase_progress_layouts) == {
+        assert set(window.progress_coordinator.phase_layouts) == {
             _PHASE_TOPOLOGY, _PHASE_ANALYSIS, _PHASE_SETUP}
-        assert set(window._phase_progress_panels) == {
+        assert set(window.progress_coordinator.phase_panels) == {
             _PHASE_TOPOLOGY, _PHASE_ANALYSIS, _PHASE_SETUP}
         for phase_index in (
                 _PHASE_TOPOLOGY, _PHASE_ANALYSIS, _PHASE_SETUP):
@@ -76,12 +76,12 @@ def test_analysis_progress_uses_global_panel_not_status_bar(qapp):
     window = _window(qapp)
     try:
         _select_phase(window, _PHASE_ANALYSIS)
-        window._progress_start("Analyzing...")
+        window.progress_start("Analyzing...")
         window._status_bar.showMessage("Idle")
 
-        worker = window.lifecycle_controller.analyze_worker = AnalyzeWorker(".", {})
-        worker.progress.connect(window.lifecycle_controller._on_worker_progress)
-        worker.progress_value.connect(window.lifecycle_controller._on_worker_progress_value)
+        worker = window.analysis_controller.analyze_worker = AnalyzeWorker(".", {})
+        worker.progress.connect(window.analysis_controller._on_worker_progress)
+        worker.progress_value.connect(window.analysis_controller._on_worker_progress_value)
         worker.progress.emit(worker, "Analyzing Kick.wav - clipping")
         worker.progress_value.emit(worker, 3, 10)
 
@@ -100,12 +100,12 @@ def test_prepare_progress_uses_global_panel_not_status_bar(qapp):
     window = _window(qapp)
     try:
         _select_phase(window, _PHASE_ANALYSIS)
-        window._progress_start("Preparing...")
+        window.progress_start("Preparing...")
         window._status_bar.showMessage("Idle")
 
-        worker = window.lifecycle_controller.prepare_worker = PrepareWorker(SessionContext([], {}), [], ".")
-        worker.progress.connect(window.lifecycle_controller._on_prepare_progress)
-        worker.progress_value.connect(window.lifecycle_controller._on_prepare_progress_value)
+        worker = window.analysis_controller.prepare_worker = PrepareWorker(SessionContext([], {}), [], ".")
+        worker.progress.connect(window.analysis_controller._on_prepare_progress)
+        worker.progress_value.connect(window.analysis_controller._on_prepare_progress_value)
         worker.progress.emit(worker, "Writing Snare.wav")
         worker.progress_value.emit(worker, 4, 12)
 
@@ -122,7 +122,7 @@ def test_topology_apply_progress_uses_global_panel(qapp):
     window = _window(qapp)
     try:
         _select_phase(window, _PHASE_TOPOLOGY)
-        window._progress_start("Applying topology...")
+        window.progress_start("Applying topology...")
 
         worker = window.topology_controller.apply_worker = TopologyApplyWorker(SessionContext([], {}), ".")
         worker.progress.connect(window.topology_controller._on_apply_progress)
@@ -143,7 +143,7 @@ def test_daw_transfer_progress_uses_global_panel_not_status_bar(qapp):
     window = _window(qapp)
     try:
         _select_phase(window, _PHASE_SETUP)
-        window._progress_start("Transferring...")
+        window.progress_start("Transferring...")
         window._status_bar.showMessage("Idle")
 
         window.daw_controller._on_transfer_progress("Creating Pro Tools session")
@@ -166,8 +166,8 @@ def test_progress_panel_switches_phase_during_running_operation(qapp):
         window.show()
         qapp.processEvents()
         _select_phase(window, _PHASE_ANALYSIS)
-        window._progress_start("Preparing...")
-        window._progress_value(4, 12)
+        window.progress_start("Preparing...")
+        window.progress_value(4, 12)
 
         _select_phase(window, _PHASE_SETUP)
         progress = _progress_panel(window, _PHASE_SETUP)
@@ -194,11 +194,11 @@ def test_phase_progress_panel_shrinks_content_above(qapp, phase_index):
         window.show()
         qapp.processEvents()
 
-        layout = window._phase_progress_layouts[phase_index]
+        layout = window.progress_coordinator.phase_layouts[phase_index]
         content = layout.itemAt(layout.count() - 2).widget()
         before_height = content.geometry().height()
 
-        window._progress_start("Working...")
+        window.progress_start("Working...")
         qapp.processEvents()
 
         progress = _progress_panel(window, phase_index)

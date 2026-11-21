@@ -205,3 +205,23 @@ def test_no_temp_shims_remain():
             if "TEMP_SHIM" in line:
                 hits.append(f"{path.relative_to(REPO_ROOT).as_posix()}:{lineno}")
     assert not hits, "Temporary shims must be removed:\n" + "\n".join(hits)
+
+
+def test_qthread_workers_do_not_shadow_finished():
+    """QThread subclasses must never shadow Qt's built-in QThread.finished signal."""
+    violations: list[str] = []
+    for path in sorted((REPO_ROOT / "sessionprepgui").rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        rel = path.relative_to(REPO_ROOT).as_posix()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ClassDef):
+                continue
+            bases = [ast.unparse(b) for b in node.bases]
+            if not any("QThread" in b for b in bases):
+                continue
+            for stmt in node.body:
+                if isinstance(stmt, ast.Assign):
+                    for target in stmt.targets:
+                        if isinstance(target, ast.Name) and target.id == "finished":
+                            violations.append(f"{rel}::{node.name} shadows QThread.finished")
+    assert not violations, "QThread.finished shadowing violations:\n" + "\n".join(violations)

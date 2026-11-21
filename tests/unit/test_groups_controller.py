@@ -80,6 +80,8 @@ def test_groups_controller_auto_group_and_linked_gain_update(_font_app, monkeypa
         track_table=table,
         on_find_table_row=lambda fn: 0 if fn == "kick.wav" else 1,
     )
+    setup_refreshes: list[bool] = []
+    ctrl.setup_table_refresh_requested.connect(lambda: setup_refreshes.append(True))
     try:
         ctrl.populate_groups_tab()
         ctrl.create_group_combo(0, t1)
@@ -88,8 +90,42 @@ def test_groups_controller_auto_group_and_linked_gain_update(_font_app, monkeypa
         ctrl.auto_group()
         assert t1.group == "Drums"
         assert t2.group == "Drums"
+        assert setup_refreshes == [True]
         assert "assigned 2 of 2 tracks" in shell.status_messages[-1]
         assert t1.processor_results["bimodal_normalize"].gain_db == t2.processor_results["bimodal_normalize"].gain_db
+    finally:
+        ctrl.page.deleteLater()
+        table.deleteLater()
+        shell.parent_widget.deleteLater()
+        _font_app.processEvents()
+
+
+def test_groups_controller_match_combo_validates_shifted_row_after_delete(_font_app):
+    state = WorkspaceState(config=build_defaults())
+    state.session_groups = [
+        {"name": "Drums", "color": "Red", "gain_linked": False, "daw_target": "",
+         "match_method": "contains", "match_pattern": "kick"},
+        {"name": "Bass", "color": "Blue", "gain_linked": False, "daw_target": "",
+         "match_method": "contains", "match_pattern": "[unclosed"},
+    ]
+    shell = _StubShell()
+    table = _DraggableTrackTable()
+    table.setColumnCount(8)
+    ctrl = GroupsController(state, shell, track_table=table)
+    try:
+        ctrl.populate_groups_tab()
+        assert ctrl.page.table.rowCount() == 2
+        # Delete row 0 ("Drums"); "Bass" shifts from row 1 to row 0.
+        ctrl.page.table.selectRow(0)
+        ctrl.remove_selected_group_row()
+        assert ctrl.page.table.rowCount() == 1
+        assert ctrl.page.table.item(0, 0).text() == "Bass"
+
+        # Switching match method on the shifted row must validate row 0, not stale row 1.
+        match_combo = ctrl.page.table.cellWidget(0, 4)
+        match_combo.setCurrentText("regex")
+        pat_item = ctrl.page.table.item(0, 5)
+        assert pat_item.toolTip().startswith("Invalid regex:")
     finally:
         ctrl.page.deleteLater()
         table.deleteLater()

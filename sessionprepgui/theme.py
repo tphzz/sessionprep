@@ -140,6 +140,15 @@ PT_COLOR_NAME_ALIASES = {
 }
 
 
+def argb_to_qcolor(argb: str) -> QColor:
+    """Parse a ``#AARRGGBB`` hex string into a QColor."""
+    s = argb.lstrip("#")
+    if len(s) == 8:
+        a, r, g, b = int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16), int(s[6:8], 16)
+        return QColor(r, g, b, a)
+    return QColor(argb)
+
+
 def normalize_color_name(
     name: str,
     colors: list[dict[str, str]] | None = None,
@@ -241,7 +250,42 @@ STYLESHEET = """
     QPushButton:hover { background-color: #4a4a4a; }
     QPushButton:pressed { background-color: #2a6db5; }
     QPushButton:disabled { color: #666666; background-color: #2d2d2d; }
-    QStatusBar { background-color: #2d2d2d; color: #888888; }
+    QStatusBar { background-color: #1e1e1e; color: #888888; border-top: 1px solid #444; }
+    QStatusBar::item { border: none; }
+    QWidget#statusBarPrompt[statusPrompt="warning"] {
+        background-color: #2a251b;
+        border-top: 1px solid #ffaa00;
+        border-left: 3px solid #ffaa00;
+    }
+    QWidget#statusBarPrompt QLabel#statusBarPromptMessage {
+        color: #dddddd;
+        background: transparent;
+    }
+    QWidget#statusBarPrompt QPushButton {
+        background-color: #3a3a3a;
+        color: #dddddd;
+        border: 1px solid #555555;
+        border-radius: 2px;
+        padding: 2px 12px;
+    }
+    QWidget#statusBarPrompt QPushButton:hover { background-color: #4a4a4a; }
+    QWidget#statusBarPrompt QPushButton:pressed { background-color: #2a6db5; }
+    QWidget#statusBarPrompt QPushButton[promptAction="caution"] {
+        border: 1px solid #ffaa00;
+    }
+    QWidget#statusBarPrompt QPushButton[promptAction="caution"]:hover {
+        background-color: #4d4026;
+        border-color: #ffbb33;
+    }
+    QWidget#statusBarPrompt QPushButton[promptAction="caution"]:pressed {
+        background-color: #6b531f;
+        border-color: #ffaa00;
+    }
+    QWidget#statusBarPrompt QPushButton:focus,
+    QWidget#statusBarPrompt QPushButton[promptAction="caution"]:focus {
+        border: 2px solid #4499ff;
+        padding: 1px 11px;
+    }
     QTabWidget::pane { border-top: 1px solid #555; background-color: #1e1e1e; }
     QTabBar { background-color: #2d2d2d; qproperty-drawBase: 0; }
     QTabBar::tab {
