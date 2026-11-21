@@ -107,6 +107,8 @@ class DawProjectDawProcessor(DawProcessor):
     id = "dawproject"
     name = "DAWproject"
     fader_ceiling_db: float = 6.0
+    output_file_filter: str = "DAWproject (*.dawproject);;All Files (*)"
+    output_dialog_title: str = "Save DAWproject"
 
     @property
     def template_identity(self) -> tuple[str, ...]:
@@ -262,45 +264,22 @@ class DawProjectDawProcessor(DawProcessor):
                     track.tracks, folders, parent_id=track.id,
                     counter=counter)
 
-    def resolve_output_path(
-        self,
-        session: SessionContext,
-        parent_widget=None,
-    ) -> str | None:
-        """Compute default .dawproject path and show a save-file dialog.
-
-        Returns the chosen path, or ``None`` if the user cancelled.
-        """
-        from PySide6.QtWidgets import QFileDialog
-        import os
-
+    def default_output_path(self, session: SessionContext) -> str:
+        """Compute the default ``.dawproject`` output path (pure, Qt-free)."""
         source_dir = session.config.get("_source_dir", "")
         output_folder = session.config.get("_output_folder", "sp_02_prepared")
         output_dir = os.path.join(source_dir, output_folder) if source_dir else ""
 
-        # Use project name if set, otherwise fallback to template name
-        safe_name = session.project_name if getattr(session, "project_name", "") else (self._template_name or self.name or "dawproject")
-        safe_name = "".join(
-            c if c.isalnum() or c in " _-" else "_" for c in safe_name)
-        default_path = os.path.join(output_dir, f"{safe_name}.dawproject") \
-            if output_dir else f"{safe_name}.dawproject"
-
-        # If in batch mode, we do NOT want a blocking dialog
-        batch_mode = False
-        if parent_widget:
-            batch_action = getattr(parent_widget, "_batch_mode_action", None)
-            if batch_action and batch_action.isChecked():
-                batch_mode = True
-
-        if batch_mode:
-            # Just return the computed path directly, do not block with a dialog.
-            return default_path
-
-        path, _ = QFileDialog.getSaveFileName(
-            parent_widget, "Save DAWproject", default_path,
-            "DAWproject (*.dawproject);;All Files (*)",
+        safe_name = (
+            session.project_name
+            if getattr(session, "project_name", "")
+            else (self._template_name or self.name or "dawproject")
         )
-        return path if path else None
+        safe_name = "".join(
+            c if c.isalnum() or c in " _-" else "_" for c in safe_name
+        )
+        filename = f"{safe_name}.dawproject"
+        return os.path.join(output_dir, filename) if output_dir else filename
 
     @_with_model_registry
     def transfer(
@@ -339,28 +318,8 @@ class DawProjectDawProcessor(DawProcessor):
                 return [DawCommandResult(DawCommand("load_template", "", {}), False, f"Failed to load template: {exc}")]
             return self._add_tracks(session, output_path, progress_cb, template, root, project)
 
-    def _add_tracks(self, session, output_path, progress_cb, template, root, project):
-        from dawproject import Audio, ContentType, FileReference, Lanes, MixerRole, TimeUnit, Utility
-
-        dp_state = session.daw_state.get(self.id, {})
-        assignments: dict[str, str] = dp_state.get("assignments", {})
-        daw_folders = dp_state.get("folders", [])
-        track_order = dp_state.get("track_order", {})
-
-        results: list[DawCommandResult] = []
-
-        # Build folder ID → Track object lookup from the loaded project
-        folder_track_map: dict[str, Any] = {}
-        self._build_folder_map(project.structure, folder_track_map)
-
-        # Build lookups
-        folder_dict_map = {f["id"]: f for f in daw_folders}
-        manifest_map = {
-            e.entry_id: e for e in session.transfer_manifest}
-        out_track_map = {
-            t.filename: t for t in session.output_tracks}
-
-        # Build ordered work list: [(entry_id, folder_id), ...]
+    @staticmethod
+    def _ordered_assignments(assignments: dict[str, str], track_order: dict[str, list[str]]) -> list[tuple[str, str]]:
         work: list[tuple[str, str]] = []
         seen: set[str] = set()
         for fid, ordered_names in track_order.items():
@@ -371,125 +330,96 @@ class DawProjectDawProcessor(DawProcessor):
         for eid, fid in sorted(assignments.items()):
             if eid not in seen:
                 work.append((eid, fid))
+        return work
 
-        total = len(work)
-        if progress_cb:
-            progress_cb(0, total, "Building DAWproject\u2026")
+    def _build_track_addition(self, session, folder_track, entry, out_tc, media):
+        from dawproject import Audio, ContentType, FileReference, Lanes, MixerRole, TimeUnit, Utility
 
-        additions = []
+        track_name = os.path.splitext(entry.daw_track_name)[0]
+        new_track = Utility.create_track(
+            name=track_name,
+            content_types={ContentType.AUDIO},
+            mixer_role=MixerRole.REGULAR,
+            volume=_db_to_linear(media.fader_db),
+            pan=0.5,
+        )
+        track_color = self._resolve_track_color(entry.group, session)
+        if track_color:
+            new_track.color = track_color
+        if folder_track.channel is not None:
+            new_track.channel.destination = folder_track.channel
+        audio = Audio(
+            time_unit=TimeUnit.SECONDS,
+            file=FileReference(path=media.filepath.replace("\\", "/"), external=True),
+            sample_rate=out_tc.samplerate,
+            channels=out_tc.channels,
+            duration=out_tc.duration_sec,
+        )
+        clips = Utility.create_clips(Utility.create_clip(content=audio, time=0.0, duration=out_tc.duration_sec))
+        track_lane = Lanes(track=new_track, time_unit=TimeUnit.SECONDS, lanes=[clips])
+        return track_name, (folder_track, new_track, track_lane)
 
-        # ── Create tracks and clips ─────────────────────────────
-        for step, (eid, fid) in enumerate(work):
-            folder_track = folder_track_map.get(fid)
-            folder_dict = folder_dict_map.get(fid)
-            entry = manifest_map.get(eid)
-            out_tc = (
-                out_track_map.get(entry.output_filename)
-                if entry else None
-            )
-
-            if not folder_track or not folder_dict or not entry or not out_tc:
-                results.append(DawCommandResult(
-                    command=DawCommand("add_track", eid,
-                                       {"folder_id": fid}),
-                    success=False,
-                    error=f"Folder, manifest entry, or output track not found: "
-                          f"{fid} / {eid}"))
-                continue
-
-            try:
-                media = resolve_transfer_audio(session, out_tc)
-            except ValueError as exc:
-                results.append(DawCommandResult(
-                    command=DawCommand("add_track", eid, {"folder_id": fid}),
-                    success=False, error=str(exc)))
-                continue
-            log.debug("%s: file=%s, fader=%+.2f dB", eid, media.filepath, media.fader_db)
-            volume_linear = _db_to_linear(media.fader_db)
-
-            # Resolve group color → #rrggbb
-            track_color = self._resolve_track_color(entry.group, session)
-
-            # Create the track with channel
-            track_name = os.path.splitext(entry.daw_track_name)[0]
-            new_track = Utility.create_track(
-                name=track_name,
-                content_types={ContentType.AUDIO},
-                mixer_role=MixerRole.REGULAR,
-                volume=volume_linear,
-                pan=0.5,
-            )
-
-            # Set color
-            if track_color:
-                new_track.color = track_color
-
-            # Route to folder's channel
-            if folder_track.channel is not None:
-                new_track.channel.destination = folder_track.channel
-
-            # Create audio clip in arrangement
-            audio = Audio(
-                time_unit=TimeUnit.SECONDS,
-                file=FileReference(
-                    path=media.filepath.replace("\\", "/"),
-                    external=True),
-                sample_rate=out_tc.samplerate,
-                channels=out_tc.channels,
-                duration=out_tc.duration_sec,
-            )
-            clip_content = audio
-
-            clip = Utility.create_clip(
-                content=clip_content, time=0.0, duration=out_tc.duration_sec)
-            clips = Utility.create_clips(clip)
-
-            # Build lane contents for this track
-            lane_contents = [clips]
-
-            # Create a Lanes entry for this track in the arrangement
-            track_lane = Lanes(
-                track=new_track,
-                time_unit=TimeUnit.SECONDS,
-                lanes=lane_contents,
-            )
-            additions.append((folder_track, new_track, track_lane))
-
-            results.append(DawCommandResult(
-                command=DawCommand("add_track", eid,
-                                   {"folder": folder_dict.get("name", ""),
-                                    "fader_db": media.fader_db}),
-                success=True))
-
-            if progress_cb:
-                progress_cb(step + 1, total,
-                            f"Added {track_name} ({step + 1}/{total})")
-
-        if results and not any(result.success for result in results):
-            session.daw_command_log.extend(results)
-            return results
-
-        # ── Save ──────────────────────────────────────────────────
+    def _save_dawproject_output(self, session, output_path, template, root, project, additions, results) -> None:
         try:
             path = Path(output_path)
             if path.resolve() == Path(template.filename).resolve():
                 raise ValueError("Choose a different output path to preserve the DAWproject template.")
             path.parent.mkdir(parents=True, exist_ok=True)
-            _save_template(template, root, path, project, additions,
-                           replace_existing=not session.config.get("_batch_transfer", False))
-            results.append(DawCommandResult(
-                command=DawCommand("save_project", output_path, {}),
-                success=True))
+            _save_template(
+                template, root, path, project, additions,
+                replace_existing=not session.config.get("_batch_transfer", False),
+            )
+            results.append(DawCommandResult(DawCommand("save_project", output_path, {}), True))
             log.info("DAWproject saved to %s", output_path)
-        except Exception as e:
+        except Exception as exc:
             for result in results:
                 if result.success:
                     result.success = False
                     result.error = "Track could not be published because the project save failed."
-            results.append(DawCommandResult(
-                command=DawCommand("save_project", output_path, {}),
-                success=False, error=f"Failed to save: {e}"))
+            results.append(DawCommandResult(DawCommand("save_project", output_path, {}), False, f"Failed to save: {exc}"))
 
+    def _add_tracks(self, session, output_path, progress_cb, template, root, project):
+        dp_state = session.daw_state.get(self.id, {})
+        folder_track_map: dict[str, Any] = {}
+        self._build_folder_map(project.structure, folder_track_map)
+        folder_dict_map = {f["id"]: f for f in dp_state.get("folders", [])}
+        manifest_map = {e.entry_id: e for e in session.transfer_manifest}
+        out_track_map = {t.filename: t for t in session.output_tracks}
+
+        work = self._ordered_assignments(dp_state.get("assignments", {}), dp_state.get("track_order", {}))
+        total = len(work)
+        if progress_cb:
+            progress_cb(0, total, "Building DAWproject\u2026")
+
+        results: list[DawCommandResult] = []
+        additions = []
+        for step, (eid, fid) in enumerate(work):
+            folder_track = folder_track_map.get(fid)
+            folder_dict = folder_dict_map.get(fid)
+            entry = manifest_map.get(eid)
+            out_tc = out_track_map.get(entry.output_filename) if entry else None
+            if not folder_track or not folder_dict or not entry or not out_tc:
+                results.append(DawCommandResult(
+                    DawCommand("add_track", eid, {"folder_id": fid}), False,
+                    f"Folder, manifest entry, or output track not found: {fid} / {eid}",
+                ))
+                continue
+            try:
+                media = resolve_transfer_audio(session, out_tc)
+            except ValueError as exc:
+                results.append(DawCommandResult(DawCommand("add_track", eid, {"folder_id": fid}), False, str(exc)))
+                continue
+            log.debug("%s: file=%s, fader=%+.2f dB", eid, media.filepath, media.fader_db)
+            track_name, addition = self._build_track_addition(session, folder_track, entry, out_tc, media)
+            additions.append(addition)
+            results.append(DawCommandResult(
+                DawCommand("add_track", eid, {"folder": folder_dict.get("name", ""), "fader_db": media.fader_db}), True,
+            ))
+            if progress_cb:
+                progress_cb(step + 1, total, f"Added {track_name} ({step + 1}/{total})")
+
+        if not (results and not any(result.success for result in results)):
+            self._save_dawproject_output(session, output_path, template, root, project, additions, results)
         session.daw_command_log.extend(results)
         return results
 

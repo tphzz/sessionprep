@@ -19,10 +19,11 @@ from sessionpreplib.repairs import RepairRecipe
 @pytest.fixture
 def window(app, monkeypatch):
     from sessionprepgui import mainwindow, settings
+    from sessionprepgui.daw import DawTransferController
     monkeypatch.setattr(mainwindow, "load_config", settings.build_defaults)
     monkeypatch.setattr(mainwindow, "save_config", lambda *args: None)
-    monkeypatch.setattr(mainwindow.SessionPrepWindow, "_configure_daw_processors",
-                        lambda self: setattr(self, "_daw_processors", []))
+    monkeypatch.setattr(DawTransferController, "configure_daw_processors",
+                        lambda self: setattr(self._state, "daw_processors", []))
     owner = mainwindow.SessionPrepWindow()
     owner._phase_tabs.setTabEnabled(1, True)
     owner._phase_tabs.setCurrentIndex(1)
@@ -46,8 +47,8 @@ def _open_track(window, tmp_path, name, *, rate=96000):
     track.audio_data = None
     track.repair_recipe = RepairRecipe(low_cut_hz=30, ultrasonic=rate >= 50000)
     track.repair_overrides.update(low_cut=True, low_cut_hz=30, ultrasonic=rate >= 50000)
-    window._session = SessionContext([track], {})
-    window._show_track_detail(track)
+    window.state.session = SessionContext([track], {})
+    window.detail_controller.show_track_detail(track)
     return track
 
 
@@ -55,11 +56,11 @@ def _wait(app, window):
     import time
     limit = time.monotonic() + 8
     app.processEvents()
-    while (window._repair_preview.worker is not None or window._repair_plan_worker is not None) and time.monotonic() < limit:
+    while (window._repair_preview.worker is not None or window.lifecycle_controller.repair_plan_worker is not None) and time.monotonic() < limit:
         app.processEvents()
         time.sleep(.005)
     assert window._repair_preview.worker is None
-    assert window._repair_plan_worker is None
+    assert window.lifecycle_controller.repair_plan_worker is None
 
 
 def test_real_file_panel_retains_zoom_cursor_and_native_spectral_scales(app, window, tmp_path):
@@ -90,7 +91,7 @@ def test_real_file_panel_retains_zoom_cursor_and_native_spectral_scales(app, win
     _wait(app, window)
     assert (renderer.mel_view_min, renderer.mel_view_max) == (0, 100)
     assert not wave.set_peak_data(object())
-    assert window._current_track is track and track.audio_data is None
+    assert window.state.current_track is track and track.audio_data is None
 
 
 def test_replaced_source_does_not_play_cached_material_and_retry_recovers(app, window, tmp_path):
@@ -98,7 +99,7 @@ def test_replaced_source_does_not_play_cached_material_and_retry_recovers(app, w
     path = tmp_path / "Recover.wav"
     _open_track(window, tmp_path, path.name)
     _wait(app, window)
-    wave = window._waveform
+    wave = window._wf_panel.waveform
     wave.set_cursor(7654)
     wave.zoom_in()
     original_view = (wave._view_start, wave._view_end, wave._vscale)
@@ -123,12 +124,12 @@ def test_late_old_file_or_recipe_cannot_replace_new_selection(app, window, tmp_p
     app.processEvents()
     second = _open_track(window, tmp_path, "Second.wav", rate=32000)
     second.repair_recipe = RepairRecipe(dc_remove=True)
-    window._refresh_repair_preview(second)
+    window.detail_controller.refresh_repair_preview(second)
     _wait(app, window)
     assert window._repair_preview.track is second and window._repair_preview.recipe == second.repair_recipe
     assert window._repair_preview.audition.sample_rate == 32000
     assert not window._wf_panel.band_actions["high"].isEnabled()
-    assert window._waveform._samplerate != first.samplerate
+    assert window._wf_panel.waveform._samplerate != first.samplerate
 
 
 def test_gated_preview_during_project_switch_releases_old_audio_and_plot(app, window, tmp_path, monkeypatch):
@@ -152,11 +153,11 @@ def test_gated_preview_during_project_switch_releases_old_audio_and_plot(app, wi
         assert entered.wait(3)
         fresh = tmp_path / "new-project"
         fresh.mkdir()
-        window._restore_session_state({"source_dir": str(fresh), "tracks": []})
+        window.lifecycle_controller.restore_session_state({"source_dir": str(fresh), "tracks": []})
     finally:
         release.set()
     _wait(app, window)
-    assert not window._waveform._channels and window._current_track is None
+    assert not window._wf_panel.waveform._channels and window.state.current_track is None
     assert window._repair_preview.track is not first
     assert window._repair_preview.audition is None and not window._repair_preview.cache
     assert not window._wf_panel.play_btn.isEnabled()
@@ -168,16 +169,16 @@ def test_changed_repair_choice_immediately_withholds_old_audio_and_retry_replans
     panel = window._wf_panel
     panel.source_selector.buttons[1].click()
     _wait(app, window)
-    window._repair_plan_pending.add(track.filename)
+    window.lifecycle_controller.repair_plan_pending.add(track.filename)
     window._repair_preview.request()
     assert window._repair_preview.audition is None
     assert not panel.play_btn.isEnabled() and panel.preview_message.text() == "Updating repair preview…"
-    window._repair_plan_pending.clear()
+    window.lifecycle_controller.repair_plan_pending.clear()
     track._cache["repair_error"] = "Source unavailable while planning"
-    window._refresh_repair_preview(track)
+    window.detail_controller.refresh_repair_preview(track)
     _wait(app, window)
     retries = []
-    monkeypatch.setattr(window, "_queue_repair_plan",
+    monkeypatch.setattr(window.lifecycle_controller, "queue_repair_plan",
                         lambda tracks, *, revalidate_source: retries.append((tracks, revalidate_source)))
     panel.preview_retry_button.click()
     assert retries == [([track], True)] and panel.corrected
@@ -202,7 +203,7 @@ def test_click_moves_cursor_without_repainting_the_cached_plot(app, window, anal
         panel = window._wf_panel
     else:
         window._phase_tabs.setCurrentIndex(0)
-        panel = window._topo_wf_panel
+        panel = window.topology_controller.page.wf_panel
         panel.set_content_available(True)
         panel.waveform.set_audio(np.sin(np.arange(12000) * .02), 48000)
     panel.set_expanded(True)
@@ -227,9 +228,9 @@ def test_click_moves_cursor_without_repainting_the_cached_plot(app, window, anal
 
 def test_track_layout_seek_pauses_at_the_clicked_sample(app, window, streams):
     window._phase_tabs.setCurrentIndex(0)
-    panel = window._topo_wf_panel
+    panel = window.topology_controller.page.wf_panel
     audio = np.sin(np.arange(96000) * .02)
-    window._topo_cached_audio = ("input", audio, audio, 48000)
+    window.topology_controller.cached_audio = ("input", audio, audio, 48000)
     panel.set_content_available(True)
     panel.set_expanded(True)
     panel.waveform.set_audio(audio, 48000)
@@ -259,7 +260,7 @@ def test_plot_gestures_follow_known_samples_and_clamp_to_visible_edges(app, wind
     from sessionpreplib.models import SessionContext
 
     total = 12000
-    panel = window._wf_panel if analysis else window._topo_wf_panel
+    panel = window._wf_panel if analysis else window.topology_controller.page.wf_panel
     window._phase_tabs.setCurrentIndex(int(analysis))
     panel.set_content_available(True)
     panel.set_expanded(True)
@@ -273,8 +274,8 @@ def test_plot_gestures_follow_known_samples_and_clamp_to_visible_edges(app, wind
     sf.write(path, audio, 8000, subtype="PCM_24")
     track = load_track(str(path))
     if analysis:
-        window._session = SessionContext([track], {})
-        window._show_track_detail(track)
+        window.state.session = SessionContext([track], {})
+        window.detail_controller.show_track_detail(track)
         _wait(app, window)
     wave.set_audio(track.audio_data if track.audio_data is not None else sf.read(path)[0], 8000)
     wave.set_display_mode(mode)
@@ -320,7 +321,7 @@ def test_plot_gestures_follow_known_samples_and_clamp_to_visible_edges(app, wind
     QTest.mouseClick(wave, Qt.LeftButton, pos=QPoint(0, 20))
     QTest.mouseClick(wave, Qt.LeftButton, pos=QPoint(wave.width() - 1, 20))
     assert clicked[-2:] == [start, end - 1]
-    assert streams == [] and window._worker is None
+    assert streams == [] and window.lifecycle_controller.analyze_worker is None
 
 
 @pytest.mark.parametrize("corrected_spectrogram", [False, True], ids=["original-waveform", "corrected-spectrogram"])
@@ -331,7 +332,7 @@ def test_play_and_seek_keep_the_displayed_plot_during_source_validation(
 
     _open_track(window, tmp_path, "Seek.wav")
     _wait(app, window)
-    panel, waveform = window._wf_panel, window._waveform
+    panel, waveform = window._wf_panel, window._wf_panel.waveform
     panel.set_expanded(True)
     if corrected_spectrogram:
         panel.source_selector.buttons[1].click()

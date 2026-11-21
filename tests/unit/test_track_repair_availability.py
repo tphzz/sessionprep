@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 pytest.importorskip("PySide6")
-from sessionprepgui.detail.mixin import DetailMixin
+from sessionprepgui.detail import resolve_audition_results
 from sessionprepgui.detail.repair_options import track_repair_options
 from sessionprepgui.detail.report import prepare_track_report
 from sessionpreplib.models import CorrectedAnalysis, DetectorResult, SessionContext, Severity, TrackContext
@@ -89,9 +89,6 @@ def test_local_measurements_survive_missing_global_detector_in_file_and_plot(tra
     track.corrected_analysis = CorrectedAnalysis("verified", dict(track.detector_results))
     track.repair_measurements = {side: {"low_band": {"regions": [[10, 50, 1]] if side == source else []}}
                                  for side in ("original", "corrected")}
-    views = {side: SimpleNamespace(_current_track=track, _session=session,
-                                   _audition_is_corrected=lambda side=side: side == "corrected")
-             for side in ("original", "corrected")}
     assert track_repair_options(track, session).targets["subsonic-local"] == "low_cut"
     rows = {r["id"]: r for r in prepare_track_report(track, session, show_clean=False)["rows"]}
     local = rows["subsonic-local"]
@@ -99,12 +96,12 @@ def test_local_measurements_survive_missing_global_detector_in_file_and_plot(tra
     assert local["outcome"] == (CheckOutcome.NEW if source == "corrected" else
                                 CheckOutcome.FAILED if global_result else CheckOutcome.PENDING)
     assert ("subsonic" in rows) is bool(global_result)
-    for side, view in views.items():
-        result = DetailMixin._audition_results(view).get("subsonic-local")
+    for side in ("original", "corrected"):
+        result = resolve_audition_results(track, session, corrected=(side == "corrected")).get("subsonic-local")
         assert bool(result and result.issues) is (side == source)
     session.config["subsonic_enabled"] = False
     assert "subsonic-local" not in track_repair_options(track, session).targets
-    assert "subsonic-local" not in DetailMixin._audition_results(views[source])
+    assert "subsonic-local" not in resolve_audition_results(track, session, corrected=(source == "corrected"))
     assert all(r["id"] != "subsonic-local" for r in prepare_track_report(track, session)["rows"])
 
 
@@ -126,8 +123,6 @@ def test_output_recovery_is_accessible_only_on_the_affected_track(track):
 def test_first_pending_or_failed_edit_does_not_copy_original_local_overlay_to_corrected(track, state):
     track.repair_measurements = {"original": {"low_band": {"regions": [[11, 66, 0]]}}}
     track._cache.update(state)
-    view = SimpleNamespace(_current_track=track, _session=SessionContext([track], {}),
-                           _audition_is_corrected=lambda: True)
-    assert not DetailMixin._audition_results(view)
-    view._audition_is_corrected = lambda: False
-    assert DetailMixin._audition_results(view)["subsonic-local"].issues
+    session = SessionContext([track], {})
+    assert not resolve_audition_results(track, session, corrected=True)
+    assert resolve_audition_results(track, session, corrected=False)["subsonic-local"].issues

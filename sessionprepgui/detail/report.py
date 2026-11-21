@@ -339,6 +339,79 @@ def _render_narrow_findings(rows, expanded, active_help, action_size):
     return parts
 
 
+def _render_finding_row_parts(
+    row: dict,
+    *,
+    widths: tuple,
+    compact: bool,
+    expanded,
+    active_help,
+    action_size,
+) -> list[str]:
+    key = row["id"]
+    token = quote(key, safe="")
+    color, label = _row_status(row)
+    arrow = _image("chevron-down" if key in expanded else "chevron-right")
+    title = _link(
+        "report-details",
+        key,
+        f'{arrow}&nbsp;&nbsp; <b>{esc(row["title"])}</b>',
+        "Toggle detector details",
+    )
+    if row["count"]:
+        title += f' &middot; <span style="color:{COLORS["metadata"]};">{esc(row["count"])}</span>'
+    finding = f'<a name="finding-{token}"></a>' + _finding_line(title, 32)
+    if compact:
+        finding += (
+            f'<p style="margin:4px 0 0 24px; color:{COLORS["metadata"]};">'
+            f'{_location_html(row["location"])}<br>'
+            f'<span style="color:{COLORS["text"]};">{esc(row["hint"])}</span></p>'
+        )
+    severity = _finding_line(f'<span style="color:{color};">{label}</span>', 32)
+    actions = _finding_actions(row, compact)
+    location = _location_html(row["location"])
+    count_in_cell = not compact and row["location"].endswith((" location", " locations"))
+    location = f"<nobr>{location}</nobr>" if count_in_cell else _finding_line(location, 32)
+    values = (
+        (severity, finding, actions)
+        if compact
+        else (severity, finding, location, _finding_line(esc(row["hint"]), 32), actions)
+    )
+    compared = bool(row.get("comparison") and key in expanded)
+    out = [
+        "<tr>"
+        + "".join(
+            _finding_cell(
+                value,
+                width,
+                active=key == active_help and color != COLORS["problems"],
+                index=i,
+                columns=len(widths),
+                expanded=compared,
+                valign="middle" if count_in_cell and i == 2 else "top",
+            )
+            for i, (value, width) in enumerate(zip(values, widths))
+        )
+        + "</tr>"
+    ]
+    if compared:
+        rule = f'border-bottom:1px solid {COLORS["border"]};'
+        lead = "" if compact else f'<td style="{rule}"></td>'
+        span = len(widths) if compact else len(widths) - 1
+        out.append(
+            f'<tr>{lead}<td colspan="{span}" style="padding:8px 12px 12px 30px; {rule}">'
+            + _expanded_finding(row, False, action_size, compact=compact)
+            + "</td></tr>"
+        )
+    elif key in expanded:
+        out.append(
+            f'<tr><td colspan="{len(widths)}" style="padding:4px 12px 4px 136px;">'
+            + _expanded_finding(row, False, action_size)
+            + "</td></tr>"
+        )
+    return out
+
+
 def render_prepared_track_report(data, *, expanded=(), compact=False, narrow=False,
                                  active_help=None, action_size=None):
     """Render cached data with severity-leading rows; Help lives in its own pane.
@@ -351,21 +424,29 @@ def render_prepared_track_report(data, *, expanded=(), compact=False, narrow=Fal
         header = data.get("header_compact", data["header"])
     else:
         header = data["header"]
-    heading = (f'<p style="{REPORT_SECTION_HEADING} color:{COLORS["heading"]};">'
-               '<a name="report-findings"></a>Detector findings</p>')
-    # Stack the heading action when Help leaves only a narrow reading column.
+    heading = (
+        f'<p style="{REPORT_SECTION_HEADING} color:{COLORS["heading"]};">'
+        '<a name="report-findings"></a>Detector findings</p>'
+    )
     heading_row = f'<td valign="middle">{heading}</td>'
     if data.get("can_review_repairs"):
         if narrow:
-            heading_row += '</tr><tr>'
+            heading_row += "</tr><tr>"
         side = "left" if narrow else "right"
         action = _repair_action("report-repairs", "track", "Track repairs…", action_size)
         heading_row += f'<td align="{side}">{action}</td>'
-    parts = [header, '<div><table width="100%" cellspacing="0" cellpadding="0" style="margin-top:16px;"><tr>'
-             + heading_row + '</tr></table>']
+    parts = [
+        header,
+        '<div><table width="100%" cellspacing="0" cellpadding="0" style="margin-top:16px;"><tr>'
+        + heading_row
+        + "</tr></table>",
+    ]
     if failure := data.get("source_failure"):
-        parts.append(f'<p style="color:{COLORS["attention"]};">Unable to verify · {esc(failure)} &nbsp; '
-                     + _link("report-retry", "track", "Retry") + "</p>")
+        parts.append(
+            f'<p style="color:{COLORS["attention"]};">Unable to verify · {esc(failure)} &nbsp; '
+            + _link("report-retry", "track", "Retry")
+            + "</p>"
+        )
     rows = data["rows"]
     if not rows:
         parts.append(f'<p style="color:{COLORS["metadata"]};">No findings to show.</p></div>')
@@ -377,53 +458,28 @@ def render_prepared_track_report(data, *, expanded=(), compact=False, narrow=Fal
     paired = any("comparison" in row for row in rows)
     status = "Status" if paired else "Severity"
     width = "146" if paired else "100"
-    widths = ((width, None, "100" if paired else "80") if compact else
-              (width, None, "96", "216", "176" if paired else "136"))
-    if paired and not compact:
-        widths = ("17.5%", "23.5%", "14%", "20%", "25%")
-    labels = ((status, "Finding, location and next step", "Actions") if compact
-              else (status, "Finding", "Location", "Next step", "Actions"))
-    # QTextDocument rounds the percentage columns independently. At 100%
-    # the table can exceed its viewport by one pixel at ordinary pane widths.
+    widths = (
+        (width, None, "100" if paired else "80")
+        if compact
+        else (("17.5%", "23.5%", "14%", "20%", "25%") if paired else (width, None, "96", "216", "136"))
+    )
+    labels = (
+        (status, "Finding, location and next step", "Actions")
+        if compact
+        else (status, "Finding", "Location", "Next step", "Actions")
+    )
     parts.append(_table_header(labels, widths, table_width="99.9%" if paired and not compact else "100%"))
     for row in rows:
-        key = row["id"]
-        token = quote(key, safe="")
-        color, label = _row_status(row)
-        arrow = _image("chevron-down" if key in expanded else "chevron-right")
-        title = _link("report-details", key, f'{arrow}&nbsp;&nbsp; <b>{esc(row["title"])}</b>',
-                      "Toggle detector details")
-        if row["count"]:
-            title += f' &middot; <span style="color:{COLORS["metadata"]};">{esc(row["count"])}</span>'
-        finding = f'<a name="finding-{token}"></a>' + _finding_line(title, 32)
-        if compact:
-            finding += (f'<p style="margin:4px 0 0 24px; color:{COLORS["metadata"]};">'
-                        f'{_location_html(row["location"])}<br>'
-                        f'<span style="color:{COLORS["text"]};">{esc(row["hint"])}</span></p>')
-        severity = _finding_line(f'<span style="color:{color};">{label}</span>', 32)
-        actions = _finding_actions(row, compact)
-        location = _location_html(row["location"])
-        count_in_cell = not compact and row["location"].endswith((" location", " locations"))
-        location = f"<nobr>{location}</nobr>" if count_in_cell else _finding_line(location, 32)
-        values = ((severity, finding, actions) if compact else
-                  (severity, finding, location, _finding_line(esc(row["hint"]), 32), actions))
-        compared = bool(row.get("comparison") and key in expanded)
-        parts.append("<tr>" + "".join(
-            _finding_cell(value, width, active=key == active_help and color != COLORS["problems"],
-                          index=i, columns=len(widths), expanded=compared,
-                          valign="middle" if count_in_cell and i == 2 else "top")
-            for i, (value, width) in enumerate(zip(values, widths))) + "</tr>")
-        if compared:
-            rule = f'border-bottom:1px solid {COLORS["border"]};'
-            # Start under the finding text beside its disclosure. Compact rows
-            # give the table the full line once the status and actions stack.
-            lead = "" if compact else f'<td style="{rule}"></td>'
-            span = len(widths) if compact else len(widths) - 1
-            parts.append(f'<tr>{lead}<td colspan="{span}" style="padding:8px 12px 12px 30px; {rule}">'
-                         + _expanded_finding(row, False, action_size, compact=compact) + '</td></tr>')
-        elif key in expanded:
-            parts.append(f'<tr><td colspan="{len(widths)}" style="padding:4px 12px 4px 136px;">'
-                         + _expanded_finding(row, False, action_size) + '</td></tr>')
+        parts.extend(
+            _render_finding_row_parts(
+                row,
+                widths=widths,
+                compact=compact,
+                expanded=expanded,
+                active_help=active_help,
+                action_size=action_size,
+            )
+        )
     parts.append("</table></div>")
     return "\n".join(parts)
 
@@ -541,210 +597,284 @@ def render_fader_table_html(session) -> str:
 # Per-track detail
 # ---------------------------------------------------------------------------
 
-def prepare_track_report(track, session=None, *, show_clean: bool = True,
-                             verbose: bool = False) -> dict:
-    """Prepare cached per-track report data.
+def _fmt_chunk_size(n: int) -> str:
+    if n < 1024:
+        return f"{n} B"
+    if n < 1024 * 1024:
+        return f"{n / 1024:.1f} KB"
+    return f"{n / (1024 * 1024):.1f} MB"
 
-    Parameters
-    ----------
-    track : TrackContext
-    session : SessionContext | None
-        If provided, configured detector/processor instances from the
-        session are used for self-rendering via their ``render_html()``
-        methods.
-    show_clean : bool
-        If False, detectors with severity ``clean`` are hidden.
-    verbose : bool
-        When True, processors may include additional analytical detail.
-    """
-    parts = []
-    rows = []
-    repairs = track_repair_options(track, session) if track.status == "OK" else None
-    parts.append(f'<div style="color:{COLORS["heading"]}; font-size:{REPORT_TITLE_SIZE}; font-weight:600;">'
-                 f'{esc(track.filename)}</div>')
 
-    if track.status != "OK":
-        parts.append(f'<div style="color:{COLORS["problems"]}; margin-top:8px;">'
-                     f'Status: {esc(track.status)}</div>')
-    else:
-        # File info
-        fmt = f"{track.samplerate} Hz / {track.bitdepth} / {track.channels}ch"
-        dur = f"{track.duration_sec:.2f}s ({track.total_samples} samples)"
-        parts.append(f'<div style="color:{COLORS["metadata"]}; margin-top:6px;">{fmt}</div>')
-        parts.append(f'<div style="color:{COLORS["metadata"]};">{dur}</div>')
+def _append_track_metadata_parts(parts: list, track) -> None:
+    fmt = f"{track.samplerate} Hz / {track.bitdepth} / {track.channels}ch"
+    dur = f"{track.duration_sec:.2f}s ({track.total_samples} samples)"
+    parts.append(f'<div style="color:{COLORS["metadata"]}; margin-top:6px;">{fmt}</div>')
+    parts.append(f'<div style="color:{COLORS["metadata"]};">{dur}</div>')
 
-        # Chunk metadata + DAW origin (single line)
-        try:
-            notable = [(name, size) for name, size in chunk_sizes(track.filepath) if name not in STANDARD_CHUNKS]
-        except (ValueError, OSError):
-            notable = []
-        origin = detect_origin(track.chunk_ids, track.filepath)
-        meta_parts = []
-        if notable:
-            def _fmt_size(n: int) -> str:
-                if n < 1024:
-                    return f"{n} B"
-                if n < 1024 * 1024:
-                    return f"{n / 1024:.1f} KB"
-                return f"{n / (1024 * 1024):.1f} MB"
-            chunk_parts = [
-                f'{esc(name.strip())} ({_fmt_size(size)})'
-                for name, size in notable
-            ]
-            meta_parts.append(f'Chunks: {" &middot; ".join(chunk_parts)}')
-        if origin:
-            meta_parts.append(f'Origin: {esc(origin)}')
-        if meta_parts:
+    try:
+        notable = [(name, size) for name, size in chunk_sizes(track.filepath) if name not in STANDARD_CHUNKS]
+    except (ValueError, OSError):
+        notable = []
+    origin = detect_origin(track.chunk_ids, track.filepath)
+    meta_parts = []
+    if notable:
+        chunk_parts = [f"{esc(name.strip())} ({_fmt_chunk_size(size)})" for name, size in notable]
+        meta_parts.append(f'Chunks: {" &middot; ".join(chunk_parts)}')
+    if origin:
+        meta_parts.append(f"Origin: {esc(origin)}")
+    if meta_parts:
+        parts.append(f'<div style="color:{COLORS["metadata"]}; margin-top:4px;">{" / ".join(meta_parts)}</div>')
+
+
+def _append_processor_parts(parts: list, track, proc_map: dict, *, verbose: bool) -> None:
+    for proc_id, pr in (track.processor_results or {}).items():
+        proc_inst = proc_map.get(proc_id)
+        if proc_inst:
+            html_fragment = proc_inst.render_html(pr, track, verbose=verbose)
+            if not html_fragment:
+                continue
+            render = proc_inst.render_html
+            compact_fragment = _layout_variant(render, (pr, track), verbose, html_fragment, compact=True)
+            narrow_fragment = _layout_variant(
+                render, (pr, track), verbose, compact_fragment, compact=True, narrow=True
+            )
+        else:
+            html_fragment = compact_fragment = narrow_fragment = (
+                f'<div>{esc(pr.classification or "")} &middot; {esc(pr.method)} &middot; {pr.gain_db:+.1f} dB</div>'
+            )
+        parts.append(
+            f'<p style="{REPORT_SECTION_HEADING} color:{COLORS["heading"]};">'
+            '<a name="report-processors"></a>'
+            f'{esc(proc_map[proc_id].name if proc_id in proc_map else proc_id)}</p>'
+        )
+        parts.append((html_fragment, compact_fragment, narrow_fragment))
+        if track.group:
+            original = pr.data.get("original_gain_db", pr.gain_db)
+            delta = pr.gain_db - original
             parts.append(
-                f'<div style="color:{COLORS["metadata"]}; margin-top:4px;">'
-                f'{" / ".join(meta_parts)}</div>'
+                f'<div style="color:{COLORS["metadata"]}; margin-top:8px;">'
+                f'Group: <b>{esc(track.group)}</b>'
+                f' &nbsp;&middot;&nbsp; Group level: <b>{_signed(pr.gain_db)} dB</b>'
+                f' (individual: {_signed(original)} dB,'
+                f' &Delta; {_signed(delta)} dB)</div>'
             )
 
-        # Build lookup maps from session instances
+
+def _attach_check_details(row: dict, check, det_id: str, track, config: dict) -> None:
+    row["outcome"] = check.outcome
+    row["retry"] = check.outcome == CheckOutcome.FAILED and not track._cache.get("repair_error")
+    row["source_labels"] = tuple(
+        tuple(sorted({i.label for i in visualizable_issues(r, track)}))
+        for r in (check.original, check.corrected)
+    )
+    readings, note, counts, partial = comparison_readings(check, track, config)
+    row["comparison"] = [entry for entry in readings if not counts or entry[0] != "Locations"]
+    row["comparison_note"] = note
+    if det_id == "subsonic" and check.original and check.corrected:
+        _, left, right = readings[0]
+        compact = []
+        for r, value in ((check.original, left), (check.corrected, right)):
+            if r.applicable and not r.error and "per_channel" in r.data:
+                names = [int(i) for i, data in r.data["per_channel"].items() if data.get("warn")]
+                if len(names) == 1 and track.channels == 2:
+                    value += " · " + ("Left", "Right")[names[0]]
+                else:
+                    value += f" · {len(names)} channels"
+            compact.append(value)
+        row["compact_readings"] = [(readings[0][0], *compact)]
+    if counts:
+        row["location"], row["count"] = counts, ""
+    if check.outcome == CheckOutcome.RESOLVED:
+        row["hint"] = ""
+    elif partial:
+        row["hint"] = partial
+    elif check.outcome == CheckOutcome.FAILED:
+        row["hint"] = check.corrected.error if check.corrected else ""
+
+
+def _resolve_paired_check(
+    det_id: str, result, *, track, original_track, detector, config: dict, pending: bool
+):
+    """Resolve paired before/after verification check for a track detector row."""
+    if not config.get(f"{det_id}_enabled", True) or getattr(detector, "_report_as", "") == "skip":
+        return None, None, True
+    check = detector_check(track, det_id, pending=pending)
+    is_relevant = getattr(detector, "is_relevant", None)
+    if check.corrected is not None and is_relevant and not is_relevant(check.corrected, track):
+        if check.original is None or not is_relevant(check.original, original_track):
+            return None, None, True
+        check = replace(
+            check,
+            outcome=CheckOutcome.INAPPLICABLE,
+            corrected=replace(
+                check.corrected, applicable=False, summary="Inactive for this normalization method"
+            ),
+        )
+    if check.outcome in {CheckOutcome.NEW, CheckOutcome.REMAINING}:
+        result = check.corrected
+    return check, result, False
+
+
+def _build_finding_row_dict(
+    row_id: str, det_id: str, result, *, is_local: bool, track, detector, repairs, fragment: str, severity: str
+) -> dict:
+    location, locations = _location_text(result)
+    repair_target = repairs.targets.get(row_id)
+    if det_id == "dc_offset" and result.data.get("dc_warn"):
+        location = "Whole track"
+    runs = result.data.get("runs")
+    count = f'{runs} {"range" if runs == 1 else "ranges"}' if isinstance(runs, int) else ""
+    help_html = getattr(detector, "html_help", "") if detector else ""
+    if callable(help_html):
+        help_html = help_html()
+    title = detector.name if detector else det_id
+    return {
+        "id": row_id,
+        "title": f"{title} · local energy" if is_local else title,
+        "severity": severity,
+        "summary": result.summary,
+        "fragment": fragment,
+        "location": location,
+        "locations": locations,
+        "count": count,
+        "hint": _guidance(result.hint),
+        "review_repair": bool(repair_target and not result.error),
+        "repair_attribution": repairs.attribution(row_id),
+        "help": help_html,
+        "visualize_labels": tuple(sorted({issue.label for issue in visualizable_issues(result, track)})),
+    }
+
+
+def _prepare_finding_row(
+    row_id: str,
+    det_id: str,
+    result,
+    local_check,
+    *,
+    track,
+    original_track,
+    detector,
+    repairs,
+    config: dict,
+    pending: bool,
+    show_clean: bool,
+) -> dict | None:
+    is_local = local_check is not None
+    check = None
+    paired = track.repair_recipe.active or pending or track._cache.get("repair_error")
+    if paired and not is_local and (
+        isinstance(detector, TrackDetector)
+        or (track.corrected_analysis and det_id in track.corrected_analysis.results)
+    ):
+        check, result, skip = _resolve_paired_check(
+            det_id,
+            result,
+            track=track,
+            original_track=original_track,
+            detector=detector,
+            config=config,
+            pending=pending,
+        )
+        if skip:
+            return None
+
+    severity = (
+        detector.effective_severity(result)
+        if detector and hasattr(detector, "effective_severity")
+        else result.severity
+    )
+    if severity is None:
+        return None
+    severity = getattr(severity, "value", str(severity))
+    if not show_clean and severity == "clean" and not (check and check.corrected and check.corrected.error):
+        return None
+    if detector:
+        context = original_track if check and result is check.original else track
+        fragment = detector.render_html(result, context)
+        if not fragment:
+            return None
+    else:
+        fragment = f"<tr><td>{esc(result.summary)}</td></tr>"
+
+    row = _build_finding_row_dict(
+        row_id,
+        det_id,
+        result,
+        is_local=is_local,
+        track=track,
+        detector=detector,
+        repairs=repairs,
+        fragment=fragment,
+        severity=severity,
+    )
+    if check:
+        _attach_check_details(row, check, det_id, track, config)
+    elif is_local:
+        row["outcome"] = local_check.outcome
+        row["source_labels"] = tuple(
+            tuple(sorted({i.label for i in visualizable_issues(r, track)}))
+            for r in (local_check.original, local_check.corrected)
+        )
+    return row
+
+
+def prepare_track_report(track, session=None, *, show_clean: bool = True,
+                         verbose: bool = False) -> dict:
+    """Prepare cached per-track report data."""
+    parts: list = []
+    rows: list[dict] = []
+    repairs = track_repair_options(track, session) if track.status == "OK" else None
+    parts.append(
+        f'<div style="color:{COLORS["heading"]}; font-size:{REPORT_TITLE_SIZE}; font-weight:600;">'
+        f"{esc(track.filename)}</div>"
+    )
+    if track.status != "OK":
+        parts.append(
+            f'<div style="color:{COLORS["problems"]}; margin-top:8px;">Status: {esc(track.status)}</div>'
+        )
+    else:
+        _append_track_metadata_parts(parts, track)
         proc_map = {p.id: p for p in (session.processors if session else [])}
         det_map = {d.id: d for d in (session.detectors if session else [])}
-
-        # Processor results
-        for proc_id, pr in (track.processor_results or {}).items():
-            proc_inst = proc_map.get(proc_id)
-            if proc_inst:
-                html_fragment = proc_inst.render_html(pr, track, verbose=verbose)
-                if not html_fragment:
-                    continue  # processor chose to suppress output (e.g. no-op)
-                render = proc_inst.render_html
-                compact_fragment = _layout_variant(render, (pr, track), verbose, html_fragment,
-                                                   compact=True)
-                # compact=True too: a **kwargs override that only knows compact
-                # then still returns its compact rather than its wide fragment.
-                narrow_fragment = _layout_variant(render, (pr, track), verbose, compact_fragment,
-                                                  compact=True, narrow=True)
-            else:
-                # Fallback: basic display
-                html_fragment = compact_fragment = narrow_fragment = (
-                    f'<div>'
-                    f'{esc(pr.classification or "")} &middot; {esc(pr.method)} '
-                    f'&middot; {pr.gain_db:+.1f} dB</div>'
-                )
-            # The anchor starts the finding body role for processor bodies
-            # (see ReportBrowser); the heading keeps its own section role.
-            parts.append(f'<p style="{REPORT_SECTION_HEADING} color:{COLORS["heading"]};">'
-                         '<a name="report-processors"></a>'
-                         f'{esc(proc_map[proc_id].name if proc_id in proc_map else proc_id)}</p>')
-            parts.append((html_fragment, compact_fragment, narrow_fragment))
-            if track.group:
-                original = pr.data.get("original_gain_db", pr.gain_db)
-                delta = pr.gain_db - original
-                parts.append(
-                    f'<div style="color:{COLORS["metadata"]}; margin-top:8px;">'
-                    f'Group: <b>{esc(track.group)}</b>'
-                    f' &nbsp;&middot;&nbsp; Group level: <b>{_signed(pr.gain_db)} dB</b>'
-                    f' (individual: {_signed(original)} dB,'
-                    f' &Delta; {_signed(delta)} dB)</div>'
-                )
+        _append_processor_parts(parts, track, proc_map, verbose=verbose)
 
         severity_order = {"problem": 0, "attention": 1, "information": 2, "info": 2, "clean": 3}
         pending = bool(track._cache.get("repair_verification_pending"))
         config = session.config if session else {}
         original_track = original_report_track(track, session)
         for row_id, det_id, result, local_check in _track_findings(track, config):
-            is_local = local_check is not None
-            detector = det_map.get(det_id)
-            check = None
-            paired = (track.repair_recipe.active or pending or track._cache.get("repair_error"))
-            if paired and not is_local and (isinstance(detector, TrackDetector)
-                    or (track.corrected_analysis and det_id in track.corrected_analysis.results)):
-                if not config.get(f"{det_id}_enabled", True) or getattr(detector, "_report_as", "") == "skip":
-                    continue
-                check = detector_check(track, det_id, pending=pending)
-                is_relevant = getattr(detector, "is_relevant", None)
-                if check.corrected is not None and is_relevant and not is_relevant(check.corrected, track):
-                    if check.original is None or not is_relevant(check.original, original_track):
-                        continue
-                    # The original finding remains readable if the repaired signal uses a
-                    # normalization method to which this diagnostic does not apply.
-                    check = replace(check, outcome=CheckOutcome.INAPPLICABLE, corrected=replace(
-                        check.corrected, applicable=False, summary="Inactive for this normalization method"))
-                if check.outcome in {CheckOutcome.NEW, CheckOutcome.REMAINING}:
-                    result = check.corrected
-            severity = (detector.effective_severity(result)
-                        if detector and hasattr(detector, "effective_severity")
-                        else result.severity)
-            if severity is None:
-                continue
-            severity = getattr(severity, "value", str(severity))
-            if not show_clean and severity == "clean" and not (
-                    check and check.corrected and check.corrected.error):
-                continue
-            if detector:
-                context = (original_track if check and result is check.original else track)
-                fragment = detector.render_html(result, context)
-                if not fragment:
-                    continue
-            else:
-                fragment = f'<tr><td>{esc(result.summary)}</td></tr>'
-            location, locations = _location_text(result)
-            repair_target = repairs.targets.get(row_id)
-            if det_id == "dc_offset" and result.data.get("dc_warn"):
-                location = "Whole track"
-            runs = result.data.get("runs")
-            count = f'{runs} {"range" if runs == 1 else "ranges"}' if isinstance(runs, int) else ""
-            help_html = getattr(detector, "html_help", "") if detector else ""
-            if callable(help_html):
-                help_html = help_html()
-            title = detector.name if detector else det_id
-            row = {
-                "id": row_id, "title": f"{title} · local energy" if is_local else title,
-                "severity": severity, "summary": result.summary, "fragment": fragment,
-                "location": location, "locations": locations, "count": count,
-                "hint": _guidance(result.hint),
-                "review_repair": bool(repair_target and not result.error),
-                "repair_attribution": repairs.attribution(row_id),
-                "help": help_html,
-                "visualize_labels": tuple(sorted({issue.label
-                    for issue in visualizable_issues(result, track)})),
-            }
-            if check:
-                row["outcome"] = check.outcome
-                row["retry"] = check.outcome == CheckOutcome.FAILED and not track._cache.get("repair_error")
-                row["source_labels"] = tuple(
-                    tuple(sorted({i.label for i in visualizable_issues(r, track)})) for r in (check.original, check.corrected))
-                readings, note, counts, partial = comparison_readings(check, track, config)
-                row["comparison"] = [entry for entry in readings if not counts or entry[0] != "Locations"]
-                row["comparison_note"] = note
-                if det_id == "subsonic" and check.original and check.corrected:
-                    # At the 400 px minimum group each energy value with its channel count.
-                    _, left, right = readings[0]
-                    compact = []
-                    for r, value in ((check.original, left), (check.corrected, right)):
-                        if r.applicable and not r.error and "per_channel" in r.data:
-                            names = [int(i) for i, data in r.data["per_channel"].items() if data.get("warn")]
-                            if len(names) == 1 and track.channels == 2:
-                                value += " · " + ("Left", "Right")[names[0]]
-                            else:
-                                value += f" · {len(names)} channels"
-                        compact.append(value)
-                    row["compact_readings"] = [(readings[0][0], *compact)]
-                if counts:
-                    row["location"], row["count"] = counts, ""
-                if check.outcome == CheckOutcome.RESOLVED:
-                    row["hint"] = ""
-                elif partial:
-                    row["hint"] = partial
-                elif check.outcome == CheckOutcome.FAILED:
-                    row["hint"] = check.corrected.error if check.corrected else ""
-            elif is_local:
-                row["outcome"] = local_check.outcome
-                before, after = local_check.original, local_check.corrected
-                row["source_labels"] = tuple(tuple(sorted({i.label for i in visualizable_issues(r, track)}))
-                                             for r in (before, after))
-            rows.append(row)
-        rows.sort(key=lambda row: (row.get("outcome") == CheckOutcome.RESOLVED,
-                                   severity_order.get(row["severity"], 99), row["title"].lower()))
+            row = _prepare_finding_row(
+                row_id,
+                det_id,
+                result,
+                local_check,
+                track=track,
+                original_track=original_track,
+                detector=det_map.get(det_id),
+                repairs=repairs,
+                config=config,
+                pending=pending,
+                show_clean=show_clean,
+            )
+            if row is not None:
+                rows.append(row)
+        rows.sort(
+            key=lambda r: (
+                r.get("outcome") == CheckOutcome.RESOLVED,
+                severity_order.get(r["severity"], 99),
+                r["title"].lower(),
+            )
+        )
     wide = [p if isinstance(p, str) else p[0] for p in parts]
     compact = [p if isinstance(p, str) else p[1] for p in parts]
     narrow = [p if isinstance(p, str) else p[2] for p in parts]
-    data = {"header": "\n".join(wide), "header_compact": "\n".join(compact),
-            "header_narrow": "\n".join(narrow), "rows": rows, "can_review_repairs": bool(repairs and repairs.available),
-            "source_failure": track._cache.get("repair_error")}
+    data = {
+        "header": "\n".join(wide),
+        "header_compact": "\n".join(compact),
+        "header_narrow": "\n".join(narrow),
+        "rows": rows,
+        "can_review_repairs": bool(repairs and repairs.available),
+        "source_failure": track._cache.get("repair_error"),
+    }
     select_report_source(data, False)
     return data

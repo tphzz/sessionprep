@@ -66,11 +66,11 @@ def wait_for(condition, seconds=8):
 
 def idle(window):
     try:
-        wait_for(lambda: window._prepare_worker is None and window._repair_plan_worker is None
-                 and not window._repair_plan_pending)
+        wait_for(lambda: window.lifecycle_controller.prepare_worker is None and window.lifecycle_controller.repair_plan_worker is None
+                 and not window.lifecycle_controller.repair_plan_pending)
     except AssertionError:
-        worker = window._repair_plan_worker or window._prepare_worker
-        pytest.fail(f"Pending {window._repair_plan_pending}, worker {worker}, "
+        worker = window.lifecycle_controller.repair_plan_worker or window.lifecycle_controller.prepare_worker
+        pytest.fail(f"Pending {window.lifecycle_controller.repair_plan_pending}, worker {worker}, "
                     f"finished {worker and worker.isFinished()}, error {getattr(worker, 'failure', None)}")
 
 
@@ -97,13 +97,13 @@ def project(app, tmp_path, monkeypatch, request):
     sf.write(source / "Bias.wav", 0.06 + 0.125 * np.sin(2 * np.pi * 150 * t), rate, subtype="PCM_16")
     sf.write(source / "Step.wav", np.where(t < 1.5, -0.875, 0.75), rate, subtype="PCM_16")
     tracks = [load_track(str(source / name)) for name in ("Bias.wav", "Step.wav")]
-    flat = window._flat_config()
+    flat = window.state.flat_config()
     session = SessionContext(tracks, flat)
     pipeline = Pipeline(default_detectors(), default_processors(), flat, max_workers=1)
     pipeline.analyze_phase2(session)
     pipeline.plan(session)
     pipeline.prepare(session, str(source / config["app"]["phase2_output_folder"]))
-    window._restore_session_state({
+    window.lifecycle_controller.restore_session_state({
         "source_dir": str(source), "active_config_preset": "Default", "session_config": preset,
         "session_config_overrides": {}, "tracks": tracks, "output_tracks": session.output_tracks,
         "prepare_state": "ready", "transfer_manifest": session.transfer_manifest,
@@ -134,7 +134,7 @@ def save_dc_preference(window, monkeypatch, value):
 
 
 def open_editor(window, track):
-    button = window._track_table.cellWidget(window._find_table_row(track.filename), 7)
+    button = window._track_table.cellWidget(window.track_table_controller.find_table_row(track.filename), 7)
     action, = [a for a in button.menu().actions() if a.text() == "Track repairs…"]
     assert action.isVisible()
     action.trigger()
@@ -146,15 +146,15 @@ def test_processing_cell_focus_and_back_keep_the_active_audition(project, monkey
     window = project
     window.show()
     window.activateWindow()
-    track = window._session.tracks[0]
-    row = window._find_table_row(track.filename)
+    track = window.state.session.tracks[0]
+    row = window.track_table_controller.find_table_row(track.filename)
     window._track_table.setCurrentCell(row, 0)
-    window._show_track_detail(track)
+    window.detail_controller.show_track_detail(track)
     wait_for(lambda: window._repair_preview.displayed)
     loads = []
     stops = []
-    monkeypatch.setattr(window, "_load_waveform", loads.append)
-    monkeypatch.setattr(window, "_on_stop", lambda: stops.append(True))
+    monkeypatch.setattr(window.detail_controller, "load_waveform", loads.append)
+    monkeypatch.setattr(window.detail_controller, "stop", lambda: stops.append(True))
     button = window._track_table.cellWidget(row, 7)
     button.setFocus()
     QApplication.processEvents()
@@ -164,19 +164,19 @@ def test_processing_cell_focus_and_back_keep_the_active_audition(project, monkey
     QApplication.processEvents()
     assert button.hasFocus() and not loads and not stops
     track.status = "Read error"
-    window._set_track_repair_choice(track, "dc_remove", True)
-    assert not track.repair_overrides and window._repair_plan_worker is None
+    window.lifecycle_controller.set_track_repair_choice(track, "dc_remove", True)
+    assert not track.repair_overrides and window.lifecycle_controller.repair_plan_worker is None
 
 
 def test_failed_reanalysis_returns_to_findings_when_the_track_is_reselected(project, monkeypatch):
     window = project
-    track = window._session.tracks[0]
+    track = window.state.session.tracks[0]
     editor = open_editor(window, track)
     monkeypatch.setattr(AnalyzeWorker, "start", lambda self: None)
-    window._on_analyze()
+    window.lifecycle_controller.analyze()
     assert editor.track is None and window._file_report.report_track is None
-    window._worker.error.emit(window._worker, "Analysis interrupted")
-    window._select_row(window._find_table_row(track.filename))
+    window.lifecycle_controller.analyze_worker.error.emit(window.lifecycle_controller.analyze_worker, "Analysis interrupted")
+    window.track_table_controller.select_row(window.track_table_controller.find_table_row(track.filename))
     assert window._file_report.report_track is track
     assert window._file_review.currentWidget() is window._file_report_pane
 
@@ -188,27 +188,27 @@ def test_failed_reanalysis_returns_to_findings_when_the_track_is_reselected(proj
 ])
 def test_adjust_gain_uses_the_verified_target_or_an_older_saved_reduction(
         project, monkeypatch, adjustment, expected):
-    track = project._session.tracks[0]
-    project._session.config["_output_gain_adjustments"] = {track.filename: adjustment}
+    track = project.state.session.tracks[0]
+    project.state.session.config["_output_gain_adjustments"] = {track.filename: adjustment}
 
     def cancel(dialog):
         assert dialog.findChild(QDoubleSpinBox).value() == expected
         return QDialog.Rejected
 
     monkeypatch.setattr(QDialog, "exec", cancel)
-    project._adjust_failed_output_gain(track)
+    project.lifecycle_controller.adjust_failed_output_gain(track)
 
 
 def test_project_and_track_inherit_explicit_values_and_reopen(project, tmp_path, monkeypatch):
     window = project
-    first, second = window._session.tracks
-    field = dc_checkbox(window._session_widgets)
+    first, second = window.state.session.tracks
+    field = dc_checkbox(window.config_controller.session_widgets)
     field.setChecked(True)
     field.setChecked(False)
     idle(window)
     save_dc_preference(window, monkeypatch, True)
     assert not field.isChecked() and not first.repair_recipe.active
-    assert window._capture_session_state()["session_config_overrides"] == {
+    assert window.lifecycle_controller.capture_session_state()["session_config_overrides"] == {
         "processors.corrective.repair_auto_dc": False,
     }
 
@@ -217,7 +217,7 @@ def test_project_and_track_inherit_explicit_values_and_reopen(project, tmp_path,
     reset.click()
     idle(window)
     assert field.isChecked() and all(t.repair_recipe.dc_remove for t in (first, second))
-    assert window._capture_session_state()["session_config_overrides"] == {}
+    assert window.lifecycle_controller.capture_session_state()["session_config_overrides"] == {}
     editor = open_editor(window, first)
     choice = editor.rows["dc_remove"].choice
     choice.setCurrentIndex(choice.findData(True))
@@ -227,14 +227,14 @@ def test_project_and_track_inherit_explicit_values_and_reopen(project, tmp_path,
 
     saved = tmp_path / "values.spsession"
     monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *args: (str(saved), ""))
-    window._on_save_session()
+    window.lifecycle_controller.save_session_dialog()
     assert load_session(str(saved))["tracks"][0].repair_overrides == {"dc_remove": True}
     save_dc_preference(window, monkeypatch, False)
     monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *args: (str(saved), ""))
-    window._on_load_session()
+    window.lifecycle_controller.load_session_dialog()
     idle(window)
-    first, second = window._session.tracks
-    assert not dc_checkbox(window._session_widgets).isChecked()
+    first, second = window.state.session.tracks
+    assert not dc_checkbox(window.config_controller.session_widgets).isChecked()
     assert first.repair_overrides == {"dc_remove": True} and first.repair_recipe.dc_remove
     assert not second.repair_overrides and not second.repair_recipe.active
     open_editor(window, first).rows["dc_remove"].reset.click()
@@ -244,7 +244,7 @@ def test_project_and_track_inherit_explicit_values_and_reopen(project, tmp_path,
 
 def test_rapid_edits_only_publish_the_latest_queued_recipe(project, monkeypatch):
     window = project
-    track = window._session.tracks[0]
+    track = window.state.session.tracks[0]
     editor = open_editor(window, track)
     row = editor.rows["low_cut"]
     dc = editor.rows["dc_remove"]
@@ -271,13 +271,13 @@ def test_rapid_edits_only_publish_the_latest_queued_recipe(project, monkeypatch)
     idle(window)
     assert track.repair_recipe == RepairRecipe(dc_remove=True)
     assert track.repair_overrides == {"low_cut": False, "dc_remove": True}
-    assert window._session.prepare_state == "stale"
+    assert window.state.session.prepare_state == "stale"
     assert window._save_session_action.isEnabled() and window._prepare_action.isEnabled()
 
 
 def test_switching_project_detaches_a_completed_plan_before_it_can_publish(project, tmp_path, monkeypatch):
     window = project
-    old_source = window._session.tracks[0]
+    old_source = window.state.session.tracks[0]
     source = tmp_path / "another project"
     source.mkdir()
     # Both projects use the same track name so a stale filename-based update would match.
@@ -285,7 +285,7 @@ def test_switching_project_detaches_a_completed_plan_before_it_can_publish(proje
     # The replacement project has a genuine low-frequency finding to repair.
     sf.write(path, np.sin(2 * np.pi * 15 * np.arange(24000) / 8000) / 8, 8000, subtype="PCM_16")
     restored = load_track(str(path))
-    config = window._flat_config()
+    config = window.state.flat_config()
     new_session = SessionContext([restored], config)
     pipeline = Pipeline(default_detectors(), default_processors(), config, max_workers=1)
     pipeline.analyze_phase2(new_session)
@@ -314,11 +314,11 @@ def test_switching_project_detaches_a_completed_plan_before_it_can_publish(proje
         choice = open_editor(window, old_source).rows["dc_remove"].choice
         choice.setCurrentIndex(choice.findData(True))
         wait_for(ready.is_set)
-        assert window._repair_plan_worker.tracks[0].repair_recipe.dc_remove
-        window._on_load_session()
-        assert window._session.project_name == "Another project"
+        assert window.lifecycle_controller.repair_plan_worker.tracks[0].repair_recipe.dc_remove
+        window.lifecycle_controller.load_session_dialog()
+        assert window.state.session.project_name == "Another project"
         assert not finished.is_set()
-        current, = window._session.tracks
+        current, = window.state.session.tracks
         assert current.filepath == str(path) and not current.repair_recipe.active
         assert current.detector_results["subsonic"].data["subsonic_warn"]
         low = open_editor(window, current).rows["low_cut"].choice
@@ -329,16 +329,16 @@ def test_switching_project_detaches_a_completed_plan_before_it_can_publish(proje
         release.set()
         if ready.is_set():
             wait_for(finished.is_set)
-    wait_for(lambda: not getattr(window, "_zombie_workers", set()))
+    wait_for(lambda: not getattr(window.lifecycle_controller, "_zombie_workers", set()))
     QApplication.processEvents()
-    assert window._session.tracks[0] is current
+    assert window.state.session.tracks[0] is current
     assert current.repair_overrides == {"low_cut": True} and current.repair_recipe == RepairRecipe(low_cut_hz=10)
     assert not old_source.repair_recipe.active
 
 
 def test_edit_while_preparing_requires_a_new_render_before_transfer(project, monkeypatch):
     window = project
-    session = window._session
+    session = window.state.session
     track = session.tracks[0]
     row = open_editor(window, track).rows["dc_remove"]
     entered, release = Event(), Event()
@@ -380,7 +380,7 @@ def test_edit_while_preparing_requires_a_new_render_before_transfer(project, mon
 @pytest.mark.parametrize("project", [True], indirect=True, ids=["normalization-enabled"])
 def test_gain_changed_during_output_write_requires_a_new_prepare(project, monkeypatch):
     window = project
-    session = window._session
+    session = window.state.session
     track = session.tracks[0]
     choice = open_editor(window, track).rows["dc_remove"].choice
     choice.setCurrentIndex(choice.findData(True))
@@ -402,9 +402,9 @@ def test_gain_changed_during_output_write_requires_a_new_prepare(project, monkey
     try:
         wait_for(ready.is_set)
         assert not window._analyze_action.isEnabled() and not window._save_session_action.isEnabled()
-        window._on_analyze()
-        assert window._worker is None and window._session is session
-        gain = window._track_table.cellWidget(window._find_table_row(track.filename), 4)
+        window.lifecycle_controller.analyze()
+        assert window.lifecycle_controller.analyze_worker is None and window.state.session is session
+        gain = window._track_table.cellWidget(window.track_table_controller.find_table_row(track.filename), 4)
         assert gain.isEnabled()
         gain.setValue(-12.0)
         assert track.manual_gain_db == -12.0
@@ -431,14 +431,14 @@ def test_gain_changed_during_output_write_requires_a_new_prepare(project, monkey
 
 def test_pcm_error_manual_dialog_cancel_apply_and_retry(project, monkeypatch):
     window = project
-    track = window._session.tracks[1]
-    path = Path(window._session.output_tracks[1].processed_filepath)
+    track = window.state.session.tracks[1]
+    path = Path(window.state.session.output_tracks[1].processed_filepath)
     original_wet = path.read_bytes()
     row = open_editor(window, track).rows["dc_remove"]
     row.choice.setCurrentIndex(row.choice.findData(True))
     idle(window)
     assert track.repair_recipe == RepairRecipe(dc_remove=True)
-    assert not window._flat_config()["bimodal_normalize_enabled"]
+    assert not window.state.flat_config()["bimodal_normalize_enabled"]
     actions = iter(("Cancel", "Apply gain"))
     proposed = []
     real_box, real_dialog = QMessageBox.exec, QDialog.exec
@@ -468,12 +468,12 @@ def test_pcm_error_manual_dialog_cancel_apply_and_retry(project, monkeypatch):
     assert track.manual_gain_db == proposed[1] and path.read_bytes() == original_wet
     window._prepare_action.trigger()
     idle(window)
-    session = window._session
+    session = window.state.session
     assert session.prepare_state == "ready" and not session.config["_prepare_errors"]
     prepared = next(t for t in session.output_tracks if t.filename == track.filename)
     wet = render_corrected(track.audio_data, track.samplerate, track.repair_recipe)
     np.testing.assert_allclose(sf.read(path)[0], wet * 10 ** (proposed[1] / 20), atol=2**-15)
     for processed, expected in [(False, Path(track.filepath)), (True, path)]:
-        window._use_processed_cb.setChecked(processed)
+        window.daw_controller.page.use_processed_cb.setChecked(processed)
         selection = resolve_transfer_audio(session, prepared)
         assert Path(selection.filepath) == expected and selection.fader_db == 0

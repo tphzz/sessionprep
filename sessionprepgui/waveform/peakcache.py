@@ -307,35 +307,18 @@ def query_peaks_fast(
         ch_mins = best_level.data[:, ch, 0]  # (n_bins,)
         ch_maxs = best_level.data[:, ch, 1]  # (n_bins,)
 
-        # Use reduceat for vectorised min/max across bin ranges
-        # Build unique start indices for reduceat
         mins_out = np.empty(width, dtype=np.float64)
         maxs_out = np.empty(width, dtype=np.float64)
 
-        # reduceat needs strictly sorted start indices.
-        # Since our bin_starts are monotonically non-decreasing, we can use
-        # reduceat directly but must handle duplicate starts.
-        unique_starts, inverse = np.unique(bin_starts, return_inverse=True)
-
-        if len(unique_starts) > 0:
-            red_min = np.minimum.reduceat(ch_mins, unique_starts)
-            red_max = np.maximum.reduceat(ch_maxs, unique_starts)
-
-            # Map back to pixels — but reduceat covers [start_i, start_{i+1})
-            # which may not match our desired [bin_starts[px], bin_ends[px]).
-            # For correctness with variable-width bins, do a refined pass.
-            for px in range(width):
-                b0 = int(bin_starts[px])
-                b1 = int(bin_ends[px])
-                if b0 < b1 and b0 < n_bins:
-                    mins_out[px] = ch_mins[b0:b1].min()
-                    maxs_out[px] = ch_maxs[b0:b1].max()
-                else:
-                    mins_out[px] = 0.0
-                    maxs_out[px] = 0.0
-        else:
-            mins_out[:] = 0.0
-            maxs_out[:] = 0.0
+        for px in range(width):
+            b0 = int(bin_starts[px])
+            b1 = int(bin_ends[px])
+            if b0 < b1 and b0 < n_bins:
+                mins_out[px] = ch_mins[b0:b1].min()
+                maxs_out[px] = ch_maxs[b0:b1].max()
+            else:
+                mins_out[px] = 0.0
+                maxs_out[px] = 0.0
 
         result.append((mins_out, maxs_out))
 

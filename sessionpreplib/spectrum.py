@@ -380,13 +380,7 @@ def _window_amplitudes(channel, start, stop, rate, weights, n_fft, quantum, band
     return amplitudes, edge_levels
 
 
-def _peak_spectrogram(channels, rate, width, hop, window, frequencies, max_columns, cancelled, source_steps):
-    """Measure each window, holding channel, frequency-cell and time-column maxima."""
-    frames = len(channels[0])
-    if not frames:
-        return np.empty(0), frequencies, np.empty((len(frequencies), 0))
-    for channel in channels:
-        validate_analysis_level(max(-float(channel.min()), float(channel.max())), frames)
+def _build_spectrogram_grid(frames, rate, width, hop, frequencies, max_columns):
     centers = np.arange(0, frames, hop)
     if centers[-1] != frames - 1:
         centers = np.append(centers, frames - 1)
@@ -395,41 +389,39 @@ def _peak_spectrogram(channels, rate, width, hop, window, frequencies, max_colum
         column = np.arange(ncols)
         times = centers / rate
     else:
-        # Each returned timestamp is the middle of its exact time cell, also
-        # when the last analysis window is a partial hop from the previous one.
         ncols = min(max_columns, max(1, frames // hop))
         column = centers * ncols // frames
         times = (np.arange(ncols) + 0.5) * (frames / (ncols * rate))
-    levels = np.full((len(frequencies), ncols), -200., dtype=np.float32)
-    taper = signal.get_window(window, width)
 
-    # Four samples across each native FFT interval limit worst-case scalloping
-    # to 0.11 dB for every selectable window. Resolution still comes from width.
     n_fft = 4 * width
-    # A physical band edge can fall between FFT samples, particularly at
-    # pulled sample rates or with a short Full window at a high sample rate.
     limits = frequencies[[0, -1]] * n_fft / rate
     nearest = np.rint(limits)
-    off_grid = np.abs(limits - nearest) > 8 * np.spacing(np.maximum(1., limits))
+    off_grid = np.abs(limits - nearest) > 8 * np.spacing(np.maximum(1.0, limits))
     lower, upper = np.where(off_grid, limits, nearest)
     first, last = int(np.ceil(lower)), int(np.floor(upper))
     extra_bins = limits[off_grid]
     lower_count = int(off_grid[0])
-    sample_bins = np.concatenate((extra_bins[:lower_count], np.arange(first, last + 1),
-                                  extra_bins[lower_count:]))
+    sample_bins = np.concatenate((
+        extra_bins[:lower_count], np.arange(first, last + 1), extra_bins[lower_count:]
+    ))
     cutoffs = [np.exp(-2j * np.pi * pos * np.arange(width) / n_fft) for pos in extra_bins]
     row_bins = frequencies * n_fft / rate
     midpoints = (row_bins[:-1] + row_bins[1:]) / 2
     edges = np.r_[0, np.searchsorted(sample_bins, midpoints), len(sample_bins)]
-    # More display rows than Fourier samples is common at the low end of
-    # Full. Extend the nearest measured level into otherwise empty cells.
     empty_rows = np.flatnonzero(np.diff(edges) == 0)
     right = np.clip(edges[empty_rows], 1, len(sample_bins) - 1)
-    nearest_empty = np.where(row_bins[empty_rows] * 2 <= sample_bins[right - 1] + sample_bins[right],
-                             right - 1, right)
-    quanta = [_pcm_step(channel) for channel in channels] if source_steps is None else source_steps
-    if len(quanta) != len(channels) or not all(np.isfinite(q) and q >= 0 for q in quanta):
-        raise ValueError("Expected one finite, nonnegative sample step per channel")
+    nearest_empty = np.where(
+        row_bins[empty_rows] * 2 <= sample_bins[right - 1] + sample_bins[right],
+        right - 1,
+        right,
+    )
+    return (
+        centers, ncols, column, times, n_fft, first, last,
+        lower_count, cutoffs, edges, empty_rows, nearest_empty,
+    )
+
+
+def _build_endpoint_bands(channels, rate, width, frequencies, cancelled):
     orientations = []
     if frequencies[0] < 4 * rate / width:
         orientations.append(False)
@@ -443,6 +435,29 @@ def _peak_spectrogram(channels, rate, width, hop, window, frequencies, max_colum
                 raise CancelledError()
             channel_bands.append(_EndpointBand(ch, width, high))
         bands.append(channel_bands)
+    return orientations, bands
+
+
+def _peak_spectrogram(channels, rate, width, hop, window, frequencies, max_columns, cancelled, source_steps):
+    """Measure each window, holding channel, frequency-cell and time-column maxima."""
+    frames = len(channels[0])
+    if not frames:
+        return np.empty(0), frequencies, np.empty((len(frequencies), 0))
+    for channel in channels:
+        validate_analysis_level(max(-float(channel.min()), float(channel.max())), frames)
+
+    (
+        centers, ncols, column, times, n_fft, first, last,
+        lower_count, cutoffs, edges, empty_rows, nearest_empty,
+    ) = _build_spectrogram_grid(frames, rate, width, hop, frequencies, max_columns)
+    levels = np.full((len(frequencies), ncols), -200.0, dtype=np.float32)
+    taper = signal.get_window(window, width)
+
+    quanta = [_pcm_step(channel) for channel in channels] if source_steps is None else source_steps
+    if len(quanta) != len(channels) or not all(np.isfinite(q) and q >= 0 for q in quanta):
+        raise ValueError("Expected one finite, nonnegative sample step per channel")
+
+    orientations, bands = _build_endpoint_bands(channels, rate, width, frequencies, cancelled)
     previous = [[None] * len(orientations) for _ in channels]
     for i, center in enumerate(centers):
         if cancelled is not None and cancelled():
@@ -455,10 +470,13 @@ def _peak_spectrogram(channels, rate, width, hop, window, frequencies, max_colum
             if not frame.any():
                 continue
             spectrum, boundaries = _window_amplitudes(
-                channel, lo, hi, rate, weights, n_fft, quanta[ch], bands[ch], previous[ch], cutoffs)
+                channel, lo, hi, rate, weights, n_fft, quanta[ch], bands[ch], previous[ch], cutoffs
+            )
             amplitude = spectrum[first:last + 1]
             if cutoffs:
-                amplitude = np.concatenate((boundaries[:lower_count], amplitude, boundaries[lower_count:]))
+                amplitude = np.concatenate(
+                    (boundaries[:lower_count], amplitude, boundaries[lower_count:])
+                )
             cells = np.maximum.reduceat(amplitude, edges[:-1])
             cells[empty_rows] = amplitude[nearest_empty]
             db = 20 * np.log10(np.maximum(cells / weights.sum(), 1e-10))

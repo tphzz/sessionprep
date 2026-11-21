@@ -37,7 +37,7 @@ def _wait(predicate):
 
 
 def _idle(window):
-    _wait(lambda: window._repair_plan_worker is None and not window._repair_plan_pending)
+    _wait(lambda: window.lifecycle_controller.repair_plan_worker is None and not window.lifecycle_controller.repair_plan_pending)
 
 
 @pytest.fixture(scope="module")
@@ -68,25 +68,25 @@ def _save_fixture(window, folder, *, active):
     track = load_track(str(path))
     if active:
         track.repair_overrides["dc_remove"] = True
-    config = window._flat_config()
+    config = window.state.flat_config()
     session = SessionContext([track], config)
     pipeline = Pipeline(default_detectors(), default_processors(), config, max_workers=1)
     pipeline.analyze_phase2(session)
     pipeline.plan(session)
     project = folder / "record.spsession"
     save_session(str(project), {"source_dir": str(folder), "tracks": [track], "active_config_preset": "Default",
-                                "session_config": window._effective_session_config(), "session_config_overrides": {}})
+                                "session_config": window.state.effective_session_config(), "session_config_overrides": {}})
     return project
 
 
 def _open(window, monkeypatch, project):
     monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *args: (str(project), ""))
-    window._on_load_session()
-    return window._session.tracks[0]
+    window.lifecycle_controller.load_session_dialog()
+    return window.state.session.tracks[0]
 
 
 def _edit(window, track, key, value):
-    row = window._find_table_row(track.filename)
+    row = window.track_table_controller.find_table_row(track.filename)
     processing = window._track_table.cellWidget(row, 7)
     next(a for a in processing.menu().actions() if a.text() == "Track repairs…").trigger()
     editor = window._repair_editor
@@ -163,9 +163,9 @@ def test_normal_repair_worker_publishes_verdict_and_file_navigation_reuses_it(wi
         _wait(lambda: not preview.pending and preview.worker is None)
         assert window._wf_panel.corrected == corrected
         assert track.corrected_analysis is snapshot
-    row = window._find_table_row(track.filename)
-    window._select_row(row)
-    window._show_track_detail(track)
+    row = window.track_table_controller.find_table_row(track.filename)
+    window.track_table_controller.select_row(row)
+    window.detail_controller.show_track_detail(track)
     assert calls == verified_calls
 
 
@@ -175,7 +175,7 @@ def test_preferences_recheck_both_sources_of_the_open_project(window, tmp_path, 
     calls = _count_dc_calls(monkeypatch)
     _set_dc_threshold(window, monkeypatch, -3.0)
     _idle(window)
-    assert window._session.tracks[0] is track
+    assert window.state.session.tracks[0] is track
     assert track.corrected_analysis.key != saved_key
     assert track.detector_results["dc_offset"].severity == Severity.CLEAN
     assert track.corrected_analysis.results["dc_offset"].severity == Severity.CLEAN
@@ -185,12 +185,12 @@ def test_preferences_recheck_both_sources_of_the_open_project(window, tmp_path, 
 def test_bypassing_the_last_repair_restores_source_findings_before_publication(window, tmp_path, monkeypatch):
     track = _open(window, monkeypatch, _save_fixture(window, tmp_path / "audio", active=True))
     assert track.corrected_analysis is not None
-    original = build_diagnostic_summary(window._session)
+    original = build_diagnostic_summary(window.state.session)
     with _hold_completed_plan(monkeypatch) as (ready, _):
         _edit(window, track, "dc_remove", False)
         _wait(ready.is_set)
         assert track.corrected_analysis is None
-        assert window._summary["attention"] == original["attention"]
+        assert window.state.summary["attention"] == original["attention"]
     _idle(window)
     assert not track.repair_recipe.active and track.corrected_analysis is None
 
@@ -208,9 +208,9 @@ def test_interrupted_repair_finishes_if_full_reanalysis_fails(window, tmp_path, 
         _wait(ready.is_set)
         assert window._analyze_action.isEnabled()
         window._analyze_action.trigger()
-        _wait(lambda: window._worker is None)
+        _wait(lambda: window.lifecycle_controller.analyze_worker is None)
     _idle(window)
-    assert window._session.tracks[0] is track
+    assert window.state.session.tracks[0] is track
     assert window._save_session_action.isEnabled() and window._prepare_action.isEnabled()
     assert "repair_verification_pending" not in track._cache
     assert track.repair_recipe.active == enable
@@ -238,7 +238,7 @@ def test_file_retry_recovers_only_the_original_audio(window, tmp_path, monkeypat
         track.source_sample_digest = None
     stat = path.stat()
     os.utime(path, ns=(stat.st_atime_ns, previous[1] + 2_000_000_000))
-    window._queue_repair_plan([track])
+    window.lifecycle_controller.queue_repair_plan([track])
     _idle(window)
     assert track._cache.get("repair_error") and track.source_file_signature == previous
     window._file_report.verificationRetryRequested.emit()
@@ -281,15 +281,15 @@ def test_completed_verification_cannot_overwrite_newer_state(window, tmp_path, m
         assert track.audio_data is None
     replacement = None
     deliveries = []
-    refresh = window._update_track_row
+    refresh = window.track_table_controller.update_track_row
 
     def observed(filename):
-        current = window._session.tracks[0]
+        current = window.state.session.tracks[0]
         if current.corrected_analysis is not None:
             deliveries.append(current.corrected_analysis.key)
         return refresh(filename)
 
-    monkeypatch.setattr(window, "_update_track_row", observed)
+    monkeypatch.setattr(window.track_table_controller, "update_track_row", observed)
     with _hold_completed_plan(monkeypatch) as (ready, plans):
         _edit(window, track, "dc_remove", True)
         _wait(ready.is_set)
@@ -299,7 +299,7 @@ def test_completed_verification_cannot_overwrite_newer_state(window, tmp_path, m
             _edit(window, track, "low_cut", True)
         elif change == "replaced track":
             replacement = load_track(track.filepath)
-            window._session.tracks[0] = replacement
+            window.state.session.tracks[0] = replacement
         elif change in buffer_changes:
             signal, _ = sf.read(track.filepath, dtype="float64")
             track.audio_data = signal - np.mean(signal)

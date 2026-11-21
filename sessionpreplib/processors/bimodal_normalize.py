@@ -45,40 +45,28 @@ class BimodalNormalizeProcessor(AudioProcessor):
             pct = config.get("rms_percentile", 95.0)
             self._rms_anchor_label = f"p{pct:g}"
 
+    def _no_gain_result(self, classification: str, error: str | None = None) -> ProcessorResult:
+        return ProcessorResult(
+            processor_id=self.id,
+            gain_db=0.0,
+            classification=classification,
+            method="None",
+            data={"gain_db_individual": 0.0},
+            error=error,
+        )
+
     def process(self, track: TrackContext) -> ProcessorResult:
-        # Read from audio_classifier detector
         crest_result = track.detector_results.get("audio_classifier")
         silence_result = track.detector_results.get("silence")
 
         if silence_result and silence_result.data.get("is_silent"):
-            return ProcessorResult(
-                processor_id=self.id,
-                gain_db=0.0,
-                classification="Silent",
-                method="None",
-                data={"gain_db_individual": 0.0},
-            )
-
+            return self._no_gain_result("Silent")
         if crest_result is None:
-            return ProcessorResult(
-                processor_id=self.id,
-                gain_db=0.0,
-                classification="Unknown",
-                method="None",
-                data={"gain_db_individual": 0.0},
-                error="audio_classifier detector result missing",
-            )
+            return self._no_gain_result("Unknown", error="audio_classifier detector result missing")
 
-        # Check for user override from the GUI dropdown
         override = track.classification_override
         if override == "Skip":
-            return ProcessorResult(
-                processor_id=self.id,
-                gain_db=0.0,
-                classification="Skip",
-                method="None",
-                data={"gain_db_individual": 0.0},
-            )
+            return self._no_gain_result("Skip")
 
         peak_db = crest_result.data["peak_db"]
         rms_anchor_db = crest_result.data["rms_anchor_db"]
@@ -90,7 +78,6 @@ class BimodalNormalizeProcessor(AudioProcessor):
             classification = crest_result.data["classification"]
             is_transient = crest_result.data["is_transient"]
 
-        # Compute both gain paths for transparency
         gain_for_peak = self.target_peak - peak_db
         gain_for_rms = self.target_rms - rms_anchor_db
 
@@ -99,15 +86,14 @@ class BimodalNormalizeProcessor(AudioProcessor):
             method = f"Peak → {self.target_peak:.0f} dB"
         else:
             gain = min(gain_for_rms, gain_for_peak)
-            if gain == gain_for_rms:
-                method = f"RMS → {self.target_rms:.0f} dB"
-            else:
-                method = "Peak Limited"
+            method = f"RMS → {self.target_rms:.0f} dB" if gain == gain_for_rms else "Peak Limited"
 
-        # Use per-track anchor label from detector if available
-        anchor_label = crest_result.data.get(
-            "rms_anchor_label", self._rms_anchor_label)
-
+        anchor_label = crest_result.data.get("rms_anchor_label", self._rms_anchor_label)
+        classifier_metrics = {
+            key: crest_result.data[key]
+            for key in ("crest", "decay_db", "decay_at_floor", "density")
+            if key in crest_result.data
+        }
         return ProcessorResult(
             processor_id=self.id,
             gain_db=float(gain),
@@ -120,9 +106,7 @@ class BimodalNormalizeProcessor(AudioProcessor):
                 "detected_peak_db": peak_db,
                 "detected_rms_db": rms_anchor_db,
                 "rms_anchor_label": anchor_label,
-                "classifier_metrics": {key: crest_result.data[key] for key in
-                                       ("crest", "decay_db", "decay_at_floor", "density")
-                                       if key in crest_result.data},
+                "classifier_metrics": classifier_metrics,
                 "gain_for_peak": float(gain_for_peak),
                 "gain_for_rms": float(gain_for_rms),
             },
@@ -130,27 +114,15 @@ class BimodalNormalizeProcessor(AudioProcessor):
 
     def render_html(self, result: ProcessorResult, track=None, *, verbose: bool = False,
                     compact: bool = False, narrow: bool = False) -> str:
-        """Render the normalization summary line and comparison table.
-
-        The table follows the report's finding-table style. The chosen or
-        limiting measure is named in text (not by colour alone). ``compact``
-        renders percentage columns with the note under the measure name;
-        ``narrow`` stacks one entry per measure under a legend band.
-        """
+        """Render the normalization summary line and comparison table."""
         d = result.data
         cls_text = result.classification or "Unknown"
-        surface, separator = "#2d2d2d", "#3a3a3a"
-        text, metadata, muted = "#dddddd", "#aaaaaa", "#888888"
-
-        # Classification color
-        if "Transient" in cls_text:
-            type_color = "#cc77ff"
-        elif "Sustained" in cls_text:
-            type_color = "#44cccc"
-        else:
-            type_color = muted
-
-        # Skip / Silent / Unknown: single-line, no breakdown
+        metadata, muted = "#aaaaaa", "#888888"
+        type_color = (
+            "#cc77ff" if "Transient" in cls_text
+            else "#44cccc" if "Sustained" in cls_text
+            else muted
+        )
         if cls_text in ("Skip", "Silent", "Unknown"):
             return (
                 f'<div><span style="color:{type_color}; font-weight:bold;">{cls_text}</span>'
@@ -159,156 +131,60 @@ class BimodalNormalizeProcessor(AudioProcessor):
             )
 
         off = self._db_offset
-
-        def fmt_inf(val):
-            return "+&infin;" if val > 0 else "&minus;&infin;"
-
-        def minus(text):
-            return "&minus;" + text[1:] if text.startswith("-") else text
-
-        def fmt_abs(val):
-            if not math.isfinite(val):
-                return fmt_inf(val)
-            return minus(f"{val + off:.1f}")
-
-        def fmt_rel(val):
-            if not math.isfinite(val):
-                return fmt_inf(val)
-            return minus(f"{val:+.1f}")
-
-        det_peak = d.get("detected_peak_db", float("-inf"))
-        det_rms = d.get("detected_rms_db", float("-inf"))
         tgt_peak = d.get("target_peak", self.target_peak)
         tgt_rms = d.get("target_rms", self.target_rms)
         anchor_label = d.get("rms_anchor_label", self._rms_anchor_label)
-        gain_for_peak = d.get("gain_for_peak", 0.0)
-        gain_for_rms = d.get("gain_for_rms", 0.0)
-
         rms_metric = f"RMS ({anchor_label})" if anchor_label else "RMS"
         is_transient = "Transient" in cls_text
         is_peak_limited = result.method == "Peak Limited"
-
         peak_active = is_transient or is_peak_limited
-        rms_active = not is_transient and not is_peak_limited
+        rms_active = not peak_active
 
         if is_peak_limited:
-            method = f"Peak (limited) &rarr; {fmt_abs(tgt_peak)} dBFS"
+            method = f"Peak (limited) &rarr; {_fmt_abs_db(tgt_peak, off)} dBFS"
         elif is_transient:
-            method = f"Peak &rarr; {fmt_abs(tgt_peak)} dBFS"
+            method = f"Peak &rarr; {_fmt_abs_db(tgt_peak, off)} dBFS"
         else:
-            method = f"RMS &rarr; {fmt_abs(tgt_rms)} dBFS"
+            method = f"RMS &rarr; {_fmt_abs_db(tgt_rms, off)} dBFS"
 
-        # --- Summary line ---
         html = (
             f'<div><span style="color:{type_color}; font-weight:bold;">{cls_text}</span>'
             f' &nbsp;&middot;&nbsp; {method}'
-            f' &nbsp;&middot;&nbsp; <b>{minus(f"{result.gain_db:+.1f}")} dB</b></div>'
+            f' &nbsp;&middot;&nbsp; <b>{_html_minus(f"{result.gain_db:+.1f}")} dB</b></div>'
         )
-
-        def note(chosen, label):
-            if not label:
-                return ""
-            style = (f"color:{type_color}; font-weight:600;" if chosen
-                     else f"color:{metadata};")
-            return f'<span style="{style}">{label}</span>'
-
-        pk_note = note(True, "Chosen &middot; limiting" if is_peak_limited
-                       else "Chosen" if is_transient else "")
-        rms_note = (note(False, "Would exceed peak") if is_peak_limited
-                    else note(True, "Chosen") if rms_active else "")
-
-        # --- Comparison table (finding-table style) ---
-        head = (f'padding:4px 12px; background-color:{surface}; color:{text};'
-                f' border-bottom:1px solid {separator};')
-        cell = f'padding:4px 12px; border-bottom:1px solid {separator};'
-
-        def value_cells(values, active, width_attrs):
-            weight = " font-weight:bold;" if active else ""
-            return "".join(
-                f'<td{width} style="{cell} white-space:nowrap; color:{text};{weight}">{value}</td>'
-                for value, width in zip(values, width_attrs))
-
-        peak_values = (f"{fmt_abs(det_peak)} dBFS", f"{fmt_abs(tgt_peak)} dBFS",
-                       f"{fmt_rel(gain_for_peak)} dB")
-        rms_values = (f"{fmt_abs(det_rms)} dBFS", f"{fmt_abs(tgt_rms)} dBFS",
-                      f"{fmt_rel(gain_for_rms)} dB")
-        if narrow:
-            header = (f'<td style="{head}">Measure<br>'
-                      f'Detected &rarr; Target &middot; Gain</td>')
-
-            def row(metric, values, active, row_note):
-                weight = " font-weight:bold;" if active else ""
-                det, tgt, gain = (f"<nobr>{value}</nobr>" for value in values)
-                return (f'<tr><td style="{cell}"><span style="color:{metadata};">{metric}</span>'
-                        + (f"<br>{row_note}" if row_note else "")
-                        + f'<br><span style="color:{text};{weight}">'
-                        f'{det} &rarr; {tgt} &middot; {gain}</span></td></tr>')
-            table_attrs = 'width="100%" '
-        elif compact:
-            widths = (' width="30%"', ' width="24%"', ' width="24%"', ' width="22%"')
-            header = "".join(f'<td{w} style="{head}">{label}</td>' for label, w in
-                             zip(("Measure", "Detected", "Target", "Gain"), widths))
-
-            def row(metric, values, active, row_note):
-                measure = metric + (f"<br>{row_note}" if row_note else "")
-                return (f'<tr><td{widths[0]} style="{cell} color:{metadata};">{measure}</td>'
-                        + value_cells(values, active, widths[1:]) + '</tr>')
-            table_attrs = 'width="100%" '
-        else:
-            widths = (' width="112"', ' width="104"', ' width="104"', ' width="88"', ' width="150"')
-            header = "".join(f'<td{w} style="{head}">{label}</td>' for label, w in
-                             zip(("Measure", "Detected", "Target", "Gain", "&nbsp;"), widths))
-
-            def row(metric, values, active, row_note):
-                return (f'<tr><td{widths[0]} style="{cell} color:{metadata};">{metric}</td>'
-                        + value_cells(values, active, widths[1:4])
-                        + f'<td{widths[4]} style="{cell} white-space:nowrap;">{row_note or "&nbsp;"}</td></tr>')
-            table_attrs = ""
-
-        html += (
-            f'<table {table_attrs}cellpadding="0" cellspacing="0"'
-            f' style="margin-top:8px; border-collapse:collapse;">'
-            f'<tr>{header}</tr>'
-            + row("Peak", peak_values, peak_active, pk_note)
-            + row(rms_metric, rms_values, rms_active, rms_note)
-            + '</table>'
+        pk_note = _note_html(
+            True,
+            "Chosen &middot; limiting" if is_peak_limited else "Chosen" if is_transient else "",
+            type_color, metadata,
         )
-
-        # Fader rebalance note
+        rms_note = (
+            _note_html(False, "Would exceed peak", type_color, metadata) if is_peak_limited
+            else _note_html(True, "Chosen", type_color, metadata) if rms_active else ""
+        )
+        peak_values = (
+            f"{_fmt_abs_db(d.get('detected_peak_db', float('-inf')), off)} dBFS",
+            f"{_fmt_abs_db(tgt_peak, off)} dBFS",
+            f"{_fmt_rel_db(d.get('gain_for_peak', 0.0))} dB",
+        )
+        rms_values = (
+            f"{_fmt_abs_db(d.get('detected_rms_db', float('-inf')), off)} dBFS",
+            f"{_fmt_abs_db(tgt_rms, off)} dBFS",
+            f"{_fmt_rel_db(d.get('gain_for_rms', 0.0))} dB",
+        )
+        html += _render_comparison_table(
+            peak_values, rms_values, peak_active, rms_active,
+            pk_note, rms_note, rms_metric, compact=compact, narrow=narrow,
+        )
         rebalance = d.get("fader_rebalance_shift", 0.0)
         if rebalance != 0.0:
             fader_off = d.get("fader_offset", 0.0)
             html += (
                 f'<div style="margin-top:8px; color:{metadata};">'
-                f'Fader rebalanced: {fmt_rel(-rebalance)} dB shift'
-                f' &rarr; fader offset {minus(f"{fader_off:+.1f}")} dB'
-                f'</div>'
+                f'Fader rebalanced: {_fmt_rel_db(-rebalance)} dB shift'
+                f' &rarr; fader offset {_html_minus(f"{fader_off:+.1f}")} dB</div>'
             )
-
-        # Verbose: append classification analysis metrics
         if verbose:
-            metrics = d.get("classifier_metrics")
-            if metrics is None and track is not None:
-                # Older plans kept the classifier in detector evidence only.
-                cr = track.detector_results.get("audio_classifier")
-                if track.repair_recipe.active:
-                    checked = track.corrected_analysis
-                    cr = (checked.results.get("audio_classifier") or checked.support_results.get("audio_classifier")
-                          if checked else None)
-                metrics = cr.data if cr and not cr.error else {}
-            if metrics and {"crest", "decay_db", "density"} <= metrics.keys():
-                crest = metrics["crest"]
-                decay = metrics["decay_db"]
-                decay_prefix = "≥" if metrics.get("decay_at_floor") else ""
-                density = metrics["density"]
-                html += (
-                    f'<div style="margin-top:8px; color:{metadata};">'
-                    f'Analysis: Crest {crest:.1f} dB'
-                    f' &middot; Decay {decay_prefix}{decay:.1f} dB'
-                    f' &middot; Density {density:.0%}'
-                    f'</div>'
-                )
-
+            html += _render_verbose_metrics(d, track, metadata)
         return html
 
     def apply(self, track: TrackContext, result: ProcessorResult) -> np.ndarray:
@@ -316,3 +192,137 @@ class BimodalNormalizeProcessor(AudioProcessor):
             return track.audio_data
         linear_gain = db_to_linear(float(result.gain_db))
         return track.audio_data * linear_gain
+
+
+def _fmt_inf(val: float) -> str:
+    return "+&infin;" if val > 0 else "&minus;&infin;"
+
+
+def _html_minus(text: str) -> str:
+    return "&minus;" + text[1:] if text.startswith("-") else text
+
+
+def _fmt_abs_db(val: float, offset: float) -> str:
+    if not math.isfinite(val):
+        return _fmt_inf(val)
+    return _html_minus(f"{val + offset:.1f}")
+
+
+def _fmt_rel_db(val: float) -> str:
+    if not math.isfinite(val):
+        return _fmt_inf(val)
+    return _html_minus(f"{val:+.1f}")
+
+
+def _note_html(chosen: bool, label: str, type_color: str, metadata: str) -> str:
+    if not label:
+        return ""
+    style = f"color:{type_color}; font-weight:600;" if chosen else f"color:{metadata};"
+    return f'<span style="{style}">{label}</span>'
+
+
+def _render_narrow_rows(rows: list[tuple[str, tuple[str, str, str], bool, str]],
+                        head: str, cell: str, text: str, metadata: str) -> tuple[str, str, str]:
+    header = f'<td style="{head}">Measure<br>Detected &rarr; Target &middot; Gain</td>'
+    body = ""
+    for metric, values, active, row_note in rows:
+        weight = " font-weight:bold;" if active else ""
+        det, tgt, gain = (f"<nobr>{value}</nobr>" for value in values)
+        body += (
+            f'<tr><td style="{cell}"><span style="color:{metadata};">{metric}</span>'
+            + (f"<br>{row_note}" if row_note else "")
+            + f'<br><span style="color:{text};{weight}">'
+            f'{det} &rarr; {tgt} &middot; {gain}</span></td></tr>'
+        )
+    return 'width="100%" ', header, body
+
+
+def _render_comparison_table(
+    peak_values: tuple[str, str, str],
+    rms_values: tuple[str, str, str],
+    peak_active: bool,
+    rms_active: bool,
+    pk_note: str,
+    rms_note: str,
+    rms_metric: str,
+    *,
+    compact: bool,
+    narrow: bool,
+) -> str:
+    surface, separator = "#2d2d2d", "#3a3a3a"
+    text, metadata = "#dddddd", "#aaaaaa"
+    head = (
+        f'padding:4px 12px; background-color:{surface}; color:{text};'
+        f' border-bottom:1px solid {separator};'
+    )
+    cell = f'padding:4px 12px; border-bottom:1px solid {separator};'
+    rows = [("Peak", peak_values, peak_active, pk_note), (rms_metric, rms_values, rms_active, rms_note)]
+
+    def value_cells(values, active, width_attrs):
+        weight = " font-weight:bold;" if active else ""
+        return "".join(
+            f'<td{width} style="{cell} white-space:nowrap; color:{text};{weight}">{value}</td>'
+            for value, width in zip(values, width_attrs)
+        )
+
+    if narrow:
+        table_attrs, header, body = _render_narrow_rows(rows, head, cell, text, metadata)
+    elif compact:
+        widths = (' width="30%"', ' width="24%"', ' width="24%"', ' width="22%"')
+        header = "".join(
+            f'<td{w} style="{head}">{label}</td>'
+            for label, w in zip(("Measure", "Detected", "Target", "Gain"), widths)
+        )
+        body = "".join(
+            f'<tr><td{widths[0]} style="{cell} color:{metadata};">'
+            f'{metric}{f"<br>{row_note}" if row_note else ""}</td>'
+            + value_cells(values, active, widths[1:]) + '</tr>'
+            for metric, values, active, row_note in rows
+        )
+        table_attrs = 'width="100%" '
+    else:
+        widths = (' width="112"', ' width="104"', ' width="104"', ' width="88"', ' width="150"')
+        header = "".join(
+            f'<td{w} style="{head}">{label}</td>'
+            for label, w in zip(("Measure", "Detected", "Target", "Gain", "&nbsp;"), widths)
+        )
+        body = "".join(
+            f'<tr><td{widths[0]} style="{cell} color:{metadata};">{metric}</td>'
+            + value_cells(values, active, widths[1:4])
+            + f'<td{widths[4]} style="{cell} white-space:nowrap;">{row_note or "&nbsp;"}</td></tr>'
+            for metric, values, active, row_note in rows
+        )
+        table_attrs = ""
+
+    return (
+        f'<table {table_attrs}cellpadding="0" cellspacing="0"'
+        f' style="margin-top:8px; border-collapse:collapse;">'
+        f'<tr>{header}</tr>{body}</table>'
+    )
+
+
+def _render_verbose_metrics(d: dict, track, metadata: str) -> str:
+    metrics = d.get("classifier_metrics")
+    if metrics is None and track is not None:
+        cr = track.detector_results.get("audio_classifier")
+        if track.repair_recipe.active:
+            checked = track.corrected_analysis
+            cr = (
+                checked.results.get("audio_classifier")
+                or checked.support_results.get("audio_classifier")
+                if checked else None
+            )
+        metrics = cr.data if cr and not cr.error else {}
+    if not (metrics and {"crest", "decay_db", "density"} <= metrics.keys()):
+        return ""
+    crest = metrics["crest"]
+    decay = metrics["decay_db"]
+    decay_prefix = "≥" if metrics.get("decay_at_floor") else ""
+    density = metrics["density"]
+    return (
+        f'<div style="margin-top:8px; color:{metadata};">'
+        f'Analysis: Crest {crest:.1f} dB'
+        f' &middot; Decay {decay_prefix}{decay:.1f} dB'
+        f' &middot; Density {density:.0%}'
+        f'</div>'
+    )

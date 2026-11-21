@@ -48,40 +48,6 @@
     GUI panel, DAWproject/PTSL/JSON export.
     ```
 
-### Unit Tests — Detectors
-
-  - priority: high
-    ```md
-    One test file per detector in tests/test_detectors/.
-    Covers: silence, clipping, dc_offset, stereo_compat, dual_mono,
-    one_sided_silence, subsonic, audio_classifier, tail_exceedance,
-    format_consistency, length_consistency.
-    ```
-
-### Unit Tests — Processors
-
-  - priority: high
-    ```md
-    tests/test_processors/test_bimodal_normalize.py
-    Test gain decisions for transient, sustained, silent, and edge cases.
-    ```
-
-### Pipeline Integration Tests
-
-  - priority: high
-    ```md
-    tests/test_pipeline.py: analyze → plan → prepare round-trip.
-    Covers: topological sort, group levelling, fader offsets, staleness.
-    ```
-
-### Test Factories
-
-  - priority: high
-    ```md
-    tests/factories.py: make_audio(), make_track(), make_session().
-    Deterministic, file-I/O-free synthetic test objects for use across all test modules.
-    ```
-
 ### Undo Execution
 
   - priority: high
@@ -191,14 +157,6 @@
     Ideas: cache shared FFT/STFT data, downsample before classification, vectorize hot loops.
     ```
 
-### Optional Auto-HPF on Processing
-
-  - priority: medium
-    ```md
-    --hpf 30 flag to clean subsonic garbage on processing.
-    Opt-in only, never default.
-    ```
-
 ### Automatic Sample Rate Conversion
 
   - priority: medium
@@ -288,14 +246,6 @@
     Categorization: ATTENTION (informational)
     ```
 
-### DC Offset Removal
-
-  - priority: high
-    ```md
-    Why detect it if we won't fix it?
-    --fix_dc flag or automatic in execute mode.
-    ```
-
 ## In Development
 
 ## Done
@@ -303,4 +253,8 @@
 ### InnoSetup Installer
 
   - defaultExpanded: false
+
+### Corrective Processing (DC Removal, Subsonic Low Cut, Ultrasonic Filter)
+
+### Built-in Detector, Processor, Pipeline & Queue Unit Tests
 

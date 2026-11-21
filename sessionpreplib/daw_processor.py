@@ -109,6 +109,8 @@ class DawProcessor(ABC):
     id: str = ""
     name: str = ""
     fader_ceiling_db: float = 12.0
+    output_file_filter: str = ""
+    output_dialog_title: str = ""
 
     @classmethod
     def config_params(cls) -> list[ParamSpec]:
@@ -189,27 +191,12 @@ class DawProcessor(ABC):
         internal cache. Processors without a cache can ignore it.
         """
 
-    def resolve_output_path(
-        self,
-        session: SessionContext,
-        parent_widget=None,
-    ) -> str | None:
-        """Resolve the output path for a transfer, optionally prompting the user.
+    def default_output_path(self, session: SessionContext) -> str:
+        """Compute the default destination file path for file-based DAW exports.
 
-        Called by the GUI before starting a transfer worker.
-
-        Return values
-        -------------
-        ``None``
-            User cancelled — the GUI should abort.
-        ``""``
-            No file path needed (e.g. gRPC-based processors like Pro Tools).
-        non-empty str
-            Absolute path to write the output file to.
-
-        The default implementation returns ``""`` (no path, no dialog).
-        File-based processors (e.g. DAWproject) override this to compute a
-        default path and show a save-file dialog.
+        Returns ``""`` when the processor does not write a standalone output file
+        (e.g. gRPC-based processors like Pro Tools). File-based processors
+        (e.g. DAWproject) override this to return a pure, Qt-free default path.
         """
         return ""
 

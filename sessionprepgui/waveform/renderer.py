@@ -249,96 +249,98 @@ class WaveformRenderer:
                     maxs[i] = chunk.max()
         return mins, maxs
 
-    def _build_peaks(self, ctx: WaveformRenderCtx):
-        """Downsample audio to peak envelope, with incremental scroll updates."""
-        channels = ctx.channels
-        width = ctx.draw_w
-        if width <= 0:
+    def _try_build_peaks_from_cache(self, ctx: WaveformRenderCtx) -> bool:
+        if self._peak_data is None or not self._peak_data.levels:
+            return False
+        vs, ve, width = ctx.view_start, ctx.view_end, ctx.draw_w
+        if ve - vs <= 0:
             self._peaks_cache = []
-            return
-        # Fast path: use pre-computed peak mipmap if available
-        if self._peak_data is not None and self._peak_data.levels:
-            vs, ve = ctx.view_start, ctx.view_end
-            if ve - vs <= 0:
-                self._peaks_cache = []
-                return
-            if self._peak_data.channels != ctx.num_channels:
-                log.warning(
-                    "Ignoring waveform peak cache with %d channels for %d-channel view",
-                    self._peak_data.channels, ctx.num_channels,
-                )
-            else:
-                finest_spb = self._peak_data.levels[0].samples_per_bin
-                samples_per_pixel = (ve - vs) / width
-                has_raw_audio = bool(channels and all(len(ch) > 0 for ch in channels))
-                if not (has_raw_audio and samples_per_pixel < finest_spb):
-                    cache_key = (width, ctx.view_start, ctx.view_end)
-                    if (self._cached_view == cache_key
-                            and len(self._peaks_cache) == ctx.num_channels):
-                        return
-                    peak_cache = query_peaks_fast(self._peak_data, vs, ve, width)
-                    if len(peak_cache) == ctx.num_channels:
-                        self._peaks_cache = peak_cache
-                        self._cached_view = cache_key
-                        return
-                    log.warning(
-                        "Ignoring waveform peak cache result with %d channels for %d-channel view",
-                        len(peak_cache), ctx.num_channels,
-                    )
-        # Fallback: raw sample downsampling
-        if not channels:
-            self._peaks_cache = []
-            return
-        cache_key = (width, ctx.view_start, ctx.view_end)
-        if self._cached_view == cache_key and self._peaks_cache:
-            return
-        vs, ve = ctx.view_start, ctx.view_end
-        view_len = ve - vs
-        if view_len <= 0:
-            self._peaks_cache = []
-            return
+            return True
+        if self._peak_data.channels != ctx.num_channels:
+            log.warning(
+                "Ignoring waveform peak cache with %d channels for %d-channel view",
+                self._peak_data.channels,
+                ctx.num_channels,
+            )
+            return False
+        finest_spb = self._peak_data.levels[0].samples_per_bin
+        has_raw_audio = bool(ctx.channels and all(len(ch) > 0 for ch in ctx.channels))
+        if has_raw_audio and (ve - vs) / width < finest_spb:
+            return False
+        cache_key = (width, vs, ve)
+        if self._cached_view == cache_key and len(self._peaks_cache) == ctx.num_channels:
+            return True
+        peak_cache = query_peaks_fast(self._peak_data, vs, ve, width)
+        if len(peak_cache) == ctx.num_channels:
+            self._peaks_cache = peak_cache
+            self._cached_view = cache_key
+            return True
+        log.warning(
+            "Ignoring waveform peak cache result with %d channels for %d-channel view",
+            len(peak_cache),
+            ctx.num_channels,
+        )
+        return False
+
+    def _try_incremental_peaks_shift(
+        self, channels, vs: int, ve: int, width: int, view_len: int
+    ) -> bool:
         old_w, old_vs, old_ve = self._cached_view
-        can_inc = (
+        if not (
             self._peaks_cache
             and old_w == width
             and (old_ve - old_vs) == view_len
             and vs != old_vs
             and len(self._peaks_cache) == len(channels)
-        )
-        if can_inc:
-            shift_samples = vs - old_vs
-            shift_bins = int(round(shift_samples * width / view_len))
-            if 0 < abs(shift_bins) < width:
-                new_cache = []
-                for ch_idx, ch_data in enumerate(channels):
-                    old_mins, old_maxs = self._peaks_cache[ch_idx]
-                    mins = np.empty(width, dtype=np.float64)
-                    maxs = np.empty(width, dtype=np.float64)
-                    if shift_bins > 0:
-                        keep = width - shift_bins
-                        mins[:keep] = old_mins[shift_bins:]
-                        maxs[:keep] = old_maxs[shift_bins:]
-                        new_vs = vs + keep * view_len // width
-                        nm, nx = self._peaks_for_view(ch_data, new_vs, ve, width - keep)
-                        mins[keep:] = nm
-                        maxs[keep:] = nx
-                    else:
-                        sb = -shift_bins
-                        keep = width - sb
-                        mins[sb:] = old_mins[:keep]
-                        maxs[sb:] = old_maxs[:keep]
-                        new_ve = vs + sb * view_len // width
-                        nm, nx = self._peaks_for_view(ch_data, vs, new_ve, sb)
-                        mins[:sb] = nm
-                        maxs[:sb] = nx
-                    new_cache.append((mins, maxs))
-                self._peaks_cache = new_cache
-                self._cached_view = cache_key
-                return
-        self._peaks_cache = []
-        for ch_data in channels:
-            mins, maxs = self._peaks_for_view(ch_data, vs, ve, width)
-            self._peaks_cache.append((mins, maxs))
+        ):
+            return False
+        shift_bins = int(round((vs - old_vs) * width / view_len))
+        if not (0 < abs(shift_bins) < width):
+            return False
+        new_cache = []
+        for ch_idx, ch_data in enumerate(channels):
+            old_mins, old_maxs = self._peaks_cache[ch_idx]
+            mins = np.empty(width, dtype=np.float64)
+            maxs = np.empty(width, dtype=np.float64)
+            if shift_bins > 0:
+                keep = width - shift_bins
+                mins[:keep], maxs[:keep] = old_mins[shift_bins:], old_maxs[shift_bins:]
+                new_vs = vs + keep * view_len // width
+                mins[keep:], maxs[keep:] = self._peaks_for_view(ch_data, new_vs, ve, width - keep)
+            else:
+                sb = -shift_bins
+                keep = width - sb
+                mins[sb:], maxs[sb:] = old_mins[:keep], old_maxs[:keep]
+                new_ve = vs + sb * view_len // width
+                mins[:sb], maxs[:sb] = self._peaks_for_view(ch_data, vs, new_ve, sb)
+            new_cache.append((mins, maxs))
+        self._peaks_cache = new_cache
+        self._cached_view = (width, vs, ve)
+        return True
+
+    def _build_peaks(self, ctx: WaveformRenderCtx):
+        """Downsample audio to peak envelope, with incremental scroll updates."""
+        width = ctx.draw_w
+        if width <= 0:
+            self._peaks_cache = []
+            return
+        if self._try_build_peaks_from_cache(ctx):
+            return
+        channels = ctx.channels
+        if not channels:
+            self._peaks_cache = []
+            return
+        vs, ve = ctx.view_start, ctx.view_end
+        cache_key = (width, vs, ve)
+        if self._cached_view == cache_key and self._peaks_cache:
+            return
+        view_len = ve - vs
+        if view_len <= 0:
+            self._peaks_cache = []
+            return
+        if self._try_incremental_peaks_shift(channels, vs, ve, width, view_len):
+            return
+        self._peaks_cache = [self._peaks_for_view(ch_data, vs, ve, width) for ch_data in channels]
         self._cached_view = cache_key
 
     def _draw_waveform_channels(self, painter: QPainter,

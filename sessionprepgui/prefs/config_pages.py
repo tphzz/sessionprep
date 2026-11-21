@@ -6,10 +6,11 @@ Depends on sessionpreplib.  Not portable to other apps as-is.
 from __future__ import annotations
 
 import re
-from typing import Any, Callable
+from typing import Any
+from collections.abc import Callable
 
-from PySide6.QtCore import QSize, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QIcon
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -33,7 +34,6 @@ from ..widgets import ColorPickerButton
 from .param_form import (
     SETTINGS_PAGE_MARGIN,
     _build_param_page,
-    _color_swatch_icon,
     _read_widget,
     _set_widget_value,
 )
@@ -622,86 +622,49 @@ def _config_section_values(preset: dict[str, Any], section: str) -> dict[str, An
     return values.get(component, {}) if component else values
 
 
-def build_config_pages(
-    tree,
-    preset: dict[str, Any],
-    widgets_dict: dict,
-    register_page: Callable[[QTreeWidgetItem, QWidget, str | None], None],
-    *,
-    on_reset: Callable[[str, QWidget], None] | None = None,
-) -> dict[str, QWidget]:
-    """Build the common config tree pages (Analysis, Detectors, Processors, DAW Processors).
+def _make_section_placeholder(message: str) -> QWidget:
+    placeholder = QWidget()
+    layout = QVBoxLayout(placeholder)
+    layout.setContentsMargins(*(SETTINGS_PAGE_MARGIN,) * 4)
+    layout.addWidget(QLabel(message))
+    layout.addStretch()
+    return placeholder
 
-    Returns a dict mapping processor IDs to their custom widgets (e.g. dawproject, protools).
-    """
-    from sessionpreplib.config import ANALYSIS_PARAMS, PRESENTATION_PARAMS, REPAIR_PARAMS
-    from sessionpreplib.detectors import default_detectors
+
+def _register_processor_pages(tree, build_page, register_page, repair_params) -> None:
     from sessionpreplib.processors import default_processors
-    from sessionpreplib.daw_processors import default_daw_processors
-
-    daw_custom_widgets: dict[str, QWidget] = {}
-
-    def build_page(section: str, params: list[Any]) -> QWidget:
-        prefix = "presentation" if section == "_presentation" else section
-
-        def reset(key: str, widget: QWidget) -> None:
-            on_reset(f"{prefix}.{key}", widget)
-
-        page, widgets_dict[section] = _build_param_page(
-            params, _config_section_values(preset, section),
-            on_reset=reset if on_reset is not None else None,
-        )
-        return page
-
-    item = QTreeWidgetItem(tree, ["Analysis"])
-    item.setFont(0, QFont("", -1, QFont.Bold))
-    pg = build_page("analysis", ANALYSIS_PARAMS)
-    register_page(item, pg, "analysis")
-
-    det_parent = QTreeWidgetItem(tree, ["Detectors"])
-    det_parent.setFont(0, QFont("", -1, QFont.Bold))
-    pg = build_page("_presentation", PRESENTATION_PARAMS)
-    register_page(det_parent, pg, "_presentation")
-
-    for det in default_detectors():
-        params = det.config_params()
-        if not params:
-            continue
-        child = QTreeWidgetItem(det_parent, [det.name])
-        pg = build_page(f"detectors.{det.id}", params)
-        register_page(child, pg, f"detectors.{det.id}")
 
     proc_parent = QTreeWidgetItem(tree, ["Processors"])
     proc_parent.setFont(0, QFont("", -1, QFont.Bold))
-    placeholder = QWidget()
-    pl = QVBoxLayout(placeholder)
-    pl.setContentsMargins(*(SETTINGS_PAGE_MARGIN,) * 4)
-    pl.addWidget(QLabel("Select a processor from the tree to configure."))
-    pl.addStretch()
-    register_page(proc_parent, placeholder, "_processors")
-
+    register_page(
+        proc_parent,
+        _make_section_placeholder("Select a processor from the tree to configure."),
+        "_processors",
+    )
     for proc in default_processors():
         params = proc.config_params()
         if not params:
             continue
         child = QTreeWidgetItem(proc_parent, [proc.name])
-        pg = build_page(f"processors.{proc.id}", params)
-        register_page(child, pg, f"processors.{proc.id}")
+        register_page(child, build_page(f"processors.{proc.id}", params), f"processors.{proc.id}")
 
     repair_item = QTreeWidgetItem(proc_parent, ["Corrective processing"])
-    repairs = build_page("processors.corrective", REPAIR_PARAMS)
+    repairs = build_page("processors.corrective", repair_params)
     repairs.layout().insertWidget(0, QLabel("<b>Automatically select matching repairs</b>"))
     register_page(repair_item, repairs, "processors.corrective")
 
+
+def _register_daw_pages(tree, preset: dict[str, Any], build_page, register_page) -> dict[str, QWidget]:
+    from sessionpreplib.daw_processors import default_daw_processors
+
+    daw_custom_widgets: dict[str, QWidget] = {}
     daw_parent = QTreeWidgetItem(tree, ["DAW Processors"])
     daw_parent.setFont(0, QFont("", -1, QFont.Bold))
-    placeholder2 = QWidget()
-    pl2 = QVBoxLayout(placeholder2)
-    pl2.setContentsMargins(*(SETTINGS_PAGE_MARGIN,) * 4)
-    pl2.addWidget(QLabel("Select a DAW processor from the tree to configure."))
-    pl2.addStretch()
-    register_page(daw_parent, placeholder2, "_daw_processors")
-
+    register_page(
+        daw_parent,
+        _make_section_placeholder("Select a DAW processor from the tree to configure."),
+        "_daw_processors",
+    )
     dp_sections = preset.get("daw_processors", {})
     for dp in default_daw_processors():
         params = dp.config_params()
@@ -719,10 +682,51 @@ def build_config_pages(
             pt_widget.set_templates(dp_sections.get(dp.id, {}).get("protools_templates", []))
             daw_custom_widgets["protools"] = pt_widget
             pg.layout().insertWidget(3, pt_widget)
-
         register_page(child, pg, f"daw_processors.{dp.id}")
-
     return daw_custom_widgets
+
+
+def build_config_pages(
+    tree,
+    preset: dict[str, Any],
+    widgets_dict: dict,
+    register_page: Callable[[QTreeWidgetItem, QWidget, str | None], None],
+    *,
+    on_reset: Callable[[str, QWidget], None] | None = None,
+) -> dict[str, QWidget]:
+    """Build the common config tree pages (Analysis, Detectors, Processors, DAW Processors)."""
+    from sessionpreplib.config import ANALYSIS_PARAMS, PRESENTATION_PARAMS, REPAIR_PARAMS
+    from sessionpreplib.detectors import default_detectors
+
+    def build_page(section: str, params: list[Any]) -> QWidget:
+        prefix = "presentation" if section == "_presentation" else section
+
+        def reset(key: str, widget: QWidget) -> None:
+            on_reset(f"{prefix}.{key}", widget)
+
+        page, widgets_dict[section] = _build_param_page(
+            params,
+            _config_section_values(preset, section),
+            on_reset=reset if on_reset is not None else None,
+        )
+        return page
+
+    item = QTreeWidgetItem(tree, ["Analysis"])
+    item.setFont(0, QFont("", -1, QFont.Bold))
+    register_page(item, build_page("analysis", ANALYSIS_PARAMS), "analysis")
+
+    det_parent = QTreeWidgetItem(tree, ["Detectors"])
+    det_parent.setFont(0, QFont("", -1, QFont.Bold))
+    register_page(det_parent, build_page("_presentation", PRESENTATION_PARAMS), "_presentation")
+    for det in default_detectors():
+        params = det.config_params()
+        if not params:
+            continue
+        child = QTreeWidgetItem(det_parent, [det.name])
+        register_page(child, build_page(f"detectors.{det.id}", params), f"detectors.{det.id}")
+
+    _register_processor_pages(tree, build_page, register_page, REPAIR_PARAMS)
+    return _register_daw_pages(tree, preset, build_page, register_page)
 
 
 def load_config_widgets(

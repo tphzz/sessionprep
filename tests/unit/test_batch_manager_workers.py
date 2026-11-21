@@ -363,7 +363,7 @@ def _quit_during_interactive_check():
         patch.setattr(QMessageBox, "warning", lambda *args: prompts.append(args[1]))
         window = SessionPrepWindow()
         window.show()
-        window._run_daw_check_then(Adapter(), lambda: created.append(True))
+        window.daw_controller.run_daw_check_then(Adapter(), lambda: created.append(True))
         _wait_until(lambda: gate.delivered)
         try:
             accepted = window.close()

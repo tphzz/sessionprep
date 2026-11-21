@@ -3,7 +3,7 @@ name = "sessionprep"
 dynamic = ["version"]
 description = "Batch audio analyzer and normalizer for mix session preparation"
 readme = "README.md"
-license = "GPL-3.0-or-later"
+license = "LGPL-3.0-or-later"
 requires-python = ">=3.13,<3.14"
 
 dependencies = [
@@ -35,6 +35,47 @@ sessionprepgui = ["res/*"]
 testpaths = ["tests"]
 pythonpath = ["."]
 
+[tool.ruff]
+target-version = "py313"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "UP"]
+ignore = [
+    "E501",   # line length handled conservatively
+    "B905",   # zip() strict= not mandatory everywhere in legacy code
+]
+
+[tool.mypy]
+python_version = "3.13"
+ignore_missing_imports = true
+follow_imports = "silent"
+warn_unused_ignores = true
+files = [
+    "sessionpreplib/paths.py",
+    "sessionpreplib/models.py",
+    "sessionpreplib/gain_staging.py",
+    "sessionpreplib/topology.py",
+    "sessionpreplib/file_io.py",
+    "sessionpreplib/layout_files.py",
+    "sessionpreplib/repairs.py",
+    "sessionpreplib/config.py",
+    "sessionpreplib/summary.py",
+    "sessionprepgui/state.py",
+    "sessionprepgui/shell.py",
+    "sessionprepgui/topology/page.py",
+    "sessionprepgui/topology/controller.py",
+    "sessionprepgui/daw/page.py",
+    "sessionprepgui/daw/controller.py",
+    "sessionprepgui/detail/controller.py",
+    "sessionprepgui/detail/repair_preview.py",
+    "sessionprepgui/tracks/table_controller.py",
+    "sessionprepgui/tracks/groups_tab.py",
+    "sessionprepgui/tracks/groups_controller.py",
+    "sessionprepgui/analysis/config_controller.py",
+    "sessionprepgui/analysis/lifecycle_controller.py",
+]
+
 [project.optional-dependencies]
 cli = ["rich>=13.0"]
 gui = [
@@ -57,4 +98,6 @@ dev = [
     "patchelf>=0.17.2.4; sys_platform != 'win32'",
     "pylint>=4.0.5",
     "pyyaml>=6.0",
+    "ruff>=0.17.6",
+    "mypy>=2.4.1",
 ]

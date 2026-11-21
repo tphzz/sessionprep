@@ -33,14 +33,15 @@ class _FakeApplyWorker(QThread):
 
 @pytest.fixture
 def window(qapp, monkeypatch):
+    from sessionprepgui.daw import DawTransferController
     monkeypatch.setattr(mainwindow, "load_config", settings.build_defaults)
     monkeypatch.setattr(mainwindow, "save_config", lambda *args: None)
-    monkeypatch.setattr(mainwindow.SessionPrepWindow, "_configure_daw_processors",
-                        lambda self: setattr(self, "_daw_processors", []))
+    monkeypatch.setattr(DawTransferController, "configure_daw_processors",
+                        lambda self: setattr(self._state, "daw_processors", []))
     monkeypatch.setattr(worker_module, "TopologyApplyWorker", _FakeApplyWorker)
     owner = mainwindow.SessionPrepWindow()
-    owner._session = SessionContext([], {})
-    owner._source_dir = "unused-source"
+    owner.state.session = SessionContext([], {})
+    owner.state.source_dir = "unused-source"
     yield owner
     dispose_window(owner)
 
@@ -48,17 +49,17 @@ def window(qapp, monkeypatch):
 def test_apply_keeps_the_toolbar_summary_and_uses_the_progress_strip(qapp, window, monkeypatch):
     started = []
     monkeypatch.setattr(window, "_progress_start", lambda message: started.append(message))
-    window._topo_status_label.setText("6 input → 6 output tracks")
-    window._on_topo_apply()
-    assert window._topo_status_label.text() == "6 input → 6 output tracks"
+    window.topology_controller.page.status_label.setText("6 input → 6 output tracks")
+    window.topology_controller.apply_topology()
+    assert window.topology_controller.page.status_label.text() == "6 input → 6 output tracks"
     assert started == ["Applying topology…"]
 
 
 def test_failed_apply_leaves_no_stale_toolbar_message(qapp, window, monkeypatch):
     monkeypatch.setattr(window, "_progress_start", lambda message: None)
     monkeypatch.setattr(window, "_progress_fail", lambda message: None)
-    window._topo_status_label.setText("6 input → 6 output tracks")
-    window._on_topo_apply()
-    worker = window._topo_apply_worker
+    window.topology_controller.page.status_label.setText("6 input → 6 output tracks")
+    window.topology_controller.apply_topology()
+    worker = window.topology_controller.apply_worker
     worker.error.emit(worker, "disk full")
-    assert window._topo_status_label.text() == "6 input → 6 output tracks"
+    assert window.topology_controller.page.status_label.text() == "6 input → 6 output tracks"

@@ -34,14 +34,14 @@ def qapp():
 
 def _window(qapp):
     window = SessionPrepWindow()
-    window._session = SessionContext([], {})
+    window.state.session = SessionContext([], {})
     window._detail_tabs.setTabEnabled(_TAB_GROUPS, True)
     window._detail_tabs.setTabEnabled(_TAB_SESSION, True)
-    window._session_groups = copy.deepcopy(
-        window._selected_group_preset_groups())
-    window._populate_groups_tab()
-    window._init_session_config()
-    window._refresh_phase2_dirty_indicators()
+    window.state.session_groups = copy.deepcopy(
+        window.groups_controller.selected_group_preset_groups())
+    window.groups_controller.populate_groups_tab()
+    window.config_controller.init_session_config()
+    window.config_controller.refresh_phase2_dirty_indicators()
     return window
 
 
@@ -80,12 +80,12 @@ def _set_different_value(widget):
 
 
 def _first_config_widget(window: SessionPrepWindow, section: str):
-    return window._session_widgets[section][0][1]
+    return window.config_controller.session_widgets[section][0][1]
 
 
 def _first_config_section(window: SessionPrepWindow, prefix: str) -> str:
     return next(
-        key for key in window._session_widgets if key.startswith(prefix))
+        key for key in window.config_controller.session_widgets if key.startswith(prefix))
 
 
 def test_phase2_dirty_indicators_are_clean_on_preset_values(qapp):
@@ -95,7 +95,7 @@ def test_phase2_dirty_indicators_are_clean_on_preset_values(qapp):
         assert not is_tab_marked(window._detail_tabs, _TAB_GROUPS)
         assert window._detail_tabs.tabText(_TAB_SESSION) == "Config"
         assert not is_tab_marked(window._detail_tabs, _TAB_SESSION)
-        for item in window._session_dirty_items.values():
+        for item in window.config_controller.session_dirty_items.values():
             assert item.icon(1).isNull()
     finally:
         dispose_window(window)
@@ -123,25 +123,25 @@ def test_default_group_preset_uses_existing_color_names(qapp):
 def test_legacy_group_color_names_resolve_to_current_palette(qapp):
     window = SessionPrepWindow()
     try:
-        window._session = SessionContext([], {})
+        window.state.session = SessionContext([], {})
         window._detail_tabs.setTabEnabled(_TAB_GROUPS, True)
-        window._session_groups = [
+        window.state.session_groups = [
             {"name": "Loops", "color": "Cafe Royale Light"},
             {"name": "A.Gtr", "color": "Lima Dark"},
             {"name": "VOX", "color": "Dodger Blue Dark"},
             {"name": "Unknown", "color": "Not A Color"},
         ]
-        window._populate_groups_tab()
+        window.groups_controller.populate_groups_tab()
 
-        assert window._groups_tab_table.cellWidget(0, 1).currentColor() == (
+        assert window.groups_controller.page.table.cellWidget(0, 1).currentColor() == (
             "Cafe Royale")
-        assert window._groups_tab_table.cellWidget(1, 1).currentColor() == (
+        assert window.groups_controller.page.table.cellWidget(1, 1).currentColor() == (
             "Lima")
-        assert window._groups_tab_table.cellWidget(2, 1).currentColor() == (
+        assert window.groups_controller.page.table.cellWidget(2, 1).currentColor() == (
             "Dodger Blue")
-        assert window._groups_tab_table.cellWidget(3, 1).currentColor() == (
-            window._config["colors"][0]["name"])
-        assert set(window._group_color_map()) == {
+        assert window.groups_controller.page.table.cellWidget(3, 1).currentColor() == (
+            window.state.config["colors"][0]["name"])
+        assert set(window.groups_controller.group_color_map()) == {
             "Loops", "A.Gtr", "VOX", "Unknown"}
     finally:
         dispose_window(window)
@@ -150,11 +150,11 @@ def test_legacy_group_color_names_resolve_to_current_palette(qapp):
 def test_phase2_groups_tab_stays_clean_before_first_analysis_groups_load(qapp):
     window = SessionPrepWindow()
     try:
-        window._session = SessionContext([], {})
-        window._session_groups = []
+        window.state.session = SessionContext([], {})
+        window.state.session_groups = []
         window._detail_tabs.setTabEnabled(_TAB_GROUPS, False)
 
-        window._refresh_phase2_dirty_indicators()
+        window.config_controller.refresh_phase2_dirty_indicators()
 
         assert window._detail_tabs.tabText(_TAB_GROUPS) == "Groups"
         assert not is_tab_marked(window._detail_tabs, _TAB_GROUPS)
@@ -165,21 +165,22 @@ def test_phase2_groups_tab_stays_clean_before_first_analysis_groups_load(qapp):
 def test_phase2_groups_dirty_highlights_cell_and_tab(qapp):
     window = _window(qapp)
     try:
-        item = window._groups_tab_table.item(0, 0)
+        item = window.groups_controller.page.table.item(0, 0)
         item.setText(item.text() + " Edited")
 
         assert window._detail_tabs.tabText(_TAB_GROUPS) == "Groups"
         assert is_tab_marked(window._detail_tabs, _TAB_GROUPS)
-        assert item.background().color() == window._GROUP_DIRTY_BG
+        from sessionprepgui.tracks.groups_controller import _GROUP_DIRTY_BG
+        assert item.background().color() == _GROUP_DIRTY_BG
         assert window._detail_tabs.tabToolTip(_TAB_GROUPS) == (
-            f"Changed from group preset “{window._active_session_preset}”")
+            f"Changed from group preset “{window.state.active_session_preset}”")
 
-        window._on_groups_tab_reset()
+        window.groups_controller.merge_groups_from_preset()
 
         assert window._detail_tabs.tabText(_TAB_GROUPS) == "Groups"
         assert not is_tab_marked(window._detail_tabs, _TAB_GROUPS)
         assert (
-            window._groups_tab_table.item(0, 0).background().style()
+            window.groups_controller.page.table.item(0, 0).background().style()
             == Qt.NoBrush
         )
     finally:
@@ -189,11 +190,11 @@ def test_phase2_groups_dirty_highlights_cell_and_tab(qapp):
 def test_phase2_groups_dirty_color_uses_centered_button_indicator(qapp):
     window = _window(qapp)
     try:
-        widget = window._groups_tab_table.cellWidget(0, 1)
+        widget = window.groups_controller.page.table.cellWidget(0, 1)
         original = widget.currentColor()
         alternate = next(
             color["name"]
-            for color in window._config["colors"]
+            for color in window.state.config["colors"]
             if color["name"] != original
         )
 
@@ -212,12 +213,12 @@ def test_phase2_groups_dirty_color_uses_centered_button_indicator(qapp):
 def test_phase2_groups_added_row_marks_full_row(qapp):
     window = _window(qapp)
     try:
-        window._on_groups_tab_add()
-        row = window._groups_tab_table.rowCount() - 1
+        window.groups_controller.add_group_row()
+        row = window.groups_controller.page.table.rowCount() - 1
 
         assert window._detail_tabs.tabText(_TAB_GROUPS) == "Groups"
         assert is_tab_marked(window._detail_tabs, _TAB_GROUPS)
-        assert window._groups_dirty_cells()[row] == set(range(6))
+        assert window.groups_controller.groups_dirty_cells()[row] == set(range(6))
     finally:
         dispose_window(window)
 
@@ -225,12 +226,12 @@ def test_phase2_groups_added_row_marks_full_row(qapp):
 def test_phase2_groups_removed_row_marks_tab(qapp):
     window = _window(qapp)
     try:
-        window._groups_tab_table.selectRow(0)
-        window._on_groups_tab_remove()
+        window.groups_controller.page.table.selectRow(0)
+        window.groups_controller.remove_selected_group_row()
 
         assert window._detail_tabs.tabText(_TAB_GROUPS) == "Groups"
         assert is_tab_marked(window._detail_tabs, _TAB_GROUPS)
-        assert window._groups_dirty_cells() == {}
+        assert window.groups_controller.groups_dirty_cells() == {}
     finally:
         dispose_window(window)
 
@@ -243,10 +244,10 @@ def test_phase2_config_analysis_dirty_marks_tree_and_tab(qapp):
 
         assert window._detail_tabs.tabText(_TAB_SESSION) == "Config"
         assert is_tab_marked(window._detail_tabs, _TAB_SESSION)
-        assert not window._session_dirty_items["analysis"].icon(1).isNull()
-        expected = f"Changed from preset “{window._active_config_preset_name}”"
+        assert not window.config_controller.session_dirty_items["analysis"].icon(1).isNull()
+        expected = f"Changed from preset “{window.state.active_config_preset_name}”"
         assert window._detail_tabs.tabToolTip(_TAB_SESSION) == expected
-        assert window._session_dirty_items["analysis"].toolTip(1) == expected
+        assert window.config_controller.session_dirty_items["analysis"].toolTip(1) == expected
         bar = window._detail_tabs.tabBar()
         if hasattr(bar, "accessibleTabName"):
             assert bar.accessibleTabName(_TAB_SESSION) == f"Config, {expected}"
@@ -255,7 +256,7 @@ def test_phase2_config_analysis_dirty_marks_tree_and_tab(qapp):
 
         assert window._detail_tabs.tabText(_TAB_SESSION) == "Config"
         assert not is_tab_marked(window._detail_tabs, _TAB_SESSION)
-        assert window._session_dirty_items["analysis"].icon(1).isNull()
+        assert window.config_controller.session_dirty_items["analysis"].icon(1).isNull()
         assert window._detail_tabs.tabToolTip(_TAB_SESSION) == ""
         if hasattr(bar, "accessibleTabName"):
             assert bar.accessibleTabName(_TAB_SESSION) == "Config"
@@ -271,8 +272,8 @@ def test_phase2_config_child_dirty_marks_parent(qapp):
 
         assert window._detail_tabs.tabText(_TAB_SESSION) == "Config"
         assert is_tab_marked(window._detail_tabs, _TAB_SESSION)
-        assert not window._session_dirty_items[section].icon(1).isNull()
-        assert not window._session_dirty_items["_presentation"].icon(1).isNull()
+        assert not window.config_controller.session_dirty_items[section].icon(1).isNull()
+        assert not window.config_controller.session_dirty_items["_presentation"].icon(1).isNull()
     finally:
         dispose_window(window)
 
@@ -285,11 +286,11 @@ def test_phase2_config_revert_clears_tree_and_tab(qapp):
         assert window._detail_tabs.tabText(_TAB_SESSION) == "Config"
         assert is_tab_marked(window._detail_tabs, _TAB_SESSION)
 
-        window._on_session_config_reset()
+        window.config_controller.on_session_config_reset()
 
         assert window._detail_tabs.tabText(_TAB_SESSION) == "Config"
         assert not is_tab_marked(window._detail_tabs, _TAB_SESSION)
-        assert window._session_dirty_items["analysis"].icon(1).isNull()
+        assert window.config_controller.session_dirty_items["analysis"].icon(1).isNull()
     finally:
         dispose_window(window)
 
@@ -297,9 +298,9 @@ def test_phase2_config_revert_clears_tree_and_tab(qapp):
 def test_phase2_change_tooltips_name_their_own_comparison_preset(qapp):
     window = _window(qapp)
     try:
-        window._active_session_preset = "Band groups"
-        window._active_config_preset_name = "Mix config"
-        assert window._phase2_change_tooltip(_TAB_GROUPS) == "Changed from group preset “Band groups”"
-        assert window._phase2_change_tooltip(_TAB_SESSION) == "Changed from preset “Mix config”"
+        window.state.active_session_preset = "Band groups"
+        window.state.active_config_preset_name = "Mix config"
+        assert window.config_controller.phase2_change_tooltip(_TAB_GROUPS) == "Changed from group preset “Band groups”"
+        assert window.config_controller.phase2_change_tooltip(_TAB_SESSION) == "Changed from preset “Mix config”"
     finally:
         dispose_window(window)

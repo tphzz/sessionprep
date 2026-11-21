@@ -355,7 +355,7 @@ def load_config() -> dict[str, Any]:
 
     # -- Read --
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             data = json.load(f)
     except (json.JSONDecodeError, OSError) as exc:
         log.warning("Cannot read config (%s) — recreating from defaults", exc)

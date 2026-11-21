@@ -79,8 +79,9 @@ class Host:
 
 @pytest.fixture
 def transfer(tmp_path, monkeypatch):
-    from sessionpreplib import config
+    from sessionpreplib import config, paths
     monkeypatch.setattr(config, "get_app_dir", lambda: str(tmp_path))
+    monkeypatch.setattr(paths, "get_app_dir", lambda: str(tmp_path))
     host = Host()
     processor = ProToolsDawProcessor(instance_group="Example", instance_name="Nested")
     processor.configure({"protools_project_dir": str(tmp_path), "protools_temp_dir": str(tmp_path), "protools_command_delay": 0})

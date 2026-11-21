@@ -223,103 +223,98 @@ class ProToolsDawProcessor(DawProcessor):
             msg = f"{msg} Last error: {last_error}"
         raise RuntimeError(msg)
 
-    def fetch(
-        self,
-        session: SessionContext,
-        progress_cb=None,
-        ignore_cache: bool = False,
-    ) -> SessionContext:
-        if not self._temp_dir:
-            raise RuntimeError(
-                "The 'Temporary project directory' is not configured in Preferences."
-            )
-        if not os.path.isdir(self._temp_dir):
-            raise RuntimeError(
-                f"The configured temporary project directory does not exist: {self._temp_dir}"
-            )
-
-        # 1. Resolve Path to template file
+    def _template_file_and_mtime(self):
         import platform
         from pathlib import Path
 
-        system = platform.system()
-        template_dir = None
-        if system == "Windows":
-            template_dir = Path.home() / "Documents" / "Pro Tools" / "Session Templates"
-        elif system == "Darwin":
-            template_dir = Path.home() / "Documents" / "Pro Tools" / "Session Templates"
+        if platform.system() not in ("Windows", "Darwin"):
+            return None, None
+        template_file = (
+            Path.home() / "Documents" / "Pro Tools" / "Session Templates"
+            / self._instance_group / f"{self._instance_name}.ptxt"
+        )
+        return template_file, (template_file.stat().st_mtime if template_file.is_file() else None)
 
-        template_file = None
-        current_mtime = None
-        if template_dir:
-            # e.g SessionPrep / MiniTemplate.ptxt
-            template_file = (
-                template_dir / self._instance_group / f"{self._instance_name}.ptxt"
-            )
-            if template_file.is_file():
-                current_mtime = template_file.stat().st_mtime
-
-        # 2. Check Cache
-        from sessionpreplib.config import get_app_dir
+    def _load_template_cache(self):
         import json
+        from pathlib import Path
+        from ..paths import get_app_dir
 
-        dbg(
-            "Pro Tools template fetch requested: "
-            f"key={self._instance_group}/{self._instance_name} "
-            f"ignore_cache={ignore_cache}"
-        )
         cache_file = Path(get_app_dir()) / "pt_template_cache.json"
-        cache_data = {}
-        if cache_file.is_file():
+        if not cache_file.is_file():
+            return cache_file, {}
+        try:
+            with open(cache_file, encoding="utf-8") as f:
+                return cache_file, json.load(f)
+        except Exception:
+            return cache_file, {}
+
+    def _apply_fetched_folders(self, session: SessionContext, folders: list[dict[str, Any]]) -> None:
+        pt_state = session.daw_state.get(self.id, {})
+        old_assignments: dict[str, str] = pt_state.get("assignments", {})
+        valid_ids = {f["id"] for f in folders}
+        assignments = {fname: fid for fname, fid in old_assignments.items() if fid in valid_ids}
+        session.daw_state[self.id] = {"folders": folders, "assignments": assignments}
+
+    def _delete_temp_session_folder(self, temp_session_name: str, temp_session_path: str) -> None:
+        import shutil
+
+        target_dir = os.path.join(self._temp_dir, temp_session_name)
+        if not (
+            os.path.isdir(target_dir)
+            and os.path.dirname(os.path.abspath(target_dir)) == os.path.abspath(self._temp_dir)
+            and not os.path.islink(target_dir)
+            and os.path.isfile(temp_session_path)
+        ):
+            return
+        for _ in range(10):
             try:
-                with open(cache_file, "r", encoding="utf-8") as f:
-                    cache_data = json.load(f)
+                dbg(f"Deleting temporary Pro Tools session folder: {target_dir!r}")
+                shutil.rmtree(target_dir, ignore_errors=True)
+                if not os.path.exists(target_dir):
+                    dbg(f"Deleted temporary Pro Tools session folder: {target_dir!r}")
+                    break
             except Exception:
-                cache_data = {}
+                pass
+            time.sleep(0.5)
 
-        cache_key = f"{self._instance_group}/{self._instance_name}"
-        if not ignore_cache and current_mtime is not None and cache_key in cache_data:
-            entry = cache_data[cache_key]
-            if entry.get("mtime") == current_mtime:
-                dbg(
-                    "Pro Tools template cache hit: "
-                    f"key={cache_key!r} mtime={current_mtime}"
-                )
-                # Fast Cache Hit
-                if progress_cb:
-                    progress_cb(
-                        100,
-                        100,
-                        f"Loaded structure for '{self._instance_name}' from cache.",
-                    )
-
-                folders = entry.get("folders", [])
-
-                pt_state = session.daw_state.get(self.id, {})
-                old_assignments: dict[str, str] = pt_state.get("assignments", {})
-                valid_ids = {f["id"] for f in folders}
-                assignments = {
-                    fname: fid
-                    for fname, fid in old_assignments.items()
-                    if fid in valid_ids
-                }
-
-                session.daw_state[self.id] = {
-                    "folders": folders,
-                    "assignments": assignments,
-                }
-                return session
-        elif ignore_cache:
-            dbg(
-                "Skipping Pro Tools template cache lookup because "
-                f"ignore_cache=True: key={cache_key!r}"
-            )
-
-        dbg(
-            "Pro Tools template cache miss: "
-            f"key={cache_key!r} template_file={str(template_file) if template_file else None!r} "
-            f"mtime={current_mtime}"
+    def _read_template_folders_from_engine(self, engine, temp_session_path: str, pt) -> list[dict[str, Any]]:
+        if not ptslh.session_matches_path(engine, temp_session_path):
+            raise RuntimeError("Pro Tools switched sessions before SessionPrep could read the template folders.")
+        all_tracks = self._track_list_with_retry(
+            engine, timeout=self._template_create_timeout, sleep_time=self._command_delay,
         )
+        if not ptslh.session_matches_path(engine, temp_session_path):
+            raise RuntimeError("Pro Tools switched sessions while SessionPrep was reading the template folders.")
+        folders: list[dict[str, Any]] = []
+        for track in all_tracks:
+            if track.type in (pt.TrackType.RoutingFolder, pt.TrackType.BasicFolder):
+                folders.append({
+                    "id": track.id,
+                    "name": track.name,
+                    "folder_type": "routing" if track.type == pt.TrackType.RoutingFolder else "basic",
+                    "index": track.index,
+                    "parent_id": track.parent_folder_id or None,
+                })
+        dbg(f"Read Pro Tools folder structure: folders={len(folders)}")
+        return folders
+
+    def _close_temp_fetch_session(self, engine, temp_session_name: str, temp_session_path: str) -> tuple[bool, Exception | None]:
+        try:
+            if not ptslh.session_matches_path(engine, temp_session_path):
+                raise RuntimeError("Pro Tools switched sessions before Fetch could close its temporary project.")
+            dbg(f"Closing temporary Pro Tools session: {temp_session_name!r}")
+            ptslh.close_session(engine)
+            if ptslh.is_session_open(engine):
+                raise RuntimeError("Pro Tools still reports an open session after CloseSession.")
+            return True, None
+        except Exception as exc:
+            log.debug(f"Failed to close temp session: {exc}")
+            dbg(f"Failed to close temporary Pro Tools session: {exc}")
+            return False, exc
+
+    def _fetch_folders_live(self, progress_cb) -> list[dict[str, Any]]:
+        import uuid
 
         try:
             from ptsl import PTSL_pb2 as pt
@@ -334,199 +329,96 @@ class ProToolsDawProcessor(DawProcessor):
         try:
             if progress_cb:
                 progress_cb(10, 100, "Connecting to Pro Tools...")
-
-            dbg(
-                "Opening Pro Tools engine for fetch: "
-                f"address={self._connection_settings.address!r}"
-            )
             engine = self._open_engine()
-            dbg("Pro Tools engine opened for fetch")
-
             if progress_cb:
                 progress_cb(15, 100, "Waiting for Pro Tools to become ready...")
-
-            dbg("Waiting for Pro Tools host readiness before template fetch")
-            if not ptslh.wait_for_host_ready(
-                engine, timeout=25.0, sleep_time=self._command_delay
-            ):
-                dbg("Pro Tools host readiness timed out before template fetch")
-                raise RuntimeError(
-                    "Pro Tools is busy or not ready. Please bring its window to the front to wake it."
-                )
-            dbg("Pro Tools host ready before template fetch")
-
+            if not ptslh.wait_for_host_ready(engine, timeout=25.0, sleep_time=self._command_delay):
+                raise RuntimeError("Pro Tools is busy or not ready. Please bring its window to the front to wake it.")
             if ptslh.is_session_open(engine):
-                dbg("Fetch aborted because a Pro Tools session is already open")
                 raise RuntimeError("PRO_TOOLS_SESSION_OPEN")
-
-            import uuid
 
             temp_session_name = f"SessionPrep_Temp_{uuid.uuid4().hex[:8]}"
             project_folder = os.path.join(self._temp_dir, temp_session_name)
             if os.path.lexists(project_folder):
                 raise FileExistsError(f"The temporary project folder already exists: {project_folder}")
-
             if progress_cb:
-                progress_cb(
-                    30,
-                    100,
-                    f"Creating temporary session from template '{self._instance_group} / {self._instance_name}'...",
-                )
-
-            # Create the temporary session from the template
-            dbg(
-                "Creating temporary Pro Tools session from template: "
-                f"name={temp_session_name!r} timeout={self._template_create_timeout:.1f}s"
-            )
+                progress_cb(30, 100, f"Creating temporary session from template '{self._instance_group} / {self._instance_name}'...")
             ptslh.create_session_from_template(
-                engine,
-                temp_session_name,
-                self._temp_dir,
-                self._instance_group,
-                self._instance_name,
-                timeout=self._template_create_timeout,
+                engine, temp_session_name, self._temp_dir,
+                self._instance_group, self._instance_name, timeout=self._template_create_timeout,
             )
             temp_session_path = os.path.join(project_folder, f"{temp_session_name}.ptx")
-            dbg(f"Temporary Pro Tools session created: {temp_session_name!r}")
-
             if progress_cb:
                 progress_cb(65, 100, "Waiting for Pro Tools session to become ready...")
-
-            dbg("Waiting for Pro Tools host readiness after template creation")
-            if not ptslh.wait_for_host_ready(
-                engine,
-                timeout=self._template_create_timeout,
-                sleep_time=self._command_delay,
-            ):
-                dbg("Pro Tools host readiness timed out after template creation")
+            if not ptslh.wait_for_host_ready(engine, timeout=self._template_create_timeout, sleep_time=self._command_delay):
                 raise RuntimeError(
-                    "Pro Tools created the temporary session, but did not become ready "
-                    f"within {self._template_create_timeout:.1f} seconds."
+                    f"Pro Tools created the temporary session, but did not become ready within {self._template_create_timeout:.1f} seconds."
                 )
-            dbg("Pro Tools host ready after template creation")
-
             if progress_cb:
                 progress_cb(70, 100, "Reading track folder structure...")
-
-            if not ptslh.session_matches_path(engine, temp_session_path):
-                raise RuntimeError("Pro Tools switched sessions before SessionPrep could read the template folders.")
-            all_tracks = self._track_list_with_retry(
-                engine,
-                timeout=self._template_create_timeout,
-                sleep_time=self._command_delay,
-            )
-            if not ptslh.session_matches_path(engine, temp_session_path):
-                raise RuntimeError("Pro Tools switched sessions while SessionPrep was reading the template folders.")
-            folders: list[dict[str, Any]] = []
-            for track in all_tracks:
-                if track.type in (pt.TrackType.RoutingFolder, pt.TrackType.BasicFolder):
-                    folder_type = (
-                        "routing"
-                        if track.type == pt.TrackType.RoutingFolder
-                        else "basic"
-                    )
-                    folders.append(
-                        {
-                            "id": track.id,
-                            "name": track.name,
-                            "folder_type": folder_type,
-                            "index": track.index,
-                            "parent_id": track.parent_folder_id or None,
-                        }
-                    )
-            dbg(f"Read Pro Tools folder structure: folders={len(folders)}")
-
+            folders = self._read_template_folders_from_engine(engine, temp_session_path, pt)
             if progress_cb:
                 progress_cb(90, 100, "Cleaning up temporary session...")
-
-        except Exception:
-            dbg("Pro Tools fetch failed; propagating exception")
-            raise
         finally:
             if engine is not None:
-                if temp_session_path:
-                    try:
-                        if ptslh.session_matches_path(engine, temp_session_path):
-                            dbg(f"Closing temporary Pro Tools session: {temp_session_name!r}")
-                            ptslh.close_session(engine)
-                            if ptslh.is_session_open(engine):
-                                raise RuntimeError("Pro Tools still reports an open session after CloseSession.")
-                            temp_closed = True
-                        else:
-                            raise RuntimeError("Pro Tools switched sessions before Fetch could close its temporary project.")
-                    except Exception as e:
-                        close_error = e
-                        log.debug(f"Failed to close temp session: {e}")
-                        dbg(f"Failed to close temporary Pro Tools session: {e}")
+                if temp_session_path and temp_session_name:
+                    temp_closed, close_error = self._close_temp_fetch_session(engine, temp_session_name, temp_session_path)
                 try:
-                    dbg("Closing Pro Tools engine after fetch")
                     engine.close()
                 except Exception:
                     pass
-
-            if temp_closed:
-                # Defensive deletion of the temporary session folder
-                target_dir = os.path.join(self._temp_dir, temp_session_name)
-                # Extreme safety checks to ensure we only delete what we created:
-                # 1. Ensure target_dir actually exists
-                # 2. Ensure target_dir is exactly a direct child of the configured temp dir
-                # 3. Ensure target_dir contains our specific UUID .ptx file
-                if (
-                    os.path.isdir(target_dir)
-                    and os.path.dirname(os.path.abspath(target_dir))
-                    == os.path.abspath(self._temp_dir)
-                    and not os.path.islink(target_dir)
-                    and os.path.isfile(temp_session_path)
-                ):
-                    import shutil
-                    import time
-
-                    # Retry loop to handle delayed file locks on Windows from Pro Tools closing
-                    for _ in range(10):  # Try for up to 5 seconds
-                        try:
-                            dbg(f"Deleting temporary Pro Tools session folder: {target_dir!r}")
-                            shutil.rmtree(target_dir, ignore_errors=True)
-                            if not os.path.exists(target_dir):
-                                dbg(
-                                    "Deleted temporary Pro Tools session folder: "
-                                    f"{target_dir!r}"
-                                )
-                                break
-                        except Exception:
-                            pass
-                        time.sleep(0.5)
+            if temp_closed and temp_session_name and temp_session_path:
+                self._delete_temp_session_folder(temp_session_name, temp_session_path)
 
         if close_error is not None:
             raise RuntimeError(f"Failed to close the temporary Pro Tools session: {close_error}") from close_error
+        return folders
 
-        # Preserve existing assignments where folder IDs still match
-        pt_state = session.daw_state.get(self.id, {})
-        old_assignments: dict[str, str] = pt_state.get("assignments", {})
-        valid_ids = {f["id"] for f in folders}
-        assignments = {
-            fname: fid for fname, fid in old_assignments.items() if fid in valid_ids
-        }
+    def _save_template_cache(self, cache_file, cache_data: dict[str, Any], cache_key: str, mtime: float, folders: list[dict[str, Any]]) -> None:
+        import json
 
-        session.daw_state[self.id] = {
-            "folders": folders,
-            "assignments": assignments,
-        }
+        cache_data[cache_key] = {"mtime": mtime, "folders": folders}
+        try:
+            cache_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(cache_file, "w", encoding="utf-8") as f:
+                json.dump(cache_data, f, indent=2, ensure_ascii=False)
+            dbg(f"Wrote Pro Tools template cache: {str(cache_file)!r}")
+        except Exception as e:
+            log.debug(f"Failed to write template cache: {e}")
+            dbg(f"Failed to write Pro Tools template cache: {e}")
 
-        # Write cache
+    def fetch(
+        self,
+        session: SessionContext,
+        progress_cb=None,
+        ignore_cache: bool = False,
+    ) -> SessionContext:
+        if not self._temp_dir:
+            raise RuntimeError("The 'Temporary project directory' is not configured in Preferences.")
+        if not os.path.isdir(self._temp_dir):
+            raise RuntimeError(f"The configured temporary project directory does not exist: {self._temp_dir}")
+
+        template_file, current_mtime = self._template_file_and_mtime()
+        cache_file, cache_data = self._load_template_cache()
+        cache_key = f"{self._instance_group}/{self._instance_name}"
+        dbg(f"Pro Tools template fetch requested: key={cache_key} ignore_cache={ignore_cache}")
+
+        if not ignore_cache and current_mtime is not None and cache_key in cache_data:
+            entry = cache_data[cache_key]
+            if entry.get("mtime") == current_mtime:
+                dbg(f"Pro Tools template cache hit: key={cache_key!r} mtime={current_mtime}")
+                if progress_cb:
+                    progress_cb(100, 100, f"Loaded structure for '{self._instance_name}' from cache.")
+                self._apply_fetched_folders(session, entry.get("folders", []))
+                return session
+
+        dbg(f"Pro Tools template cache miss: key={cache_key!r} template_file={str(template_file) if template_file else None!r} mtime={current_mtime}")
+        folders = self._fetch_folders_live(progress_cb)
+        self._apply_fetched_folders(session, folders)
         if current_mtime is not None:
-            cache_data[cache_key] = {"mtime": current_mtime, "folders": folders}
-            try:
-                cache_file.parent.mkdir(parents=True, exist_ok=True)
-                with open(cache_file, "w", encoding="utf-8") as f:
-                    json.dump(cache_data, f, indent=2, ensure_ascii=False)
-                dbg(f"Wrote Pro Tools template cache: {str(cache_file)!r}")
-            except Exception as e:
-                log.debug(f"Failed to write template cache: {e}")
-                dbg(f"Failed to write Pro Tools template cache: {e}")
-
+            self._save_template_cache(cache_file, cache_data, cache_key, current_mtime, folders)
         if progress_cb:
             progress_cb(100, 100, "Fetch complete")
-
         return session
 
     def _resolve_group_color(
@@ -593,60 +485,15 @@ class ProToolsDawProcessor(DawProcessor):
             depth_map.get(common_depth, "Bit24"),
         )
 
-    def transfer(
-        self,
-        session: SessionContext,
-        output_path: str,
-        progress_cb=None,
-        close_when_done: bool = True,
-    ) -> list[DawCommandResult]:
-        """Create a new Pro Tools session from a template and import audio.
-
-        The transfer is structured in phases:
-          0. Connect and verify empty workspace
-          1. Determine optimal specs and create new session
-          2. Batch import all audio files in one call
-          3. Create tracks in folder order and spot clips
-          4. Batch colorize by group
-          5. Set fader offsets when volume automation is enabled
-          6. Complete and save session
-
-        Args:
-            session: The current session context.
-            output_path: Not used for Pro Tools (it uses internal prefs).
-            progress_cb: Optional callable(current, total, message).
-
-        Returns:
-            List of DawCommandResult for each operation attempted.
-        """
-        log.debug("transfer() called")
-        try:
-            from ptsl import PTSL_pb2 as pt  # noqa: F401 – validates install
-        except ImportError:
-            log.debug("py-ptsl not installed")
-            return [
-                DawCommandResult(
-                    command=DawCommand("transfer", "", {}),
-                    success=False,
-                    error="py-ptsl package not installed",
-                )
-            ]
-
-        pt_state = session.daw_state.get(self.id, {})
+    def _ordered_transfer_work(
+        self, session: SessionContext, pt_state: dict[str, Any], record,
+    ) -> tuple[dict[str, Any], list[tuple[str, TransferAudio, str, TrackContext]]]:
         assignments: dict[str, str] = pt_state.get("assignments", {})
-        folders = pt_state.get("folders", [])
+        folder_map = {f["id"]: f for f in pt_state.get("folders", [])}
         track_order = pt_state.get("track_order", {})
-
-        if not assignments:
-            log.debug("No assignments, returning early")
-            return []
-
-        # Build lookups
-        folder_map = {f["id"]: f for f in folders}
         manifest_map = {e.entry_id: e for e in session.transfer_manifest}
         out_track_map = {t.filename: t for t in session.output_tracks}
 
-        # Build ordered work list: [(entry_id, folder_id), ...]
         work: list[tuple[str, str]] = []
         seen: set[str] = set()
         for fid, ordered_names in track_order.items():
@@ -657,11 +504,6 @@ class ProToolsDawProcessor(DawProcessor):
         for eid, fid in sorted(assignments.items()):
             if eid not in seen:
                 work.append((eid, fid))
-
-        results: list[DawCommandResult] = []
-
-        def record(operation: str, target: str = "", *, error: str | None = None, **params: Any) -> None:
-            results.append(DawCommandResult(DawCommand(operation, target, params), error is None, error))
 
         valid_work: list[tuple[str, TransferAudio, str, TrackContext]] = []
         for entry_id, folder_id in work:
@@ -680,266 +522,240 @@ class ProToolsDawProcessor(DawProcessor):
             try:
                 media = resolve_transfer_audio(session, track)
             except ValueError as exc:
-                record("validate_track", entry.daw_track_name,
-                       error=str(exc))
+                record("validate_track", entry.daw_track_name, error=str(exc))
                 continue
-            name = os.path.splitext(entry.daw_track_name)[0]
-            valid_work.append((folder_id, media, name, track))
+            valid_work.append((folder_id, media, os.path.splitext(entry.daw_track_name)[0], track))
+        return folder_map, valid_work
 
+    def _create_transfer_session(self, engine, session: SessionContext, progress_cb, record) -> str:
+        if not self._project_dir:
+            raise RuntimeError("Pro Tools 'Project directory' is not configured.")
+        if not os.path.isdir(self._project_dir):
+            raise RuntimeError(f"Pro Tools 'Project directory' does not exist: {self._project_dir}")
+        if not session.project_name:
+            raise RuntimeError("Project name is empty.")
+        if ptslh.is_session_open(engine):
+            raise RuntimeError("A Pro Tools session is currently open. Save and close it in Pro Tools, then try again.")
+        if progress_cb:
+            progress_cb(5, 100, "Calculating audio specifications...")
+        rate_enum, depth_enum = self._get_optimal_session_specs(session)
+        if progress_cb:
+            progress_cb(10, 100, f"Creating session '{session.project_name}'...")
+        ptslh.create_session_from_template(
+            engine, session.project_name, self._project_dir,
+            self._instance_group, self._instance_name,
+            sample_rate=rate_enum, bit_depth=depth_enum, timeout=self._template_create_timeout,
+        )
+        created_path = os.path.join(self._project_dir, session.project_name, f"{session.project_name}.ptx")
+        record("create_session", session.project_name)
+        if not ptslh.wait_for_host_ready(engine, timeout=self._template_create_timeout, sleep_time=self._command_delay):
+            raise RuntimeError(
+                f"Pro Tools did not become ready within {self._template_create_timeout:g} seconds after creating the session."
+            )
+        if not ptslh.session_matches_path(engine, created_path):
+            raise RuntimeError("Pro Tools is no longer in the session created for this transfer.")
+        return created_path
+
+    def _build_group_palette(self, engine, session: SessionContext) -> dict[str, int]:
+        pt_palette = ptslh.get_color_palette(engine)
+        group_palette_idx: dict[str, int] = {}
+        if not pt_palette:
+            return group_palette_idx
+        for entry in session.transfer_manifest:
+            if entry.group and entry.group not in group_palette_idx:
+                argb = self._resolve_group_color(entry.group, session)
+                if argb:
+                    idx = _closest_palette_index(argb, pt_palette)
+                    if idx is not None:
+                        group_palette_idx[entry.group] = idx
+        return group_palette_idx
+
+    def _import_transfer_audio(self, engine, valid_work, batch_job_id, record):
+        all_filepaths = list(dict.fromkeys(media.filepath for _, media, _, _ in valid_work))
+        clip_id_map: dict[str, list[str]] = {}
+        import_failures: dict[str, str] = {}
+        try:
+            import_resp = ptslh.batch_import_audio(engine, all_filepaths, batch_job_id=batch_job_id, progress=25)
+            time.sleep(self._command_delay)
+            if import_resp:
+                for entry in import_resp.get("file_list", []):
+                    orig = entry.get("original_input_path", "")
+                    dest_list = entry.get("destination_file_list", [])
+                    if dest_list and dest_list[0].get("clip_id_list"):
+                        clip_id_map[os.path.normcase(orig)] = list(dest_list[0]["clip_id_list"])
+                for fail in import_resp.get("failure_list", []):
+                    fail_path = fail.get("file_path") or fail.get("original_input_path", "")
+                    import_failures[os.path.normcase(fail_path)] = (
+                        fail.get("failure_message") or "Pro Tools rejected the audio file."
+                    )
+        except Exception as exc:
+            record("batch_import", error=str(exc))
+            return None, None
+        return clip_id_map, import_failures
+
+    def _spot_transfer_tracks(
+        self, engine, valid_work, folder_map, clip_id_map, import_failures,
+        group_palette_idx, batch_job_id, progress_cb, record,
+    ):
+        work_by_folder: dict[str, list[tuple[str, TrackContext, list[str], float]]] = {}
+        for folder_id, media, name, track in valid_work:
+            key = os.path.normcase(media.filepath)
+            clip_ids = clip_id_map.get(key)
+            if not clip_ids or key in import_failures:
+                record("import_audio", name, error=import_failures.get(
+                    key, f"Pro Tools returned no clips for '{media.filepath}'."))
+                continue
+            work_by_folder.setdefault(folder_id, []).append((name, track, clip_ids, media.fader_db))
+
+        total_spot = sum(len(items) for items in work_by_folder.values())
+        if total_spot == len(valid_work):
+            record("batch_import")
+
+        color_groups: dict[int, list[str]] = {}
+        created_tracks: list[tuple[str, str, float]] = []
+        attempted = 0
+        for fid, folder_items in work_by_folder.items():
+            folder_name = folder_map[fid]["name"]
+            for name, track, clip_ids, fader_db in reversed(folder_items):
+                attempted += 1
+                pct = 30 + int(50 * attempted / total_spot)
+                track_format = "TF_Mono" if track.channels == 1 else "TF_Stereo"
+                try:
+                    tid, created_name = ptslh.create_track_with_name(
+                        engine, name, track_format,
+                        insertion_point_track_name=folder_name, insertion_point_position="TIPoint_First",
+                        batch_job_id=batch_job_id, progress=pct,
+                    )
+                    ptslh.spot_clips(engine, clip_ids, tid, batch_job_id=batch_job_id, progress=pct)
+                    record("spot_clip", created_name)
+                    created_tracks.append((created_name, tid, fader_db))
+                    if track.group in group_palette_idx:
+                        color_groups.setdefault(group_palette_idx[track.group], []).append(created_name)
+                except Exception as exc:
+                    record("spot_clip", name, error=str(exc))
+                if progress_cb:
+                    progress_cb(pct, 100, f"Transferred {len(created_tracks)}/{total_spot} tracks")
+        return color_groups, created_tracks
+
+    def _apply_transfer_colors_and_faders(self, engine, color_groups, created_tracks, batch_job_id, record) -> None:
+        for cidx, names in color_groups.items():
+            try:
+                ptslh.colorize_tracks(engine, names, cidx, batch_job_id=batch_job_id, progress=90)
+                record("colorize_tracks", ", ".join(names))
+            except Exception as exc:
+                record("colorize_tracks", ", ".join(names), error=str(exc))
+
+        if not ptslh.VOLUME_AUTOMATION_ENABLED:
+            return
+        for name, t_id, fader_db in created_tracks:
+            if fader_db == 0.0:
+                continue
+            try:
+                ptslh.set_track_volume(engine, t_id, fader_db, batch_job_id=batch_job_id, progress=95)
+                record("set_fader", name, fader_db=fader_db)
+            except Exception as exc:
+                detail = str(exc)
+                error = f"Could not write volume automation at sample 0. {detail}"
+                command_error = detail.casefold()
+                unavailable = (
+                    "private api has not been enabled in this session" in command_error
+                    or "pt_unsupportedcommand" in command_error
+                )
+                if unavailable:
+                    error += " SessionPrep stopped volume automation writes for this transfer."
+                record("set_fader", name, fader_db=fader_db, error=error)
+                if unavailable:
+                    break
+
+    def _finalize_transfer_session(
+        self, engine, session_name: str, created_session_path: str, close_when_done: bool, progress_cb, record,
+    ) -> None:
+        operation = "close_session" if close_when_done else "save_session"
+        try:
+            if progress_cb:
+                msg = "Saving and closing session..." if close_when_done else "Saving session..."
+                progress_cb(98, 100, msg)
+            if not ptslh.session_matches_path(engine, created_session_path):
+                raise RuntimeError("Pro Tools switched sessions before SessionPrep could save this project.")
+            if close_when_done:
+                ptslh.close_session(engine, save_on_close=True, delay=self._command_delay)
+            else:
+                ptslh.save_session(engine)
+            record(operation, session_name)
+        except Exception as exc:
+            record(operation, session_name, error=str(exc))
+
+    def transfer(
+        self,
+        session: SessionContext,
+        output_path: str,
+        progress_cb=None,
+        close_when_done: bool = True,
+    ) -> list[DawCommandResult]:
+        """Create a new Pro Tools session from a template and import audio."""
+        log.debug("transfer() called")
+        try:
+            from ptsl import PTSL_pb2 as pt  # noqa: F401 – validates install
+        except ImportError:
+            log.debug("py-ptsl not installed")
+            return [DawCommandResult(DawCommand("transfer", "", {}), False, "py-ptsl package not installed")]
+
+        pt_state = session.daw_state.get(self.id, {})
+        if not pt_state.get("assignments"):
+            log.debug("No assignments, returning early")
+            return []
+
+        results: list[DawCommandResult] = []
+
+        def record(operation: str, target: str = "", *, error: str | None = None, **params: Any) -> None:
+            results.append(DawCommandResult(DawCommand(operation, target, params), error is None, error))
+
+        folder_map, valid_work = self._ordered_transfer_work(session, pt_state, record)
         if not valid_work:
             return results
 
         engine = None
-        delay = self._command_delay
         batch_job_id: str | None = None
         created_session_path: str | None = None
-
         try:
             if progress_cb:
                 progress_cb(0, 100, "Connecting to Pro Tools...")
             engine = self._open_engine()
-
             if progress_cb:
                 progress_cb(2, 100, "Waiting for Pro Tools to become ready...")
+            if not ptslh.wait_for_host_ready(engine, timeout=25.0, sleep_time=self._command_delay):
+                raise RuntimeError("Pro Tools is busy or not ready. Please bring its window to the front to wake it.")
 
-            if not ptslh.wait_for_host_ready(
-                engine, timeout=25.0, sleep_time=self._command_delay
-            ):
-                raise RuntimeError(
-                    "Pro Tools is busy or not ready. Please bring its window to the front to wake it."
-                )
-
-            # ── 0. Setup & Safety Checks ─────────────────────────
-
-            if not self._project_dir:
-                raise RuntimeError("Pro Tools 'Project directory' is not configured.")
-            if not os.path.isdir(self._project_dir):
-                raise RuntimeError(
-                    f"Pro Tools 'Project directory' does not exist: {self._project_dir}"
-                )
-            if not session.project_name:
-                raise RuntimeError("Project name is empty.")
-
-            if ptslh.is_session_open(engine):
-                raise RuntimeError(
-                    "A Pro Tools session is currently open. Save and close it in Pro Tools, then try again."
-                )
-
-            if progress_cb:
-                progress_cb(5, 100, "Calculating audio specifications...")
-
-            rate_enum, depth_enum = self._get_optimal_session_specs(session)
-
-            # ── 1. Create New Session ────────────────────────────
-
-            if progress_cb:
-                progress_cb(10, 100, f"Creating session '{session.project_name}'...")
-
-            ptslh.create_session_from_template(
-                engine,
-                session.project_name,
-                self._project_dir,
-                self._instance_group,
-                self._instance_name,
-                sample_rate=rate_enum,
-                bit_depth=depth_enum,
-                timeout=self._template_create_timeout,
-            )
-            created_session_path = os.path.join(
-                self._project_dir, session.project_name, f"{session.project_name}.ptx")
-            record("create_session", session.project_name)
-            if not ptslh.wait_for_host_ready(
-                engine, timeout=self._template_create_timeout, sleep_time=delay,
-            ):
-                raise RuntimeError(
-                    f"Pro Tools did not become ready within {self._template_create_timeout:g} seconds "
-                    "after creating the session."
-                )
-            if not ptslh.session_matches_path(engine, created_session_path):
-                raise RuntimeError("Pro Tools is no longer in the session created for this transfer.")
-
-            # Re-fetch color palette from the new session
-            pt_palette = ptslh.get_color_palette(engine)
-            group_palette_idx: dict[str, int] = {}
-            if pt_palette:
-                for entry in session.transfer_manifest:
-                    if entry.group and entry.group not in group_palette_idx:
-                        argb = self._resolve_group_color(entry.group, session)
-                        if argb:
-                            idx = _closest_palette_index(argb, pt_palette)
-                            if idx is not None:
-                                group_palette_idx[entry.group] = idx
-
-            # ── 2. Batch Import ──────────────────────────────────
-
-            batch_job_id = ptslh.create_batch_job(
-                engine, "SessionPrep Create", f"Importing {len(valid_work)} tracks"
-            )
-
+            created_session_path = self._create_transfer_session(engine, session, progress_cb, record)
+            group_palette_idx = self._build_group_palette(engine, session)
+            batch_job_id = ptslh.create_batch_job(engine, "SessionPrep Create", f"Importing {len(valid_work)} tracks")
             if progress_cb:
                 progress_cb(20, 100, "Importing audio to clip list...")
 
-            all_filepaths = list(dict.fromkeys(media.filepath for _, media, _, _ in valid_work))
-            clip_id_map: dict[str, list[str]] = {}
-            import_failures: dict[str, str] = {}
-
-            try:
-                import_resp = ptslh.batch_import_audio(
-                    engine, all_filepaths, batch_job_id=batch_job_id, progress=25
-                )
-                time.sleep(delay)
-
-                if import_resp:
-                    for entry in import_resp.get("file_list", []):
-                        orig = entry.get("original_input_path", "")
-                        dest_list = entry.get("destination_file_list", [])
-                        if dest_list:
-                            ids = dest_list[0].get("clip_id_list", [])
-                            if ids:
-                                clip_id_map[os.path.normcase(orig)] = list(ids)
-                    for fail in import_resp.get("failure_list", []):
-                        fail_path = fail.get("file_path") or fail.get("original_input_path", "")
-                        import_failures[os.path.normcase(fail_path)] = (
-                            fail.get("failure_message") or "Pro Tools rejected the audio file."
-                        )
-            except Exception as exc:
-                record("batch_import", error=str(exc))
+            clip_id_map, import_failures = self._import_transfer_audio(engine, valid_work, batch_job_id, record)
+            if clip_id_map is None:
                 return results
-
-            # ── 3. Ordered Track Creation + Spot ────────────────
-
-            color_groups: dict[int, list[str]] = {}
-            created_tracks: list[tuple[str, str, float]] = []
-            work_by_folder: dict[str, list[tuple[str, TrackContext, list[str], float]]] = {}
-            for folder_id, media, name, track in valid_work:
-                key = os.path.normcase(media.filepath)
-                clip_ids = clip_id_map.get(key)
-                if not clip_ids or key in import_failures:
-                    record("import_audio", name, error=import_failures.get(
-                        key, f"Pro Tools returned no clips for '{media.filepath}'."))
-                    continue
-                work_by_folder.setdefault(folder_id, []).append((name, track, clip_ids, media.fader_db))
-
-            total_spot = sum(len(items) for items in work_by_folder.values())
-            if total_spot == len(valid_work):
-                record("batch_import")
-
-            attempted = 0
-            for fid, folder_items in work_by_folder.items():
-                folder_name = folder_map[fid]["name"]
-
-                # PTSL can insert at the first child of a routing folder but
-                # cannot reorder tracks after creation. Creating the folder's
-                # tracks in reverse with TIPoint_First preserves SessionPrep's
-                # final order while pushing template tracks to the end.
-                for name, track, clip_ids, fader_db in reversed(folder_items):
-                    track_format = "TF_Mono" if track.channels == 1 else "TF_Stereo"
-                    attempted += 1
-                    pct = 30 + int(50 * attempted / total_spot)
-
-                    try:
-                        tid, created_name = ptslh.create_track_with_name(
-                            engine,
-                            name,
-                            track_format,
-                            insertion_point_track_name=folder_name,
-                            insertion_point_position="TIPoint_First",
-                            batch_job_id=batch_job_id,
-                            progress=pct,
-                        )
-                        ptslh.spot_clips(
-                            engine,
-                            clip_ids,
-                            tid,
-                            batch_job_id=batch_job_id,
-                            progress=pct,
-                        )
-
-                        record("spot_clip", created_name)
-                        created_tracks.append((created_name, tid, fader_db))
-                        if track.group in group_palette_idx:
-                            color_groups.setdefault(group_palette_idx[track.group], []).append(created_name)
-                    except Exception as exc:
-                        record("spot_clip", name, error=str(exc))
-
-                    if progress_cb:
-                        progress_cb(
-                            pct,
-                            100,
-                            f"Transferred {len(created_tracks)}/{total_spot} tracks",
-                        )
-
-            # ── 4. Colorize ──────────────────────────────────────
-
-            for cidx, names in color_groups.items():
-                try:
-                    ptslh.colorize_tracks(
-                        engine, names, cidx, batch_job_id=batch_job_id, progress=90
-                    )
-                    record("colorize_tracks", ", ".join(names))
-                except Exception as exc:
-                    record("colorize_tracks", ", ".join(names), error=str(exc))
-
-            # ── 5. Faders ────────────────────────────────────────
-
-            if ptslh.VOLUME_AUTOMATION_ENABLED:
-                for name, t_id, fader_db in created_tracks:
-                    if fader_db == 0.0:
-                        continue
-                    try:
-                        ptslh.set_track_volume(
-                            engine,
-                            t_id,
-                            fader_db,
-                            batch_job_id=batch_job_id,
-                            progress=95,
-                        )
-                        record("set_fader", name, fader_db=fader_db)
-                    except Exception as exc:
-                        detail = str(exc)
-                        error = f"Could not write volume automation at sample 0. {detail}"
-                        command_error = detail.casefold()
-                        volume_unavailable = (
-                            "private api has not been enabled in this session" in command_error
-                            or "pt_unsupportedcommand" in command_error
-                        )
-                        if volume_unavailable:
-                            error += " SessionPrep stopped volume automation writes for this transfer."
-                        record("set_fader", name, fader_db=fader_db, error=error)
-                        if volume_unavailable:
-                            break
-
-            # ── 6. Save & Close ──────────────────────────────────
-
+            color_groups, created_tracks = self._spot_transfer_tracks(
+                engine, valid_work, folder_map, clip_id_map, import_failures,
+                group_palette_idx, batch_job_id, progress_cb, record,
+            )
+            self._apply_transfer_colors_and_faders(engine, color_groups, created_tracks, batch_job_id, record)
             if batch_job_id:
                 try:
                     ptslh.complete_batch_job(engine, batch_job_id)
                     batch_job_id = None
                 except Exception as exc:
                     record("complete_batch", error=str(exc))
-
         except Exception as exc:
-            operation = "transfer" if created_session_path else "create_session"
-            record(operation, session.project_name, error=str(exc))
+            record("transfer" if created_session_path else "create_session", session.project_name, error=str(exc))
         finally:
             if engine is not None:
                 if batch_job_id:
                     ptslh.cancel_batch_job(engine, batch_job_id)
                 if created_session_path:
-                    operation = "close_session" if close_when_done else "save_session"
-                    try:
-                        if progress_cb:
-                            msg = "Saving and closing session..." if close_when_done else "Saving session..."
-                            progress_cb(98, 100, msg)
-                        if not ptslh.session_matches_path(engine, created_session_path):
-                            raise RuntimeError("Pro Tools switched sessions before SessionPrep could save this project.")
-                        if close_when_done:
-                            ptslh.close_session(engine, save_on_close=True, delay=delay)
-                        else:
-                            ptslh.save_session(engine)
-                        record(operation, session.project_name)
-                    except Exception as exc:
-                        record(operation, session.project_name, error=str(exc))
+                    self._finalize_transfer_session(
+                        engine, session.project_name, created_session_path, close_when_done, progress_cb, record,
+                    )
                 engine.close()
 
         if progress_cb and all(result.success for result in results):

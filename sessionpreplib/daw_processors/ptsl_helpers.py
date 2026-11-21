@@ -321,7 +321,7 @@ def create_session_from_template(  # pylint: disable=too-many-positional-argumen
     timeout: float = 60.0,
 ) -> None:
     """Create a new Pro Tools session from a template.
-    
+
     Paths use native OS separators. CId_CreateSession automatically opens the session.
     """
     from ptsl import PTSL_pb2 as pt
@@ -370,41 +370,32 @@ def create_session_from_template(  # pylint: disable=too-many-positional-argumen
     # 1. Create the session (Pro Tools automatically opens it as well)
     run_command(engine, pt.CommandId.CId_CreateSession, body)
     dbg(f"PTSL CId_CreateSession returned for {session_name!r}")
+    _wait_for_session_file(session_path, template_group, template_name, timeout)
 
-    # Wait until Pro Tools actually loads the template and writes the PTX file.
-    # It can take a few seconds for the background creation to finish.
+
+def _wait_for_session_file(session_path: str, template_group: str, template_name: str, timeout: float) -> None:
+    """Wait until Pro Tools writes the PTX document on disk."""
     import time
+
     dbg(f"Waiting for Pro Tools session file: {session_path!r}")
     start_time = time.monotonic()
     last_log_second = -1
-    success = False
     while time.monotonic() - start_time < timeout:
         if os.path.isfile(session_path):
-            success = True
-            break
+            dbg(f"Pro Tools session file appeared: elapsed={time.monotonic() - start_time:.1f}s path={session_path!r}")
+            return
         elapsed = time.monotonic() - start_time
         elapsed_second = int(elapsed)
         if elapsed_second != last_log_second and elapsed_second % 5 == 0:
-            dbg(
-                "Still waiting for Pro Tools session file: "
-                f"elapsed={elapsed:.1f}s timeout={timeout:.1f}s path={session_path!r}"
-            )
+            dbg(f"Still waiting for Pro Tools session file: elapsed={elapsed:.1f}s timeout={timeout:.1f}s path={session_path!r}")
             last_log_second = elapsed_second
         time.sleep(0.5)
 
-    if not success:
-        elapsed = time.monotonic() - start_time
-        dbg(
-            "Timed out waiting for Pro Tools session file: "
-            f"elapsed={elapsed:.1f}s timeout={timeout:.1f}s path={session_path!r}"
-        )
-        raise RuntimeError(
-            f"Pro Tools failed to create the session at '{session_path}' within {timeout:g} seconds. "
-            f"Check the destination and template '{template_group} / {template_name}' in Pro Tools."
-        )
-    dbg(
-        "Pro Tools session file appeared: "
-        f"elapsed={time.monotonic() - start_time:.1f}s path={session_path!r}"
+    elapsed = time.monotonic() - start_time
+    dbg(f"Timed out waiting for Pro Tools session file: elapsed={elapsed:.1f}s timeout={timeout:.1f}s path={session_path!r}")
+    raise RuntimeError(
+        f"Pro Tools failed to create the session at '{session_path}' within {timeout:g} seconds. "
+        f"Check the destination and template '{template_group} / {template_name}' in Pro Tools."
     )
 
 def close_session(engine, save_on_close: bool = False, delay: float = 0.5) -> None:

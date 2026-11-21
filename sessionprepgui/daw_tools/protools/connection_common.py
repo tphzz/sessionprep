@@ -8,9 +8,9 @@ from sessionpreplib.daw_processors.ptsl_connection import (
     DEFAULT_PTSL_HOST_READY_TIMEOUT_SECONDS,
     DEFAULT_PTSL_PORT,
     ProToolsConnectionSettings,
-    connection_failure_message,
-    connection_failure_message_from_text,
-    connection_timeout_message,
+    connection_failure_message as connection_failure_message,
+    connection_failure_message_from_text as connection_failure_message_from_text,
+    connection_timeout_message as connection_timeout_message,
     create_ptsl_engine,
 )
 

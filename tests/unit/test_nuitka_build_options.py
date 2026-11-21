@@ -17,7 +17,6 @@ def test_windows_debug_command_keeps_symbols_and_attaches_console(tmp_path, monk
     monkeypatch.setattr(build,"write_build_version_file",lambda version: versions.append(version) or version)
     monkeypatch.setattr(build,"remove_build_version_file",lambda: None)
     monkeypatch.setattr(build.subprocess,"check_call",lambda args: calls.append(args))
-    monkeypatch.setattr(build,"fetch_and_bundle_rps",lambda *a: None)
     build.run_nuitka("gui",debug=debug,build_version="0.3.5.dev0+gabcdef0")
     command=calls[0]
     assert ("--unstripped" in command) is debug
@@ -55,7 +54,6 @@ def test_low_memory_option_reaches_each_nuitka_target(tmp_path, monkeypatch, tar
     monkeypatch.setattr(build, "write_build_version_file", lambda version: version)
     monkeypatch.setattr(build, "remove_build_version_file", lambda: None)
     monkeypatch.setattr(build.subprocess, "check_call", lambda args: calls.append(args))
-    monkeypatch.setattr(build, "fetch_and_bundle_rps", lambda *args: None)
 
     build.run_nuitka(target, low_memory=low_memory, debug=True, build_version="0.3.5")
 
@@ -91,7 +89,6 @@ def test_explicit_jobs_override_the_low_memory_single_job(tmp_path, monkeypatch,
     monkeypatch.setattr(build, "write_build_version_file", lambda version: version)
     monkeypatch.setattr(build, "remove_build_version_file", lambda: None)
     monkeypatch.setattr(build.subprocess, "check_call", lambda args: calls.append(args))
-    monkeypatch.setattr(build, "fetch_and_bundle_rps", lambda *args: None)
 
     build.run_nuitka("cli", low_memory=True, jobs=jobs, build_version="0.3.5")
 
@@ -129,7 +126,6 @@ def test_arm64_preserves_lebedev_as_bytecode(tmp_path, monkeypatch, target, debu
     monkeypatch.setattr(build, "write_build_version_file", lambda version: version)
     monkeypatch.setattr(build, "remove_build_version_file", lambda: None)
     monkeypatch.setattr(build.subprocess, "check_call", lambda args: calls.append(args))
-    monkeypatch.setattr(build, "fetch_and_bundle_rps", lambda *args: None)
 
     build.run_nuitka(target, low_memory=True, debug=debug, build_version="0.3.5")
 

@@ -43,7 +43,7 @@ _MIME_TRACKS = "application/x-sessionprep-tracks"
 
 # ── Helper functions ─────────────────────────────────────────────────────────
 
-def _make_analysis_cell(html: str, sort_key: int) -> tuple[QLabel, '_SortableItem']:
+def _make_analysis_cell(html: str, sort_key: int) -> tuple[QLabel, _SortableItem]:
     """Create a QLabel + hidden sort item for the Analysis column."""
     lbl = QLabel(html)
     lbl.setStyleSheet(

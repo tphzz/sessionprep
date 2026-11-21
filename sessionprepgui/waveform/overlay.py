@@ -89,6 +89,28 @@ def draw_issue_overlays(
         painter.drawRect(rx, ry, rw, rh)
 
 
+_NICE_TIME_INTERVALS = (
+    0.001, 0.002, 0.005,
+    0.01, 0.02, 0.05,
+    0.1, 0.2, 0.5,
+    1, 2, 5, 10, 15, 30,
+    60, 120, 300, 600, 1800, 3600,
+)
+_MIN_TIME_TICK_PX = 60
+
+
+def _format_time_tick(t: float, interval: float) -> str:
+    m = int(t) // 60
+    if interval >= 1.0:
+        return f"{m}:{int(t) % 60:02d}"
+    s = t - m * 60
+    if interval >= 0.1:
+        return f"{m}:{s:04.1f}"
+    if interval >= 0.01:
+        return f"{m}:{s:05.2f}"
+    return f"{m}:{s:06.3f}"
+
+
 def draw_time_scale(
     painter: QPainter,
     x0: int,
@@ -108,48 +130,14 @@ def draw_time_scale(
     if visible_dur <= 0:
         return
 
-    _NICE_INTERVALS = [
-        0.001, 0.002, 0.005,
-        0.01, 0.02, 0.05,
-        0.1, 0.2, 0.5,
-        1, 2, 5, 10, 15, 30,
-        60, 120, 300, 600, 1800, 3600,
-    ]
-    _MIN_TICK_PX = 60
+    interval = next(
+        (ni for ni in _NICE_TIME_INTERVALS if ni / visible_dur * draw_w >= _MIN_TIME_TICK_PX),
+        _NICE_TIME_INTERVALS[-1],
+    )
 
-    interval = _NICE_INTERVALS[-1]
-    for ni in _NICE_INTERVALS:
-        if ni / visible_dur * draw_w >= _MIN_TICK_PX:
-            interval = ni
-            break
-
-    if interval >= 1.0:
-        def _fmt(t):
-            m = int(t) // 60
-            s = int(t) % 60
-            return f"{m}:{s:02d}"
-    elif interval >= 0.1:
-        def _fmt(t):
-            m = int(t) // 60
-            s = t - m * 60
-            return f"{m}:{s:04.1f}"
-    elif interval >= 0.01:
-        def _fmt(t):
-            m = int(t) // 60
-            s = t - m * 60
-            return f"{m}:{s:05.2f}"
-    else:
-        def _fmt(t):
-            m = int(t) // 60
-            s = t - m * 60
-            return f"{m}:{s:06.3f}"
-
-    scale_font = QFont("Consolas", 7)
-    painter.setFont(scale_font)
+    painter.setFont(QFont("Consolas", 7))
     fm = painter.fontMetrics()
-
-    label_color = QColor(COLORS["dim"])
-    tick_pen = QPen(label_color, 1)
+    tick_pen = QPen(QColor(COLORS["dim"]), 1)
     grid_color = QColor(COLORS["accent"])
     grid_color.setAlpha(25)
     grid_pen = QPen(grid_color, 1, Qt.DotLine)
@@ -161,23 +149,13 @@ def draw_time_scale(
     t = first_tick
     bottom_y = int(draw_h)
     while t <= view_end_sec + interval * 0.01:
-        frac = (t - view_start_sec) / visible_dur
-        px = x0 + int(frac * draw_w)
-
-        if px < x0 or px > x0 + draw_w:
-            t += interval
-            continue
-
-        painter.setPen(grid_pen)
-        painter.drawLine(px, 0, px, bottom_y)
-
-        painter.setPen(tick_pen)
-        painter.drawLine(px, bottom_y, px, bottom_y + 4)
-
-        label = _fmt(t)
-        tw = fm.horizontalAdvance(label)
-        lx = px - tw // 2
-        ly = bottom_y + 4 + fm.ascent()
-        painter.drawText(int(lx), int(ly), label)
-
+        px = x0 + int((t - view_start_sec) / visible_dur * draw_w)
+        if x0 <= px <= x0 + draw_w:
+            painter.setPen(grid_pen)
+            painter.drawLine(px, 0, px, bottom_y)
+            painter.setPen(tick_pen)
+            painter.drawLine(px, bottom_y, px, bottom_y + 4)
+            label = _format_time_tick(t, interval)
+            lx = px - fm.horizontalAdvance(label) // 2
+            painter.drawText(int(lx), int(bottom_y + 4 + fm.ascent()), label)
         t += interval

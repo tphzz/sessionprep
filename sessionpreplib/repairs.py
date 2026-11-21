@@ -361,8 +361,8 @@ class _BandWindow:
         tol = 1e-7 * self.bin_hz
         partial_power = 0.0
         noise = self._noise_power(powers)
-        for partial in self.partials:
-            fit = self._resolve(partial, spectrum, powers, noise)
+        for boundary in self.partials:
+            fit = self._resolve(boundary, spectrum, powers, noise)
             if fit is None:
                 continue
             cycles, (cosine, sine) = fit
@@ -383,8 +383,8 @@ class _BandWindow:
         frequency = np.clip(self.freqs - shift.imag, 0, self.nyquist)
         inside = (frequency > 0) & (frequency >= self.low - tol) & (frequency <= self.high + tol)
         confirmed = inside.copy()
-        for hz, direction, partial in self.edges:
-            bins = partial.bins
+        for hz, direction, edge_partial in self.edges:
+            bins = edge_partial.bins
             local = spectrum[bins]
             # For two unresolved lines, the magnitude of the second central
             # frequency moment is the product of their distances from the mean.
@@ -404,7 +404,7 @@ class _BandWindow:
 
 
 # Cache window readings only. Each entry holds at most 32 triples of numbers.
-_band_readings = OrderedDict()
+_band_readings: OrderedDict[tuple[object, ...], list[tuple[int, float, float, float]]] = OrderedDict()
 _band_readings_lock = Lock()
 
 

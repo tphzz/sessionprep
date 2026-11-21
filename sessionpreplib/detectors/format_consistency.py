@@ -41,7 +41,9 @@ class FormatConsistencyDetector(SessionDetector):
         most_common_sr = sr_counter.most_common(1)[0][0] if sr_counter else None
         most_common_bd = bd_counter.most_common(1)[0][0] if bd_counter else None
 
-        # Store on session config for other consumers
+        # Store on typed session consensus (and mirror to config for legacy consumers)
+        session.format_consensus.most_common_sr = most_common_sr
+        session.format_consensus.most_common_bd = most_common_bd
         session.config["_most_common_sr"] = most_common_sr
         session.config["_most_common_bd"] = most_common_bd
 

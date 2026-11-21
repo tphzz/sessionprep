@@ -16,7 +16,11 @@ from PySide6.QtCore import QThread, Signal
 from sessionpreplib.audio import SourceChangedError, max_momentary_rms, squared_sample_prefix, validate_analysis_level
 from sessionpreplib.audition import RepairAudition, inspection_spectrogram
 from sessionpreplib.repair_plan import source_for_render
-from sessionpreplib.spectrum import full_spectrogram, hz_to_mel as _hz_to_mel, mel_to_hz as _mel_to_hz
+from sessionpreplib.spectrum import (
+    full_spectrogram,
+    hz_to_mel as _hz_to_mel,  # noqa: F401 (re-export)
+    mel_to_hz as _mel_to_hz,  # noqa: F401 (re-export)
+)
 from .peakcache import peak_source_key
 
 
@@ -182,42 +186,24 @@ class WaveformLoadWorker(QThread):
         finally:
             self.settled.emit()
 
-    def _compute(self):
-        import time, logging
-        t_start = time.perf_counter()
-        log = logging.getLogger(__name__)
-
-        data = self._audio_data
-        sr = self._samplerate
-        win = self._rms_win
-
-        # --- Channel splitting ---
+    @staticmethod
+    def _split_channels(data) -> list[np.ndarray]:
         if isinstance(data, list):
-            channels = data
-        else:
-            if data is None or data.size == 0:
-                return
-            if data.ndim == 1:
-                channels = [data]
-            else:
-                channels = [data[:, ch] for ch in range(data.shape[1])]
-        if not channels:
-            return
-        nch = len(channels)
-        total = len(channels[0])
+            return data
+        if data is None or data.size == 0:
+            return []
+        if data.ndim == 1:
+            return [data]
+        return [data[:, ch] for ch in range(data.shape[1])]
 
-        if self._cancelled.is_set():
-            return
-
-        # --- Peak finding (Zero allocation) ---
-        t0 = time.perf_counter()
-
+    @staticmethod
+    def _find_global_peak(channels: list[np.ndarray], total: int) -> tuple[int, int, float, float]:
         def _find_peak(ch: np.ndarray) -> int:
             p_max = int(np.argmax(ch))
             p_min = int(np.argmin(ch))
             return p_min if abs(float(ch[p_min])) > abs(float(ch[p_max])) else p_max
 
-        if nch == 1:
+        if len(channels) == 1:
             peak_sample = _find_peak(channels[0])
             peak_channel = 0
         else:
@@ -225,19 +211,57 @@ class WaveformLoadWorker(QThread):
             max_vals = [abs(float(channels[i][p])) for i, p in enumerate(peaks_per_ch)]
             peak_channel = int(np.argmax(max_vals))
             peak_sample = peaks_per_ch[peak_channel]
-        peak_lin = abs(float(channels[peak_channel][peak_sample]))
-        validate_analysis_level(peak_lin, total)
-        peak_db = 20.0 * np.log10(peak_lin) if peak_lin > 0 else float('-inf')
         peak_amplitude = float(channels[peak_channel][peak_sample])
+        peak_lin = abs(peak_amplitude)
+        validate_analysis_level(peak_lin, total)
+        peak_db = 20.0 * np.log10(peak_lin) if peak_lin > 0 else float("-inf")
+        return peak_sample, peak_channel, peak_db, peak_amplitude
 
+    def _compute_spectrogram_data(self, channels: list[np.ndarray], data, sr: int):
+        source_steps = self.audition.source_steps if self.audition is not None else None
+        if self.band == "full" and self.track is not None:
+            return full_spectrogram(
+                channels,
+                sr,
+                width=self._spec_n_fft,
+                window=self._spec_window,
+                frequency_max=sr / 2,
+                rows=_SPEC_N_MELS,
+                cancelled=self._cancelled.is_set,
+                source_steps=source_steps,
+            )
+        if self.band == "full":
+            spec_db = compute_mel_spectrogram(
+                channels,
+                sr,
+                n_fft=self._spec_n_fft,
+                window=self._spec_window,
+                cancelled=self._cancelled.is_set,
+            )
+            return None, None, spec_db
+        return inspection_spectrogram(
+            data, sr, self.band, cancelled=self._cancelled.is_set, source_steps=source_steps
+        )
+
+    def _compute(self):
+        import time
+
+        t_start = time.perf_counter()
+        data = self._audio_data
+        sr = self._samplerate
+        channels = self._split_channels(data)
+        if not channels or self._cancelled.is_set():
+            return
+        total = len(channels[0])
+
+        t0 = time.perf_counter()
+        peak_sample, peak_channel, peak_db, peak_amplitude = self._find_global_peak(channels, total)
         log.debug("[Trace] WaveformLoadWorker Peak finding: %.2f ms", (time.perf_counter() - t0) * 1000)
-
         if self._cancelled.is_set():
             return
 
-        # --- RMS cumsum (computed once, reused for envelope drawing) ---
         t0 = time.perf_counter()
-        win = min(win, total)
+        win = min(self._rms_win, total)
         rms_cumsums = []
         if win > 0:
             for channel in channels:
@@ -245,38 +269,19 @@ class WaveformLoadWorker(QThread):
                     return
                 rms_cumsums.append(squared_sample_prefix(channel))
         rms_max_sample, rms_max_db, rms_max_amplitude = max_momentary_rms(rms_cumsums, win)
-
         log.debug("[Trace] WaveformLoadWorker RMS: %.2f ms", (time.perf_counter() - t0) * 1000)
-
         if self._cancelled.is_set():
             return
 
-        # --- Spectrogram ---
-        spec_db = None
-        spec_freq = None
-        spec_times = None
+        spec_times = spec_freq = spec_db = None
         if self._compute_spectrogram:
             t0 = time.perf_counter()
-            source_steps = self.audition.source_steps if self.audition is not None else None
-            if self.band == "full" and self.track is not None:
-                spec_times, spec_freq, spec_db = full_spectrogram(
-                    channels, sr, width=self._spec_n_fft, window=self._spec_window,
-                    frequency_max=sr / 2, rows=_SPEC_N_MELS, cancelled=self._cancelled.is_set,
-                    source_steps=source_steps)
-            elif self.band == "full":
-                spec_db = compute_mel_spectrogram(
-                    channels, sr, n_fft=self._spec_n_fft, window=self._spec_window,
-                    cancelled=self._cancelled.is_set)
-            else:
-                spec_times, spec_freq, spec_db = inspection_spectrogram(
-                    data, sr, self.band, cancelled=self._cancelled.is_set, source_steps=source_steps)
+            spec_times, spec_freq, spec_db = self._compute_spectrogram_data(channels, data, sr)
             log.debug("[Trace] WaveformLoadWorker STFT: %.2f ms", (time.perf_counter() - t0) * 1000)
-
             if self._cancelled.is_set():
                 return
 
         log.debug("[Trace] WaveformLoadWorker TOTAL: %.2f ms", (time.perf_counter() - t_start) * 1000)
-
         self.finished.emit({
             "channels": channels,
             "samplerate": sr,

@@ -50,7 +50,6 @@ from .operations import (
     sum_channel,
     unique_output_name,
     wire_channel,
-    wire_file,
 )
 
 if TYPE_CHECKING:
@@ -1110,14 +1109,14 @@ class OutputTree(QTreeWidget):
     def _action_remove_output(self, output_filename: str):
         if not self._topo:
             return
-            
+
         items = self.selectedItems()
         selected_files = set()
         for item in items:
             data = item.data(COL_NAME, Qt.UserRole)
             if data and data[0] == "file":
                 selected_files.add(data[1])
-                
+
         if output_filename in selected_files:
             # The clicked item is part of the selection; remove all selected files
             for fn in selected_files:
@@ -1125,7 +1124,7 @@ class OutputTree(QTreeWidget):
         else:
             # The clicked item is NOT part of the selection; remove only it
             remove_output(self._topo, output_filename)
-            
+
         self.topology_modified.emit()
 
     def _action_clear_channel(self, output_filename: str, target_ch: int):

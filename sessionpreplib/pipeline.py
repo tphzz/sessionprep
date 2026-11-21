@@ -9,18 +9,18 @@ from decimal import Decimal, ROUND_CEILING
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Callable
+from typing import Any
+from collections.abc import Callable
 
 import logging
 from collections import Counter
 from collections.abc import Collection
 
-log = logging.getLogger(__name__)
-
 import numpy as np
 
 from .gain_staging import apply_group_gains
 from .models import (
+    ConfigError,
     DetectorResult,
     ProcessorResult,
     Severity,
@@ -28,20 +28,20 @@ from .models import (
     SessionContext,
     LifecyclePhase,
 )
-from .detector import TrackDetector, SessionDetector
+from .detector import TrackDetector, SessionDetector, topo_sort_detectors as _topo_sort_detectors
 from .processor import AudioProcessor
 from .repair_plan import boundary_settling, plan_repairs, repair_levels, revalidate_restored_source, source_for_render
 from .repair_verification import RepairVerification, measure_detector
 from .repairs import OutputHeadroomError, check_output_headroom, render_corrected
 from .events import EventBus
 from .file_io import ensure_audio_backup
-from .audio import file_revision, load_track, format_duration, linear_to_db, AUDIO_EXTENSIONS
-from .config import ConfigError, validate_config
+from .audio import file_revision, load_track, linear_to_db
 from .utils import (
-    protools_sort_key,
     parse_group_specs,
     assign_groups,
 )
+
+log = logging.getLogger(__name__)
 
 
 class Pipeline:
@@ -203,6 +203,7 @@ class Pipeline:
                 results = det.analyze(session)
                 dt = (time.perf_counter() - t0) * 1000
                 log.debug(f"session detector {det.id}: {dt:.1f} ms")
+                session.session_detector_results[det.id] = results
                 session.config[f"_session_det_{det.id}"] = results
                 # Distribute per-track results back into each track
                 for result in results:
@@ -211,7 +212,7 @@ class Pipeline:
                         track_map[fname].detector_results[det.id] = result
                 self._emit("session_detector.complete", detector_id=det.id)
             except Exception as e:
-                session.config[f"_session_det_{det.id}"] = [
+                err_results = [
                     DetectorResult(
                         detector_id=det.id,
                         severity=Severity.PROBLEM,
@@ -220,6 +221,8 @@ class Pipeline:
                         error=str(e),
                     )
                 ]
+                session.session_detector_results[det.id] = err_results
+                session.config[f"_session_det_{det.id}"] = err_results
 
     def analyze_phase1(self, session: SessionContext) -> SessionContext:
         """Run structural/formatting detectors for track layout and validation."""
@@ -307,6 +310,8 @@ class Pipeline:
         An explicit retry may revalidate a restored file against its stored PCM and audio format.
         """
         log.info("Pipeline: plan (%d tracks)", len(session.tracks))
+        session.execution_receipts.execute_errors.clear()
+        session.execution_receipts.executed_files.clear()
         session.config.pop("_execute_errors", None)
         session.config.pop("_executed_files", None)
         total = len(session.tracks)
@@ -385,33 +390,9 @@ class Pipeline:
             audio = audio * (10.0 ** (track.manual_gain_db / 20))
         return corrected, audio, applied
 
-    def prepare(
-        self,
-        session: SessionContext,
-        output_dir: str,
-        progress_cb: Callable[[int, int, str], None] | None = None,
-    ) -> SessionContext:
-        """Render each output atomically. A failed retry retains its last successful render."""
-        from .topology import build_default_topology, build_transfer_manifest, resolve_entry_audio
-
-        # A callback may cancel the render after only some files have been replaced.
-        # Publish readiness only once every requested output has been checked.
-        session.prepare_state = "stale" if session.output_tracks else "none"
-        written = []
-        session.config["_prepared_files"] = written
-        root = Path(output_dir).resolve()
-        root.mkdir(parents=True, exist_ok=True)
-        topology = session.topology or build_default_topology(session.tracks)
-        session.topology = topology
-        sources = {t.filename: t for t in session.tracks if t.status == "OK"}
-        needed = dict.fromkeys(s.input_filename for e in topology.entries for s in e.sources)
-        rerouted = {i for i, entry in enumerate(topology.entries) if not _passthrough_entry(entry, sources)}
-        routed_names = {s.input_filename for i in rerouted for s in topology.entries[i].sources}
-        direct_names = {e.sources[0].input_filename for i, e in enumerate(topology.entries) if i not in rerouted}
+    def _render_prepare_sources(self, needed, sources, routed_names, direct_names, expected, progress_cb):
         rendered, original, applied, source_errors = {}, {}, {}, {}
         unity, source_gaps = {}, {}
-        expected = len(needed) + len(topology.entries)
-        destinations = Counter((root / e.output_filename).resolve() for e in topology.entries)
         for step, name in enumerate(needed):
             if progress_cb:
                 progress_cb(step, expected, f"Processing {name}")
@@ -426,10 +407,169 @@ class Pipeline:
                     source_gaps[name] = boundary_settling(track.audio_data, corrected, track.samplerate)
             except Exception as exc:
                 source_errors[name] = str(exc)
+        return rendered, original, applied, source_errors, unity, source_gaps
+
+    def _prepare_routed_dry_source(self, entry, names, src, root, prior, sources, original, unity):
+        import hashlib
+        from .topology import resolve_entry_audio
+
+        dry_audio = resolve_entry_audio(entry, original)
+        try:
+            check_output_headroom(dry_audio, "FLOAT")
+        except ValueError as exc:
+            raise ValueError(
+                "The routed original cannot be encoded as finite FLOAT audio. "
+                "Check the source levels and routing gains."
+            ) from exc
+        measurements = {}
+        if any(sources[n].repair_recipe.active for n in names):
+            corrected_route = resolve_entry_audio(entry, unity)
+            measurements = {
+                "original": repair_levels(dry_audio),
+                "corrected": repair_levels(corrected_route),
+                "boundary_settling": boundary_settling(dry_audio, corrected_route, src.samplerate),
+            }
+        digest = hashlib.blake2b(dry_audio, digest_size=16).hexdigest()
+        dry = root / ".routed" / str(src.samplerate) / digest / (Path(entry.output_filename).name + ".wav")
+        old = prior.get(entry.output_filename)
+        current_signature, dry_revision = None, None
+        if dry.is_file():
+            stat = dry.stat()
+            current_signature = (stat.st_size, stat.st_mtime_ns)
+            dry_revision = file_revision(dry, stat)
+        if (current_signature is None or old is None or Path(old.filepath) != dry
+                or old.source_file_signature != current_signature or old.source_file_revision != dry_revision):
+            current_signature, dry_revision = _write_atomic(dry, dry_audio, src.samplerate, "FLOAT")
+        return str(dry), current_signature, dry_revision, measurements
+
+    def _prepare_single_entry(
+        self, index, entry, root, destinations, input_paths, sources, prior, rerouted,
+        rendered, original, applied, source_errors, unity, source_gaps, gain_adjustments,
+    ):
+        from .topology import resolve_entry_audio
+
+        name = entry.output_filename
+        names = [s.input_filename for s in entry.sources]
+        for source in names:
+            if source in source_errors:
+                raise ValueError(f"{source}: {source_errors[source]}")
+        src = sources[names[0]]
+        if any(sources[n].samplerate != src.samplerate for n in names):
+            raise ValueError("Routed sources have different sample rates")
+        dest = (root / name).resolve()
+        if destinations[dest] != 1:
+            raise ValueError("Multiple output tracks use this filename")
+        if not dest.is_relative_to(root) or dest in input_paths or dest.is_relative_to(root / ".routed"):
+            raise ValueError("Prepared output must be separate from its source")
+        audio = resolve_entry_audio(entry, rendered)
+        try:
+            if len(set(names)) == 1:
+                self._check_source_headroom(audio, src, original[src.filename][0], applied[src.filename], entry)
+            else:
+                check_output_headroom(audio, src.subtype)
+        except OutputHeadroomError as overload:
+            advice = overload.adjustment
+            if advice is not None:
+                prev = gain_adjustments.get(src.filename)
+                if prev is None or (advice["reduction_db"], advice["peak_db"]) > (prev["reduction_db"], prev["peak_db"]):
+                    gain_adjustments[src.filename] = advice
+            raise
+
+        fader = _routed_fader(entry, sources, rendered, applied)
+        identity = index not in rerouted
+        if identity:
+            measurements = deepcopy(src.repair_measurements)
+            if src.filename in source_gaps:
+                measurements["boundary_settling"] = source_gaps[src.filename]
+            elif "boundary_settling" in measurements:
+                for key in ("boundary_settling", "low_cut_resolved", "subsonic_resolved"):
+                    measurements.pop(key, None)
+                measurements["corrected"] = deepcopy(measurements.get("original", {}))
+            dry_path, dry_signature, dry_revision = src.filepath, src.source_file_signature, src.source_file_revision
+        else:
+            dry_path, dry_signature, dry_revision, measurements = self._prepare_routed_dry_source(
+                entry, names, src, root, prior, sources, original, unity,
+            )
+
+        ids = list(dict.fromkeys(pid for n in names for pid in applied[n]))
+        out = replace(
+            src, filename=name, filepath=dry_path, processed_filepath=str(dest),
+            audio_data=None, total_samples=len(audio), channels=entry.output_channels,
+            duration_sec=len(audio) / src.samplerate, applied_processors=ids, prepared_fader_db=fader,
+            source_file_signature=dry_signature, source_file_revision=dry_revision,
+            source_sample_digest=src.source_sample_digest if identity else None,
+            detector_results=dict(src.detector_results) if identity else {},
+            detector_analysis_key=src.detector_analysis_key if identity else None,
+            detector_sample_digest=src.detector_sample_digest if identity else None,
+            corrected_analysis=src.corrected_analysis if identity and src.repair_recipe.active else None,
+            processor_results=deepcopy(src.processor_results), _cache={},
+            repair_overrides=dict(src.repair_overrides), repair_measurements=measurements,
+        )
+        out.prepared_file_signature, out.prepared_file_revision = _write_atomic(dest, audio, src.samplerate, src.subtype)
+        if identity:
+            src.processed_filepath = str(dest)
+            src.applied_processors = list(ids)
+            src.prepared_file_signature = out.prepared_file_signature
+            src.prepared_file_revision = out.prepared_file_revision
+            src.prepared_fader_db = out.prepared_fader_db
+        return out
+
+    @staticmethod
+    def _cleanup_obsolete_prepared_files(root: Path, input_paths: set[Path], output_tracks, prior) -> None:
+        protected = input_paths | {
+            Path(path).resolve() for track in output_tracks
+            for path in (track.filepath, track.processed_filepath) if path
+        }
+        for obsolete in prior.values():
+            if not obsolete.processed_filepath or obsolete.prepared_file_signature is None:
+                continue
+            path = Path(obsolete.processed_filepath)
+            try:
+                resolved = path.resolve()
+                if (resolved in protected or not resolved.is_relative_to(root)
+                        or resolved.is_relative_to(root / ".routed") or path.is_symlink()):
+                    continue
+                stat = path.stat()
+                if ((stat.st_size, stat.st_mtime_ns) == obsolete.prepared_file_signature
+                        and obsolete.prepared_file_revision is not None
+                        and file_revision(path, stat) == obsolete.prepared_file_revision):
+                    path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                log.warning("Could not remove obsolete prepared file %s: %s", path, exc)
+
+    def prepare(
+        self,
+        session: SessionContext,
+        output_dir: str,
+        progress_cb: Callable[[int, int, str], None] | None = None,
+    ) -> SessionContext:
+        """Render each output atomically. A failed retry retains its last successful render."""
+        from .topology import build_default_topology, build_transfer_manifest
+
+        session.prepare_state = "stale" if session.output_tracks else "none"
+        written: list[str] = []
+        session.execution_receipts.prepared_files = written
+        session.config["_prepared_files"] = written
+        root = Path(output_dir).resolve()
+        root.mkdir(parents=True, exist_ok=True)
+        topology = session.topology or build_default_topology(session.tracks)
+        session.topology = topology
+        sources = {t.filename: t for t in session.tracks if t.status == "OK"}
+        needed = dict.fromkeys(s.input_filename for e in topology.entries for s in e.sources)
+        rerouted = {i for i, entry in enumerate(topology.entries) if not _passthrough_entry(entry, sources)}
+        routed_names = {s.input_filename for i in rerouted for s in topology.entries[i].sources}
+        direct_names = {e.sources[0].input_filename for i, e in enumerate(topology.entries) if i not in rerouted}
+        expected = len(needed) + len(topology.entries)
+        destinations = Counter((root / e.output_filename).resolve() for e in topology.entries)
+        rendered, original, applied, source_errors, unity, source_gaps = self._render_prepare_sources(
+            needed, sources, routed_names, direct_names, expected, progress_cb,
+        )
 
         prior = {t.filename: t for t in session.output_tracks}
         output_tracks, errors = [], []
-        gain_adjustments = {}
+        gain_adjustments: dict[str, dict[str, float]] = {}
         input_paths = {Path(t.filepath).resolve() for t in session.tracks if t.filepath}
         for index, entry in enumerate(topology.entries):
             name = entry.output_filename
@@ -437,108 +577,12 @@ class Pipeline:
             if progress_cb:
                 progress_cb(step, expected, f"Writing {name}")
             try:
-                names = [s.input_filename for s in entry.sources]
-                for source in names:
-                    if source in source_errors:
-                        raise ValueError(f"{source}: {source_errors[source]}")
-                src = sources[names[0]]
-                if any(sources[n].samplerate != src.samplerate for n in names):
-                    raise ValueError("Routed sources have different sample rates")
-                dest = (root / name).resolve()
-                if destinations[dest] != 1:
-                    raise ValueError("Multiple output tracks use this filename")
-                if not dest.is_relative_to(root) or dest in input_paths or dest.is_relative_to(root / ".routed"):
-                    raise ValueError("Prepared output must be separate from its source")
-                audio = resolve_entry_audio(entry, rendered)
-                try:
-                    if len(set(names)) == 1:
-                        self._check_source_headroom(audio, src, original[src.filename][0],
-                                                    applied[src.filename], entry)
-                    else:
-                        check_output_headroom(audio, src.subtype)
-                except OutputHeadroomError as overload:
-                    advice = overload.adjustment
-                    if advice is not None:
-                        previous = gain_adjustments.get(src.filename)
-                        if previous is None or (advice["reduction_db"], advice["peak_db"]) > (
-                                previous["reduction_db"], previous["peak_db"]):
-                            gain_adjustments[src.filename] = advice
-                    raise
-                fader = _routed_fader(entry, sources, rendered, applied)
-                identity = index not in rerouted
-                measurements = deepcopy(src.repair_measurements) if identity else {}
-                if identity and src.filename in source_gaps:
-                    measurements["boundary_settling"] = source_gaps[src.filename]
-                elif identity and "boundary_settling" in measurements:
-                    # A direct library render can bypass a previously planned repair.
-                    for key in ("boundary_settling", "low_cut_resolved", "subsonic_resolved"):
-                        measurements.pop(key, None)
-                    measurements["corrected"] = deepcopy(measurements.get("original", {}))
-                dry_path = src.filepath
-                dry_signature = src.source_file_signature
-                dry_revision = src.source_file_revision
-                if not identity:
-                    # A gain mix or channel mapping has no single dry source file.
-                    # Give each routed revision its own path so a failed retry
-                    # cannot invalidate an older output's dry counterpart.
-                    import hashlib
-                    dry_audio = resolve_entry_audio(entry, original)
-                    try:
-                        check_output_headroom(dry_audio, "FLOAT")
-                    except ValueError as exc:
-                        raise ValueError(
-                            "The routed original cannot be encoded as finite FLOAT audio. "
-                            "Check the source levels and routing gains."
-                        ) from exc
-                    if any(sources[n].repair_recipe.active for n in names):
-                        corrected_route = resolve_entry_audio(entry, unity)
-                        measurements = {
-                            "original": repair_levels(dry_audio),
-                            "corrected": repair_levels(corrected_route),
-                            "boundary_settling": boundary_settling(dry_audio, corrected_route, src.samplerate),
-                        }
-                    digest = hashlib.blake2b(dry_audio, digest_size=16).hexdigest()
-                    dry = root / ".routed" / str(src.samplerate) / digest / (Path(name).name + ".wav")
-                    old = prior.get(name)
-                    current_signature = None
-                    dry_revision = None
-                    if dry.is_file():
-                        stat = dry.stat()
-                        current_signature = (stat.st_size, stat.st_mtime_ns)
-                        dry_revision = file_revision(dry, stat)
-                    if (current_signature is None or old is None or Path(old.filepath) != dry
-                            or old.source_file_signature != current_signature
-                            or old.source_file_revision != dry_revision):
-                        current_signature, dry_revision = _write_atomic(dry, dry_audio, src.samplerate, "FLOAT")
-                    dry_path = str(dry)
-                    dry_signature = current_signature
-                ids = list(dict.fromkeys(pid for n in names for pid in applied[n]))
-                out = replace(
-                    src, filename=name, filepath=dry_path, processed_filepath=str(dest),
-                    audio_data=None, total_samples=len(audio), channels=entry.output_channels,
-                    duration_sec=len(audio) / src.samplerate, applied_processors=ids,
-                    prepared_fader_db=fader,
-                    source_file_signature=dry_signature,
-                    source_file_revision=dry_revision,
-                    source_sample_digest=src.source_sample_digest if identity else None,
-                    detector_results=dict(src.detector_results) if identity else {},
-                    detector_analysis_key=src.detector_analysis_key if identity else None,
-                    detector_sample_digest=src.detector_sample_digest if identity else None,
-                    corrected_analysis=src.corrected_analysis if identity and src.repair_recipe.active else None,
-                    processor_results=deepcopy(src.processor_results), _cache={},
-                    repair_overrides=dict(src.repair_overrides),
-                    repair_measurements=measurements,
+                out = self._prepare_single_entry(
+                    index, entry, root, destinations, input_paths, sources, prior, rerouted,
+                    rendered, original, applied, source_errors, unity, source_gaps, gain_adjustments,
                 )
-                out.prepared_file_signature, out.prepared_file_revision = _write_atomic(
-                    dest, audio, src.samplerate, src.subtype)
                 output_tracks.append(out)
                 written.append(name)
-                if identity:
-                    src.processed_filepath = str(dest)
-                    src.applied_processors = list(ids)
-                    src.prepared_file_signature = out.prepared_file_signature
-                    src.prepared_file_revision = out.prepared_file_revision
-                    src.prepared_fader_db = out.prepared_fader_db
                 self._emit("track.prepared", filename=name, index=index, total=len(topology.entries))
             except Exception as exc:
                 errors.append((name, str(exc)))
@@ -549,28 +593,7 @@ class Pipeline:
                 progress_cb(step + 1, expected, name)
 
         if not errors:
-            protected = input_paths | {
-                Path(path).resolve() for track in output_tracks
-                for path in (track.filepath, track.processed_filepath) if path
-            }
-            for obsolete in prior.values():
-                if not obsolete.processed_filepath or obsolete.prepared_file_signature is None:
-                    continue
-                path = Path(obsolete.processed_filepath)
-                try:
-                    resolved = path.resolve()
-                    if (resolved in protected or not resolved.is_relative_to(root)
-                            or resolved.is_relative_to(root / ".routed") or path.is_symlink()):
-                        continue
-                    stat = path.stat()
-                    if ((stat.st_size, stat.st_mtime_ns) == obsolete.prepared_file_signature
-                            and obsolete.prepared_file_revision is not None
-                            and file_revision(path, stat) == obsolete.prepared_file_revision):
-                        path.unlink()
-                except FileNotFoundError:
-                    pass
-                except OSError as exc:
-                    log.warning("Could not remove obsolete prepared file %s: %s", path, exc)
+            self._cleanup_obsolete_prepared_files(root, input_paths, output_tracks, prior)
         session.config["_prepare_errors"] = errors
         session.config["_output_gain_adjustments"] = gain_adjustments
         session.output_tracks = output_tracks
@@ -706,6 +729,8 @@ class Pipeline:
             self._emit("track.write_complete", filename=track.filename,
                        index=idx, total=total)
 
+        session.execution_receipts.execute_errors = errors
+        session.execution_receipts.executed_files = receipts
         session.config["_execute_errors"] = errors
         session.config["_executed_files"] = receipts
         return session
@@ -880,47 +905,3 @@ def load_session(
         session.warnings.extend(warnings)
 
     return session
-
-
-def _topo_sort_detectors(detectors: list[TrackDetector]) -> list[TrackDetector]:
-    """
-    Topological sort by depends_on.
-    Raises ConfigError if a cycle is detected or a dependency is missing.
-    """
-    by_id = {}
-    for detector in detectors:
-        if detector.id in by_id:
-            raise ConfigError(f"Duplicate detector ID: {detector.id}")
-        by_id[detector.id] = detector
-    all_ids = set(by_id.keys())
-
-    # Validate dependencies exist
-    for d in detectors:
-        for dep in (d.depends_on or []):
-            if dep not in all_ids:
-                raise ConfigError(
-                    f"Detector '{d.id}' depends on '{dep}' which does not exist"
-                )
-
-    # Kahn's algorithm
-    in_degree = {d.id: 0 for d in detectors}
-    adjacency: dict[str, list[str]] = {d.id: [] for d in detectors}
-    for d in detectors:
-        for dep in (d.depends_on or []):
-            adjacency[dep].append(d.id)
-            in_degree[d.id] += 1
-
-    queue = [did for did, deg in in_degree.items() if deg == 0]
-    sorted_ids = []
-    while queue:
-        node = queue.pop(0)
-        sorted_ids.append(node)
-        for neighbor in adjacency.get(node, []):
-            in_degree[neighbor] -= 1
-            if in_degree[neighbor] == 0:
-                queue.append(neighbor)
-
-    if len(sorted_ids) != len(detectors):
-        raise ConfigError("Cyclic dependency detected among track detectors")
-
-    return [by_id[did] for did in sorted_ids]

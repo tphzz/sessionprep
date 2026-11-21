@@ -2,9 +2,8 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Callable
-
-log = logging.getLogger(__name__)
+from typing import Any
+from collections.abc import Callable
 
 from PySide6.QtCore import QObject, Signal, Slot
 from sessionpreplib.models import SessionContext
@@ -14,6 +13,8 @@ from sessionprepgui.analysis.worker import DawCheckWorker, DawTransferWorker
 from sessionprepgui.session.io import restore_layout_sources
 
 from .panel import BatchItem
+
+log = logging.getLogger(__name__)
 
 class BatchManager(QObject):
     """Orchestrates DAW check and sequential transfer workers for batch processing."""

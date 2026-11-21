@@ -4,6 +4,7 @@ import logging
 import os
 from pathlib import Path
 import shutil
+import sys
 from tempfile import mkdtemp
 
 from .audio import AUDIO_EXTENSIONS, file_revision
@@ -22,7 +23,7 @@ def publish_layout(root: Path, staged: Path, outputs, previous):
     # releases the OS lock even if the process exits during an Apply.
     with (root / ".sessionprep-layout.lock").open("a+b") as lock:
         try:
-            if os.name == "nt":
+            if sys.platform == "win32":
                 import msvcrt
                 lock.seek(0)
                 msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)

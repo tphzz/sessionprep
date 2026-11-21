@@ -98,10 +98,29 @@ class FileReportPane(QWidget):
         layout.setSpacing(_HELP_GAP)
         layout.addWidget(report, 1)
 
-        self._help_panel = QFrame()
-        self._help_panel.setObjectName("detectorHelpPanel")
-        self._help_panel.setAccessibleName("Detector help")
-        self._help_panel.setStyleSheet(f"""
+        self._help_panel = self._build_help_panel()
+        self._help_dock = QWidget()
+        dock_layout = QVBoxLayout(self._help_dock)
+        dock_layout.setContentsMargins(0, REPORT_INSET, REPORT_INSET, REPORT_INSET)
+        dock_layout.setSpacing(0)
+        dock_layout.addWidget(self._help_panel)
+        layout.addWidget(self._help_dock)
+        self._help_dock.hide()
+        self._escape = QShortcut(QKeySequence(Qt.Key_Escape), self._help_panel)
+        self._escape.setContext(Qt.WidgetWithChildrenShortcut)
+        self._escape.activated.connect(self.close_help)
+
+        report.helpRequested.connect(self._show_help)
+        report.reportChanged.connect(self._report_changed)
+        self.setFocusProxy(report)
+        self.refresh_fonts()
+        self._fit_help_width()
+
+    def _build_help_panel(self) -> QFrame:
+        panel = QFrame()
+        panel.setObjectName("detectorHelpPanel")
+        panel.setAccessibleName("Detector help")
+        panel.setStyleSheet(f"""
             QFrame#detectorHelpPanel {{
                 background:{COLORS["surface"]}; border:1px solid {COLORS["border"]};
             }}
@@ -116,9 +135,23 @@ class FileReportPane(QWidget):
             QToolButton#detectorHelpClose:hover {{ background:{COLORS["accent"]}; }}
             QToolButton#detectorHelpClose:focus {{ border-color:{COLORS["information"]}; }}
         """)
-        panel_layout = QVBoxLayout(self._help_panel)
+        panel_layout = QVBoxLayout(panel)
         panel_layout.setContentsMargins(0, 0, 0, 0)
         panel_layout.setSpacing(0)
+        panel_layout.addWidget(self._build_help_header())
+
+        self.help_browser = QTextBrowser()
+        self.help_browser.setObjectName("detectorHelpBody")
+        self.help_browser.setAccessibleName("Detector explanation")
+        self.help_browser.setOpenLinks(False)
+        self.help_browser.setOpenExternalLinks(False)
+        self.help_browser.setWordWrapMode(QTextOption.WrapAtWordBoundaryOrAnywhere)
+        self.help_browser.document().setDocumentMargin(16)
+        panel_layout.addWidget(self.help_browser, 1)
+        self.help_browser.installEventFilter(self)
+        return panel
+
+    def _build_help_header(self) -> QFrame:
         header = QFrame()
         header.setObjectName("detectorHelpHeader")
         header_layout = QHBoxLayout(header)
@@ -128,7 +161,7 @@ class FileReportPane(QWidget):
         titles.setSpacing(4)
         context = QLabel("Detector help")
         context.setObjectName("detectorHelpContext")
-        context.setWordWrap(True)  # wraps beside Close in a narrow dock (approved design)
+        context.setWordWrap(True)
         context.setStyleSheet(f"color:{COLORS['metadata']};")
         self.help_title = QLabel()
         self.help_title.setTextFormat(Qt.PlainText)
@@ -150,35 +183,7 @@ class FileReportPane(QWidget):
         self.close_button.setFocusPolicy(Qt.StrongFocus)
         self.close_button.clicked.connect(lambda: self.close_help())
         header_layout.addWidget(self.close_button, 0, Qt.AlignTop)
-        panel_layout.addWidget(header)
-
-        self.help_browser = QTextBrowser()
-        self.help_browser.setObjectName("detectorHelpBody")
-        self.help_browser.setAccessibleName("Detector explanation")
-        self.help_browser.setOpenLinks(False)
-        self.help_browser.setOpenExternalLinks(False)
-        self.help_browser.setWordWrapMode(QTextOption.WrapAtWordBoundaryOrAnywhere)
-        self.help_browser.document().setDocumentMargin(16)
-        panel_layout.addWidget(self.help_browser, 1)
-        self.help_browser.installEventFilter(self)
-        # The dock keeps the detail-tab padding from the pane's top, right and
-        # bottom edges; the report keeps the full height beside it.
-        self._help_dock = QWidget()
-        dock_layout = QVBoxLayout(self._help_dock)
-        dock_layout.setContentsMargins(0, REPORT_INSET, REPORT_INSET, REPORT_INSET)
-        dock_layout.setSpacing(0)
-        dock_layout.addWidget(self._help_panel)
-        layout.addWidget(self._help_dock)
-        self._help_dock.hide()
-        self._escape = QShortcut(QKeySequence(Qt.Key_Escape), self._help_panel)
-        self._escape.setContext(Qt.WidgetWithChildrenShortcut)
-        self._escape.activated.connect(self.close_help)
-
-        report.helpRequested.connect(self._show_help)
-        report.reportChanged.connect(self._report_changed)
-        self.setFocusProxy(report)
-        self.refresh_fonts()
-        self._fit_help_width()
+        return header
 
     @property
     def active_detector_id(self):

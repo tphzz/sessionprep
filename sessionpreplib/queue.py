@@ -3,7 +3,8 @@ from __future__ import annotations
 from copy import deepcopy
 from datetime import datetime
 import os
-from typing import Any, Callable
+from typing import Any
+from collections.abc import Callable
 from uuid import uuid4
 
 from .models import SessionJob, SessionResult, JobStatus, SessionContext
@@ -153,7 +154,11 @@ class SessionQueue:
 
 def _job_errors(session: SessionContext) -> list[str]:
     """Collect operational failures while keeping successful sibling results."""
-    errors = list(session.config.get("_execute_errors", []))
+    errors = list(
+        session.execution_receipts.execute_errors
+        if session.execution_receipts.execute_errors
+        else session.config.get("_execute_errors", [])
+    )
     for track in session.tracks:
         if track.status != "OK":
             errors.append((track.filename, track.status))
@@ -163,7 +168,10 @@ def _job_errors(session: SessionContext) -> list[str]:
             if result.error:
                 errors.append((track.filename, result.error))
     for detector in session.detectors:
-        for result in session.config.get(f"_session_det_{detector.id}", []):
+        det_results = session.session_detector_results.get(
+            detector.id, session.config.get(f"_session_det_{detector.id}", [])
+        )
+        for result in det_results:
             if result.error:
                 errors.append((detector.id, result.error))
     return [f"{name}: {message}" for name, message in dict.fromkeys(errors)]

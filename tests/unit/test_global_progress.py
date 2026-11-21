@@ -79,9 +79,9 @@ def test_analysis_progress_uses_global_panel_not_status_bar(qapp):
         window._progress_start("Analyzing...")
         window._status_bar.showMessage("Idle")
 
-        worker = window._worker = AnalyzeWorker(".", {})
-        worker.progress.connect(window._on_worker_progress)
-        worker.progress_value.connect(window._on_worker_progress_value)
+        worker = window.lifecycle_controller.analyze_worker = AnalyzeWorker(".", {})
+        worker.progress.connect(window.lifecycle_controller._on_worker_progress)
+        worker.progress_value.connect(window.lifecycle_controller._on_worker_progress_value)
         worker.progress.emit(worker, "Analyzing Kick.wav - clipping")
         worker.progress_value.emit(worker, 3, 10)
 
@@ -103,9 +103,9 @@ def test_prepare_progress_uses_global_panel_not_status_bar(qapp):
         window._progress_start("Preparing...")
         window._status_bar.showMessage("Idle")
 
-        worker = window._prepare_worker = PrepareWorker(SessionContext([], {}), [], ".")
-        worker.progress.connect(window._on_prepare_progress)
-        worker.progress_value.connect(window._on_prepare_progress_value)
+        worker = window.lifecycle_controller.prepare_worker = PrepareWorker(SessionContext([], {}), [], ".")
+        worker.progress.connect(window.lifecycle_controller._on_prepare_progress)
+        worker.progress_value.connect(window.lifecycle_controller._on_prepare_progress_value)
         worker.progress.emit(worker, "Writing Snare.wav")
         worker.progress_value.emit(worker, 4, 12)
 
@@ -124,9 +124,9 @@ def test_topology_apply_progress_uses_global_panel(qapp):
         _select_phase(window, _PHASE_TOPOLOGY)
         window._progress_start("Applying topology...")
 
-        worker = window._topo_apply_worker = TopologyApplyWorker(SessionContext([], {}), ".")
-        worker.progress.connect(window._on_topo_apply_progress)
-        worker.progress_value.connect(window._on_topo_apply_progress_value)
+        worker = window.topology_controller.apply_worker = TopologyApplyWorker(SessionContext([], {}), ".")
+        worker.progress.connect(window.topology_controller._on_apply_progress)
+        worker.progress_value.connect(window.topology_controller._on_apply_progress_value)
         worker.progress.emit(worker, "Writing 01_Kick.wav")
         worker.progress_value.emit(worker, 1, 8)
 
@@ -146,8 +146,8 @@ def test_daw_transfer_progress_uses_global_panel_not_status_bar(qapp):
         window._progress_start("Transferring...")
         window._status_bar.showMessage("Idle")
 
-        window._on_transfer_progress("Creating Pro Tools session")
-        window._on_transfer_progress_value(2, 5)
+        window.daw_controller._on_transfer_progress("Creating Pro Tools session")
+        window.daw_controller._on_transfer_progress_value(2, 5)
 
         progress = _progress_panel(window, _PHASE_SETUP)
         assert progress._label.text() == (

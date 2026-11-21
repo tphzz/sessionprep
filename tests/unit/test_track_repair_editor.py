@@ -10,9 +10,9 @@ from PySide6.QtWidgets import QApplication, QHBoxLayout, QTableWidget, QTableWid
 
 from sessionprepgui.detail.browser import ReportBrowser
 from sessionprepgui.detail.help_panel import FileReportPane
-from sessionprepgui.detail.mixin import DetailMixin
 from sessionprepgui.detail.file_review import FileReviewPane
-from sessionprepgui.tracks.columns_mixin import TrackColumnsMixin
+from sessionprepgui.tracks.table_controller import TrackTableController
+from sessionprepgui.state import WorkspaceState
 from sessionpreplib.detectors.subsonic import SubsonicDetector
 from sessionpreplib.models import CorrectedAnalysis, DetectorResult, IssueLocation, SessionContext, Severity, TrackContext
 from sessionpreplib.processors.bimodal_normalize import BimodalNormalizeProcessor
@@ -330,30 +330,45 @@ def test_peak_layout_releases_moved_native_items_on_reflow(editor_pane, app):
 
 
 def test_processing_menu_opens_same_editor_and_restores_focus_without_normalization(app, editor_pane):
+    from types import SimpleNamespace
+    from sessionprepgui.detail.controller import TrackDetailController
+
     pane, editor, track, session = editor_pane
-    class Table(TrackColumnsMixin, DetailMixin):
-        pass
-    owner = Table()
-    owner._file_review = pane
-    owner._file_report = pane.report
-    owner._current_track = track
-    owner._session = session
-    owner._detail_tabs = QTabWidget()
-    owner._detail_tabs.addTab(QWidget(), "Summary")
-    owner._detail_tabs.addTab(pane, "File")
-    owner._detail_tabs.setCurrentIndex(1)
-    owner._track_table = QTableWidget(1, 8)
-    owner._track_table.setItem(0, 0, QTableWidgetItem(track.filename))
-    owner._create_processing_button(0, track)
-    pane.processingFocusRequested.connect(owner._focus_processing_menu)
+    detail_tabs = QTabWidget()
+    detail_tabs.addTab(QWidget(), "Summary")
+    detail_tabs.addTab(pane, "File")
+    detail_tabs.setCurrentIndex(1)
+    track_table = QTableWidget(1, 8)
+    track_table.setItem(0, 0, QTableWidgetItem(track.filename))
+
+    state = WorkspaceState()
+    state.session = session
+    state.current_track = track
+    table_ctrl = TrackTableController(state, SimpleNamespace(), track_table=track_table)
+    detail_ctrl = TrackDetailController(
+        state,
+        SimpleNamespace(),
+        summary_view=None,
+        file_report=pane.report,
+        file_review=pane,
+        repair_editor=editor,
+        detail_tabs=detail_tabs,
+        track_table=track_table,
+        wf_panel=None,
+        playback=None,
+        on_find_table_row=table_ctrl.find_table_row,
+    )
+    table_ctrl._on_open_track_repairs = detail_ctrl.open_track_repairs
+    table_ctrl.create_processing_button(0, track)
+    pane.processingFocusRequested.connect(detail_ctrl.focus_processing_menu)
     window = QWidget()
     layout = QHBoxLayout(window)
-    layout.addWidget(owner._track_table)
-    layout.addWidget(owner._detail_tabs)
+    layout.addWidget(track_table)
+    layout.addWidget(detail_tabs)
     window.show()
     window.activateWindow()
     app.processEvents()
-    button = owner._track_table.cellWidget(0, 7)
+    button = track_table.cellWidget(0, 7)
     action, = [a for a in button.menu().actions() if a.text() == "Track repairs…"]
     action.trigger()
     assert editor.track is track and editor.isVisible()
@@ -600,11 +615,13 @@ def test_processing_menu_tracks_findings_without_hiding_normalization(editor_pan
     track.repair_recipe = RepairRecipe()
     track.repair_measurements.clear()
     track.repair_overrides.clear()
-    owner = TrackColumnsMixin()
-    owner._session = session
-    owner._track_table = QTableWidget(1, 8)
-    owner._create_processing_button(0, track)
-    button = owner._track_table.cellWidget(0, 7)
+    from types import SimpleNamespace
+    state = WorkspaceState()
+    state.session = session
+    track_table = QTableWidget(1, 8)
+    table_ctrl = TrackTableController(state, SimpleNamespace(), track_table=track_table)
+    table_ctrl.create_processing_button(0, track)
+    button = track_table.cellWidget(0, 7)
     normalization, separator, repairs = button.menu().actions()
     assert repairs.isVisible() and separator.isVisible()
     session.config["subsonic_enabled"] = False

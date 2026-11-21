@@ -22,12 +22,12 @@ def qapp():
 def test_phase1_config_impact_routes_to_track_layout_reanalysis(qapp, monkeypatch):
     window = SessionPrepWindow()
     calls: list[str] = []
-    monkeypatch.setattr(
-        window, "_on_topo_reanalyze", lambda: calls.append("phase1"))
-    monkeypatch.setattr(window, "_on_analyze", lambda: calls.append("phase2"))
+    ctrl = window.config_controller
+    monkeypatch.setattr(ctrl, "_on_reanalyze_phase1", lambda: calls.append("phase1"))
+    monkeypatch.setattr(ctrl, "_on_reanalyze_phase2", lambda: calls.append("phase2"))
 
     try:
-        window._apply_config_change_impact(
+        ctrl.apply_config_change_impact(
             ConfigChangeImpact(
                 phase1_keys=frozenset({
                     "detectors.dual_mono.dual_mono_eps",
@@ -41,12 +41,12 @@ def test_phase1_config_impact_routes_to_track_layout_reanalysis(qapp, monkeypatc
 def test_phase2_config_impact_routes_to_phase2_reanalysis(qapp, monkeypatch):
     window = SessionPrepWindow()
     calls: list[str] = []
-    monkeypatch.setattr(
-        window, "_on_topo_reanalyze", lambda: calls.append("phase1"))
-    monkeypatch.setattr(window, "_on_analyze", lambda: calls.append("phase2"))
+    ctrl = window.config_controller
+    monkeypatch.setattr(ctrl, "_on_reanalyze_phase1", lambda: calls.append("phase1"))
+    monkeypatch.setattr(ctrl, "_on_reanalyze_phase2", lambda: calls.append("phase2"))
 
     try:
-        window._apply_config_change_impact(
+        ctrl.apply_config_change_impact(
             ConfigChangeImpact(
                 phase2_keys=frozenset({
                     "processors.bimodal_normalize.target_rms",
@@ -60,12 +60,12 @@ def test_phase2_config_impact_routes_to_phase2_reanalysis(qapp, monkeypatch):
 def test_mixed_preset_change_refreshes_daw_before_analysis_rerun(qapp, monkeypatch):
     window = SessionPrepWindow()
     calls: list[str] = []
-    monkeypatch.setattr(window, "_on_analyze", lambda: calls.append("analysis"))
-    monkeypatch.setattr(
-        window, "_refresh_daw_processors_from_config", lambda: calls.append("daw"))
+    ctrl = window.config_controller
+    monkeypatch.setattr(ctrl, "_on_reanalyze_phase2", lambda: calls.append("analysis"))
+    monkeypatch.setattr(ctrl, "_on_refresh_daw_from_config", lambda: calls.append("daw"))
 
     try:
-        window._apply_config_change_impact(
+        ctrl.apply_config_change_impact(
             ConfigChangeImpact(
                 phase2_keys=frozenset({"processors.bimodal_normalize.target_rms"}),
                 daw_keys=frozenset({"daw_processors.protools.protools_temp_dir"}),
@@ -81,22 +81,14 @@ def test_daw_only_config_impact_refreshes_phase3_without_reanalysis(
         qapp, monkeypatch):
     window = SessionPrepWindow()
     calls: list[str] = []
-    monkeypatch.setattr(
-        window, "_on_topo_reanalyze", lambda: calls.append("phase1"))
-    monkeypatch.setattr(window, "_on_analyze", lambda: calls.append("phase2"))
-    monkeypatch.setattr(
-        window,
-        "_refresh_daw_processors_from_config",
-        lambda: calls.append("daw"),
-    )
-    monkeypatch.setattr(
-        window,
-        "_refresh_config_changed_display",
-        lambda: calls.append("display"),
-    )
+    ctrl = window.config_controller
+    monkeypatch.setattr(ctrl, "_on_reanalyze_phase1", lambda: calls.append("phase1"))
+    monkeypatch.setattr(ctrl, "_on_reanalyze_phase2", lambda: calls.append("phase2"))
+    monkeypatch.setattr(ctrl, "_on_refresh_daw_from_config", lambda: calls.append("daw"))
+    monkeypatch.setattr(ctrl, "refresh_config_changed_display", lambda: calls.append("display"))
 
     try:
-        window._apply_config_change_impact(
+        ctrl.apply_config_change_impact(
             ConfigChangeImpact(
                 daw_keys=frozenset({
                     "daw_processors.protools.protools_project_dir",

@@ -35,10 +35,10 @@ def layout_window(qapp, monkeypatch, tmp_path):
     ]
     tracks[0].detector_results["clipping"] = DetectorResult(
         "clipping", Severity.PROBLEM, "clipping detected (1 clipped range)", {})
-    window._topo_source_tracks = tracks
-    window._topo_topology = build_default_topology(tracks)
-    window._session = SessionContext(tracks, window._flat_config())
-    window._populate_topology_tab()
+    window.state.topo_source_tracks = tracks
+    window.state.topo_topology = build_default_topology(tracks)
+    window.state.session = SessionContext(tracks, window.state.flat_config())
+    window.topology_controller.populate()
     window.resize(1320, 680)
     window.show()
     window.activateWindow()
@@ -50,14 +50,14 @@ def layout_window(qapp, monkeypatch, tmp_path):
 
 
 def _output_item(window, filename, channel=None):
-    tree = window._topo_output_tree
+    tree = window.topology_controller.page.output_tree
     item = next(tree.topLevelItem(i) for i in range(tree.topLevelItemCount())
                 if tree.topLevelItem(i).data(0, Qt.UserRole) == ("file", filename))
     return item if channel is None else item.child(channel)
 
 
 def _delete_output(window, filename, channel=None):
-    tree = window._topo_output_tree
+    tree = window.topology_controller.page.output_tree
     tree.setCurrentItem(_output_item(window, filename, channel))
     tree.setFocus()
     QTest.keyClick(tree, Qt.Key_Delete)
@@ -65,8 +65,8 @@ def _delete_output(window, filename, channel=None):
 
 
 def _drop_piano_right(window, target):
-    inputs = window._topo_input_tree
-    outputs = window._topo_output_tree
+    inputs = window.topology_controller.page.input_tree
+    outputs = window.topology_controller.page.output_tree
     source = inputs.find_item(PIANO).child(1)
     mime = inputs.mimeData([source])
     pos = outputs.visualItemRect(_output_item(window, target)).center()
@@ -94,7 +94,7 @@ def _has_status_ink(colors):
 
 def test_release_and_reassignment_follow_the_last_route(layout_window):
     window = layout_window
-    inputs = window._topo_input_tree
+    inputs = window.topology_controller.page.input_tree
     assert inputs.find_item(PIANO).child(1).foreground(0).color().name() == "#aaaaaa"
 
     _drop_piano_right(window, BASS)
@@ -123,7 +123,7 @@ def test_release_and_reassignment_follow_the_last_route(layout_window):
 
 
 def test_collapsed_count_and_warning_paint_together(form_font, layout_window):
-    inputs = layout_window._topo_input_tree
+    inputs = layout_window.topology_controller.page.input_tree
     inputs.collapseAll()
     _delete_output(layout_window, PIANO)
     piano = inputs.find_item(PIANO)
@@ -142,7 +142,7 @@ def test_collapsed_count_and_warning_paint_together(form_font, layout_window):
 
 def test_selected_and_narrow_rows_keep_the_unassigned_status(form_font, layout_window):
     _delete_output(layout_window, PIANO, 1)
-    inputs = layout_window._topo_input_tree
+    inputs = layout_window.topology_controller.page.input_tree
     channel = inputs.find_item(PIANO).child(1)
     inputs.setColumnWidth(0, 190)
     QApplication.processEvents()

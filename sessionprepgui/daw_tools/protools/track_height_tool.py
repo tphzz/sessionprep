@@ -232,6 +232,20 @@ class TrackHeightTool(QWidget):
         self._desc.setStyleSheet("color: #aaa; font-size: 9pt;")
         layout.addWidget(self._desc)
 
+        self._build_preset_bar(layout)
+        layout.addLayout(self._build_controls_bar())
+        self._build_height_table(layout)
+
+        self._status = QLabel("")
+        self._status.setStyleSheet("color: #888; font-size: 8pt;")
+        self._status.hide()
+        layout.addWidget(self._status)
+        self._bottom_stretch = QSpacerItem(0, 0, QSizePolicy.Minimum, QSizePolicy.Fixed)
+        layout.addItem(self._bottom_stretch)
+        self._update_mode_visibility()
+        self._update_dirty_state()
+
+    def _build_preset_bar(self, layout: QVBoxLayout) -> None:
         self._preset_panel = NamedPresetPanel([], label="Preset:", parent=self)
         self._preset_panel.preset_switching.connect(self._on_preset_switching)
         self._preset_panel.preset_added.connect(self._on_preset_added)
@@ -240,16 +254,15 @@ class TrackHeightTool(QWidget):
         self._preset_panel.preset_deleted.connect(self._on_preset_deleted)
         layout.addWidget(self._preset_panel)
         self._save_btn = self._preset_panel.add_trailing_button(
-            "Save Preset",
-            tooltip="Save changes to the active track-height preset",
+            "Save Preset", tooltip="Save changes to the active track-height preset"
         )
         self._save_btn.clicked.connect(self._on_save_preset)
         self._reset_btn = self._preset_panel.add_trailing_button(
-            "Restore Defaults",
-            tooltip="Load the built-in track-height defaults into this preset",
+            "Restore Defaults", tooltip="Load the built-in track-height defaults into this preset"
         )
         self._reset_btn.clicked.connect(self._on_reset_defaults)
 
+    def _build_controls_bar(self) -> QHBoxLayout:
         controls = QHBoxLayout()
         self._controls_layout = controls
         controls.addWidget(QLabel("Mode:"))
@@ -271,9 +284,7 @@ class TrackHeightTool(QWidget):
         self._all_height_combo = QComboBox()
         for value, text in HEIGHT_CHOICES:
             self._all_height_combo.addItem(text, value)
-        self._all_height_combo.currentIndexChanged.connect(
-            self._on_all_height_changed
-        )
+        self._all_height_combo.currentIndexChanged.connect(self._on_all_height_changed)
         controls.addWidget(self._all_height_combo)
         self._all_summary = QLabel("")
         self._all_summary.setStyleSheet("color: #aaa; font-size: 9pt;")
@@ -286,8 +297,9 @@ class TrackHeightTool(QWidget):
         self._apply_btn = FormActionButton("Apply")
         self._apply_btn.clicked.connect(self._apply_preset)
         controls.addWidget(self._apply_btn)
-        layout.addLayout(controls)
+        return controls
 
+    def _build_height_table(self, layout: QVBoxLayout) -> None:
         self._table = QTableWidget(len(TRACK_TYPES), 4, self)
         self._table.setHorizontalHeaderLabels(
             ["Track Type", "Matched", "Current Heights", "Preset Height"]
@@ -327,17 +339,6 @@ class TrackHeightTool(QWidget):
             self._table.setCellWidget(row, COL_PRESET, combo)
 
         self._sort_table(COL_TYPE, Qt.AscendingOrder)
-
-        self._status = QLabel("")
-        self._status.setStyleSheet("color: #888; font-size: 8pt;")
-        self._status.hide()  # shown only while it has a message
-        layout.addWidget(self._status)
-        self._bottom_stretch = QSpacerItem(
-            0, 0, QSizePolicy.Minimum, QSizePolicy.Fixed
-        )
-        layout.addItem(self._bottom_stretch)
-        self._update_mode_visibility()
-        self._update_dirty_state()
 
     def preferred_expanded_height_for_width(self, width: int) -> int:
         """Return the height needed to show the controls and table comfortably."""

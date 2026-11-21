@@ -1,13 +1,15 @@
-"""Analysis subpackage: analysis mixin and background workers."""
+"""Analysis subpackage: session config/lifecycle controllers and background workers."""
 
-from .mixin import AnalysisMixin
+from .config_controller import SessionConfigController
+from .lifecycle_controller import SessionLifecycleController
 from .worker import (
     AudioLoadWorker, AnalyzeWorker, PrepareWorker,
     BatchReanalyzeWorker, DawCheckWorker, DawFetchWorker, DawTransferWorker,
 )
 
 __all__ = [
-    "AnalysisMixin",
+    "SessionConfigController",
+    "SessionLifecycleController",
     "AudioLoadWorker", "AnalyzeWorker", "PrepareWorker",
     "BatchReanalyzeWorker", "DawCheckWorker", "DawFetchWorker", "DawTransferWorker",
 ]

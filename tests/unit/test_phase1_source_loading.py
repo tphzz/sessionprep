@@ -179,7 +179,8 @@ def test_unreadable_source_is_isolated_and_recovers_on_reanalysis(tmp_path, dama
 
     outputs = _analyze([ready, damaged, good])
 
-    assert damaged.status == "ERROR" and damaged.error
+    assert damaged.status.startswith("Error: ") and len(damaged.status) > len("Error: ")
+    assert not hasattr(damaged, "error")
     assert not damaged.detector_results
     assert [output.output_filename for output in outputs] == [ready.filename, good.filename]
     assert all(output.output_channels == 1 for output in outputs)

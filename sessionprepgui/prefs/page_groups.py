@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 import copy
-from typing import Callable
+from collections.abc import Callable
 
 from PySide6.QtCore import Signal
-from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QLabel,
     QVBoxLayout,

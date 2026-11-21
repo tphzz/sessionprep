@@ -142,7 +142,7 @@ def resolve_ref_version(ref_type: str, ref_name: str, commit: str) -> str:
         versions = {}
         reachable = _git(["tag", "--merged", commit], cwd=root)
         if reachable is None:
-            raise VersionResolutionError("Could not inspect reachable version tags")
+            raise VersionResolutionError("Could not inspect reachable version tags") from None
         for tag in reachable.splitlines():
             try:
                 versions[tag] = _normalize_version(tag, source="ancestor tag")
@@ -155,11 +155,11 @@ def resolve_ref_version(ref_type: str, ref_name: str, commit: str) -> str:
                 args.extend(["--match", tag])
             nearest = _git([*args, commit], cwd=root)
             if nearest not in versions:
-                raise VersionResolutionError("Could not resolve the nearest version tag")
+                raise VersionResolutionError("Could not resolve the nearest version tag") from None
             base = versions[nearest]
             distance = _git(["rev-list", "--count", f"{nearest}..{commit}"], cwd=root)
             if distance is None or not distance.isdigit():
-                raise VersionResolutionError("Could not count commits since the version tag")
+                raise VersionResolutionError("Could not count commits since the version tag") from None
     # Do not stack a second dev/local suffix on an already-development base.
     base = base.split("+", 1)[0].split(".dev", 1)[0]
     return _normalize_version(

@@ -77,11 +77,11 @@ def build_default_topology(tracks: list[TrackContext]) -> TopologyMapping:
     for track in tracks:
         if track.status != "OK":
             continue
-            
+
         # Consult detector results if any component has a topology recommendation
         action = None
         action_ch = 0
-        
+
         if track.detector_results:
             for res in track.detector_results.values():
                 act = res.data.get("topology_action")
@@ -91,10 +91,10 @@ def build_default_topology(tracks: list[TrackContext]) -> TopologyMapping:
                         action_ch = res.data.get("topology_channel", 0)
                     if act == "drop":
                         break  # 'drop' is highest priority, stop checking others
-                    
+
         if action == "drop":
             continue
-            
+
         if action == "extract_channel":
             entries.append(TopologyEntry(
                 output_filename=track.filename,
@@ -201,10 +201,7 @@ def build_transfer_manifest(
     preserved: list = []
     valid_outputs = {e.output_filename for e in mapping.entries}
     if existing_manifest:
-        # Count how many entries exist per output_filename in the old manifest
         from collections import Counter
-        old_counts: Counter = Counter(
-            e.output_filename for e in existing_manifest)
         seen: Counter = Counter()
         for e in existing_manifest:
             seen[e.output_filename] += 1

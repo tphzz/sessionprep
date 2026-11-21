@@ -146,11 +146,11 @@ def comparison_readings(check, track, config):
     rows = []
     for name, key, unit, places in fields:
         if any(r and key in r.data for r in sources):
-            def format_value(r):
-                value = r.data.get(key)
-                if key in {"dc_db", "l_rms_db", "r_rms_db"} and isinstance(value, (int, float)):
+            def format_value(r, _key=key, _unit=unit, _places=places):
+                value = r.data.get(_key)
+                if _key in {"dc_db", "l_rms_db", "r_rms_db"} and isinstance(value, (int, float)):
                     value += offset
-                return _level(value, unit, places)
+                return _level(value, _unit, _places)
             rows.append((name, *(reading(r, format_value) for r in sources)))
     if not rows:
         rows.append(("Result", *(reading(r, lambda v: v.summary) for r in sources)))

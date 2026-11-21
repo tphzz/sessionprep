@@ -506,21 +506,20 @@ class WaveformPanel(QWidget):
             splitter.setSizes(sizes)
         self.updateGeometry()
 
-    def _build_toolbar(self) -> "_ViewControlRow":
+    def _build_toolbar(self) -> _ViewControlRow:
         toolbar = _ViewControlRow()
-
         toggle_style = (
             "QToolButton:checked { background-color: #2a6db5;"
-            " color: #ffffff; }")
-
-        # Reserve the existing menu-label gap and use the disclosure artwork.
+            " color: #ffffff; }"
+        )
         chevron = icon_path("chevron-down").as_posix()
         dropdown_style = (
             "QToolButton { padding-right: 21px; }"
             "QToolButton::menu-indicator { subcontrol-position: right center;"
             " subcontrol-origin: padding; right: 7px; top: 2px;"
             f" width: {_PREVIEW_CHEVRON_SIZE}px; height: {_PREVIEW_CHEVRON_SIZE}px;"
-            f' image: url("{chevron}"); }}')
+            f' image: url("{chevron}"); }}'
+        )
 
         if self._analysis_mode:
             self.source_selector = AuditionSourceSelector()
@@ -528,11 +527,21 @@ class WaveformPanel(QWidget):
             toolbar.add_control(self.source_selector)
             toolbar.set_wanted(self.source_selector, False)
 
-        # Display mode dropdown
+        self._build_display_mode_control(toolbar, dropdown_style)
+        self._build_spec_settings_control(toolbar, dropdown_style)
+        self._build_wf_settings_control(toolbar, dropdown_style)
+        self._build_analysis_overlay_controls(toolbar, dropdown_style, toggle_style)
+
+        if not self._analysis_mode:
+            for control in self._analysis_controls():
+                toolbar.set_wanted(control, False)
+        toolbar.setFixedHeight(32)
+        return toolbar
+
+    def _build_display_mode_control(self, toolbar: _ViewControlRow, dropdown_style: str) -> None:
         self.display_mode_btn = QToolButton()
         self.display_mode_btn.setText("Waveform")
-        self.display_mode_btn.setToolTip(
-            "Switch between Waveform and Spectrogram display")
+        self.display_mode_btn.setToolTip("Switch between Waveform and Spectrogram display")
         self.display_mode_btn.setPopupMode(QToolButton.InstantPopup)
         self.display_mode_btn.setAutoRaise(True)
         self.display_mode_btn.setStyleSheet(dropdown_style)
@@ -550,143 +559,128 @@ class WaveformPanel(QWidget):
         self.display_mode_btn.setAccessibleName("Waveform display mode")
         toolbar.add_control(self.display_mode_btn)
 
-        # Spectrogram settings dropdown
+    def _add_choice_submenu(
+        self,
+        menu: QMenu,
+        title: str,
+        choices: list[tuple[str, object]],
+        default: object,
+    ) -> tuple[QMenu, QActionGroup]:
+        submenu = menu.addMenu(title)
+        group = QActionGroup(self)
+        for label, value in choices:
+            act = submenu.addAction(label)
+            act.setCheckable(True)
+            act.setData(value)
+            if value == default:
+                act.setChecked(True)
+            group.addAction(act)
+        return submenu, group
+
+    def _build_spec_settings_control(self, toolbar: _ViewControlRow, dropdown_style: str) -> None:
         self.spec_settings_btn = QToolButton()
         self.spec_settings_btn.setText("Display")
-        self.spec_settings_btn.setToolTip(
-            "Configure spectrogram display parameters")
+        self.spec_settings_btn.setToolTip("Configure spectrogram display parameters")
         self.spec_settings_btn.setPopupMode(QToolButton.InstantPopup)
         self.spec_settings_btn.setAutoRaise(True)
         self.spec_settings_btn.setStyleSheet(dropdown_style)
         spec_menu = QMenu(self.spec_settings_btn)
+
         if self._analysis_mode:
-            self.band_btn = QToolButton()
-            self.band_btn.setObjectName("spectrogramRange")
-            self.band_btn.setText("Full range")
-            self.band_btn.setAccessibleName("Spectrogram range")
-            self.band_btn.setToolTip("Select the frequency range for both sources")
-            self.band_btn.setPopupMode(QToolButton.InstantPopup)
-            self.band_btn.setAutoRaise(True)
-            self.band_btn.setStyleSheet(dropdown_style)
-            band_menu = QMenu(self.band_btn)
-            self.band_btn.setMenu(band_menu)
-            toolbar.add_control(self.band_btn)
-            toolbar.set_wanted(self.band_btn, False)
-            group = QActionGroup(band_menu)
-            self.band_actions = {}
-            for key, label in (("full", "Full range"), ("low", "0–100 Hz"),
-                               ("high", "20 kHz–Nyquist")):
-                action = band_menu.addAction(label)
-                action.setCheckable(True)
-                action.setChecked(key == "full")
-                action.setData(key)
-                group.addAction(action)
-                self.band_actions[key] = action
-            group.triggered.connect(lambda action: self._choose_band(action.data()))
+            self._build_band_control(toolbar, dropdown_style)
 
-        # -- FFT Size submenu --
-        fft_menu = spec_menu.addMenu("FFT Size")
-        self.fft_group = QActionGroup(self)
-        for sz in (512, 1024, 2048, 4096, 8192):
-            act = fft_menu.addAction(str(sz))
-            act.setCheckable(True)
-            act.setData(sz)
-            if sz == 2048:
-                act.setChecked(True)
-            self.fft_group.addAction(act)
-
-        # -- Window submenu --
-        win_menu = spec_menu.addMenu("Window")
+        fft_menu, self.fft_group = self._add_choice_submenu(
+            spec_menu, "FFT Size", [(str(sz), sz) for sz in (512, 1024, 2048, 4096, 8192)], 2048
+        )
+        win_menu, self.win_group = self._add_choice_submenu(
+            spec_menu,
+            "Window",
+            [("Hann", "hann"), ("Hamming", "hamming"), ("Blackman-Harris", "blackmanharris")],
+            "hann",
+        )
         self._spec_transform_menus = [fft_menu, win_menu]
-        self.win_group = QActionGroup(self)
-        _WINDOW_MAP = [("Hann", "hann"), ("Hamming", "hamming"),
-                       ("Blackman-Harris", "blackmanharris")]
-        for label, key in _WINDOW_MAP:
-            act = win_menu.addAction(label)
-            act.setCheckable(True)
-            act.setData(key)
-            if key == "hann":
-                act.setChecked(True)
-            self.win_group.addAction(act)
-
-        # -- Color Theme submenu --
-        cmap_menu = spec_menu.addMenu("Color Theme")
-        self.cmap_group = QActionGroup(self)
-        for name in ("Magma", "Viridis", "Grayscale"):
-            act = cmap_menu.addAction(name)
-            act.setCheckable(True)
-            act.setData(name.lower())
-            if name == "Magma":
-                act.setChecked(True)
-            self.cmap_group.addAction(act)
-
-        # -- dB Floor submenu --
-        floor_menu = spec_menu.addMenu("dB Floor")
-        self.floor_group = QActionGroup(self)
-        for val in (-120, -100, -80, -60, -50, -40, -30, -20):
-            act = floor_menu.addAction(f"{val} dB")
-            act.setCheckable(True)
-            act.setData(val)
-            if val == (-100 if self._analysis_mode else -80):
-                act.setChecked(True)
-            self.floor_group.addAction(act)
+        _, self.cmap_group = self._add_choice_submenu(
+            spec_menu,
+            "Color Theme",
+            [(name, name.lower()) for name in ("Magma", "Viridis", "Grayscale")],
+            "magma",
+        )
+        floor_default = -100 if self._analysis_mode else -80
+        _, self.floor_group = self._add_choice_submenu(
+            spec_menu,
+            "dB Floor",
+            [(f"{val} dB", val) for val in (-120, -100, -80, -60, -50, -40, -30, -20)],
+            floor_default,
+        )
         if self._analysis_mode:
             self.waveform.set_spec_db_floor(-100)
-
-        # -- dB Ceiling submenu --
-        ceil_menu = spec_menu.addMenu("dB Ceiling")
-        self.ceil_group = QActionGroup(self)
-        for val in (-30, -20, -10, -5, 0):
-            act = ceil_menu.addAction(f"{val} dB")
-            act.setCheckable(True)
-            act.setData(val)
-            if val == 0:
-                act.setChecked(True)
-            self.ceil_group.addAction(act)
+        _, self.ceil_group = self._add_choice_submenu(
+            spec_menu,
+            "dB Ceiling",
+            [(f"{val} dB", val) for val in (-30, -20, -10, -5, 0)],
+            0,
+        )
 
         self.spec_settings_btn.setMenu(spec_menu)
         self.spec_settings_btn.setAccessibleName("Spectrogram display options")
         toolbar.add_control(self.spec_settings_btn)
         toolbar.set_wanted(self.spec_settings_btn, False)
 
-        # Waveform settings dropdown
+    def _build_band_control(self, toolbar: _ViewControlRow, dropdown_style: str) -> None:
+        self.band_btn = QToolButton()
+        self.band_btn.setObjectName("spectrogramRange")
+        self.band_btn.setText("Full range")
+        self.band_btn.setAccessibleName("Spectrogram range")
+        self.band_btn.setToolTip("Select the frequency range for both sources")
+        self.band_btn.setPopupMode(QToolButton.InstantPopup)
+        self.band_btn.setAutoRaise(True)
+        self.band_btn.setStyleSheet(dropdown_style)
+        band_menu = QMenu(self.band_btn)
+        self.band_btn.setMenu(band_menu)
+        toolbar.add_control(self.band_btn)
+        toolbar.set_wanted(self.band_btn, False)
+        group = QActionGroup(band_menu)
+        self.band_actions = {}
+        for key, label in (("full", "Full range"), ("low", "0–100 Hz"), ("high", "20 kHz–Nyquist")):
+            action = band_menu.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(key == "full")
+            action.setData(key)
+            group.addAction(action)
+            self.band_actions[key] = action
+        group.triggered.connect(lambda action: self._choose_band(action.data()))
+
+    def _build_wf_settings_control(self, toolbar: _ViewControlRow, dropdown_style: str) -> None:
         self.wf_settings_btn = QToolButton()
         self.wf_settings_btn.setText("Display")
-        self.wf_settings_btn.setToolTip(
-            "Configure waveform display parameters")
+        self.wf_settings_btn.setToolTip("Configure waveform display parameters")
         self.wf_settings_btn.setPopupMode(QToolButton.InstantPopup)
         self.wf_settings_btn.setAutoRaise(True)
         self.wf_settings_btn.setStyleSheet(dropdown_style)
         wf_menu = QMenu(self.wf_settings_btn)
 
-        # -- Anti-Aliased Lines toggle --
         self.wf_aa_action = wf_menu.addAction("Anti-Aliased Lines")
         self.wf_aa_action.setCheckable(True)
         self.wf_aa_action.setChecked(False)
         self.wf_aa_action.toggled.connect(self.waveform.set_wf_antialias)
 
-        # -- Line Thickness submenu --
-        thick_menu = wf_menu.addMenu("Line Thickness")
-        self.wf_thick_group = QActionGroup(self)
-        for label, val in [("Thin (1px)", 1), ("Normal (2px)", 2)]:
-            act = thick_menu.addAction(label)
-            act.setCheckable(True)
-            act.setData(val)
-            if val == 1:
-                act.setChecked(True)
-            self.wf_thick_group.addAction(act)
+        _, self.wf_thick_group = self._add_choice_submenu(
+            wf_menu, "Line Thickness", [("Thin (1px)", 1), ("Normal (2px)", 2)], 1
+        )
         self.wf_thick_group.triggered.connect(
-            lambda a: self.waveform.set_wf_line_width(int(a.data())))
+            lambda a: self.waveform.set_wf_line_width(int(a.data()))
+        )
 
         self.wf_settings_btn.setMenu(wf_menu)
         self.wf_settings_btn.setAccessibleName("Waveform display options")
         toolbar.add_control(self.wf_settings_btn)
 
-        # Overlay dropdown (analysis-only)
+    def _build_analysis_overlay_controls(
+        self, toolbar: _ViewControlRow, dropdown_style: str, toggle_style: str
+    ) -> None:
         self.overlay_btn = QToolButton()
         self.overlay_btn.setText("Detector Overlays")
-        self.overlay_btn.setToolTip(
-            "Select detector overlays to display on the waveform")
+        self.overlay_btn.setToolTip("Select detector overlays to display on the waveform")
         self.overlay_btn.setPopupMode(QToolButton.InstantPopup)
         self.overlay_btn.setAutoRaise(True)
         self.overlay_btn.setStyleSheet(dropdown_style)
@@ -695,50 +689,37 @@ class WaveformPanel(QWidget):
         self.overlay_btn.setAccessibleName("Detector overlays")
         toolbar.add_control(self.overlay_btn)
 
-        # Markers toggle (analysis-only)
-        self.markers_toggle = QToolButton()
-        self.markers_toggle.setText("Peak / RMS Max")
-        self.markers_toggle.setToolTip(
-            "Toggle peak and maximum RMS markers on the waveform")
-        self.markers_toggle.setCheckable(True)
-        self.markers_toggle.setChecked(False)
-        self.markers_toggle.setAutoRaise(True)
-        self.markers_toggle.setStyleSheet(toggle_style)
-        self.markers_toggle.toggled.connect(self.waveform.toggle_markers)
-        self.markers_toggle.setAccessibleName("Peak / RMS Max markers")
-        toolbar.add_control(self.markers_toggle)
+        def _make_toggle(text: str, tooltip: str, accessible: str, slot) -> QToolButton:
+            btn = QToolButton()
+            btn.setText(text)
+            btn.setToolTip(tooltip)
+            btn.setCheckable(True)
+            btn.setChecked(False)
+            btn.setAutoRaise(True)
+            btn.setStyleSheet(toggle_style)
+            btn.toggled.connect(slot)
+            btn.setAccessibleName(accessible)
+            toolbar.add_control(btn)
+            return btn
 
-        # RMS L/R toggle (analysis-only)
-        self.rms_lr_toggle = QToolButton()
-        self.rms_lr_toggle.setText("RMS L/R")
-        self.rms_lr_toggle.setToolTip(
-            "Toggle per-channel RMS envelope overlay")
-        self.rms_lr_toggle.setCheckable(True)
-        self.rms_lr_toggle.setAutoRaise(True)
-        self.rms_lr_toggle.setStyleSheet(toggle_style)
-        self.rms_lr_toggle.toggled.connect(self.waveform.toggle_rms_lr)
-        self.rms_lr_toggle.setAccessibleName("RMS L/R envelopes")
-        toolbar.add_control(self.rms_lr_toggle)
-
-        # RMS AVG toggle (analysis-only)
-        self.rms_avg_toggle = QToolButton()
-        self.rms_avg_toggle.setText("RMS AVG")
-        self.rms_avg_toggle.setToolTip(
-            "Toggle combined (average) RMS envelope overlay")
-        self.rms_avg_toggle.setCheckable(True)
-        self.rms_avg_toggle.setAutoRaise(True)
-        self.rms_avg_toggle.setStyleSheet(toggle_style)
-        self.rms_avg_toggle.toggled.connect(self.waveform.toggle_rms_avg)
-        self.rms_avg_toggle.setAccessibleName("RMS AVG envelope")
-        toolbar.add_control(self.rms_avg_toggle)
-
-        # Hide analysis-only controls when not in analysis mode
-        if not self._analysis_mode:
-            for control in self._analysis_controls():
-                toolbar.set_wanted(control, False)
-        # The header draws the background and the single bottom border.
-        toolbar.setFixedHeight(32)
-        return toolbar
+        self.markers_toggle = _make_toggle(
+            "Peak / RMS Max",
+            "Toggle peak and maximum RMS markers on the waveform",
+            "Peak / RMS Max markers",
+            self.waveform.toggle_markers,
+        )
+        self.rms_lr_toggle = _make_toggle(
+            "RMS L/R",
+            "Toggle per-channel RMS envelope overlay",
+            "RMS L/R envelopes",
+            self.waveform.toggle_rms_lr,
+        )
+        self.rms_avg_toggle = _make_toggle(
+            "RMS AVG",
+            "Toggle combined (average) RMS envelope overlay",
+            "RMS AVG envelope",
+            self.waveform.toggle_rms_avg,
+        )
 
     def _analysis_controls(self) -> tuple[QToolButton, ...]:
         return (self.overlay_btn, self.markers_toggle, self.rms_lr_toggle, self.rms_avg_toggle)

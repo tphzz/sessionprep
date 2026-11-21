@@ -60,14 +60,15 @@ def _track(filename):
 
 @pytest.fixture
 def window(qapp, monkeypatch):
+    from sessionprepgui.daw import DawTransferController
     monkeypatch.setattr(mainwindow, "load_config", settings.build_defaults)
     monkeypatch.setattr(mainwindow, "save_config", lambda *args: None)
-    monkeypatch.setattr(mainwindow.SessionPrepWindow, "_configure_daw_processors",
-                        lambda self: setattr(self, "_daw_processors", []))
+    monkeypatch.setattr(DawTransferController, "configure_daw_processors",
+                        lambda self: setattr(self._state, "daw_processors", []))
     monkeypatch.setattr(report, "chunk_sizes", lambda path: [])
     owner = mainwindow.SessionPrepWindow()
     # No audio, devices or DAW services are involved in this layout test.
-    monkeypatch.setattr(owner, "_load_waveform", lambda track: None)
+    monkeypatch.setattr(owner.detail_controller, "load_waveform", lambda track: None)
     tracks = [_track("A file.wav"), _track("B file.wav")]
     detector = ClippingDetector()
     detector.configure({})
@@ -75,14 +76,14 @@ def window(qapp, monkeypatch):
     for processor in processors:
         processor.configure({})
     session = SessionContext(tracks, {}, detectors=[detector], processors=processors)
-    owner._session = session
-    owner._summary = build_diagnostic_summary(session)
+    owner.state.session = session
+    owner.state.summary = build_diagnostic_summary(session)
     with QSignalBlocker(owner._track_table):
         owner._track_table.setRowCount(len(tracks))
         for row, current in enumerate(tracks):
             owner._track_table.setItem(row, 0, QTableWidgetItem(current.filename))
-        owner._populate_table(session)
-    owner._render_summary()
+        owner.track_table_controller.populate_table(session)
+    owner.detail_controller.render_summary()
     for index in range(owner._detail_tabs.count()):
         owner._detail_tabs.setTabEnabled(index, True)
     owner._phase_tabs.setTabEnabled(1, True)
@@ -121,7 +122,7 @@ def test_summary_and_file_reports_inset_text_on_every_side(qapp, window):
     summary_origin = _first_text_origin(owner._summary_view, summary_page)
 
     owner._detail_tabs.setTabEnabled(_TAB_FILE, True)
-    owner._file_report.present_track(tracks[0], owner._session)
+    owner._file_report.present_track(tracks[0], owner.state.session)
     file_page = _show_tab(qapp, owner, _TAB_FILE)
     assert _root_margins(owner._file_report) == (REPORT_INSET,) * 4
     file_origin = _first_text_origin(owner._file_report, file_page)
@@ -153,7 +154,7 @@ def test_report_header_minimum_width_follows_the_shared_inset(qapp, window, monk
 
     owner, tracks = window
     browser = owner._file_report
-    browser.present_track(tracks[0], owner._session)
+    browser.present_track(tracks[0], owner.state.session)
     minimum = browser.minimum_header_width()
     browser._minimum_header_cache = None
     monkeypatch.setattr(browser_module, "REPORT_INSET", REPORT_INSET + 10)
@@ -173,11 +174,11 @@ def test_groups_and_config_pages_inset_every_edge(qapp, window, tab):
     right = revert.mapTo(page, QPoint(revert.width(), 0)).x()
     assert right == page.width() - CONTENT_INSET
     if tab == _TAB_SESSION:
-        bottom_control = owner._session_stack
+        bottom_control = owner.config_controller.session_stack
     else:
         bottom_control = next(b for b in page.findChildren(QPushButton)
                               if b.text() == "Add")
-        table = owner._groups_tab_table
+        table = owner.groups_controller.page.table
         assert table.mapTo(page, QPoint()).x() == CONTENT_INSET
         assert table.width() == page.width() - 2 * CONTENT_INSET
     bottom = bottom_control.mapTo(page, QPoint(0, bottom_control.height())).y()
@@ -186,7 +187,7 @@ def test_groups_and_config_pages_inset_every_edge(qapp, window, tab):
 
 def test_waveform_preview_stays_full_width_in_file_tab(qapp, window):
     owner, tracks = window
-    owner._file_report.present_track(tracks[0], owner._session)
+    owner._file_report.present_track(tracks[0], owner.state.session)
     page = _show_tab(qapp, owner, _TAB_FILE)
     panel = owner._wf_panel
     assert panel.mapTo(page, QPoint(0, 0)).x() == 0
@@ -347,15 +348,15 @@ def test_narrow_help_header_wraps_instead_of_clipping(qapp, pane, monkeypatch):
 def test_phase2_config_tree_and_form_have_matching_splitter_gutters(qapp, window):
     owner, _tracks = window
     _show_tab(qapp, owner, _TAB_SESSION)
-    splitter = owner._session_tree.parentWidget().parentWidget()
+    splitter = owner.config_controller.session_tree.parentWidget().parentWidget()
     assert isinstance(splitter, QSplitter)
-    scroll = owner._session_stack.currentWidget()
-    left = owner._session_tree.mapTo(splitter, QPoint(owner._session_tree.width(), 0)).x()
+    scroll = owner.config_controller.session_stack.currentWidget()
+    left = owner.config_controller.session_tree.mapTo(splitter, QPoint(owner.config_controller.session_tree.width(), 0)).x()
     divider = splitter.widget(1).x() - splitter.handleWidth()
     start = scroll.widget().layout().contentsMargins().left()
     right = scroll.widget().mapTo(splitter, QPoint(start, 0)).x()
     assert (divider - left, splitter.handleWidth(), right - divider - 1) == (6, 1, 6)
-    assert owner._session_tree.width() == owner._session_tree.maximumWidth()
+    assert owner.config_controller.session_tree.width() == owner.config_controller.session_tree.maximumWidth()
 
 
 def _assert_centered_splitter_gutters(splitter, left, right):
@@ -371,11 +372,11 @@ def test_track_layout_panes_keep_centered_splitter_gutters(qapp, window):
     owner, _tracks = window
     owner._phase_tabs.setCurrentIndex(0)
     _settle(qapp, owner)
-    splitter = owner._topo_input_tree.parentWidget().parentWidget()
+    splitter = owner.topology_controller.page.input_tree.parentWidget().parentWidget()
     page = owner._phase_tabs.currentWidget()
     toolbar = page.findChild(QToolBar)
     assert splitter.mapTo(page, QPoint()).y() == toolbar.geometry().bottom() + 1
-    _assert_centered_splitter_gutters(splitter, owner._topo_input_tree, owner._topo_output_tree)
+    _assert_centered_splitter_gutters(splitter, owner.topology_controller.page.input_tree, owner.topology_controller.page.output_tree)
 
 
 def _assert_flush_track_table(splitter, table):
@@ -421,20 +422,20 @@ def test_transfer_table_is_flush_and_the_right_pane_keeps_insets(qapp, window, r
     owner, _tracks = window
     owner._phase_tabs.setTabEnabled(2, True)
     owner._phase_tabs.setCurrentIndex(2)
-    owner._setup_right_stack.setCurrentIndex(int(routing_visible))
-    owner._setup_table.setRowCount(80)
+    owner.daw_controller.page.right_stack.setCurrentIndex(int(routing_visible))
+    owner.daw_controller.page.setup_table.setRowCount(80)
     _settle(qapp, owner)
-    splitter = owner._setup_splitter
+    splitter = owner.daw_controller.page.splitter
     page = owner._phase_tabs.currentWidget()
-    assert splitter.mapTo(page, QPoint()).y() == owner._setup_toolbar.geometry().bottom() + 1
-    _assert_flush_track_table(splitter, owner._setup_table)
-    right = owner._setup_right_stack.currentWidget()
+    assert splitter.mapTo(page, QPoint()).y() == owner.daw_controller.page.toolbar.geometry().bottom() + 1
+    _assert_flush_track_table(splitter, owner.daw_controller.page.setup_table)
+    right = owner.daw_controller.page.right_stack.currentWidget()
     assert right.layout().contentsRect() == right.rect().adjusted(6, 6, -6, -6)
     if routing_visible:
-        tree = owner._folder_tree
+        tree = owner.daw_controller.page.folder_tree
         assert tree.x() == CONTENT_INSET
         assert tree.x() + tree.width() == right.width() - CONTENT_INSET
-        project_row = owner._project_name_edit.parentWidget()
+        project_row = owner.daw_controller.page.project_name_edit.parentWidget()
         assert project_row.pos() == QPoint(CONTENT_INSET, CONTENT_INSET)
 
 
@@ -444,7 +445,7 @@ def test_phase2_auto_fit_shows_every_column_with_the_scrollbar_visible(qapp, win
     owner.resize(2100, owner.height())
     table.setRowCount(80)
     _settle(qapp, owner)
-    owner._auto_fit_track_table()
+    owner.track_table_controller.auto_fit_track_table()
     _settle(qapp, owner)
     assert table.width() == calculate_track_table_layout(table).table_width
     assert table.verticalScrollBar().maximum() > 0

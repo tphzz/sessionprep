@@ -1,7 +1,8 @@
-"""Tracks subpackage: track columns mixin, groups mixin, and table widgets."""
+"""Tracks subpackage: track table controller, groups controller, and table widgets."""
 
-from .columns_mixin import TrackColumnsMixin
-from .groups_mixin import GroupsMixin
+from .table_controller import TrackTableController
+from .groups_controller import GroupsController
+from .groups_tab import GroupsTabWidget
 from .table_widgets import (
     _HelpBrowser, _DraggableTrackTable, _SortableItem, _make_analysis_cell,
     _TAB_SUMMARY, _TAB_FILE, _TAB_GROUPS, _TAB_SESSION,
@@ -12,7 +13,7 @@ from .table_widgets import (
 )
 
 __all__ = [
-    "TrackColumnsMixin", "GroupsMixin",
+    "TrackTableController", "GroupsController", "GroupsTabWidget",
     "_HelpBrowser", "_DraggableTrackTable", "_SortableItem", "_make_analysis_cell",
     "_TAB_SUMMARY", "_TAB_FILE", "_TAB_GROUPS", "_TAB_SESSION",
     "_PAGE_TABS", "_PHASE_ANALYSIS", "_PHASE_TOPOLOGY", "_PHASE_SETUP",

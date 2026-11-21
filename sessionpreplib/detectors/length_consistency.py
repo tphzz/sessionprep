@@ -36,7 +36,11 @@ class LengthConsistencyDetector(SessionDetector):
         if not ok_tracks:
             return []
 
-        most_common_sr = session.config.get("_most_common_sr")
+        most_common_sr = (
+            session.format_consensus.most_common_sr
+            if session.format_consensus.most_common_sr is not None
+            else session.config.get("_most_common_sr")
+        )
         if most_common_sr is None:
             # Compute it ourselves if format_consistency hasn't run
             from collections import Counter as C
@@ -64,7 +68,9 @@ class LengthConsistencyDetector(SessionDetector):
         most_common_len = eq_len_counter.most_common(1)[0][0]
         most_common_len_fmt = format_duration(int(most_common_len), int(most_common_sr))
 
-        # Store for other consumers
+        # Store on typed session consensus (and mirror to config for legacy consumers)
+        session.format_consensus.most_common_len = most_common_len
+        session.format_consensus.most_common_len_fmt = most_common_len_fmt
         session.config["_most_common_len"] = most_common_len
         session.config["_most_common_len_fmt"] = most_common_len_fmt
 

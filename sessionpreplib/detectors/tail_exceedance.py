@@ -86,69 +86,24 @@ class TailExceedanceDetector(TrackDetector):
         self.tail_max_regions = config.get("tail_max_regions", 20)
         self.tail_hop_ms = config.get("tail_hop_ms", 10)
 
-    def analyze(self, track: TrackContext) -> DetectorResult:
-        empty_data = {
-            "tail_regions": [],
-            "tail_summary": {
-                "regions": 0,
-                "total_duration_sec": 0.0,
-                "max_exceed_db": 0.0,
-                "anchor_db": float(-np.inf),
+    def _non_applicable(self, summary: str, anchor_db: float = float(-np.inf)) -> DetectorResult:
+        return DetectorResult(
+            detector_id=self.id,
+            severity=Severity.CLEAN,
+            summary=summary,
+            applicable=False,
+            data={
+                "tail_regions": [],
+                "tail_summary": {
+                    "regions": 0,
+                    "total_duration_sec": 0.0,
+                    "max_exceed_db": 0.0,
+                    "anchor_db": anchor_db,
+                },
             },
-        }
+        )
 
-        if is_silent(track):
-            return DetectorResult(
-                detector_id=self.id,
-                severity=Severity.CLEAN,
-                summary="silent track",
-                applicable=False,
-                data=empty_data,
-            )
-
-        # Resolve per-track RMS anchor override
-        ov = getattr(track, "rms_anchor_override", None)
-        if ov == "max":
-            effective_mode = "max"
-        elif ov and ov.startswith("p"):
-            effective_mode = "percentile"
-        else:
-            effective_mode = self.rms_anchor_mode
-
-        if effective_mode != "percentile":
-            return DetectorResult(
-                detector_id=self.id,
-                severity=Severity.CLEAN,
-                summary="tail reporting only for percentile anchoring",
-                applicable=False,
-                data=empty_data,
-            )
-
-        # Read anchor_mean from audio_classifier detector result
-        crest_result = track.detector_results.get("audio_classifier")
-        if crest_result is None:
-            return DetectorResult(
-                detector_id=self.id,
-                severity=Severity.CLEAN,
-                summary="audio_classifier result missing",
-                applicable=False,
-                data=empty_data,
-            )
-
-        anchor_mean = crest_result.data.get("rms_anchor_mean", 0.0)
-        rms_anchor_db = crest_result.data.get("rms_anchor_db", float(-np.inf))
-
-        if anchor_mean <= 0:
-            empty_data["tail_summary"]["anchor_db"] = rms_anchor_db
-            return DetectorResult(
-                detector_id=self.id,
-                severity=Severity.CLEAN,
-                summary="anchor is zero",
-                applicable=False,
-                data=empty_data,
-            )
-
-        # Get shared cached data
+    def _scan_tail_regions(self, track: TrackContext, anchor_mean: float) -> list[dict]:
         window_means = get_rms_window_means(track, self.window_ms, self.stereo_mode)
         gated = get_gated_rms_data(
             track, self.window_ms, self.stereo_mode, self.gate_relative_db
@@ -160,32 +115,14 @@ class TailExceedanceDetector(TrackDetector):
 
         hop_samples = max(1, int((self.tail_hop_ms / 1000) * samplerate))
         starts_all = np.arange(0, window_means.size, hop_samples, dtype=np.int64)
-        sampled_active_mask = active_mask[starts_all]
-        active_hop_indices = starts_all[sampled_active_mask]
+        active_hop_indices = starts_all[active_mask[starts_all]]
         sampled_means = window_means[active_hop_indices]
 
         exceed_db = 10.0 * np.log10(np.maximum(sampled_means, floor) / anchor_mean)
-        mask = exceed_db > float(self.tail_min_exceed_db)
-
-        idx = np.flatnonzero(mask)
+        idx = np.flatnonzero(exceed_db > float(self.tail_min_exceed_db))
         if idx.size == 0:
-            return DetectorResult(
-                detector_id=self.id,
-                severity=Severity.CLEAN,
-                summary="no significant tail exceedances",
-                data={
-                    "tail_regions": [],
-                    "tail_summary": {
-                        "regions": 0,
-                        "total_duration_sec": 0.0,
-                        "max_exceed_db": 0.0,
-                        "anchor_db": float(rms_anchor_db),
-                    },
-                },
-            )
+            return []
 
-        # Gating compacts the arrays. Only consecutive, touching analysis
-        # windows on the original timeline can form one continuous region.
         splits = np.flatnonzero(np.diff(active_hop_indices[idx]) > min(hop_samples, window_samples))
         starts = np.concatenate(([0], splits + 1))
         ends = np.concatenate((splits, [idx.size - 1]))
@@ -193,33 +130,29 @@ class TailExceedanceDetector(TrackDetector):
         data_shape_0 = int(track.audio_data.shape[0]) if track.audio_data is not None else 0
         regions = []
         for s_i, e_i in zip(starts, ends):
-            i_start = int(idx[s_i])
-            i_end = int(idx[e_i])
-
+            i_start, i_end = int(idx[s_i]), int(idx[e_i])
             sample_start = int(active_hop_indices[i_start])
-            sample_end = min(
-                int(active_hop_indices[i_end]) + window_samples, data_shape_0
-            )
-
-            region_exceed_max = float(np.max(exceed_db[i_start:i_end + 1]))
-            region_mean_max = float(np.max(sampled_means[i_start:i_end + 1]))
-            region_rms_max_db = linear_to_db(np.sqrt(region_mean_max))
-
+            sample_end = min(int(active_hop_indices[i_end]) + window_samples, data_shape_0)
             regions.append({
                 "start_sample": sample_start,
                 "end_sample": sample_end,
                 "start_time": format_duration(sample_start, samplerate),
                 "end_time": format_duration(sample_end, samplerate),
-                "max_exceed_db": region_exceed_max,
-                "max_rms_db": region_rms_max_db,
+                "max_exceed_db": float(np.max(exceed_db[i_start:i_end + 1])),
+                "max_rms_db": linear_to_db(np.sqrt(float(np.max(sampled_means[i_start:i_end + 1])))),
             })
 
-        # Pick top regions by exceedance, keep chronological order
         regions.sort(key=lambda r: r["max_exceed_db"], reverse=True)
         regions = regions[:int(self.tail_max_regions)]
         regions.sort(key=lambda r: r["start_sample"])
+        return regions
 
-        # Separate runs of qualifying hops can still share RMS window support.
+    def _build_tail_result(
+        self,
+        regions: list[dict],
+        samplerate: int,
+        rms_anchor_db: float,
+    ) -> DetectorResult:
         covered_samples = 0
         covered_end = 0
         for region in regions:
@@ -234,16 +167,13 @@ class TailExceedanceDetector(TrackDetector):
             "max_exceed_db": float(max_exceed),
             "anchor_db": float(rms_anchor_db),
         }
-
         summary_text = (
             f"{len(regions)} tail region(s) exceed anchor "
             f"by >{self.tail_min_exceed_db:g} dB (max +{max_exceed:.1f} dB)"
         )
-
         issues = [
             IssueLocation(
                 sample_start=r["start_sample"],
-                # Region durations use an exclusive end. Plot and project issue bounds are inclusive.
                 sample_end=r["end_sample"] - 1,
                 channel=None,
                 severity=Severity.ATTENTION,
@@ -261,3 +191,44 @@ class TailExceedanceDetector(TrackDetector):
             hint="check for section-based riding",
             issues=issues,
         )
+
+    def analyze(self, track: TrackContext) -> DetectorResult:
+        if is_silent(track):
+            return self._non_applicable("silent track")
+
+        ov = getattr(track, "rms_anchor_override", None)
+        if ov == "max":
+            effective_mode = "max"
+        elif ov and ov.startswith("p"):
+            effective_mode = "percentile"
+        else:
+            effective_mode = self.rms_anchor_mode
+        if effective_mode != "percentile":
+            return self._non_applicable("tail reporting only for percentile anchoring")
+
+        crest_result = track.detector_results.get("audio_classifier")
+        if crest_result is None:
+            return self._non_applicable("audio_classifier result missing")
+
+        anchor_mean = crest_result.data.get("rms_anchor_mean", 0.0)
+        rms_anchor_db = crest_result.data.get("rms_anchor_db", float(-np.inf))
+        if anchor_mean <= 0:
+            return self._non_applicable("anchor is zero", anchor_db=rms_anchor_db)
+
+        regions = self._scan_tail_regions(track, anchor_mean)
+        if not regions:
+            return DetectorResult(
+                detector_id=self.id,
+                severity=Severity.CLEAN,
+                summary="no significant tail exceedances",
+                data={
+                    "tail_regions": [],
+                    "tail_summary": {
+                        "regions": 0,
+                        "total_duration_sec": 0.0,
+                        "max_exceed_db": 0.0,
+                        "anchor_db": float(rms_anchor_db),
+                    },
+                },
+            )
+        return self._build_tail_result(regions, track.samplerate, rms_anchor_db)

@@ -23,7 +23,7 @@ def create_runtime_daw_processors(
     """Create configured processor instances for runtime use.
 
     Both Pro Tools and DAWProject expand into one instance per configured
-    template. Processors that are disabled via their ``*_enabled`` config 
+    template. Processors that are disabled via their ``*_enabled`` config
     key are excluded unless requested for reconciling template state.
     """
     processors: list[DawProcessor] = []

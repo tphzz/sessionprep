@@ -118,8 +118,10 @@ def _cache_file(tmp_path, monkeypatch):
     monkeypatch.setattr(protools, "get_app_dir", lambda: str(cache_dir), raising=False)
 
     import sessionpreplib.config as config
+    import sessionpreplib.paths as paths
 
     monkeypatch.setattr(config, "get_app_dir", lambda: str(cache_dir))
+    monkeypatch.setattr(paths, "get_app_dir", lambda: str(cache_dir))
     return cache_dir / "pt_template_cache.json"
 
 

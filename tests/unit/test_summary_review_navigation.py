@@ -26,14 +26,15 @@ def qapp():
 
 @pytest.fixture
 def window(qapp, monkeypatch):
+    from sessionprepgui.daw import DawTransferController
     monkeypatch.setattr(mainwindow, "load_config", settings.build_defaults)
     monkeypatch.setattr(mainwindow, "save_config", lambda *args: None)
-    monkeypatch.setattr(mainwindow.SessionPrepWindow, "_configure_daw_processors",
-                        lambda self: setattr(self, "_daw_processors", []))
+    monkeypatch.setattr(DawTransferController, "configure_daw_processors",
+                        lambda self: setattr(self._state, "daw_processors", []))
     monkeypatch.setattr(report, "chunk_sizes", lambda path: [])
     owner = mainwindow.SessionPrepWindow()
     # No audio jobs, devices or DAW services are involved in this navigation test.
-    monkeypatch.setattr(owner, "_load_waveform", lambda track: None)
+    monkeypatch.setattr(owner.detail_controller, "load_waveform", lambda track: None)
     tracks = []
     for filename in ["A file.wav", "B file.wav"]:
         current = TrackContext(filename, "missing-" + filename, None, 48000, 1,
@@ -54,14 +55,14 @@ def window(qapp, monkeypatch):
     for processor in processors:
         processor.configure({})
     session = SessionContext(tracks, {}, detectors=[detector], processors=processors)
-    owner._session = session
-    owner._summary = build_diagnostic_summary(session)
+    owner.state.session = session
+    owner.state.summary = build_diagnostic_summary(session)
     with QSignalBlocker(owner._track_table):
         owner._track_table.setRowCount(len(tracks))
         for row, current in enumerate(tracks):
             owner._track_table.setItem(row, 0, QTableWidgetItem(current.filename))
-        owner._populate_table(session)
-    owner._render_summary()
+        owner.track_table_controller.populate_table(session)
+    owner.detail_controller.render_summary()
     for index in range(owner._detail_tabs.count()):
         owner._detail_tabs.setTabEnabled(index, True)
     owner._phase_tabs.setTabEnabled(1, True)
@@ -100,10 +101,10 @@ def assert_file_visible(owner, target):
     assert owner._file_splitter.isVisibleTo(owner)
     assert owner._file_report.isVisibleTo(owner)
     assert not owner._summary_view.isVisibleTo(owner)
-    assert owner._current_track is target
+    assert owner.state.current_track is target
     assert owner._file_report.track_filename == target.filename
     assert owner._file_report.toPlainText().startswith(target.filename)
-    assert owner._track_table.currentItem().row() == owner._find_table_row(target.filename)
+    assert owner._track_table.currentItem().row() == owner.track_table_controller.find_table_row(target.filename)
 
 
 @pytest.mark.parametrize("method", ["direct", "mouse", "keyboard"])
@@ -162,7 +163,7 @@ def test_tab_departure_preserves_multiple_selected_rows_and_current_track(qapp, 
     table = owner._track_table
     with QSignalBlocker(table):
         table.selectionModel().select(
-            table.model().index(owner._find_table_row(tracks[0].filename), 0),
+            table.model().index(owner.track_table_controller.find_table_row(tracks[0].filename), 0),
             QItemSelectionModel.Select | QItemSelectionModel.Rows)
     owner._file_report.setFocus()
     owner._detail_tabs.setCurrentIndex(0)

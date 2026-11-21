@@ -72,50 +72,42 @@ class ProToolsWorker:
             self._engine = None
             self._settings = None
 
+    def _handle_connect(self, params: dict[str, Any]) -> dict[str, bool]:
+        settings_payload = (
+            params.get("settings") if isinstance(params.get("settings"), dict) else params
+        )
+        settings = ProToolsConnectionSettings.from_config(settings_payload)
+        if self._engine is not None and settings != self._settings:
+            log.debug("Pro Tools worker connection settings changed; reconnecting")
+            self.close()
+        if self._engine is None:
+            log.debug("Creating Pro Tools PTSL engine")
+            self._engine = create_ptsl_engine(settings)
+            self._settings = settings
+            log.debug("Created Pro Tools PTSL engine")
+        log.debug("Waiting for Pro Tools host readiness: timeout=%.1fs", settings.host_ready_timeout)
+        if not ptslh.wait_for_host_ready(
+            self._engine,
+            timeout=settings.host_ready_timeout,
+            sleep_time=min(settings.command_delay, 0.25),
+        ):
+            log.debug("Pro Tools host readiness check did not complete")
+            raise RuntimeError("Pro Tools is still starting.")
+        log.debug("Pro Tools host readiness confirmed")
+        return {"connected": True}
+
     def handle(self, method: str, params: dict[str, Any]) -> Any:
         log.debug("Handling Pro Tools worker request: method=%s", method)
         if method == "connect":
-            settings_payload = (
-                params.get("settings")
-                if isinstance(params.get("settings"), dict)
-                else params
-            )
-            settings = ProToolsConnectionSettings.from_config(
-                settings_payload
-            )
-            if self._engine is not None and settings != self._settings:
-                log.debug("Pro Tools worker connection settings changed; reconnecting")
-                self.close()
-            if self._engine is None:
-                log.debug("Creating Pro Tools PTSL engine")
-                self._engine = create_ptsl_engine(settings)
-                self._settings = settings
-                log.debug("Created Pro Tools PTSL engine")
-            log.debug(
-                "Waiting for Pro Tools host readiness: timeout=%.1fs",
-                settings.host_ready_timeout,
-            )
-            if not ptslh.wait_for_host_ready(
-                self._engine,
-                timeout=settings.host_ready_timeout,
-                sleep_time=min(settings.command_delay, 0.25),
-            ):
-                log.debug("Pro Tools host readiness check did not complete")
-                raise RuntimeError("Pro Tools is still starting.")
-            log.debug("Pro Tools host readiness confirmed")
-            return {"connected": True}
+            return self._handle_connect(params)
         if method == "disconnect":
             self.close()
             return {"connected": False}
+        self._require_engine()
         if method == "ping":
-            self._require_engine()
             return {"connected": True}
         if method == "run_command":
-            self._require_engine()
-            log.debug(
-                "Running Pro Tools command through worker: command=%r",
-                params.get("command"),
-            )
+            log.debug("Running Pro Tools command through worker: command=%r", params.get("command"))
             return ptslh.run_command(
                 self._engine,
                 params.get("command"),
@@ -124,16 +116,13 @@ class ProToolsWorker:
                 progress=int(params.get("progress") or 0),
             )
         if method == "get_color_palette":
-            self._require_engine()
             target = params.get("target") or "CPTarget_Tracks"
             log.debug("Fetching Pro Tools color palette: target=%s", target)
             return ptslh.get_color_palette(self._engine, target=target)
         if method == "get_selected_track_names":
-            self._require_engine()
             log.debug("Fetching selected Pro Tools track names")
             return ptslh.get_selected_track_names(self._engine)
         if method == "set_track_color":
-            self._require_engine()
             log.debug("Setting Pro Tools track color through worker")
             return ptslh.set_track_color(
                 self._engine,
@@ -142,7 +131,6 @@ class ProToolsWorker:
                 track_ids=params.get("track_ids"),
             )
         if method == "get_track_list":
-            self._require_engine()
             log.debug("Fetching Pro Tools track list")
             resp = ptslh.run_command(
                 self._engine,
@@ -151,7 +139,6 @@ class ProToolsWorker:
             )
             return list((resp or {}).get("track_list", []))
         if method == "set_track_height":
-            self._require_engine()
             log.debug("Setting Pro Tools track height through worker")
             return ptslh.set_track_height(
                 self._engine,

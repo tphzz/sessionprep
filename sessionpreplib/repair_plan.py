@@ -116,45 +116,33 @@ def source_for_render(track):
                    source_sample_digest=loaded.source_sample_digest)
 
 
-def plan_repairs(track, config, verification=None):
-    """Keep source findings intact. Return a temporary track for gain analysis."""
+def _default_verification(config):
+    from .detector import TrackDetector, topo_sort_detectors
+    from .detectors import default_detectors
+    from .repair_verification import RepairVerification
+
+    track_dets = topo_sort_detectors(
+        [d for d in default_detectors() if isinstance(d, TrackDetector)]
+    )
+    for det in track_dets:
+        det.configure(config)
+    return RepairVerification(track_dets, config)
+
+
+def _resolve_repair_recipe(track, source, config, consider_dc, consider_low, high_rate):
     choices = track.repair_overrides
-    dc = track.detector_results.get("dc_offset")
-    sub = track.detector_results.get("subsonic")
-    high_rate = track.samplerate >= 50000
-    consider_dc = config.get("dc_offset_enabled", True) and (
-        dc is not None and dc.data.get("dc_warn") or config.get("repair_auto_dc"))
-    consider_low = config.get("subsonic_enabled", True) and (
-        sub is not None or config.get("repair_auto_low_cut"))
-    if not (choices or consider_dc or consider_low or high_rate):
-        track.repair_recipe = RepairRecipe()
-        track.repair_measurements = {}
-        track.corrected_analysis = None
-        return track
-    source = source_for_render(track)
-    cached = track._cache.pop("unvalidated_corrected_analysis", None)
-    if cached is not None:
-        # source_for_render just checked the complete on-disk revision.
-        source.corrected_analysis = cached
-    data = source.audio_data
-    validate_analysis_level(np.max(np.abs(data), initial=0.), len(data))
-    rate = source.samplerate
-    if (any(choices.get(key) for key in ("dc_remove", "low_cut", "ultrasonic"))
-            or any(config.get(key) for key in ("repair_auto_dc", "repair_auto_low_cut", "repair_auto_ultrasonic"))):
-        if verification is None:
-            from .detectors import default_detectors
-            from .pipeline import Pipeline
-            verification = Pipeline(default_detectors(), config=config).repair_verification
-        verification.complete_original(source)
-        dc = source.detector_results.get("dc_offset")
-        sub = source.detector_results.get("subsonic")
-        consider_dc = config.get("dc_offset_enabled", True) and (dc is not None or config.get("repair_auto_dc"))
-        consider_low = config.get("subsonic_enabled", True) and (sub is not None or config.get("repair_auto_low_cut"))
+    data, rate = source.audio_data, source.samplerate
+    dc = source.detector_results.get("dc_offset")
+    sub = source.detector_results.get("subsonic")
+
     if consider_dc and dc is None:
         dc = _analyze(DCOffsetDetector, source, config)
     dc_suggested = bool(dc and dc.data.get("dc_warn") and config.get("dc_offset_enabled", True))
-    dc_auto = bool(config.get("repair_auto_dc") and dc_suggested and
-                   _persistent_bias(data, rate, 10 ** (config.get("dc_offset_warn_db", -40) / 20)))
+    dc_auto = bool(
+        config.get("repair_auto_dc")
+        and dc_suggested
+        and _persistent_bias(data, rate, 10 ** (config.get("dc_offset_warn_db", -40) / 20))
+    )
     dc_on = choices.get("dc_remove", dc_auto)
     if consider_low and sub is None:
         sub = _analyze(SubsonicDetector, source, config)
@@ -168,6 +156,7 @@ def plan_repairs(track, config, verification=None):
         low = _low_cut_evidence(dc_audio, rate, config)
     low_match = bool(consider_low and low.get("regions"))
     low_on = choices.get("low_cut", bool(config.get("repair_auto_low_cut") and low_match))
+
     high = source.detector_results.get("ultrasonic")
     high_enabled = high_rate and config.get("ultrasonic_enabled", True)
     if high is None and high_rate and (high_enabled or choices.get("ultrasonic")):
@@ -176,13 +165,21 @@ def plan_repairs(track, config, verification=None):
             track.detector_results["ultrasonic"] = high
     high_match = bool(high_enabled and high and high.data.get("regions"))
     high_on = choices.get("ultrasonic", bool(config.get("repair_auto_ultrasonic") and high_match))
-    recipe = RepairRecipe(dc_on, choices.get("low_cut_hz", config.get("repair_low_cut_hz", 10))
-                          if low_on else None, high_on)
+
+    recipe = RepairRecipe(
+        dc_on,
+        choices.get("low_cut_hz", config.get("repair_low_cut_hz", 10)) if low_on else None,
+        high_on,
+    )
     measurements = {
         "suggested": {"dc_remove": dc_suggested, "low_cut": low_match, "ultrasonic": high_match},
-        "inherited": {"dc_remove": dc_auto, "low_cut": bool(config.get("repair_auto_low_cut") and low_match),
-                      "ultrasonic": bool(config.get("repair_auto_ultrasonic") and high_match)},
-        "original": repair_levels(data), "low_band": low,
+        "inherited": {
+            "dc_remove": dc_auto,
+            "low_cut": bool(config.get("repair_auto_low_cut") and low_match),
+            "ultrasonic": bool(config.get("repair_auto_ultrasonic") and high_match),
+        },
+        "original": repair_levels(data),
+        "low_band": low,
     }
     if measure_low:
         measurements["original"]["low_band"] = original_low
@@ -190,37 +187,96 @@ def plan_repairs(track, config, verification=None):
         measurements["original"]["subsonic_ratio_db"] = sub.data.get("subsonic_ratio_db")
     if high:
         measurements["original"]["ultrasonic"] = high.data
-    gain_track = source
-    checked = None
+    return recipe, measurements, dc_audio, low, sub, measure_low
+
+
+def _evaluate_corrected_track(
+    source, recipe, config, verification, dc_audio, low, sub, high_rate, measure_low, measurements
+):
+    data, rate = source.audio_data, source.samplerate
+    audio = (
+        dc_audio
+        if dc_audio is not None and recipe.low_cut_hz is None and not recipe.ultrasonic
+        else render_corrected(data, rate, recipe)
+    )
+    gain_track = replace(
+        source, audio_data=audio, subtype="DOUBLE", bitdepth="64-bit float",
+        _cache={}, detector_results={}, processor_results={},
+    )
+    checked = verification.corrected(source, gain_track, recipe)
+    most_recent = repair_levels(audio)
+    measurements["boundary_settling"] = boundary_settling(data, audio, rate)
+    if measure_low:
+        corrected_low = low if audio is dc_audio else _low_cut_evidence(audio, rate, config)
+        most_recent["low_band"] = corrected_low
+        if recipe.low_cut_hz is not None and low.get("regions"):
+            measurements["low_cut_resolved"] = not corrected_low["regions"]
+    result = gain_track.detector_results.get("subsonic")
+    if result and not result.error and result.applicable:
+        most_recent["subsonic_ratio_db"] = result.data["subsonic_ratio_db"]
+        if sub and sub.data.get("subsonic_warn"):
+            measurements["subsonic_resolved"] = not result.data["subsonic_warn"]
+    result = gain_track.detector_results.get("ultrasonic")
+    if result is None and high_rate and recipe.ultrasonic:
+        result = _analyze(UltrasonicDetector, gain_track, config)
+    if high_rate and result and not result.error and result.applicable:
+        most_recent["ultrasonic"] = result.data
+    measurements["corrected"] = most_recent
+    check_source_signature(source)
+    return gain_track, checked
+
+
+def plan_repairs(track, config, verification=None):
+    """Keep source findings intact. Return a temporary track for gain analysis."""
+    choices = track.repair_overrides
+    dc = track.detector_results.get("dc_offset")
+    sub = track.detector_results.get("subsonic")
+    high_rate = track.samplerate >= 50000
+    consider_dc = config.get("dc_offset_enabled", True) and (
+        dc is not None and dc.data.get("dc_warn") or config.get("repair_auto_dc")
+    )
+    consider_low = config.get("subsonic_enabled", True) and (
+        sub is not None or config.get("repair_auto_low_cut")
+    )
+    if not (choices or consider_dc or consider_low or high_rate):
+        track.repair_recipe = RepairRecipe()
+        track.repair_measurements = {}
+        track.corrected_analysis = None
+        return track
+
+    source = source_for_render(track)
+    cached = track._cache.pop("unvalidated_corrected_analysis", None)
+    if cached is not None:
+        source.corrected_analysis = cached
+    validate_analysis_level(np.max(np.abs(source.audio_data), initial=0.0), len(source.audio_data))
+
+    needs_verification = (
+        any(choices.get(key) for key in ("dc_remove", "low_cut", "ultrasonic"))
+        or any(config.get(key) for key in ("repair_auto_dc", "repair_auto_low_cut", "repair_auto_ultrasonic"))
+    )
+    if needs_verification:
+        if verification is None:
+            verification = _default_verification(config)
+        verification.complete_original(source)
+        consider_dc = config.get("dc_offset_enabled", True) and (
+            source.detector_results.get("dc_offset") is not None or config.get("repair_auto_dc")
+        )
+        consider_low = config.get("subsonic_enabled", True) and (
+            source.detector_results.get("subsonic") is not None or config.get("repair_auto_low_cut")
+        )
+
+    recipe, measurements, dc_audio, low, sub, measure_low = _resolve_repair_recipe(
+        track, source, config, consider_dc, consider_low, high_rate
+    )
     if recipe.active:
-        audio = dc_audio if dc_audio is not None and not low_on and not high_on else render_corrected(data, rate, recipe)
-        # Corrected samples reach the meters before output quantization.
-        gain_track = replace(source, audio_data=audio, subtype="DOUBLE", bitdepth="64-bit float",
-                             _cache={}, detector_results={}, processor_results={})
-        checked = verification.corrected(source, gain_track, recipe)
-        most_recent = repair_levels(audio)
-        measurements["boundary_settling"] = boundary_settling(data, audio, rate)
-        if measure_low:
-            corrected_low = low if audio is dc_audio else _low_cut_evidence(audio, rate, config)
-            most_recent["low_band"] = corrected_low
-            if low_on and low.get("regions"):
-                measurements["low_cut_resolved"] = not corrected_low["regions"]
-        result = gain_track.detector_results.get("subsonic")
-        if result and not result.error and result.applicable:
-            most_recent["subsonic_ratio_db"] = result.data["subsonic_ratio_db"]
-            if sub and sub.data.get("subsonic_warn"):
-                measurements["subsonic_resolved"] = not result.data["subsonic_warn"]
-        result = gain_track.detector_results.get("ultrasonic")
-        if result is None and high_rate and high_on:
-            # A manually selected filter still has before/after meters when
-            # the diagnostic is disabled. These readings are not findings.
-            result = _analyze(UltrasonicDetector, gain_track, config)
-        if high_rate and result and not result.error and result.applicable:
-            most_recent["ultrasonic"] = result.data
-        measurements["corrected"] = most_recent
-        check_source_signature(source)
+        gain_track, checked = _evaluate_corrected_track(
+            source, recipe, config, verification, dc_audio, low, sub,
+            high_rate, measure_low, measurements,
+        )
     else:
+        gain_track, checked = source, None
         measurements["corrected"] = measurements["original"].copy()
+
     track.repair_measurements = measurements
     track.repair_recipe = recipe
     track.detector_analysis_key = source.detector_analysis_key

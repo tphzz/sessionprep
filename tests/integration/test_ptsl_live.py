@@ -45,7 +45,9 @@ def test_duplicate_media_reopens_on_two_tracks_at_sample_zero(tmp_path, request,
                 raise
         else:
             pytest.skip("Close the open Pro Tools session before running this test.")
+        from sessionpreplib import paths
         monkeypatch.setattr(config, "get_app_dir", lambda: str(tmp_path))
+        monkeypatch.setattr(paths, "get_app_dir", lambda: str(tmp_path))
         assert not ptsl_helpers.VOLUME_AUTOMATION_ENABLED
         sent_commands = []
         send_command = ptsl_helpers.run_command

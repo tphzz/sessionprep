@@ -233,3 +233,44 @@ class SessionDetector(ABC):
 
     def clean_message(self) -> str | None:
         return None
+
+
+def topo_sort_detectors(detectors: list[TrackDetector]) -> list[TrackDetector]:
+    """Topological sort by ``depends_on``; raises ConfigError on cycle or missing dep."""
+    from .models import ConfigError
+
+    by_id: dict[str, TrackDetector] = {}
+    for detector in detectors:
+        if detector.id in by_id:
+            raise ConfigError(f"Duplicate detector ID: {detector.id}")
+        by_id[detector.id] = detector
+    all_ids = set(by_id.keys())
+
+    for d in detectors:
+        for dep in (d.depends_on or []):
+            if dep not in all_ids:
+                raise ConfigError(
+                    f"Detector '{d.id}' depends on '{dep}' which does not exist"
+                )
+
+    in_degree = {d.id: 0 for d in detectors}
+    adjacency: dict[str, list[str]] = {d.id: [] for d in detectors}
+    for d in detectors:
+        for dep in (d.depends_on or []):
+            adjacency[dep].append(d.id)
+            in_degree[d.id] += 1
+
+    queue = [did for did, deg in in_degree.items() if deg == 0]
+    sorted_ids: list[str] = []
+    while queue:
+        node = queue.pop(0)
+        sorted_ids.append(node)
+        for neighbor in adjacency.get(node, []):
+            in_degree[neighbor] -= 1
+            if in_degree[neighbor] == 0:
+                queue.append(neighbor)
+
+    if len(sorted_ids) != len(detectors):
+        raise ConfigError("Cyclic dependency detected among track detectors")
+
+    return [by_id[did] for did in sorted_ids]

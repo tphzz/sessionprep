@@ -9,8 +9,6 @@ import threading
 
 import numpy as np
 
-log = logging.getLogger(__name__)
-
 from PySide6.QtCore import QThread, Signal
 
 from sessionpreplib.audio import SourceChangedError
@@ -23,6 +21,8 @@ from sessionpreplib.rendering import build_diagnostic_summary
 from sessionpreplib.events import EventBus
 from sessionpreplib.models import LifecyclePhase
 from sessionpreplib.repair_plan import check_source_signature
+
+log = logging.getLogger(__name__)
 
 
 def _gui_source_samples(samples):
@@ -196,107 +196,94 @@ class Phase1AnalyzeWorker(QThread):
         self._is_cancelled = True
         self._event_bus.cancel()
 
+    def _decode_missing_sources(self, session) -> None:
+        missing = [
+            track for track in session.tracks
+            if track.status == "OK" and _needs_source_decode(track)
+        ]
+        if not missing:
+            return
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import os
+        from sessionpreplib.audio import load_track
+
+        self.progress.emit("Loading audio data\u2026")
+        self.progress_value.emit(0, len(missing))
+        with ThreadPoolExecutor(max_workers=min(os.cpu_count() or 4, 8)) as pool:
+            futures = {pool.submit(load_track, t.filepath): t for t in missing}
+            for loaded, future in enumerate(as_completed(futures), 1):
+                if self._is_cancelled:
+                    break
+                t = futures[future]
+                try:
+                    _adopt_decoded_source(t, future.result())
+                except Exception as e:
+                    t.status = f"Error: {e}"
+                    t.audio_data = None
+                self.progress_value.emit(loaded, len(missing))
+
+    def _subscribe_phase1_events(self, event_bus, track_map) -> None:
+        def on_detector_complete(detector_id, filename, **_kw):
+            with self._step_lock:
+                self._step += 1
+                step = self._step
+            self.progress.emit(f"Checking {filename} \u2014 {detector_id}")
+            self.progress_value.emit(step, self._total)
+
+        def on_session_detector_complete(detector_id, **_kw):
+            with self._step_lock:
+                self._step += 1
+                step = self._step
+            self.progress.emit(f"Session check \u2014 {detector_id}")
+            self.progress_value.emit(step, self._total)
+
+        def on_track_analyze_complete(filename, **_kw):
+            track = track_map.get(filename)
+            if track:
+                self.track_analyzed.emit(filename, track)
+
+        event_bus.subscribe("detector.complete", on_detector_complete)
+        event_bus.subscribe("session_detector.complete", on_session_detector_complete)
+        event_bus.subscribe("track.analyze_complete", on_track_analyze_complete)
+
     def run(self):
         try:
             event_bus = self._event_bus
-
-            # Use the already loaded session
             session = self.session_context
-
             if not session.tracks:
                 self.error.emit("No audio files found in session.")
                 return
 
             self.progress.emit("Building pipeline\u2026")
-            detectors = default_detectors()
             pipeline = Pipeline(
-                detectors=detectors,
+                detectors=default_detectors(),
                 config=self.config,
                 event_bus=event_bus,
             )
+            p1_track_dets = [
+                d for d in pipeline.track_detectors
+                if d.phase == LifecyclePhase.PHASE1
+                and d.id in pipeline.repair_verification.required_ids
+            ]
+            p1_sess_dets = [
+                d for d in pipeline.session_detectors
+                if getattr(d, "phase", LifecyclePhase.PHASE2) == LifecyclePhase.PHASE1
+            ]
 
-            p1_track_dets = [d for d in pipeline.track_detectors if d.phase == LifecyclePhase.PHASE1
-                             and d.id in pipeline.repair_verification.required_ids]
-            p1_sess_dets = [d for d in pipeline.session_detectors if getattr(d, 'phase', LifecyclePhase.PHASE2) == LifecyclePhase.PHASE1]
-
-            num_track_det = len(p1_track_dets)
-            num_session_det = len(p1_sess_dets)
-
-            # Preview can already have decoded individual sources.
-            missing = [track for track in session.tracks
-                       if track.status == "OK" and _needs_source_decode(track)]
-            if missing:
-                from sessionpreplib.audio import load_track
-                from concurrent.futures import ThreadPoolExecutor, as_completed
-                import os
-
-                self.progress.emit("Loading audio data\u2026")
-                self.progress_value.emit(0, len(missing))
-
-                with ThreadPoolExecutor(max_workers=min(os.cpu_count() or 4, 8)) as pool:
-                    futures = {
-                        pool.submit(load_track, t.filepath): t
-                        for t in missing
-                    }
-                    for loaded, future in enumerate(as_completed(futures), 1):
-                        if self._is_cancelled:
-                            break
-                        t = futures[future]
-                        try:
-                            _adopt_decoded_source(t, future.result())
-                        except Exception as e:
-                            t.status = "ERROR"
-                            t.error = str(e)
-                            t.audio_data = None
-                        self.progress_value.emit(loaded, len(missing))
-
-            # Discovery-time measurements (such as the peak of an unloaded source)
-            # are stale even when the preview worker supplied the samples.
+            self._decode_missing_sources(session)
             ok_tracks = [t for t in session.tracks if t.status == "OK"]
             for track in ok_tracks:
                 track._cache.clear()
-            num_ok = len(ok_tracks)
 
-            total_steps = (
-                num_ok * num_track_det
-                + num_session_det
-            )
+            total_steps = len(ok_tracks) * len(p1_track_dets) + len(p1_sess_dets)
             self._step = 0
             self._total = max(total_steps, 1)
             self._step_lock = threading.Lock()
+            self._subscribe_phase1_events(event_bus, {t.filename: t for t in session.tracks})
 
-            # Track map for emitting track objects
-            track_map = {t.filename: t for t in session.tracks}
-
-            # Subscribe to pipeline events
-            def on_detector_complete(detector_id, filename, **_kw):
-                with self._step_lock:
-                    self._step += 1
-                    step = self._step
-                self.progress.emit(f"Checking {filename} \u2014 {detector_id}")
-                self.progress_value.emit(step, self._total)
-
-            def on_session_detector_complete(detector_id, **_kw):
-                with self._step_lock:
-                    self._step += 1
-                    step = self._step
-                self.progress.emit(f"Session check \u2014 {detector_id}")
-                self.progress_value.emit(step, self._total)
-
-            def on_track_analyze_complete(filename, **_kw):
-                track = track_map.get(filename)
-                if track:
-                    self.track_analyzed.emit(filename, track)
-
-            event_bus.subscribe("detector.complete", on_detector_complete)
-            event_bus.subscribe("session_detector.complete", on_session_detector_complete)
-            event_bus.subscribe("track.analyze_complete", on_track_analyze_complete)
-
-            # Phase 1: Analyze
             self.progress.emit("Validating Layout\u2026")
             self.progress_value.emit(0, self._total)
             session = pipeline.analyze_phase1(session)
-
             self.finished.emit(session)
         except Exception as e:
             self.error.emit(str(e))
@@ -326,13 +313,51 @@ class AnalyzeWorker(QThread):
         self._is_cancelled = True
         self._event_bus.cancel()
 
+    def _subscribe_phase2_events(self, event_bus, track_map) -> None:
+        def on_detector_complete(detector_id, filename, **_kw):
+            with self._step_lock:
+                self._step += 1
+                step = self._step
+            self.progress.emit(self, f"Analyzing {filename} \u2014 {detector_id}")
+            self.progress_value.emit(self, step, self._total)
+
+        def on_session_detector_complete(detector_id, **_kw):
+            with self._step_lock:
+                self._step += 1
+                step = self._step
+            self.progress.emit(self, f"Session detector \u2014 {detector_id}")
+            self.progress_value.emit(self, step, self._total)
+
+        def on_track_analyze_complete(filename, **_kw):
+            track = track_map.get(filename)
+            if track:
+                self.track_analyzed.emit(self, filename, track)
+
+        def on_track_plan_complete(filename, **_kw):
+            with self._step_lock:
+                self._step += 1
+                step = self._step
+            self.progress_value.emit(self, step, self._total)
+            track = track_map.get(filename)
+            if track:
+                self.track_planned.emit(self, filename, track)
+
+        event_bus.subscribe("detector.complete", on_detector_complete)
+        event_bus.subscribe("session_detector.complete", on_session_detector_complete)
+        event_bus.subscribe("track.analyze_complete", on_track_analyze_complete)
+        event_bus.subscribe("track.plan_complete", on_track_plan_complete)
+
     def run(self):
         try:
             event_bus = self._event_bus
-
             self.progress.emit(self, "Loading session\u2026")
-            session = load_session(self.source_dir, self.config, event_bus=event_bus,
-                                   recursive=self.recursive, filenames=self.layout_files)
+            session = load_session(
+                self.source_dir,
+                self.config,
+                event_bus=event_bus,
+                recursive=self.recursive,
+                filenames=self.layout_files,
+            )
             for track in session.tracks:
                 _gui_source_samples(track.audio_data)
                 for key, value in self.track_settings.get(track.filename, {}).items():
@@ -343,86 +368,44 @@ class AnalyzeWorker(QThread):
                 return
 
             self.progress.emit(self, "Building pipeline\u2026")
-            detectors = default_detectors()
-            processors = default_processors()
             pipeline = Pipeline(
-                detectors=detectors,
-                audio_processors=processors,
+                detectors=default_detectors(),
+                audio_processors=default_processors(),
                 config=self.config,
                 event_bus=event_bus,
             )
-
-            # Calculate total progress steps
-            ok_tracks = [t for t in session.tracks if t.status == "OK"]
-            num_ok = len(ok_tracks)
-            num_track_det = sum(d.phase == LifecyclePhase.PHASE2 and d.id in pipeline.repair_verification.required_ids
-                                for d in pipeline.track_detectors)
-            num_session_det = len([d for d in pipeline.session_detectors if getattr(d, 'phase', LifecyclePhase.PHASE2) == LifecyclePhase.PHASE2])
-            total_steps = (
-                num_ok * num_track_det      # analyze: per-track detectors
-                + num_session_det           # analyze: session detectors
-                + num_ok                    # plan: repairs and gain for each track
-                + 1                         # build summary
+            num_ok = sum(t.status == "OK" for t in session.tracks)
+            num_track_det = sum(
+                d.phase == LifecyclePhase.PHASE2 and d.id in pipeline.repair_verification.required_ids
+                for d in pipeline.track_detectors
+            )
+            num_session_det = sum(
+                getattr(d, "phase", LifecyclePhase.PHASE2) == LifecyclePhase.PHASE2
+                for d in pipeline.session_detectors
             )
             self._step = 0
-            self._total = max(total_steps, 1)
+            self._total = max(num_ok * num_track_det + num_session_det + num_ok + 1, 1)
             self._step_lock = threading.Lock()
+            self._subscribe_phase2_events(event_bus, {t.filename: t for t in session.tracks})
 
-            # Track map for emitting track objects
-            track_map = {t.filename: t for t in session.tracks}
-
-            # Subscribe to pipeline events (called from pool threads)
-            def on_detector_complete(detector_id, filename, **_kw):
-                with self._step_lock:
-                    self._step += 1
-                    step = self._step
-                self.progress.emit(self, f"Analyzing {filename} \u2014 {detector_id}")
-                self.progress_value.emit(self, step, self._total)
-
-            def on_session_detector_complete(detector_id, **_kw):
-                with self._step_lock:
-                    self._step += 1
-                    step = self._step
-                self.progress.emit(self, f"Session detector \u2014 {detector_id}")
-                self.progress_value.emit(self, step, self._total)
-
-            def on_track_analyze_complete(filename, **_kw):
-                track = track_map.get(filename)
-                if track:
-                    self.track_analyzed.emit(self, filename, track)
-
-            def on_track_plan_complete(filename, **_kw):
-                with self._step_lock:
-                    self._step += 1
-                    step = self._step
-                self.progress_value.emit(self, step, self._total)
-                track = track_map.get(filename)
-                if track:
-                    self.track_planned.emit(self, filename, track)
-
-            event_bus.subscribe("detector.complete", on_detector_complete)
-            event_bus.subscribe("session_detector.complete", on_session_detector_complete)
-            event_bus.subscribe("track.analyze_complete", on_track_analyze_complete)
-            event_bus.subscribe("track.plan_complete", on_track_plan_complete)
-
-            # Phase 2: Analyze (per-track detectors run in parallel)
             self.progress.emit(self, "Analyzing Content\u2026")
             self.progress_value.emit(self, 0, self._total)
             session = pipeline.analyze_phase2(session)
 
-            # Phase 2: Plan (per-track processors run in parallel)
             self.progress.emit(self, "Checking track repairs and planning gains\u2026")
-            session = pipeline.plan(session, preserve_selections={
-                name for name, settings in self.track_settings.items() if "processor_skip" in settings})
+            session = pipeline.plan(
+                session,
+                preserve_selections={
+                    name for name, settings in self.track_settings.items() if "processor_skip" in settings
+                },
+            )
 
-            # Build summary
             with self._step_lock:
                 self._step += 1
                 step = self._step
             self.progress.emit(self, "Building summary\u2026")
             self.progress_value.emit(self, step, self._total)
             summary = build_diagnostic_summary(session, remaining=True)
-
             self.completed.emit(self, session, summary)
         except Exception as e:
             self.error.emit(self, str(e))
@@ -547,175 +530,144 @@ class TopoMultiAudioWorker(QThread):
     def cancel(self):
         self._cancelled = True
 
-    def run(self):
-        import logging, time
-        t0 = time.perf_counter()
-        log = logging.getLogger(__name__)
-        log.debug("[Trace] TopoMultiAudioWorker loading %d items", len(self._items))
+    def _load_required_files(self) -> dict[str, tuple] | None:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import os
+        import soundfile as sf
 
-        try:
-            import os
-            import numpy as np
-            import soundfile as sf
+        required_files = set()
+        if self._side == "input":
+            required_files.update(item[0] for item in self._items)
+        else:
+            for item in self._items:
+                for src in item[0].sources:
+                    required_files.add(os.path.join(self._source_dir, src.input_filename))
 
-            track_arrays = []   # list of 2-D arrays (samples, ch)
-            track_ch_counts = []
-            track_labels_list = []
-            sr = 44100
+        audio_cache: dict[str, tuple] = {}
+        max_workers = min(4, os.cpu_count() or 1)
+        log.debug(
+            "[Trace] TopoMultiAudioWorker loading %d unique files with %d workers",
+            len(required_files),
+            max_workers,
+        )
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            fut_to_path = {pool.submit(sf.read, path, dtype="float64"): path for path in required_files}
+            for fut in as_completed(fut_to_path):
+                if self._cancelled:
+                    pool.shutdown(wait=False, cancel_futures=True)
+                    return None
+                path = fut_to_path[fut]
+                data, file_sr = fut.result()
+                log.debug(
+                    "[Trace] TopoMultiAudioWorker loaded '%s'. Shape: %s, %.1f MB",
+                    os.path.basename(path),
+                    data.shape,
+                    data.nbytes / (1024 * 1024),
+                )
+                audio_cache[path] = (data, file_sr)
+        return None if self._cancelled else audio_cache
 
-            from sessionprepgui.waveform.panel import WaveformPanel
+    @staticmethod
+    def _slice_and_label_channels(data, name: str, channels_to_keep) -> tuple:
+        from sessionprepgui.waveform.panel import WaveformPanel
 
-            from concurrent.futures import ThreadPoolExecutor, as_completed
+        if data.ndim == 1:
+            data = data.reshape(-1, 1)
+        if channels_to_keep is not None:
+            return data[:, channels_to_keep], [f"{name} Ch{c}" for c in channels_to_keep]
+        n_ch = data.shape[1]
+        names = WaveformPanel._CHANNEL_LABELS.get(n_ch)
+        labels = [
+            f"{name} {names[c]}" if names and c < len(names) else f"{name} Ch{c}"
+            for c in range(n_ch)
+        ]
+        return data, labels
 
-            # --- 1. Pre-collect all unique audio file paths ---
-            required_files = set()
-            if self._side == "input":
-                required_files.update(item[0] for item in self._items)
-            else:
-                for item in self._items:
-                    for src in item[0].sources:
-                        required_files.add(os.path.join(self._source_dir, src.input_filename))
+    def _resolve_items(self, audio_cache: dict[str, tuple]):
+        import os
+        from sessionpreplib.topology import resolve_entry_audio
 
-            # --- 2. Parallel I/O Load ---
-            audio_cache: dict[str, tuple[np.ndarray, int]] = {}
-            # Limit workers to 4 to prevent SSD thrashing and massive memory spike
-            max_workers = min(4, (os.cpu_count() or 1))
-
-            log.debug("[Trace] TopoMultiAudioWorker loading %d unique files with %d workers", len(required_files), max_workers)
-
-            with ThreadPoolExecutor(max_workers=max_workers) as pool:
-                fut_to_path = {
-                    pool.submit(sf.read, path, dtype='float64'): path
-                    for path in required_files
-                }
-                for fut in as_completed(fut_to_path):
-                    if self._cancelled:
-                        pool.shutdown(wait=False, cancel_futures=True)
-                        return
-                    path = fut_to_path[fut]
-                    t_load = time.perf_counter()
-                    data, file_sr = fut.result()
-                    log.debug("[Trace] TopoMultiAudioWorker loaded '%s'. Shape: %s, %.1f MB",
-                              os.path.basename(path), data.shape, data.nbytes / (1024 * 1024))
-                    audio_cache[path] = (data, file_sr)
-
+        track_arrays, track_ch_counts, track_labels_list = [], [], []
+        sr = 44100
+        for item in self._items:
             if self._cancelled:
-                return
+                return None
+            name = item[1]
+            channels_to_keep = item[2] if len(item) > 2 else None
+            if self._side == "input":
+                data, file_sr = audio_cache[item[0]]
+                sr = file_sr
+            else:
+                entry = item[0]
+                track_audio = {}
+                for src in entry.sources:
+                    if self._cancelled:
+                        return None
+                    path = os.path.join(self._source_dir, src.input_filename)
+                    data_s, file_sr = audio_cache[path]
+                    track_audio[src.input_filename] = (data_s, file_sr)
+                    sr = file_sr
+                data = resolve_entry_audio(entry, track_audio)
+            sliced, ch_labels = self._slice_and_label_channels(data, name, channels_to_keep)
+            track_arrays.append(sliced)
+            track_ch_counts.append(sliced.shape[1])
+            track_labels_list.append(ch_labels)
+        return track_arrays, track_ch_counts, track_labels_list, sr
 
+    @staticmethod
+    def _assemble_display_and_playback(track_arrays, track_ch_counts, track_labels_list):
+        import numpy as np
+
+        display_audio = []
+        max_samples = max(a.shape[0] for a in track_arrays)
+        for a in track_arrays:
+            if a.shape[0] < max_samples:
+                pad = np.zeros((max_samples - a.shape[0], a.shape[1]), dtype=np.float64)
+                a = np.vstack([a, pad])
+            for c in range(a.shape[1]):
+                display_audio.append(np.ascontiguousarray(a[:, c]))
+
+        max_ch = max(track_ch_counts)
+        playback = np.zeros((max_samples, max_ch), dtype=np.float64)
+        for a in track_arrays:
+            playback[:a.shape[0], :a.shape[1]] += a
+        playback /= len(track_arrays)
+        if playback.shape[1] == 1:
+            playback = playback[:, 0]
+        labels = [lbl for lst in track_labels_list for lbl in lst]
+        return display_audio, playback, labels
+
+    def run(self):
+        import time
+
+        t0 = time.perf_counter()
+        log.debug("[Trace] TopoMultiAudioWorker loading %d items", len(self._items))
+        try:
+            audio_cache = self._load_required_files()
+            if audio_cache is None:
+                return
             log.debug("[Trace] TopoMultiAudioWorker completed parallel I/O in %.2f ms", (time.perf_counter() - t0) * 1000)
             t_process = time.perf_counter()
-
-            # --- 3. Process loaded audio natively ---
-            if self._side == "input":
-                for item in self._items:
-                    if self._cancelled:
-                        return
-                    filepath = item[0]
-                    name = item[1]
-                    channels_to_keep = item[2] if len(item) > 2 else None
-
-                    # Retrieve directly from in-memory parallel cache
-                    data, file_sr = audio_cache[filepath]
-                    sr = file_sr
-                    if data.ndim == 1:
-                        data = data.reshape(-1, 1)
-
-                    if channels_to_keep is not None:
-                        data = data[:, channels_to_keep]
-                        ch_labels = [f"{name} Ch{c}" for c in channels_to_keep]
-                    else:
-                        n_ch = data.shape[1]
-                        ch_labels = []
-                        names = WaveformPanel._CHANNEL_LABELS.get(n_ch)
-                        for c in range(n_ch):
-                            if names and c < len(names):
-                                ch_labels.append(f"{name} {names[c]}")
-                            else:
-                                ch_labels.append(f"{name} Ch{c}")
-
-                    track_arrays.append(data)
-                    track_ch_counts.append(data.shape[1])
-                    track_labels_list.append(ch_labels)
-            else:  # output
-                from sessionpreplib.topology import resolve_entry_audio
-                for item in self._items:
-                    if self._cancelled:
-                        return
-                    entry = item[0]
-                    name = item[1]
-                    channels_to_keep = item[2] if len(item) > 2 else None
-
-                    # Load source audio for this entry
-                    track_audio: dict[str, tuple] = {}
-                    for src in entry.sources:
-                        if self._cancelled:
-                            return
-                        path = os.path.join(self._source_dir, src.input_filename)
-                        data, file_sr = audio_cache[path]
-                        track_audio[src.input_filename] = (data, file_sr)
-                        sr = file_sr
-
-                    resolved = resolve_entry_audio(entry, track_audio)
-                    if resolved.ndim == 1:
-                        resolved = resolved.reshape(-1, 1)
-
-                    if channels_to_keep is not None:
-                        resolved = resolved[:, channels_to_keep]
-                        ch_labels = [f"{name} Ch{c}" for c in channels_to_keep]
-                    else:
-                        n_ch = resolved.shape[1]
-                        ch_labels = []
-                        names = WaveformPanel._CHANNEL_LABELS.get(n_ch)
-                        for c in range(n_ch):
-                            if names and c < len(names):
-                                ch_labels.append(f"{name} {names[c]}")
-                            else:
-                                ch_labels.append(f"{name} Ch{c}")
-
-                    track_arrays.append(resolved)
-                    track_ch_counts.append(resolved.shape[1])
-                    track_labels_list.append(ch_labels)
-
+            resolved = self._resolve_items(audio_cache)
+            if resolved is None:
+                return
+            track_arrays, track_ch_counts, track_labels_list, sr = resolved
             if self._cancelled or not track_arrays:
                 return
-
-            # --- Build display audio (list of contiguous 1D channels) ---
-            log.debug("[Trace] TopoMultiAudioWorker building display & playback arrays...")
-            t_stack = time.perf_counter()
-            display_audio = []
-            max_samples = max(a.shape[0] for a in track_arrays)
-            for a in track_arrays:
-                if a.shape[0] < max_samples:
-                    pad = np.zeros((max_samples - a.shape[0], a.shape[1]),
-                                   dtype=np.float64)
-                    a = np.vstack([a, pad])
-                # Each channel becomes its own perfectly contiguous slice
-                for c in range(a.shape[1]):
-                    display_audio.append(np.ascontiguousarray(a[:, c]))
-
-            # --- Build playback audio (summed by channel position) ---
-            max_ch = max(track_ch_counts)
-            n_tracks = len(track_arrays)
-            playback = np.zeros((max_samples, max_ch), dtype=np.float64)
-            for a in track_arrays:
-                playback[:a.shape[0], :a.shape[1]] += a
-            playback /= n_tracks
-
-            # Squeeze mono playback
-            if playback.shape[1] == 1:
-                playback = playback[:, 0]
-
-            # --- Channel labels ---
-            labels = []
-            for lst in track_labels_list:
-                labels.extend(lst)
-
-            log.debug("[Trace] TopoMultiAudioWorker finished %d items (Total: %.2f ms, Process/Stack: %.2f ms)",
-                      len(self._items), (time.perf_counter() - t0) * 1000, (time.perf_counter() - t_process) * 1000)
+            display_audio, playback, labels = self._assemble_display_and_playback(
+                track_arrays, track_ch_counts, track_labels_list
+            )
+            log.debug(
+                "[Trace] TopoMultiAudioWorker finished %d items (Total: %.2f ms, Process/Stack: %.2f ms)",
+                len(self._items),
+                (time.perf_counter() - t0) * 1000,
+                (time.perf_counter() - t_process) * 1000,
+            )
             self.finished.emit(display_audio, playback, sr, labels)
         except Exception as exc:
-            import traceback, logging
-            logging.getLogger(__name__).error("TopoMultiAudioWorker error: %s", traceback.format_exc())
+            import traceback
+
+            log.error("TopoMultiAudioWorker error: %s", traceback.format_exc())
             self.error.emit(str(exc))
 
 
@@ -723,7 +675,7 @@ class RepairPlanWorker(QThread):
     """Plan edited repairs from immutable choices without changing a live session."""
 
     completed = Signal(object)
-    progress_value = Signal(int, int)
+    progress_value = Signal(object, int, int)
 
     def __init__(self, session, tracks, config, parent=None, *, refresh_anchors=(), revalidate_sources=()):
         super().__init__(parent)
@@ -746,7 +698,7 @@ class RepairPlanWorker(QThread):
     def _on_planned(self, **_):
         with self._progress_lock:
             self._done += 1
-            self.progress_value.emit(self._done, len(self.tracks))
+            self.progress_value.emit(self, self._done, len(self.tracks))
 
     def cancel(self):
         self._events.cancel()
@@ -866,141 +818,111 @@ class TopologyApplyWorker(QThread):
     def cancel(self):
         self._is_cancelled = True
 
-    def run(self):
-        staging = None
-        try:
-            import os
-            from pathlib import Path
-            import soundfile as sf
-            from tempfile import TemporaryDirectory
-            from sessionpreplib.audio import load_track, AUDIO_EXTENSIONS
-            from sessionpreplib.layout_files import publish_layout
-            from sessionpreplib.repairs import check_output_headroom
-            from sessionpreplib.repair_plan import check_source_signature
-            from sessionpreplib.topology import resolve_entry_audio
-            from sessionpreplib.models import TrackContext
+    def _load_topology_sources(self, needed_sources, track_map, output_path, source_root, total):
+        from pathlib import Path
+        from sessionpreplib.audio import load_track
+        from sessionpreplib.repair_plan import check_source_signature
 
-            session = self._session
-            topology = session.topology
-            if topology is None:
-                self.error.emit(self, "No topology defined.")
-                return
-
-            output_dir = self._output_dir
-            output_path = Path(output_dir).resolve()
-            source_root = Path(self._source_dir).resolve() if self._source_dir else None
-            if source_root is not None and source_root.is_relative_to(output_path):
-                raise ValueError("The layout output folder must be separate from the source folder.")
-
-            # Collect source filenames referenced by topology
-            tracks = self._source_tracks if self._source_tracks is not None else session.tracks
-            track_map = {t.filename: t for t in tracks if t.status == "OK"}
-
-            needed_sources = {src.input_filename for entry in topology.entries
-                              if entry.output_channels > 0 for src in entry.sources}
-
-            n_sources = len(needed_sources)
-            n_entries = len(topology.entries)
-            # Total includes peak building phase when peaks_dir is set
-            total = n_sources + n_entries + (n_entries if self._peaks_dir else 0)
-
-            # Phase 2 tracks may be renders with the same relative names. Keep
-            # the PCM and format together, anchored to the original source path.
-            source_audio: dict[str, tuple] = {}
-            sources: dict[str, TrackContext] = {}
-            for step, filename in enumerate(sorted(needed_sources)):
-                if self._is_cancelled:
-                    raise InterruptedError("Layout apply cancelled")
-
-                log.debug("Apply topology: loading source '%s' (%d/%d)", filename, step + 1, total)
-                self.progress.emit(self, f"Loading {filename}")
-                self.progress_value.emit(self, step, total)
-                track = track_map.get(filename)
-                if source_root is None and track is None:
-                    raise ValueError(f"Missing source: {filename}")
-                path = (source_root / filename if source_root is not None else Path(track.filepath)).resolve()
-                if source_root is not None and (Path(filename).is_absolute() or not path.is_relative_to(source_root)):
-                    raise ValueError(f"{filename}: the layout source is outside the project directory.")
-                if path.is_relative_to(output_path):
-                    raise ValueError(f"{filename}: the original source is inside the layout output folder.")
-                if source_root is not None and track is not None and Path(track.filepath).resolve() != path:
-                    track = None
-                if (track is not None and track.audio_data is not None and
-                        (source_root is None or (track.source_file_signature and track.source_file_revision))):
-                    source = track
-                else:
-                    source = load_track(str(path))
-                    if track is not None:
-                        source.group = track.group
-                if source_root is not None and track is not None:
-                    check_source_signature(track)
-                sources[filename] = source
-                source_audio[filename] = (source.audio_data, source.samplerate)
-
-            # Validate every route before replacing any previous layout audio.
-            for entry in topology.entries:
-                if entry.output_channels < 1:
-                    continue
-                for src in entry.sources:
-                    samples = sources[src.input_filename].audio_data
-                    channels = 1 if samples.ndim == 1 else samples.shape[1]
-                    for route in src.routes:
-                        if not 0 <= route.source_channel < channels:
-                            raise ValueError(f"{src.input_filename}: source channel {route.source_channel + 1} "
-                                             f"is unavailable ({channels} channels).")
-                        if not 0 <= route.target_channel < entry.output_channels:
-                            raise ValueError(f"{entry.output_filename}: output channel {route.target_channel + 1} "
-                                             f"is unavailable ({entry.output_channels} channels).")
-
+        source_audio: dict[str, tuple] = {}
+        sources: dict[str, object] = {}
+        for step, filename in enumerate(sorted(needed_sources)):
             if self._is_cancelled:
                 raise InterruptedError("Layout apply cancelled")
-            os.makedirs(output_dir, exist_ok=True)
-            staging = TemporaryDirectory(dir=output_path, prefix=".sp-layout-")
-            stage = Path(staging.name)
+            log.debug("Apply topology: loading source '%s' (%d/%d)", filename, step + 1, total)
+            self.progress.emit(self, f"Loading {filename}")
+            self.progress_value.emit(self, step, total)
+            track = track_map.get(filename)
+            if source_root is None and track is None:
+                raise ValueError(f"Missing source: {filename}")
+            path = (source_root / filename if source_root is not None else Path(track.filepath)).resolve()
+            if source_root is not None and (Path(filename).is_absolute() or not path.is_relative_to(source_root)):
+                raise ValueError(f"{filename}: the layout source is outside the project directory.")
+            if path.is_relative_to(output_path):
+                raise ValueError(f"{filename}: the original source is inside the layout output folder.")
+            if source_root is not None and track is not None and Path(track.filepath).resolve() != path:
+                track = None
+            if (
+                track is not None
+                and track.audio_data is not None
+                and (source_root is None or (track.source_file_signature and track.source_file_revision))
+            ):
+                source = track
+            else:
+                source = load_track(str(path))
+                if track is not None:
+                    source.group = track.group
+            if source_root is not None and track is not None:
+                check_source_signature(track)
+            sources[filename] = source
+            source_audio[filename] = (source.audio_data, source.samplerate)
+        return sources, source_audio
 
-            # Phase B: Resolve topology + write output files (no peak building)
-            output_tracks = []
-            destinations = set()
-            errors = []
-            written_files: list[tuple[str, str, int]] = []  # (output_filename, dst_path, sr)
-            base_step = n_sources
-            for idx, entry in enumerate(topology.entries):
-                if self._is_cancelled:
-                    raise InterruptedError("Layout apply cancelled")
+    @staticmethod
+    def _validate_topology_routes(topology, sources) -> None:
+        for entry in topology.entries:
+            if entry.output_channels < 1:
+                continue
+            for src in entry.sources:
+                samples = sources[src.input_filename].audio_data
+                channels = 1 if samples.ndim == 1 else samples.shape[1]
+                for route in src.routes:
+                    if not 0 <= route.source_channel < channels:
+                        raise ValueError(
+                            f"{src.input_filename}: source channel {route.source_channel + 1} "
+                            f"is unavailable ({channels} channels)."
+                        )
+                    if not 0 <= route.target_channel < entry.output_channels:
+                        raise ValueError(
+                            f"{entry.output_filename}: output channel {route.target_channel + 1} "
+                            f"is unavailable ({entry.output_channels} channels)."
+                        )
 
-                step = base_step + idx
-                log.debug("Apply topology: writing '%s' (%d/%d)", entry.output_filename, step + 1, total)
-                self.progress.emit(self, f"Writing {entry.output_filename}")
-                self.progress_value.emit(self, step, total)
+    def _stage_topology_entries(self, topology, output_path, stage, sources, source_audio, base_step, total):
+        from pathlib import Path
+        import soundfile as sf
+        from sessionpreplib.audio import AUDIO_EXTENSIONS
+        from sessionpreplib.models import TrackContext
+        from sessionpreplib.repairs import check_output_headroom
+        from sessionpreplib.topology import resolve_entry_audio
 
-                # Skip entries with no channels (e.g. all channels moved elsewhere)
-                if entry.output_channels < 1 or not entry.sources:
-                    continue
-
-                try:
-                    resolved = resolve_entry_audio(entry, source_audio)
-                    src_track = sources[entry.sources[0].input_filename]
-                    sr = src_track.samplerate
-
-                    name = Path(entry.output_filename)
-                    dst = output_path / name
-                    if (name.is_absolute() or name.drive or ".." in name.parts
-                            or name.suffix.lower() not in AUDIO_EXTENSIONS
-                            or not dst.resolve().is_relative_to(output_path) or dst.is_symlink()
-                            or dst.resolve() in destinations):
-                        raise ValueError(f"Invalid or duplicate layout destination: {name}")
-                    destinations.add(dst.resolve())
-                    check_output_headroom(resolved, src_track.subtype)
-                    temporary = stage / name
-                    temporary.parent.mkdir(parents=True, exist_ok=True)
-                    sf.write(temporary, resolved, sr, subtype=src_track.subtype)
-                    dst = str(dst)
-                    written_files.append((entry.output_filename, dst, sr))
-
-                    n_samples = resolved.shape[0]
-                    out_tc = TrackContext(
+        output_tracks, destinations, errors, written_files = [], set(), [], []
+        for idx, entry in enumerate(topology.entries):
+            if self._is_cancelled:
+                raise InterruptedError("Layout apply cancelled")
+            step = base_step + idx
+            log.debug("Apply topology: writing '%s' (%d/%d)", entry.output_filename, step + 1, total)
+            self.progress.emit(self, f"Writing {entry.output_filename}")
+            self.progress_value.emit(self, step, total)
+            if entry.output_channels < 1 or not entry.sources:
+                continue
+            try:
+                resolved = resolve_entry_audio(entry, source_audio)
+                src_track = sources[entry.sources[0].input_filename]
+                sr = src_track.samplerate
+                name = Path(entry.output_filename)
+                dst = output_path / name
+                if (
+                    name.is_absolute()
+                    or name.drive
+                    or ".." in name.parts
+                    or name.suffix.lower() not in AUDIO_EXTENSIONS
+                    or not dst.resolve().is_relative_to(output_path)
+                    or dst.is_symlink()
+                    or dst.resolve() in destinations
+                ):
+                    raise ValueError(f"Invalid or duplicate layout destination: {name}")
+                destinations.add(dst.resolve())
+                check_output_headroom(resolved, src_track.subtype)
+                temporary = stage / name
+                temporary.parent.mkdir(parents=True, exist_ok=True)
+                sf.write(temporary, resolved, sr, subtype=src_track.subtype)
+                dst_str = str(dst)
+                written_files.append((entry.output_filename, dst_str, sr))
+                n_samples = resolved.shape[0]
+                output_tracks.append(
+                    TrackContext(
                         filename=entry.output_filename,
-                        filepath=dst,
+                        filepath=dst_str,
                         audio_data=None,
                         samplerate=sr,
                         channels=entry.output_channels,
@@ -1010,70 +932,103 @@ class TopologyApplyWorker(QThread):
                         duration_sec=(n_samples / sr) if sr > 0 else 0.0,
                         group=src_track.group,
                     )
-                    output_tracks.append(out_tc)
-                except Exception as e:
-                    errors.append((entry.output_filename, str(e)))
+                )
+            except Exception as e:
+                errors.append((entry.output_filename, str(e)))
+        return output_tracks, written_files, errors
 
-            # Free source audio memory before peak building
-            source_audio.clear()
-            sources.clear()
+    def _build_layout_peaks(self, written_files, peak_base_step: int, total: int) -> None:
+        import os
+        import time as _time
+        import soundfile as sf
+        from ..waveform.peakcache import build_peaks, get_source_mtime, peaks_path_for, save_peaks
+
+        for idx, (out_fn, dst, _sr) in enumerate(written_files):
+            if self._is_cancelled:
+                break
+            step = peak_base_step + idx
+            log.debug("Apply topology: building peaks '%s' (%d/%d)", out_fn, step + 1, total)
+            self.progress.emit(self, f"Building peaks for {out_fn}")
+            self.progress_value.emit(self, step, total)
+            pp = peaks_path_for(self._peaks_dir, os.path.abspath(dst))
+            try:
+                mtime = get_source_mtime(dst)
+                _t0 = _time.perf_counter()
+                data, file_sr = sf.read(dst, dtype="float64")
+                _t_read = _time.perf_counter()
+                pd = build_peaks(data, file_sr, source_mtime=mtime)
+                _t_build = _time.perf_counter()
+                save_peaks(pd, pp)
+                _t_save = _time.perf_counter()
+                log.debug(
+                    "Built peak cache for '%s' -> %s (%d ch, %d levels, read=%.1f ms, build=%.1f ms, save=%.1f ms, total=%.1f ms)",
+                    out_fn, pp, pd.channels, len(pd.levels),
+                    (_t_read - _t0) * 1000, (_t_build - _t_read) * 1000,
+                    (_t_save - _t_build) * 1000, (_t_save - _t0) * 1000,
+                )
+            except Exception as e:
+                log.debug("Failed to build/save peak cache for '%s' -> %s: %s", out_fn, pp, e)
+
+    def run(self):
+        try:
+            import os
+            from pathlib import Path
+            from tempfile import TemporaryDirectory
+            from sessionpreplib.layout_files import publish_layout
+
+            session = self._session
+            topology = session.topology
+            if topology is None:
+                self.error.emit(self, "No topology defined.")
+                return
+
+            output_path = Path(self._output_dir).resolve()
+            source_root = Path(self._source_dir).resolve() if self._source_dir else None
+            if source_root is not None and source_root.is_relative_to(output_path):
+                raise ValueError("The layout output folder must be separate from the source folder.")
+
+            tracks = self._source_tracks if self._source_tracks is not None else session.tracks
+            track_map = {t.filename: t for t in tracks if t.status == "OK"}
+            needed_sources = {
+                src.input_filename
+                for entry in topology.entries
+                if entry.output_channels > 0
+                for src in entry.sources
+            }
+            n_sources, n_entries = len(needed_sources), len(topology.entries)
+            total = n_sources + n_entries + (n_entries if self._peaks_dir else 0)
+
+            sources, source_audio = self._load_topology_sources(
+                needed_sources, track_map, output_path, source_root, total
+            )
+            self._validate_topology_routes(topology, sources)
             if self._is_cancelled:
                 raise InterruptedError("Layout apply cancelled")
-            if errors:
-                raise ValueError("\n".join(f"{name}: {error}" for name, error in errors))
-            publish_layout(output_path, stage, output_tracks, [*session.tracks, *session.output_tracks])
 
-            # Phase C: Build peak caches (re-reading from just-written files)
-            if self._peaks_dir:
-                from ..waveform.peakcache import (
-                    build_peaks, save_peaks,
-                    peaks_path_for, get_source_mtime,
+            os.makedirs(self._output_dir, exist_ok=True)
+            with TemporaryDirectory(dir=output_path, prefix=".sp-layout-") as staging_dir:
+                stage = Path(staging_dir)
+                output_tracks, written_files, errors = self._stage_topology_entries(
+                    topology, output_path, stage, sources, source_audio, n_sources, total
                 )
-                peak_base_step = n_sources + n_entries
-                for idx, (out_fn, dst, sr) in enumerate(written_files):
-                    if self._is_cancelled:
-                        break  # Audio is committed. Only disposable peaks remain.
+                source_audio.clear()
+                sources.clear()
+                if self._is_cancelled:
+                    raise InterruptedError("Layout apply cancelled")
+                if errors:
+                    raise ValueError("\n".join(f"{name}: {error}" for name, error in errors))
+                publish_layout(output_path, stage, output_tracks, [*session.tracks, *session.output_tracks])
 
-                    step = peak_base_step + idx
-                    log.debug("Apply topology: building peaks '%s' (%d/%d)", out_fn, step + 1, total)
-                    self.progress.emit(self, f"Building peaks for {out_fn}")
-                    self.progress_value.emit(self, step, total)
-
-                    try:
-                        pp = peaks_path_for(self._peaks_dir, os.path.abspath(dst))
-                        mtime = get_source_mtime(dst)
-                        import time as _time
-                        _t0 = _time.perf_counter()
-                        data, file_sr = sf.read(dst, dtype="float64")
-                        _t_read = _time.perf_counter()
-                        pd = build_peaks(data, file_sr, source_mtime=mtime)
-                        _t_build = _time.perf_counter()
-                        save_peaks(pd, pp)
-                        _t_save = _time.perf_counter()
-                        log.debug(
-                            "Built peak cache for '%s' -> %s "
-                            "(%d ch, %d levels, read=%.1f ms, build=%.1f ms, save=%.1f ms, total=%.1f ms)",
-                            out_fn, pp, pd.channels, len(pd.levels),
-                            (_t_read - _t0) * 1000,
-                            (_t_build - _t_read) * 1000,
-                            (_t_save - _t_build) * 1000,
-                            (_t_save - _t0) * 1000,
-                        )
-                    except Exception as e:
-                        log.debug("Failed to build/save peak cache for '%s' -> %s: %s", out_fn, pp, e)
+            if self._peaks_dir:
+                self._build_layout_peaks(written_files, n_sources + n_entries, total)
 
             self.progress_value.emit(self, total, total)
-
             session.output_tracks = output_tracks
             session.prepare_state = "none"
             session.config["_topology_apply_errors"] = errors
             self.apply_finished.emit(self)
-
         except Exception as e:
             self.error.emit(self, str(e))
-        finally:
-            if staging is not None:
-                staging.cleanup()
 
 
 class BatchReanalyzeWorker(QThread):

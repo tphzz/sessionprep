@@ -23,13 +23,13 @@ from sessionpreplib.repair_verification import CheckOutcome, detector_check
 def test_waveform_source_failure_revokes_published_evidence(window, tmp_path, monkeypatch, source_change):
     track = _open(window, monkeypatch, _save_fixture(window, tmp_path / "audio", active=True))
     _idle(window)
-    window._select_row(window._find_table_row(track.filename))
-    window._show_track_detail(track)
+    window.track_table_controller.select_row(window.track_table_controller.find_table_row(track.filename))
+    window.detail_controller.show_track_detail(track)
     preview = window._repair_preview
     _wait(lambda: preview.displayed and preview.worker is None)
     assert detector_check(track, "dc_offset").outcome == CheckOutcome.RESOLVED
     assert "Correction applied" in window._file_report.toPlainText()
-    assert window._summary["clean_count"] == 1
+    assert window.state.summary["clean_count"] == 1
 
     source = Path(track.filepath)
     if source_change == "remove":
@@ -38,15 +38,15 @@ def test_waveform_source_failure_revokes_published_evidence(window, tmp_path, mo
         samples, rate = sf.read(source, dtype="float64")
         sf.write(source, -0.05 + 0.1 * samples, rate, subtype="DOUBLE")
     window._wf_panel.source_selector.buttons[1].click()
-    _wait(lambda: preview.worker is None and window._waveform_unavailable_generation is not None)
+    _wait(lambda: preview.worker is None and window.detail_controller.waveform_unavailable_generation is not None)
 
     assert track.corrected_analysis is None
     assert detector_check(track, "dc_offset").outcome == CheckOutcome.FAILED
     report = window._file_report.toPlainText()
     assert "Unable to verify" in report and "Correction applied" not in report
-    assert "Unable to verify" in track_analysis_label(track, window._session.detectors)[0]
-    assert window._summary["clean_count"] == 0
-    window._open_track_repairs(track)
+    assert "Unable to verify" in track_analysis_label(track, window.state.session.detectors)[0]
+    assert window.state.summary["clean_count"] == 0
+    window.detail_controller.open_track_repairs(track)
     dc = window._repair_editor.rows["dc_remove"]
     assert dc.verdict.text() == "Unable to verify"
     assert "0.33%" not in dc.evidence.text()
@@ -57,7 +57,7 @@ def test_waveform_source_failure_revokes_published_evidence(window, tmp_path, mo
 def test_repair_meters_change_before_new_plan_is_published(window, tmp_path, monkeypatch, key, value):
     track = _open(window, monkeypatch, _save_fixture(window, tmp_path / "audio", active=True))
     _idle(window)
-    window._open_track_repairs(track)
+    window.detail_controller.open_track_repairs(track)
     editor = window._repair_editor
     dc = editor.rows["dc_remove"]
     assert "12.50%" in dc.evidence.text() and "0.33%" in dc.evidence.text()

@@ -220,7 +220,7 @@ class InputTree(QTreeWidget):
 
             # Check for Phase 1 detector warnings/suggestions
             p1_warnings = []
-            for det_id, res in track.detector_results.items():
+            for _det_id, res in track.detector_results.items():
                 if res.severity and res.severity.name != "CLEAN":
                     p1_warnings.append(res.summary)
 

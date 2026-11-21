@@ -63,7 +63,7 @@ def _qualifying_window_seconds(regions, rate):
     """Display elapsed time once when channels report overlapping locations."""
     end = -1
     samples = 0
-    for first, last, channel in sorted(regions):
+    for first, last, _channel in sorted(regions):
         samples += max(0, last - max(first, end + 1) + 1)
         end = max(end, last)
     return samples / rate
@@ -257,6 +257,12 @@ class TrackRepairEditor(QFrame):
         self.body = QVBoxLayout(self)
         self.body.setContentsMargins(REPORT_INSET, REPORT_INSET, REPORT_INSET, REPORT_INSET)
         self.body.setSpacing(6)
+        self._build_header_and_rows()
+        self._build_cutoff_and_peak()
+        self._build_recovery_section()
+        self._wire_tab_order_and_events()
+
+    def _build_header_and_rows(self) -> None:
         header = QHBoxLayout()
         self.back_button = FormActionButton("Back to findings")
         self.back_button.setToolTip("Back to findings (Alt+Left)")
@@ -283,6 +289,8 @@ class TrackRepairEditor(QFrame):
             row.toggle.clicked.connect(lambda opened, key=key: self.select_repair(key if opened else None))
             self.rows[key] = row
             self.body.addWidget(row)
+
+    def _build_cutoff_and_peak(self) -> None:
         self.cutoff = _CutoffSpinBox()
         self.cutoff.setRange(_CUTOFF.min, _CUTOFF.max)
         self.cutoff.setSingleStep(1)
@@ -311,6 +319,8 @@ class TrackRepairEditor(QFrame):
         self.peak_layout.addWidget(self.peak_name, 0, 0)
         self.peak_layout.addWidget(self.peak, 0, 1)
         self.body.addWidget(self.peak_box)
+
+    def _build_recovery_section(self) -> None:
         self.boundary = _disclosure("Boundary settling")
         self.body.addWidget(self.boundary, 0, Qt.AlignLeft)
         self.boundary_details = _label()
@@ -322,8 +332,6 @@ class TrackRepairEditor(QFrame):
         title_font.setWeight(QFont.DemiBold)
         self.recovery_title.setFont(title_font)
         self.body.addWidget(self.recovery_title)
-        # A render error can contain an entire unbroken path. Let Qt wrap it
-        # anywhere and give the outer repair scroller all vertical scrolling.
         self.error = QTextBrowser()
         self.error.setAccessibleName("Repair error")
         self.error.setWordWrapMode(QTextOption.WrapAtWordBoundaryOrAnywhere)
@@ -334,7 +342,8 @@ class TrackRepairEditor(QFrame):
         self.error.setStyleSheet(f"color:{COLORS['attention']}; background:transparent; border:0; padding:0;")
         self.error.document().setDocumentMargin(0)
         self.error.document().documentLayout().documentSizeChanged.connect(
-            lambda size: self.error.setFixedHeight(math.ceil(size.height())))
+            lambda size: self.error.setFixedHeight(math.ceil(size.height()))
+        )
         self.body.addWidget(self.error)
         self.recovery = _label()
         self.body.addWidget(self.recovery)
@@ -344,6 +353,8 @@ class TrackRepairEditor(QFrame):
         self.adjust_gain.clicked.connect(lambda: self.adjustGainRequested.emit(self.track))
         self.body.addWidget(self.adjust_gain, 0, Qt.AlignLeft)
         self.body.addStretch()
+
+    def _wire_tab_order_and_events(self) -> None:
         order = [self.back_button]
         for key, row in self.rows.items():
             order.extend((row.toggle, row.choice, row.reset))
@@ -352,8 +363,6 @@ class TrackRepairEditor(QFrame):
         order.extend((self.boundary, self.adjust_gain))
         for first, second in zip(order, order[1:]):
             QWidget.setTabOrder(first, second)
-        # The application also binds Space to playback. Focused controls get
-        # first use of it for activation and selection.
         for child in self.findChildren(QWidget):
             child.installEventFilter(self)
 
@@ -392,14 +401,12 @@ class TrackRepairEditor(QFrame):
         self.select_repair(options.targets.get(detector, first))
         self.refresh(track, session, options)
 
-    def refresh(self, track, session, options=None):
-        if track is not self.track or session is not self.session:
-            return
-        options = options or track_repair_options(track, session)
+    def _sync_visible_rows_and_focus(self, options) -> None:
         focus = QApplication.focusWidget()
         previous = next((key for key, row in self.rows.items() if row.toggle.isChecked()), None)
-        focus_removed = focus is not None and any(key not in options.rows and row.isAncestorOf(focus)
-                                                  for key, row in self.rows.items())
+        focus_removed = focus is not None and any(
+            key not in options.rows and row.isAncestorOf(focus) for key, row in self.rows.items()
+        )
         for key, row in self.rows.items():
             row.setVisible(key in options.rows)
         if previous is not None and previous not in options.rows:
@@ -408,42 +415,31 @@ class TrackRepairEditor(QFrame):
             target = next((row.toggle for key, row in self.rows.items() if key in options.rows), self.back_button)
             target.setFocus(Qt.OtherFocusReason)
         self.empty.setVisible(not options.available)
-        measures = track.repair_measurements
-        before, after = measures.get("original", {}), measures.get("corrected", {})
-        suggested, inherited = measures.get("suggested", {}), measures.get("inherited", {})
-        config, overrides = session.config, track.repair_overrides
-        recipe = track.repair_recipe
-        selected = {"dc_remove": recipe.dc_remove, "low_cut": recipe.low_cut_hz is not None, "ultrasonic": recipe.ultrasonic}
-        pending = bool(track._cache.get("repair_verification_pending"))
-        unavailable = pending or bool(track._cache.get("repair_error"))
-        if unavailable or not recipe.active:
-            after = {}
-        checks = {key: detector_check(track, detector_id, pending=pending)
-                  for detector_id, key in DETECTOR_REPAIRS.items() if detector_id != "subsonic-local"}
-        whole = checks["low_cut"]
-        low_check = whole
-        if options.targets.get("subsonic-local") == "low_cut":
-            local = local_rumble_check(track, config, whole)
-            outstanding = {CheckOutcome.NEW, CheckOutcome.REMAINING}
-            if (self._opening_finding == "subsonic-local"
-                    or options.targets.get("subsonic") != "low_cut"
-                    or (self._opening_finding != "subsonic" and local.outcome in outstanding
-                        and whole.outcome not in outstanding)):
-                low_check = local
+
+    def _update_row_verdicts_and_choices(
+        self, track, options, checks, low_check, selected, inherited, overrides, pending
+    ) -> None:
         for key, row in self.rows.items():
             check = low_check if key == "low_cut" else checks[key]
             status = verification_status(check.outcome)
             if check.outcome in {CheckOutcome.REMAINING, CheckOutcome.NEW}:
-                status = ("Still detected" if check.outcome == CheckOutcome.REMAINING else "New after repair",
-                          COLORS["attention"] if check.corrected.severity.value != "info" else COLORS["information"])
-            show_status = bool(status and (check.original or check.corrected or pending) and
-                               (key != "ultrasonic" or track.samplerate >= 50000))
+                status = (
+                    "Still detected" if check.outcome == CheckOutcome.REMAINING else "New after repair",
+                    COLORS["attention"] if check.corrected.severity.value != "info" else COLORS["information"],
+                )
+            show_status = bool(
+                status
+                and (check.original or check.corrected or pending)
+                and (key != "ultrasonic" or track.samplerate >= 50000)
+            )
             row.verdict.setText(status[0] if show_status else "")
             if show_status:
                 row.verdict.setStyleSheet(f"color:{status[1]};")
             value = overrides.get(key)
             with QSignalBlocker(row.choice):
-                row.choice.setItemText(0, f"Use preset ({'On' if inherited.get(key, selected[key] and value is None) else 'Off'})")
+                row.choice.setItemText(
+                    0, f"Use preset ({'On' if inherited.get(key, selected[key] and value is None) else 'Off'})"
+                )
                 row.choice.setCurrentIndex(0 if value is None else 1 if value else 2)
             enabled = key != "ultrasonic" or track.samplerate >= 50000
             row.editable = enabled or value is not None or selected[key]
@@ -451,21 +447,34 @@ class TrackRepairEditor(QFrame):
             row.unavailable = f"Unavailable at {track.samplerate / 1000:g} kHz" if not enabled else ""
             row.choice.model().item(1).setEnabled(enabled)
             row.reset.setEnabled(key in overrides)
+
+    def _update_repair_sections(self, track, options, before, after, suggested, selected, config, overrides, checks) -> None:
         dc = self.rows["dc_remove"]
-        dc.description.setText("Suggested · 2 Hz high-pass" if options.targets.get("dc_offset") == "dc_remove"
-                               and not recipe.dc_remove else "2 Hz high-pass")
-        dc_values = []
+        dc.description.setText(
+            "Suggested · 2 Hz high-pass"
+            if options.targets.get("dc_offset") == "dc_remove" and not track.repair_recipe.dc_remove
+            else "2 Hz high-pass"
+        )
         dc_after = after.get("signed_dc", [])
-        for i, mean in enumerate(before.get("signed_dc", [])):
-            label = ("Left", "Right")[i] if track.channels == 2 and i < 2 else f"Ch {i + 1}"
-            corrected_dc = _reading(dc_after[i] * 100, 2, "%") if i < len(dc_after) else "—"
-            dc_values.append((label, _reading(mean * 100, 2, "%"), corrected_dc))
+        dc_values = [
+            (
+                ("Left", "Right")[i] if track.channels == 2 and i < 2 else f"Ch {i + 1}",
+                _reading(mean * 100, 2, "%"),
+                _reading(dc_after[i] * 100, 2, "%") if i < len(dc_after) else "—",
+            )
+            for i, mean in enumerate(before.get("signed_dc", []))
+        ]
         dc_table = measurement_table(dc_values, heading="DC mean (% FS)", editor=True) if dc_values else ""
         dc.set_evidence(dc_table, dc_table)
+
         low = self.rows["low_cut"]
-        low.description.setText("Whole-track high-pass" if selected["low_cut"] else
-                                "Suggested" if "low_cut" in options.targets.values() else
-                                options.attribution("subsonic"))
+        low.description.setText(
+            "Whole-track high-pass"
+            if selected["low_cut"]
+            else "Suggested"
+            if "low_cut" in options.targets.values()
+            else options.attribution("subsonic")
+        )
         self._set_low_evidence(before, after, checks["low_cut"])
         preset = config.get(_CUTOFF.key, _CUTOFF.default)
         cutoff_value = overrides.get("low_cut_hz", preset)
@@ -474,7 +483,10 @@ class TrackRepairEditor(QFrame):
             self.cutoff.setValue(cutoff_value)
         self.cutoff_reset.setEnabled("low_cut_hz" in overrides)
         self.cutoff_default.setText(f"Preset: {preset:g} Hz")
-        self.cutoff_box.setVisible(selected["low_cut"] or overrides.get("low_cut") is True or "low_cut_hz" in overrides)
+        self.cutoff_box.setVisible(
+            selected["low_cut"] or overrides.get("low_cut") is True or "low_cut_hz" in overrides
+        )
+
         high = self.rows["ultrasonic"]
         original_high = before.get("ultrasonic", {})
         if track.samplerate < 50000:
@@ -485,16 +497,24 @@ class TrackRepairEditor(QFrame):
         else:
             high.description.setText("Audible passband through 20 kHz")
         if original_high.get("eligible"):
-            high_values = [("Energy ≥24.1 kHz", _reading(original_high.get("band_dbfs"), 1, " dBFS RMS"),
-                            _reading(after.get("ultrasonic", {}).get("band_dbfs"), 1, " dBFS RMS"))]
+            high_values = [
+                (
+                    "Energy ≥24.1 kHz",
+                    _reading(original_high.get("band_dbfs"), 1, " dBFS RMS"),
+                    _reading(after.get("ultrasonic", {}).get("band_dbfs"), 1, " dBFS RMS"),
+                )
+            ]
             high.set_evidence(measurement_table(high_values, editor=True), compact_measurements(high_values))
         else:
             high.set_evidence("", "")
-        for row in self.rows.values():
-            row.update_disclosure()
+
+    def _update_peak_and_recovery(self, track, options, measures, before, after, config, unavailable) -> None:
+        recipe = track.repair_recipe
+
         def peak(data):
             value = data.get("peak_dbfs")
             return _number(value, 2 if value is not None and abs(value) < 1 else 1, sign=True)
+
         self.peak.setText(f"{peak(before)} → {peak(after)} dBFS")
         self.peak_box.setVisible(recipe.active and "peak_dbfs" in before)
         errors = options.errors
@@ -504,10 +524,16 @@ class TrackRepairEditor(QFrame):
         if adjustment:
             errors = [msg for msg in errors if not msg.startswith("Output peak ")]
             errors.insert(0, f"Output peak {_number(adjustment['peak_db'], 2, sign=True)} dBFS")
-            self.recovery.setText(f"Lower output Gain by at least {adjustment['reduction_db']:.1f} dB, then retry Prepare.")
+            self.recovery.setText(
+                f"Lower output Gain by at least {adjustment['reduction_db']:.1f} dB, then retry Prepare."
+            )
             norm = track.processor_results.get("bimodal_normalize")
-            if (not config.get("bimodal_normalize_enabled", True) or "bimodal_normalize" in track.processor_skip
-                    or norm is None or norm.classification in ("Skip", "Silent")):
+            if (
+                not config.get("bimodal_normalize_enabled", True)
+                or "bimodal_normalize" in track.processor_skip
+                or norm is None
+                or norm.classification in ("Skip", "Silent")
+            ):
                 details.append("With normalization bypassed, Adjust Gain opens a manual output gain for this track.")
             if options.has_stale_output:
                 details.append("The previous prepared output is marked stale.")
@@ -522,6 +548,56 @@ class TrackRepairEditor(QFrame):
         self.error.setVisible(bool(errors))
         self.recovery.setVisible(bool(adjustment))
         self.adjust_gain.setVisible(bool(adjustment))
+
+    def refresh(self, track, session, options=None):
+        if track is not self.track or session is not self.session:
+            return
+        options = options or track_repair_options(track, session)
+        self._sync_visible_rows_and_focus(options)
+        measures = track.repair_measurements
+        before, after = measures.get("original", {}), measures.get("corrected", {})
+        suggested, inherited = measures.get("suggested", {}), measures.get("inherited", {})
+        config, overrides = session.config, track.repair_overrides
+        recipe = track.repair_recipe
+        selected = {
+            "dc_remove": recipe.dc_remove,
+            "low_cut": recipe.low_cut_hz is not None,
+            "ultrasonic": recipe.ultrasonic,
+        }
+        pending = bool(track._cache.get("repair_verification_pending"))
+        unavailable = pending or bool(track._cache.get("repair_error"))
+        if unavailable or not recipe.active:
+            after = {}
+        checks = {
+            key: detector_check(track, detector_id, pending=pending)
+            for detector_id, key in DETECTOR_REPAIRS.items()
+            if detector_id != "subsonic-local"
+        }
+        whole = checks["low_cut"]
+        low_check = whole
+        if options.targets.get("subsonic-local") == "low_cut":
+            local = local_rumble_check(track, config, whole)
+            outstanding = {CheckOutcome.NEW, CheckOutcome.REMAINING}
+            if (
+                self._opening_finding == "subsonic-local"
+                or options.targets.get("subsonic") != "low_cut"
+                or (
+                    self._opening_finding != "subsonic"
+                    and local.outcome in outstanding
+                    and whole.outcome not in outstanding
+                )
+            ):
+                low_check = local
+
+        self._update_row_verdicts_and_choices(
+            track, options, checks, low_check, selected, inherited, overrides, pending
+        )
+        self._update_repair_sections(
+            track, options, before, after, suggested, selected, config, overrides, checks
+        )
+        for row in self.rows.values():
+            row.update_disclosure()
+        self._update_peak_and_recovery(track, options, measures, before, after, config, unavailable)
 
     def _set_low_evidence(self, before, after, check):
         config, track = self.session.config, self.track

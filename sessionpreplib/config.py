@@ -3,15 +3,17 @@ from __future__ import annotations
 import json
 import math
 import os
-import platform
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
 
-from .models import ParamSpec
+from .models import ConfigError as ConfigError, ParamSpec
+from .paths import (
+    DEFAULT_STEREO_WINDOW_MS as DEFAULT_STEREO_WINDOW_MS,
+    get_app_dir as get_app_dir,
+)
 
 PRESET_SCHEMA_VERSION = "1.0"
-DEFAULT_STEREO_WINDOW_MS = 250
 
 # Keys that are internal/CLI-only and should not be saved in presets
 _INTERNAL_KEYS = {
@@ -23,32 +25,6 @@ _INTERNAL_KEYS = {
     "json",
     "_source_dir",
 }
-
-
-def get_app_dir() -> str:
-    """Return the OS-specific configuration directory for SessionPrep."""
-    system = platform.system()
-    if system == "Windows":
-        base = os.environ.get("APPDATA")
-        if not base:
-            base = os.path.expanduser("~")
-        return os.path.join(base, "sessionprep")
-    if system == "Darwin":
-        return os.path.join(
-            os.path.expanduser("~"),
-            "Library",
-            "Application Support",
-            "sessionprep",
-        )
-    # Linux / BSD / …
-    base = os.environ.get("XDG_CONFIG_HOME")
-    if not base:
-        base = os.path.join(os.path.expanduser("~"), ".config")
-    return os.path.join(base, "sessionprep")
-
-
-class ConfigError(Exception):
-    """Raised when configuration validation fails."""
 
 
 @dataclass
@@ -108,45 +84,29 @@ class ConfigChangeImpact:
 
 
 def default_config() -> dict[str, Any]:
-    """Returns the built-in default configuration."""
-    return {
-        "target_rms": -18.0,
-        "target_peak": -6.0,
-        "crest_threshold": 12.0,
-        "clip_consecutive": 3,
-        "clip_report_max_ranges": 10,
-        "dc_offset_warn_db": -40.0,
-        "repair_auto_dc": False,
-        "repair_auto_low_cut": False,
-        "repair_auto_ultrasonic": False,
-        "repair_low_cut_hz": 10.0,
-        "corr_warn": -0.3,
-        "corr_window_ms": DEFAULT_STEREO_WINDOW_MS,
-        "dual_mono_eps": 1e-5,
-        "mono_loss_warn_db": 6.0,
-        "one_sided_silence_db": -80.0,
-        "subsonic_hz": 30.0,
-        "subsonic_warn_ratio_db": -20.0,
-        "window": 400,
-        "stereo_mode": "avg",
-        "rms_anchor": "percentile",
-        "rms_percentile": 95.0,
-        "gate_relative_db": 40.0,
-        "tail_max_regions": 20,
-        "tail_min_exceed_db": 3.0,
-        "tail_hop_ms": 10,
+    """Returns the built-in default configuration derived from ParamSpec definitions."""
+    from .detectors import default_detectors
+    from .processors import default_processors
+
+    cfg: dict[str, Any] = {}
+    for spec in (*ANALYSIS_PARAMS, *PRESENTATION_PARAMS, *REPAIR_PARAMS):
+        cfg[spec.key] = deepcopy(spec.default)
+    for component in (*default_detectors(), *default_processors()):
+        for spec in component.config_params():
+            cfg[spec.key] = deepcopy(spec.default)
+    cfg.update({
         "force_transient": [],
         "force_sustained": [],
         "group": [],
         "anchor": None,
-        "fader_headroom_db": 8.0,
         "execute": False,
         "overwrite": False,
         "output_folder": "processed",
         "backup": "_originals",
         "report": "sessionprep.txt",
         "json": "sessionprep.json",
-    }
+    })
+    return cfg
 
 
 def merge_configs(*configs: dict[str, Any]) -> dict[str, Any]:
@@ -179,7 +139,7 @@ def load_preset(path: str) -> dict[str, Any]:
     if not os.path.isfile(path):
         raise ConfigError(f"Preset file not found: {path}")
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             data = json.load(f)
     except json.JSONDecodeError as e:
         raise ConfigError(f"Invalid JSON in preset file {path}: {e}") from e
@@ -349,6 +309,77 @@ PRESENTATION_PARAMS: list[ParamSpec] = [
 # ---------------------------------------------------------------------------
 
 
+def _validate_numeric_range(
+    spec: ParamSpec,
+    value: int | float,
+) -> ConfigFieldError | None:
+    if isinstance(value, float) and not math.isfinite(value):
+        return ConfigFieldError(spec.key, value, f"{spec.label} must be finite.")
+    if spec.min is not None:
+        if spec.min_exclusive and value <= spec.min:
+            return ConfigFieldError(
+                spec.key, value, f"{spec.label} must be greater than {spec.min}."
+            )
+        if not spec.min_exclusive and value < spec.min:
+            return ConfigFieldError(
+                spec.key, value, f"{spec.label} must be at least {spec.min}."
+            )
+    if spec.max is not None:
+        if spec.max_exclusive and value >= spec.max:
+            return ConfigFieldError(
+                spec.key, value, f"{spec.label} must be less than {spec.max}."
+            )
+        if not spec.max_exclusive and value > spec.max:
+            return ConfigFieldError(
+                spec.key, value, f"{spec.label} must be at most {spec.max}."
+            )
+    return None
+
+
+def _validate_single_param(
+    spec: ParamSpec,
+    value: Any,
+) -> ConfigFieldError | None:
+    if value is None:
+        if spec.nullable:
+            return None
+        return ConfigFieldError(spec.key, value, f"{spec.label} must not be empty.")
+
+    expected = spec.type
+    if expected is not bool and isinstance(value, bool):
+        return ConfigFieldError(
+            spec.key,
+            value,
+            f"{spec.label} must be {_type_label(expected)}, got boolean.",
+        )
+    if not isinstance(value, expected):
+        return ConfigFieldError(
+            spec.key,
+            value,
+            f"{spec.label} must be {_type_label(expected)}, got {type(value).__name__}.",
+        )
+
+    if spec.choices is not None and value not in spec.choices:
+        opts = ", ".join(repr(c) for c in spec.choices)
+        return ConfigFieldError(spec.key, value, f"{spec.label} must be one of {opts}.")
+
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        err = _validate_numeric_range(spec, value)
+        if err is not None:
+            return err
+
+    if spec.item_type is not None and isinstance(value, list):
+        for i, item in enumerate(value):
+            if not isinstance(item, spec.item_type):
+                return ConfigFieldError(
+                    spec.key,
+                    value,
+                    f"{spec.label}[{i}] must be {spec.item_type.__name__}, "
+                    f"got {type(item).__name__}.",
+                )
+    return None
+
+
 def validate_param_values(
     params: list[ParamSpec],
     values: dict[str, Any],
@@ -360,119 +391,12 @@ def validate_param_values(
     (they will receive their default).
     """
     errors: list[ConfigFieldError] = []
-
     for spec in params:
         if spec.key not in values:
             continue
-
-        value = values[spec.key]
-
-        # -- nullable --
-        if value is None:
-            if spec.nullable:
-                continue
-            errors.append(
-                ConfigFieldError(
-                    spec.key,
-                    value,
-                    f"{spec.label} must not be empty.",
-                )
-            )
-            continue
-
-        # -- type (bool ⊄ int guard) --
-        expected = spec.type
-        if expected is not bool and isinstance(value, bool):
-            errors.append(
-                ConfigFieldError(
-                    spec.key,
-                    value,
-                    f"{spec.label} must be {_type_label(expected)}, got boolean.",
-                )
-            )
-            continue
-        if not isinstance(value, expected):
-            errors.append(
-                ConfigFieldError(
-                    spec.key,
-                    value,
-                    f"{spec.label} must be {_type_label(expected)}, "
-                    f"got {type(value).__name__}.",
-                )
-            )
-            continue
-
-        # -- choices --
-        if spec.choices is not None and value not in spec.choices:
-            opts = ", ".join(repr(c) for c in spec.choices)
-            errors.append(
-                ConfigFieldError(
-                    spec.key,
-                    value,
-                    f"{spec.label} must be one of {opts}.",
-                )
-            )
-            continue
-
-        # -- numeric range --
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            if isinstance(value, float) and not math.isfinite(value):
-                errors.append(ConfigFieldError(spec.key, value, f"{spec.label} must be finite."))
-                continue
-            if spec.min is not None:
-                if spec.min_exclusive and value <= spec.min:
-                    errors.append(
-                        ConfigFieldError(
-                            spec.key,
-                            value,
-                            f"{spec.label} must be greater than {spec.min}.",
-                        )
-                    )
-                    continue
-                if not spec.min_exclusive and value < spec.min:
-                    errors.append(
-                        ConfigFieldError(
-                            spec.key,
-                            value,
-                            f"{spec.label} must be at least {spec.min}.",
-                        )
-                    )
-                    continue
-            if spec.max is not None:
-                if spec.max_exclusive and value >= spec.max:
-                    errors.append(
-                        ConfigFieldError(
-                            spec.key,
-                            value,
-                            f"{spec.label} must be less than {spec.max}.",
-                        )
-                    )
-                    continue
-                if not spec.max_exclusive and value > spec.max:
-                    errors.append(
-                        ConfigFieldError(
-                            spec.key,
-                            value,
-                            f"{spec.label} must be at most {spec.max}.",
-                        )
-                    )
-                    continue
-
-        # -- list items --
-        if spec.item_type is not None and isinstance(value, list):
-            for i, item in enumerate(value):
-                if not isinstance(item, spec.item_type):
-                    errors.append(
-                        ConfigFieldError(
-                            spec.key,
-                            value,
-                            f"{spec.label}[{i}] must be "
-                            f"{spec.item_type.__name__}, "
-                            f"got {type(item).__name__}.",
-                        )
-                    )
-                    break
-
+        err = _validate_single_param(spec, values[spec.key])
+        if err is not None:
+            errors.append(err)
     return errors
 
 
@@ -674,27 +598,15 @@ def infer_session_overrides(
     }
 
 
-def classify_structured_config_change(
-    old: dict[str, Any],
-    new: dict[str, Any],
-) -> ConfigChangeImpact:
-    """Classify how changing one structured config preset affects analysis.
-
-    The result is intentionally conservative. Unknown detector keys inherit
-    the owning detector's lifecycle phase; unknown processor keys require
-    Phase 2; unknown DAW processor keys are DAW-only.
-    """
-    from .detectors import default_detectors
+def _known_config_impacts() -> tuple[dict[tuple[str, str | None, str], str], dict[str, str]]:
     from .daw_processors import default_daw_processors
+    from .detectors import default_detectors
     from .models import LifecyclePhase
     from .processors import default_processors
 
     known: dict[tuple[str, str | None, str], str] = {}
-
     for spec in ANALYSIS_PARAMS:
-        impact = "presentation" if spec.presentation_only else "phase2"
-        known[("analysis", None, spec.key)] = impact
-
+        known[("analysis", None, spec.key)] = "presentation" if spec.presentation_only else "phase2"
     for spec in PRESENTATION_PARAMS:
         known[("presentation", None, spec.key)] = "presentation"
     for spec in REPAIR_PARAMS:
@@ -702,47 +614,36 @@ def classify_structured_config_change(
 
     detector_phase: dict[str, str] = {}
     for det in default_detectors():
-        phase = getattr(det, "phase", LifecyclePhase.PHASE2)
-        impact = "phase1" if phase == LifecyclePhase.PHASE1 else "phase2"
+        impact = "phase1" if getattr(det, "phase", LifecyclePhase.PHASE2) == LifecyclePhase.PHASE1 else "phase2"
         detector_phase[det.id] = impact
         for spec in det.config_params():
-            key_impact = "presentation" if spec.presentation_only else impact
-            known[("detectors", det.id, spec.key)] = key_impact
-
+            known[("detectors", det.id, spec.key)] = "presentation" if spec.presentation_only else impact
     for proc in default_processors():
         for spec in proc.config_params():
-            impact = "presentation" if spec.presentation_only else "phase2"
-            known[("processors", proc.id, spec.key)] = impact
-
+            known[("processors", proc.id, spec.key)] = "presentation" if spec.presentation_only else "phase2"
     for dp in default_daw_processors():
         for spec in dp.config_params():
-            impact = "presentation" if spec.presentation_only else "daw"
-            known[("daw_processors", dp.id, spec.key)] = impact
+            known[("daw_processors", dp.id, spec.key)] = "presentation" if spec.presentation_only else "daw"
+    return known, detector_phase
+
+
+def classify_structured_config_change(
+    old: dict[str, Any],
+    new: dict[str, Any],
+) -> ConfigChangeImpact:
+    """Classify how changing one structured config preset affects analysis."""
+    known, detector_phase = _known_config_impacts()
 
     def _impact_for(section: str, component: str | None, key: str) -> str:
-        known_impact = known.get((section, component, key))
-        if known_impact:
-            return known_impact
+        if (hit := known.get((section, component, key))) is not None:
+            return hit
         if section == "presentation":
             return "presentation"
         if section == "detectors" and component:
             return detector_phase.get(component, "phase2")
-        if section == "processors":
-            return "phase2"
-        if section == "daw_processors":
-            return "daw"
-        if section == "analysis":
-            return "phase2"
-        return "phase2"
+        return "daw" if section == "daw_processors" else "phase2"
 
-    changed: dict[str, set[str]] = {
-        "phase1": set(),
-        "phase2": set(),
-        "presentation": set(),
-        "daw": set(),
-        "repair": set(),
-    }
-
+    changed: dict[str, set[str]] = {k: set() for k in ("phase1", "phase2", "presentation", "daw", "repair")}
     old_values = _structured_config_values(old)
     new_values = _structured_config_values(new)
     for path in old_values.keys() | new_values.keys():
@@ -849,9 +750,14 @@ def validate_structured_config(
     proc_sections = structured.get("processors", {})
     for proc_id, section in proc_sections.items():
         proc = proc_map.get(proc_id)
-        if (proc is None and proc_id != "corrective") or not isinstance(section, dict):
-            continue
-        specs = REPAIR_PARAMS if proc_id == "corrective" else proc.config_params()
+        if proc_id == "corrective":
+            if not isinstance(section, dict):
+                continue
+            specs = REPAIR_PARAMS
+        else:
+            if proc is None or not isinstance(section, dict):
+                continue
+            specs = proc.config_params()
         for err in validate_param_values(specs, section):
             errors.append(
                 ConfigFieldError(

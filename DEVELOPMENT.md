@@ -501,15 +501,20 @@ sessionprepgui/                  # GUI package (PySide6)
     settings.py                  # Persistent config (load/save/validate, OS paths)
     theme.py                     # Colors, FILE_COLOR_* constants, dark theme
     helpers.py                   # esc(), track_analysis_label() (severity counts), fmt_time(), severity maps
-    mainwindow.py                # SessionPrepWindow (QMainWindow) + main() — thin orchestrator composing all mixins
+    state.py                     # WorkspaceState — shared cross-phase session, config, topology, DAW & peak state
+    shell.py                     # MainWindowShell Protocol — narrow shell surface for controllers
+    mainwindow.py                # SessionPrepWindow (QMainWindow) + main() — thin composition shell (zero mixins)
     analysis/
-        mixin.py                 # AnalysisMixin — open/save session, analyze, prepare, session Config tab
+        config_controller.py     # SessionConfigController — Phase 2 Config tab, overrides, presets, impact routing
+        lifecycle_controller.py  # SessionLifecycleController — open/save/load, Phase 1/2 analysis, peaks, repairs, Prepare
         worker.py                # QThread workers: AnalyzeWorker, RepairPlanWorker, PrepareWorker,
                                  #   DawCheckWorker, DawFetchWorker, DawTransferWorker
     daw/
-        mixin.py                 # DawMixin — DAW processor selection, fetch, transfer, folder tree, assignments
+        page.py                  # DawSetupPage — Phase 3 DAW Transfer widgets
+        controller.py            # DawTransferController — DAW selection, fetch, transfer, folder tree, assignments
     detail/
-        mixin.py                 # DetailMixin — file detail view, waveform display, overlays, playback
+        controller.py            # TrackDetailController — file detail view, waveform display, overlays, playback
+        repair_preview.py        # RepairPreview — async original/corrected audition & preview coordinator
         playback.py              # PlaybackController (sounddevice lifecycle + signals)
         report.py                # HTML rendering: render_summary_html(), render_fader_table_html(),
                                  #   render_track_detail_html()
@@ -526,7 +531,8 @@ sessionprepgui/                  # GUI package (PySide6)
         dialog.py                # PreferencesDialog — thin ~270-line orchestrator
         param_widgets.py         # Backward-compatible re-export shim → param_form + config_pages
     topology/
-        mixin.py                 # TopologyMixin — Phase 1 Channel Topology UI, Apply worker, waveform preview
+        page.py                  # TopologyPage — Phase 1 Track Layout widgets
+        controller.py            # TopologyController — Phase 1 Channel Topology UI, Apply worker, waveform preview
         input_tree.py            # InputTree — QTreeWidget for source tracks with drag-out support
         output_tree.py           # OutputTree — QTreeWidget for output tracks with drag-in, reorder,
                                  #   cross-file channel moves, insert-position indicator
@@ -535,8 +541,9 @@ sessionprepgui/                  # GUI package (PySide6)
     session/
         io.py                    # Session save/load (.spsession JSON) — serialises analysis state
     tracks/
-        columns_mixin.py         # TrackColumnsMixin — track table column setup and sorting
-        groups_mixin.py          # GroupsMixin — group assignment UI and color rendering
+        table_controller.py      # TrackTableController — Phase 2 & Phase 3 track tables, cell widgets, batch edits
+        groups_tab.py            # GroupsTabWidget — Phase 2 Groups tab widget
+        groups_controller.py     # GroupsController — group rules, auto-group, linked gains, preset sync
         table_widgets.py         # Track table widget classes
     waveform/
         __init__.py              # Re-exports WaveformWidget, WaveformLoadWorker, SPECTROGRAM_COLORMAPS
@@ -1868,7 +1875,7 @@ descriptions. Zebra rows use the `alt_row` palette role (`#2c2c2c`,
 Structured summary `item_refs` provide file identities alongside unchanged
 legacy item strings, so Review file does not parse filenames. Qt may move focus
 to a table cell while its tab bar already points at the destination but its page
-stack still contains the outgoing view. `TrackColumnsMixin` ignores navigation
+stack still contains the outgoing view. `TrackTableController` ignores navigation
 from that transient current-cell event and restores the previous valid cell under
 `QSignalBlocker`, preserving single and multiple row selections. This prevents
 reentrant tab changes from leaving the File label over Summary content. Stable
@@ -1940,19 +1947,26 @@ separator.
 | `helpers.py`              | `esc()`, `track_analysis_label(track, detectors=None)` (filters via `is_relevant()`), `fmt_time()`, severity maps                                                                                                                                                                                                                                                                             |
 | `widgets.py`              | `BatchEditTableWidget`, `BatchComboBox` — reusable batch-edit base classes preserving multi-row selection across cell-widget clicks (zero app imports)                                                                                                                                                                                                                                        |
 | `log.py`                  | `dbg(msg)` — lightweight debug logging to stderr, gated by `SP_LOG_LEVEL=DEBUG`. Timestamped output with caller class name. Used by `pipeline.py`, `dawproject.py`, and other modules via conditional import.                                                                                                                                                                                   |
-| `analysis/mixin.py`       | `AnalysisMixin` — open/save/load session, analyze, prepare, session Config tab wiring                                                                                                                                                                                                                                                                                                         |
+| `state.py`                | `WorkspaceState` — shared cross-phase desktop state (session, summary, source/topology paths, config/presets/overrides, groups, DAW bindings, peak cache) |
+| `shell.py`                | `MainWindowShell` — typing `Protocol` exposing the narrow shell surface (status bar, progress panel, phase tabs, dialog parent, batch mode) to controllers |
+| `analysis/config_controller.py` | `SessionConfigController` — Phase 2 Config tab, preset switching, session overrides, dirty markers, and `ConfigChangeImpact` routing |
+| `analysis/lifecycle_controller.py` | `SessionLifecycleController` — open/save/load `.spsession`, Phase 1/2 analysis workers, peak-cache build, repair planning, and Prepare execution |
 | `analysis/worker.py` | Background workers for analysis, per-track and batch repair planning, Prepare, DAW connectivity, folder discovery and transfer. |
-| `daw/mixin.py`            | `DawMixin` — DAW processor selection, check/fetch/transfer/sync, folder tree, drag-and-drop track assignment, Track Name inline editing, duplication with `-[N]` naming                                                                                                                                                                                                                       |
-| `topology/mixin.py`       | `TopologyMixin` — Phase 1 Channel Topology UI, "Scan subfolders" checkbox (recursive discovery), Apply worker, collapsible waveform preview                                                                                                                                                                                                                                                   |
-| `topology/input_tree.py`  | `InputTree` — QTreeWidget for source tracks, drag-out of channels via custom MIME                                                                                                                                                                                                                                                                                                             |
-| `topology/output_tree.py` | `OutputTree` — QTreeWidget for output tracks, drag-in from input tree, internal channel reorder with insert-position line, cross-file channel moves                                                                                                                                                                                                                                           |
-| `topology/operations.py`  | Topology mutation functions: add/remove/reorder/move/wire channels, rename/remove outputs                                                                                                                                                                                                                                                                                                     |
-| `detail/mixin.py`         | `DetailMixin` — file detail view, waveform display, detector overlay panel, playback toolbar wiring                                                                                                                                                                                                                                                                                           |
-| `detail/playback.py`      | `PlaybackController` — sounddevice OutputStream lifecycle, QTimer cursor updates, signal-based API                                                                                                                                                                                                                                                                                            |
-| `detail/report.py`        | HTML rendering: `render_summary_html()`, `render_fader_table_html()`, `render_track_detail_html()`                                                                                                                                                                                                                                                                                            |
-| `session/io.py`           | Session save/load — serialises full analysis state (detector + processor results, user edits, recursive_scan flag) to `.spsession` JSON without re-running analysis. Versioned format (v4) with forward-compatible migrations.                                                                                                                                                                |
-| `tracks/columns_mixin.py` | `TrackColumnsMixin` — track table column definitions, cell rendering, sorting                                                                                                                                                                                                                                                                                                                 |
-| `tracks/groups_mixin.py`  | `GroupsMixin` — group assignment UI, color rendering in track table                                                                                                                                                                                                                                                                                                                           |
+| `daw/page.py`             | `DawSetupPage` — Phase 3 DAW Transfer toolbar, setup table, folder tree, and project name controls |
+| `daw/controller.py`       | `DawTransferController` — DAW processor selection, check/fetch/transfer/sync, folder tree, drag-and-drop track assignment, Track Name inline editing, duplication with `-[N]` naming |
+| `topology/page.py`        | `TopologyPage` — Phase 1 Track Layout toolbar, input/output trees, and preview panel |
+| `topology/controller.py`  | `TopologyController` — Phase 1 Channel Topology UI, "Scan subfolders" checkbox (recursive discovery), Apply worker, collapsible waveform preview |
+| `topology/input_tree.py`  | `InputTree` — QTreeWidget for source tracks, drag-out of channels via custom MIME |
+| `topology/output_tree.py` | `OutputTree` — QTreeWidget for output tracks, drag-in from input tree, internal channel reorder with insert-position line, cross-file channel moves |
+| `topology/operations.py`  | Topology mutation functions: add/remove/reorder/move/wire channels, rename/remove outputs |
+| `detail/controller.py`    | `TrackDetailController` — file detail view, waveform display, detector overlay panel, playback toolbar wiring |
+| `detail/repair_preview.py`| `RepairPreview` — async original/corrected audition and waveform/spectrogram preview lifecycle |
+| `detail/playback.py`      | `PlaybackController` — sounddevice OutputStream lifecycle, QTimer cursor updates, signal-based API |
+| `detail/report.py`        | HTML rendering: `render_summary_html()`, `render_fader_table_html()`, `render_track_detail_html()` |
+| `session/io.py`           | Session save/load — serialises full analysis state (detector + processor results, user edits, recursive_scan flag) to `.spsession` JSON without re-running analysis. Versioned format (v4) with forward-compatible migrations. |
+| `tracks/table_controller.py` | `TrackTableController` — Phase 2 & Phase 3 track tables, cell editors, sorting, and `Alt+Shift` batch edits |
+| `tracks/groups_tab.py`    | `GroupsTabWidget` — Phase 2 Groups tab preset selector, rule table, and buttons |
+| `tracks/groups_controller.py` | `GroupsController` — group rules, auto-group matching, linked gains, dirty markers, and preset sync |
 | `tracks/table_widgets.py` | Track table widget classes (custom cell widgets, batch-edit base classes)                                                                                                                                                                                                                                                                                                                     |
 | `waveform/__init__.py`    | Re-exports `WaveformWidget`, `WaveformLoadWorker`, `SPECTROGRAM_COLORMAPS`                                                                                                                                                                                                                                                                                                                    |
 | `waveform/compute.py`     | Colormaps (magma/viridis/grayscale LUTs), spectral view preparation, `WaveformLoadWorker` QThread, `PeakBuildWorker` (batch peak cache builder using thread pool)                                                                                                                                                                                                                      |
@@ -1970,26 +1984,22 @@ separator.
 | `prefs/page_groups.py`    | `GroupsPage` — named group presets using `NamedPresetPanel` + `GroupsTableWidget` with `load`/`commit` interface.                                                                                                                                                                                                                                                                             |
 | `prefs/dialog.py`         | `PreferencesDialog` — thin ~270-line orchestrator wiring all pages, managing config presets via `NamedPresetPanel`, and handling save with validation.                                                                                                                                                                                                                                        |
 | `prefs/param_widgets.py`  | Backward-compatible re-export shim — all public names forward to `param_form.py` / `config_pages.py`.                                                                                                                                                                                                                                                                                         |
-| `mainwindow.py`           | `SessionPrepWindow` (QMainWindow) — orchestrator, UI layout, slot handlers, toolbar config/group preset combos, session Config tab                                                                                                                                                                                                                                                            |
+| `mainwindow.py`           | `SessionPrepWindow` (`QMainWindow`, zero mixins) — thin composition shell owning menus, global progress panel, phase tabs, `BatchQueueDock`, Preferences/Tools launchers, `WorkspaceState`, and the 7 phase controllers |
 
 ### 18.3 Dependency Direction
 
 ```
-settings (leaf) <--  mainwindow
-theme (leaf)  <--  helpers  <--  detail/report  <--  mainwindow
-widgets (leaf) <--  tracks/  <---------------------------+
-                                                         |
-              waveform/    <----------------------------+
-              detail/      <----------------------------+
-              analysis/    <----------------------------+
-              daw/         <----------------------------+
-              session/     <----------------------------+
-              prefs/       <----------------------------+
+settings (leaf) <--  state / mainwindow
+theme (leaf)  <--  helpers  <--  detail/report  <--  detail/controller <-- mainwindow
+widgets (leaf) <--  tracks/  <-----------------------------------------------+
+shell (Protocol) <-- controllers (topology, daw, detail, tracks, analysis) --+
+                     waveform/    <------------------------------------------+
+                     session/     <------------------------------------------+
+                     prefs/       <------------------------------------------+
 ```
 
-No circular imports. `settings`, `theme`, `helpers`, and `widgets` are pure
-leaves. `prefs/` reads `ParamSpec` metadata from detectors and processors.
-`mainwindow` composes all subpackage mixins.
+No circular imports. `settings`, `theme`, `helpers`, `widgets`, `state`, and `shell` are decoupled foundations. `prefs/` reads `ParamSpec` metadata from detectors and processors.
+`SessionPrepWindow` composes `WorkspaceState` and the 7 focused `QObject` controllers (`TopologyController`, `DawTransferController`, `TrackDetailController`, `TrackTableController`, `GroupsController`, `SessionConfigController`, `SessionLifecycleController`) with zero mixin inheritance.
 
 ### 18.4 Key Design Decisions
 
@@ -2389,15 +2399,15 @@ Four mip levels at 256, 1024, 4096, and 16384 samples/bin. A 5-minute stereo
 
 - `settings.py` — `peak_cache_folder` default (`"sp_peaks"`), added to
   `skip_folders` so the cache directory is not scanned as audio content.
-- `analysis/mixin.py` — `_start_peak_build()` triggered from
-  `_on_phase1_done()` and `_on_analyze_done()`. Maintains `_peak_cache` dict
+- `analysis/lifecycle_controller.py` — `start_peak_build()` triggered from
+  `_on_phase1_done()` and `_on_analyze_done()`. Maintains `state.peak_cache` dict
   (normalized absolute source path → `PeakData`). Reopening queues original
   inputs and routed files in one job. Queued deliveries identify their job
-  explicitly. Worker cleanup runs in `_clear_workspace()`.
-- `topology/mixin.py` — injects `PeakData` into the Phase 1 waveform display
+  explicitly. Worker cleanup runs in `clear_workspace()`.
+- `topology/controller.py` — injects `PeakData` into the Phase 1 waveform display
   via `set_peak_data()` after `set_precomputed()`. Passes `peaks_dir` to
   `TopologyApplyWorker` so output files get cached during Apply.
-- `detail/mixin.py` — injects `PeakData` into the Phase 2 waveform display
+- `detail/controller.py` — injects `PeakData` into the Phase 2 waveform display
   after `set_precomputed()`.
 - `analysis/worker.py` — `TopologyApplyWorker` builds and saves `.peaks` files
   immediately after writing each output file.
@@ -2481,7 +2491,7 @@ DawProcessor (orchestrated by GUI/CLI, outside Pipeline)
 Detector finding Actions are prepared once with the report: Visualize is offered
 only for valid in-bounds `IssueLocation` samples/channels and nonempty labels;
 Help stays independent. `ReportBrowser.visualizeRequested` dispatches cached
-links, including keyboard activation. `DetailMixin` revalidates the current
+links, including keyboard activation. `TrackDetailController` revalidates the current
 session, track identity, report generation, detector relevance and suppression
 before selecting the detector's actual issue labels. Both presentation and
 incremental file refresh use the same validated overlay list. Session detectors

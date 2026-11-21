@@ -45,12 +45,12 @@ def analyzed_window(tmp_path, monkeypatch):
     window.resize(1300, 650)
     window.show()
     try:
-        window._load_directory(str(folder))
-        wait_until(window._topo_apply_action.isEnabled)
-        window._topo_apply_action.trigger()
-        wait_until(lambda: window._worker is None and window._topology_dir
-                   and window._session is not None and window._session.tracks
-                   and "dc_offset" in window._session.tracks[0].detector_results)
+        window.lifecycle_controller.load_directory(str(folder))
+        wait_until(window.topology_controller.page.apply_action.isEnabled)
+        window.topology_controller.page.apply_action.trigger()
+        wait_until(lambda: window.lifecycle_controller.analyze_worker is None and window.state.topology_dir
+                   and window.state.session is not None and window.state.session.tracks
+                   and "dc_offset" in window.state.session.tracks[0].detector_results)
         yield window
     finally:
         dispose_window(window)
@@ -77,17 +77,17 @@ def test_file_repair_audition_and_save_reopen_preserve_evidence(analyzed_window,
 
     monkeypatch.setattr("sessionprepgui.detail.playback.sd.OutputStream", Sink)
     name = "Kit Kick.wav"
-    track = next(t for t in window._session.tracks if t.filename == name)
+    track = next(t for t in window.state.session.tracks if t.filename == name)
     samples, rate = sf.read(tmp_path / "audio" / name)
     routed, routed_rate = sf.read(track.filepath)
     assert routed_rate == rate
     np.testing.assert_array_equal(routed, samples)
     detector = DCOffsetDetector()
-    detector.configure(window._flat_config())
+    detector.configure(window.state.flat_config())
     original = detector.analyze(replace(track, audio_data=samples))
     assert original.issues and original.data["signed_dc"][0] == pytest.approx(.09, abs=1e-6)
-    window._track_table.selectRow(window._find_table_row(name))
-    window._show_track_detail(track)
+    window._track_table.selectRow(window.track_table_controller.find_table_row(name))
+    window.detail_controller.show_track_detail(track)
     report = window._file_report
     wait_until(lambda: window._repair_preview.worker is None and "DC Offset" in report.toPlainText())
     report.activate_report_link(QUrl("report-details:dc_offset"))
@@ -99,7 +99,7 @@ def test_file_repair_audition_and_save_reopen_preserve_evidence(analyzed_window,
     choice = window._repair_editor.rows["dc_remove"].choice
     choice.setCurrentIndex(choice.findData(True))
     wait_until(lambda: track.corrected_analysis and window._repair_preview.worker is None
-               and window._repair_plan_worker is None and window._repair_preview.audition)
+               and window.lifecycle_controller.repair_plan_worker is None and window._repair_preview.audition)
     corrected = render_corrected(samples, rate, track.repair_recipe)
     expected = detector.analyze(replace(track, audio_data=corrected))
     assert not expected.issues
@@ -130,9 +130,9 @@ def test_file_repair_audition_and_save_reopen_preserve_evidence(analyzed_window,
     assert "Correction applied" in report.toPlainText()
     assert report.cursorRect(report._reading_cursor(anchor.detector_id)).top() == anchor.top
     assert report.textCursor().charFormat().anchorHref() == "report-repair:dc_offset"
-    window._on_save_session()
-    window._on_load_session()
-    restored = next(t for t in window._session.tracks if t.filename == name)
+    window.lifecycle_controller.save_session_dialog()
+    window.lifecycle_controller.load_session_dialog()
+    restored = next(t for t in window.state.session.tracks if t.filename == name)
     assert restored is not track and restored.repair_overrides["dc_remove"]
     assert restored.detector_results["dc_offset"].issues == original.issues
     verified = restored.corrected_analysis.results["dc_offset"]
@@ -143,17 +143,17 @@ def test_file_repair_audition_and_save_reopen_preserve_evidence(analyzed_window,
 
 def test_sorted_auto_group_cancel_reassign_rename_and_export(analyzed_window, tmp_path, monkeypatch):
     window = analyzed_window
-    window._session_groups = [
+    window.state.session_groups = [
         {"name": "Kit", "match_pattern": "kit"},
         {"name": "Kick", "match_pattern": "kit kick"},
     ]
-    window._populate_groups_tab()
-    window._refresh_group_combos()
+    window.groups_controller.populate_groups_tab()
+    window.groups_controller.refresh_group_combos()
     table = window._track_table
     table.sortItems(0, Qt.DescendingOrder)
 
     def groups():
-        return {t.filename: t.group for t in window._session.tracks}
+        return {t.filename: t.group for t in window.state.session.tracks}
 
     before = groups()
     answers = iter([QMessageBox.No, QMessageBox.Yes])
@@ -162,22 +162,22 @@ def test_sorted_auto_group_cancel_reassign_rename_and_export(analyzed_window, tm
     assert groups() == before
     window._auto_group_action.trigger()
     assert groups() == {"Kit Kick.wav": "Kick", "Kit Snare.wav": "Kit", "Room.wav": None}
-    combo = table.cellWidget(window._find_table_row("Room.wav"), 6)
+    combo = table.cellWidget(window.track_table_controller.find_table_row("Room.wav"), 6)
     combo.setCurrentIndex(combo.findData("Kit"))
     combo.textActivated.emit(combo.currentText())
     window._prepare_action.trigger()
-    wait_until(lambda: window._prepare_worker is None and window._session.prepare_state == "ready")
-    window._groups_tab_table.item(0, 0).setText("Drums")
+    wait_until(lambda: window.lifecycle_controller.prepare_worker is None and window.state.session.prepare_state == "ready")
+    window.groups_controller.page.table.item(0, 0).setText("Drums")
     expected = {"Kit Kick.wav": "Kick", "Kit Snare.wav": "Drums", "Room.wav": "Drums"}
     assert groups() == expected
     for name, group in expected.items():
-        assert table.cellWidget(window._find_table_row(name), 6).currentData() == group
-    window._on_save_session()
-    window._on_load_session()
+        assert table.cellWidget(window.track_table_controller.find_table_row(name), 6).currentData() == group
+    window.lifecycle_controller.save_session_dialog()
+    window.lifecycle_controller.load_session_dialog()
     assert groups() == expected
-    for manifest in (window._session.transfer_manifest, window._session.base_transfer_manifest):
+    for manifest in (window.state.session.transfer_manifest, window.state.session.base_transfer_manifest):
         assert {e.output_filename: e.group for e in manifest} == expected
     path = tmp_path / "report.json"
-    save_json(window._session, window._flat_config(), str(path), [])
+    save_json(window.state.session, window.state.flat_config(), str(path), [])
     exported = json.loads(path.read_text(encoding="utf8"))["tracks"]
     assert {row["filename"]: row["processing"]["group"] for row in exported} == expected

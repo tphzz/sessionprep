@@ -2,13 +2,12 @@ from __future__ import annotations
 
 import math
 
-import numpy as np
 
 from ..models import ParamSpec
 from ..detector import TrackDetector, detector_badge_cell_html
 from ..models import DetectorResult, IssueLocation, Severity, TrackContext
 from ..audio import is_silent, windowed_stereo_correlation
-from ..config import DEFAULT_STEREO_WINDOW_MS
+from ..paths import DEFAULT_STEREO_WINDOW_MS
 
 
 class StereoCompatDetector(TrackDetector):
@@ -122,108 +121,43 @@ class StereoCompatDetector(TrackDetector):
         self.window_ms = config.get("corr_window_ms", DEFAULT_STEREO_WINDOW_MS)
         self.max_regions = config.get("corr_max_regions", 20)
 
-    def analyze(self, track: TrackContext) -> DetectorResult:
-        if is_silent(track):
-            return DetectorResult(
-                detector_id=self.id,
-                severity=Severity.CLEAN,
-                summary="silent track",
-                applicable=False,
-                data={"lr_corr": None, "mono_loss_db": None,
-                      "corr_warn": False, "mono_warn": False},
-            )
-
-        data = track.audio_data
-        if data is None or data.ndim < 2 or data.shape[1] < 2:
-            return DetectorResult(
-                detector_id=self.id,
-                severity=Severity.CLEAN,
-                summary="not stereo",
-                applicable=False,
-                data={"lr_corr": None, "mono_loss_db": None,
-                      "corr_warn": False, "mono_warn": False},
-            )
-
-        if data.shape[1] > 2:
-            return DetectorResult(
-                detector_id=self.id,
-                severity=Severity.CLEAN,
-                summary="multichannel (>2ch), skipped",
-                applicable=False,
-                data={"lr_corr": None, "mono_loss_db": None,
-                      "corr_warn": False, "mono_warn": False},
-            )
-
-        left = data[:, 0]
-        right = data[:, 1]
-
-        whole_corr, whole_mono_loss, win_results = windowed_stereo_correlation(
-            left, right, track.samplerate,
-            window_ms=int(self.window_ms), include_windows=self.windowed,
+    def _non_applicable(self, summary: str) -> DetectorResult:
+        return DetectorResult(
+            detector_id=self.id,
+            severity=Severity.CLEAN,
+            summary=summary,
+            applicable=False,
+            data={"lr_corr": None, "mono_loss_db": None,
+                  "corr_warn": False, "mono_warn": False},
         )
 
-        corr_threshold = float(self.corr_warn)
-        mono_threshold = float(self.mono_loss_warn_db)
-
-        # Whole-file warnings
-        corr_warn = (not math.isnan(whole_corr)
-                     and whole_corr < corr_threshold)
-        mono_warn = whole_mono_loss > mono_threshold
-
-        result_data: dict = {
-            "lr_corr": whole_corr if not math.isnan(whole_corr) else None,
-            "mono_loss_db": None if math.isnan(whole_mono_loss) else whole_mono_loss,
-            "corr_warn": corr_warn,
-            "mono_warn": mono_warn,
-        }
-
-        # If nothing triggers at whole-file level, return CLEAN early
-        # (windowed analysis can still upgrade to ATTENTION below)
-        any_whole_warn = corr_warn or mono_warn
-
-        # --- Windowed analysis ---
-        issues: list[IssueLocation] = []
-        detail_lines: list[str] = []
-        has_attention_regions = False
-
-        if self.windowed and win_results:
-            result_data.update(self._windowed_analysis(
-                track, win_results, corr_threshold, mono_threshold,
-                issues, detail_lines,
-            ))
-            has_attention_regions = bool(issues)
-
-        # --- Determine severity ---
-        if has_attention_regions:
-            severity = Severity.ATTENTION
-        elif any_whole_warn:
-            severity = Severity.INFO
-        else:
-            return DetectorResult(
-                detector_id=self.id,
-                severity=Severity.CLEAN,
-                summary="stereo compatibility OK",
-                data=result_data,
-            )
-
-        # --- Build summary ---
+    def _build_issue_result(
+        self,
+        track: TrackContext,
+        severity: Severity,
+        result_data: dict,
+        whole_mono_loss: float,
+        corr_threshold: float,
+        mono_threshold: float,
+        corr_warn: bool,
+        mono_warn: bool,
+        has_attention_regions: bool,
+        issues: list[IssueLocation],
+        detail_lines: list[str],
+    ) -> DetectorResult:
         summary_parts: list[str] = []
         if corr_warn and result_data["lr_corr"] is not None:
-            summary_parts.append(
-                f"corr {result_data['lr_corr']:.2f} (< {corr_threshold:g})")
+            summary_parts.append(f"corr {result_data['lr_corr']:.2f} (< {corr_threshold:g})")
         if mono_warn and result_data["mono_loss_db"] is not None:
             summary_parts.append(
-                f"mono loss {format_mono_loss(whole_mono_loss)} (> {mono_threshold:g} dB)")
+                f"mono loss {format_mono_loss(whole_mono_loss)} (> {mono_threshold:g} dB)"
+            )
         if has_attention_regions and not summary_parts:
-            # Whole-file OK but regions are bad
             mc = result_data.get("min_window_corr")
             if mc is not None:
-                summary_parts.append(
-                    f"regions: min corr {mc:.2f}")
+                summary_parts.append(f"regions: min corr {mc:.2f}")
 
         summary = ", ".join(summary_parts) if summary_parts else "stereo compat issue"
-
-        # Whole-file issue span as fallback when no windowed regions
         if not issues:
             issues.append(IssueLocation(
                 sample_start=0,
@@ -248,6 +182,60 @@ class StereoCompatDetector(TrackDetector):
             detail_lines=detail_lines,
             hint=", ".join(hint_parts) if hint_parts else None,
             issues=issues,
+        )
+
+    def analyze(self, track: TrackContext) -> DetectorResult:
+        if is_silent(track):
+            return self._non_applicable("silent track")
+
+        data = track.audio_data
+        if data is None or data.ndim < 2 or data.shape[1] < 2:
+            return self._non_applicable("not stereo")
+        if data.shape[1] > 2:
+            return self._non_applicable("multichannel (>2ch), skipped")
+
+        whole_corr, whole_mono_loss, win_results = windowed_stereo_correlation(
+            data[:, 0], data[:, 1], track.samplerate,
+            window_ms=int(self.window_ms), include_windows=self.windowed,
+        )
+        corr_threshold = float(self.corr_warn)
+        mono_threshold = float(self.mono_loss_warn_db)
+        corr_warn = not math.isnan(whole_corr) and whole_corr < corr_threshold
+        mono_warn = whole_mono_loss > mono_threshold
+
+        result_data: dict = {
+            "lr_corr": whole_corr if not math.isnan(whole_corr) else None,
+            "mono_loss_db": None if math.isnan(whole_mono_loss) else whole_mono_loss,
+            "corr_warn": corr_warn,
+            "mono_warn": mono_warn,
+        }
+
+        issues: list[IssueLocation] = []
+        detail_lines: list[str] = []
+        has_attention_regions = False
+        if self.windowed and win_results:
+            result_data.update(self._windowed_analysis(
+                track, win_results, corr_threshold, mono_threshold,
+                issues, detail_lines,
+            ))
+            has_attention_regions = bool(issues)
+
+        if has_attention_regions:
+            severity = Severity.ATTENTION
+        elif corr_warn or mono_warn:
+            severity = Severity.INFO
+        else:
+            return DetectorResult(
+                detector_id=self.id,
+                severity=Severity.CLEAN,
+                summary="stereo compatibility OK",
+                data=result_data,
+            )
+
+        return self._build_issue_result(
+            track, severity, result_data, whole_mono_loss,
+            corr_threshold, mono_threshold, corr_warn, mono_warn,
+            has_attention_regions, issues, detail_lines,
         )
 
     # ------------------------------------------------------------------

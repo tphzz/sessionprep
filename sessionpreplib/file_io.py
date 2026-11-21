@@ -79,10 +79,10 @@ def ensure_audio_backup(source, destination):
     backup_digest = sha256_file(destination)
     try:
         recorded = json.loads(receipt.read_text(encoding="utf-8"))
-    except FileNotFoundError:
+    except FileNotFoundError as exc:
         # Adopt legacy backups only while they can be compared with the original.
         if current != backup_digest:
-            raise ValueError(f"Existing backup cannot be verified against the source: {destination}")
+            raise ValueError(f"Existing backup cannot be verified against the source: {destination}") from exc
     else:
         if (recorded["original"] != backup_digest
                 or current not in (backup_digest, recorded["previous"], recorded["rendered"])):

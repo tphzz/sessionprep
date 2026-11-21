@@ -128,6 +128,94 @@ class AudioClassifierDetector(TrackDetector):
         self.force_transient = config.get("force_transient", [])
         self.force_sustained = config.get("force_sustained", [])
 
+    def _resolve_rms_anchor(
+        self,
+        track: TrackContext,
+        active_means: np.ndarray,
+        max_mean: float,
+    ) -> tuple[float, float, str]:
+        ov = getattr(track, "rms_anchor_override", None)
+        if ov == "max":
+            anchor_mode, percentile = "max", self.rms_percentile
+        elif ov and ov.startswith("p"):
+            anchor_mode, percentile = "percentile", float(ov[1:])
+        else:
+            anchor_mode, percentile = self.rms_anchor_mode, self.rms_percentile
+
+        anchor_mean = (
+            max_mean if anchor_mode == "max"
+            else float(np.percentile(active_means, percentile))
+        )
+        rms_anchor_db = float(linear_to_db(np.sqrt(anchor_mean)))
+        anchor_label = "max" if anchor_mode == "max" else f"p{percentile:g}"
+        return anchor_mean, rms_anchor_db, anchor_label
+
+    def _compute_decay(self, audio: np.ndarray, sr: int) -> tuple[float, bool]:
+        decay_env_samples = max(1, int((10 / 1000.0) * sr))
+        if audio.ndim > 1 and audio.shape[1] > 1:
+            mono_sq = np.mean(audio.astype(np.float64) ** 2, axis=1)
+        else:
+            mono_sq = (audio.flatten().astype(np.float64)) ** 2
+
+        env = _decay_envelope(mono_sq, decay_env_samples)
+        peak_power = float(np.max(env))
+        peak_env_idx = int(np.argmax(env >= peak_power * 10 ** (-_PEAK_TIE_DB / 10)))
+        lookahead_env = max(1, int((self.decay_lookahead_ms / 1000.0) * sr))
+        decay_end = min(len(env), peak_env_idx + 1 + lookahead_env)
+
+        if decay_end > peak_env_idx + 1:
+            tail_slice = env[peak_env_idx + 1:decay_end]
+            quarter = max(1, len(tail_slice) // 4)
+            tail_median = float(np.median(tail_slice[-quarter:]))
+        else:
+            tail_median = float(env[peak_env_idx])
+
+        decay_db = 0.0
+        if peak_power > 0:
+            decay_db = (
+                float(10 * np.log10(peak_power) - 10 * np.log10(tail_median))
+                if tail_median > 0 else _DECAY_LIMIT_DB
+            )
+        decay_at_floor = decay_db >= _DECAY_LIMIT_DB
+        return min(decay_db, _DECAY_LIMIT_DB), decay_at_floor
+
+    def _classify_track(
+        self,
+        filename: str,
+        crest: float,
+        decay_db: float,
+        density: float,
+    ) -> tuple[str, bool, bool]:
+        crest_says_transient = crest > self.crest_threshold
+        decay_says_transient = decay_db > self.decay_db_threshold
+        is_sparse = density < self.sparse_density_threshold
+
+        if matches_keywords(filename, self.force_transient):
+            is_transient, classification = True, "Transient (Forced)"
+        elif matches_keywords(filename, self.force_sustained):
+            is_transient, classification = False, "Sustained (Forced)"
+        elif is_sparse and (crest_says_transient or decay_says_transient):
+            is_transient, classification = True, "Transient"
+        elif crest_says_transient and decay_says_transient:
+            is_transient, classification = True, "Transient"
+        elif not crest_says_transient and not decay_says_transient:
+            is_transient, classification = False, "Sustained"
+        elif crest_says_transient and not decay_says_transient:
+            is_transient, classification = False, "Sustained"
+        else:
+            is_transient, classification = True, "Transient"
+
+        forced = "Forced" in classification
+        near_threshold = (
+            not forced
+            and np.isfinite(crest)
+            and (
+                abs(crest - self.crest_threshold) < 2.0
+                or abs(decay_db - self.decay_db_threshold) < 2.0
+            )
+        )
+        return classification, is_transient, near_threshold
+
     def analyze(self, track: TrackContext) -> DetectorResult:
         if is_silent(track):
             return DetectorResult(
@@ -158,123 +246,26 @@ class AudioClassifierDetector(TrackDetector):
 
         max_mean = float(np.max(active_means)) if active_means.size else 0.0
         rms_max_db = float(linear_to_db(np.sqrt(max_mean)))
-
-        # Resolve per-track RMS anchor override
-        ov = getattr(track, "rms_anchor_override", None)
-        if ov == "max":
-            anchor_mode, percentile = "max", self.rms_percentile
-        elif ov and ov.startswith("p"):
-            anchor_mode, percentile = "percentile", float(ov[1:])
-        else:
-            anchor_mode, percentile = self.rms_anchor_mode, self.rms_percentile
-
-        if anchor_mode == "max":
-            anchor_mean = max_mean
-        else:
-            anchor_mean = float(np.percentile(active_means, percentile))
-
-        rms_anchor_db = float(linear_to_db(np.sqrt(anchor_mean)))
-
-        # Crest factor: based on MAX window RMS (same as original)
-        if np.isfinite(peak_db) and np.isfinite(rms_max_db):
-            crest = float(peak_db - rms_max_db)
-        else:
-            crest = 0.0
-
-        # --- Envelope decay rate ---
-        # Build a short-window (~10 ms) energy envelope from raw audio
-        # so transient details are not smeared by the main RMS window.
-        # Then measure how much energy drops in the lookahead region
-        # after the peak.  Uses the median of the tail quarter to be
-        # robust against single-window outliers.
-        _DECAY_ENV_MS = 10  # short envelope resolution
-        sr = track.samplerate
-        decay_env_samples = max(1, int((_DECAY_ENV_MS / 1000.0) * sr))
-
-        audio = track.audio_data
-        if audio.ndim > 1 and audio.shape[1] > 1:
-            mono_sq = np.mean(audio.astype(np.float64) ** 2, axis=1)
-        else:
-            mono_sq = (audio.flatten().astype(np.float64)) ** 2
-
-        env = _decay_envelope(mono_sq, decay_env_samples)
-        peak_power = float(np.max(env))
-        # Prefer the beginning of an equal-energy sustain. Numerical noise
-        # on the plateau must not move the lookahead into the note's release.
-        peak_env_idx = int(np.argmax(env >= peak_power * 10**(-_PEAK_TIE_DB / 10)))
-        lookahead_env = max(1, int((self.decay_lookahead_ms / 1000.0) * sr))
-        decay_end = min(len(env), peak_env_idx + 1 + lookahead_env)
-
-        if decay_end > peak_env_idx + 1:
-            tail_slice = env[peak_env_idx + 1 : decay_end]
-            # Use the median of the last quarter of the tail for stability
-            quarter = max(1, len(tail_slice) // 4)
-            tail_median = float(np.median(tail_slice[-quarter:]))
-        else:
-            tail_median = float(env[peak_env_idx])
-
-        decay_db = 0.0
-        if peak_power > 0:
-            decay_db = (float(10 * np.log10(peak_power) - 10 * np.log10(tail_median))
-                        if tail_median > 0 else _DECAY_LIMIT_DB)
-        decay_at_floor = decay_db >= _DECAY_LIMIT_DB
-        decay_db = min(decay_db, _DECAY_LIMIT_DB)
-
-        # --- Density: fraction of windows above the relative gate ---
+        anchor_mean, rms_anchor_db, anchor_label = self._resolve_rms_anchor(
+            track, active_means, max_mean
+        )
+        crest = (
+            float(peak_db - rms_max_db)
+            if np.isfinite(peak_db) and np.isfinite(rms_max_db)
+            else 0.0
+        )
+        decay_db, decay_at_floor = self._compute_decay(track.audio_data, track.samplerate)
         density = (
             float(len(active_means) / len(window_means))
             if len(window_means) > 0 else 1.0
         )
-
-        # --- Three-metric classification ---
-        crest_says_transient = crest > self.crest_threshold
-        decay_says_transient = decay_db > self.decay_db_threshold
-        is_sparse = density < self.sparse_density_threshold
-
-        # Classification with overrides
-        if matches_keywords(track.filename, self.force_transient):
-            is_transient = True
-            classification = "Transient (Forced)"
-        elif matches_keywords(track.filename, self.force_sustained):
-            is_transient = False
-            classification = "Sustained (Forced)"
-        elif is_sparse and (crest_says_transient or decay_says_transient):
-            # Sparse track + at least one dynamic metric agrees → percussion
-            is_transient = True
-            classification = "Transient"
-        elif crest_says_transient and decay_says_transient:
-            # Both agree → high-confidence transient
-            is_transient = True
-            classification = "Transient"
-        elif not crest_says_transient and not decay_says_transient:
-            # Both agree → high-confidence sustained
-            is_transient = False
-            classification = "Sustained"
-        elif crest_says_transient and not decay_says_transient:
-            # High crest but slow decay → plucked / piano / compressed
-            is_transient = False
-            classification = "Sustained"
-        else:
-            # Low crest but fast decay → compressed drums / loop
-            is_transient = True
-            classification = "Transient"
-
-        # Near-threshold flag: ambiguous when either metric is close
-        forced = "Forced" in classification
-        near_threshold = (
-            not forced
-            and np.isfinite(crest)
-            and (abs(crest - self.crest_threshold) < 2.0
-                 or abs(decay_db - self.decay_db_threshold) < 2.0)
+        classification, is_transient, near_threshold = self._classify_track(
+            track.filename, crest, decay_db, density
         )
-
         summary = (
             f"crest {crest:.1f} dB, decay {'≥' if decay_at_floor else ''}{decay_db:.1f} dB, "
             f"density {density:.0%}, {classification}"
         )
-
-        anchor_label = "max" if anchor_mode == "max" else f"p{percentile:g}"
-
         return DetectorResult(
             detector_id=self.id,
             severity=Severity.INFO,

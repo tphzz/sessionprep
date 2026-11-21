@@ -126,35 +126,92 @@ def test_visualize_keyboard_dispatch_preserves_help_details_and_cached_content(q
 @pytest.fixture
 def host(pane, monkeypatch):
     import numpy as np
-    from sessionprepgui.detail.mixin import DetailMixin
+    from sessionprepgui.detail.controller import TrackDetailController
+    from sessionprepgui.state import WorkspaceState
     from sessionprepgui.waveform.panel import WaveformPanel
 
-    class Host(DetailMixin):
-        pass
+    session, track = session_with_issues()
+    state = WorkspaceState(config={})
+    state.session = session
+    state.current_track = track
+    state.selected_detector_overlays = {"tail-region", "unavailable"}
+    wf_panel = WaveformPanel()
+    status_bar = SimpleNamespace(showMessage=lambda message: None)
+    shell = SimpleNamespace(show_status=lambda message: status_bar.showMessage(message))
+    detail_tabs = SimpleNamespace(currentIndex=lambda: 1)
+
+    ctrl = TrackDetailController(
+        state,
+        shell,
+        summary_view=None,
+        file_report=pane.report,
+        file_review=None,
+        repair_editor=None,
+        detail_tabs=detail_tabs,
+        track_table=None,
+        wf_panel=wf_panel,
+        playback=None,
+    )
+    ctrl.update_time_label = lambda value=0: None
+
+    class Host:
+        def __init__(self):
+            self._state = state
+            self._ctrl = ctrl
+            self._file_report = pane.report
+            self._wf_panel = wf_panel
+            self._wf_container = wf_panel
+            self._waveform = wf_panel.waveform
+            self._overlay_menu = wf_panel.overlay_menu
+            self._overlay_btn = wf_panel.overlay_btn
+            self._cmap_group = wf_panel.cmap_group
+            self._play_btn = wf_panel.play_btn
+            self._status_bar = status_bar
+            self._detail_tabs = detail_tabs
+
+        @property
+        def _session(self): return self._state.session
+        @_session.setter
+        def _session(self, v): self._state.session = v
+        @property
+        def _current_track(self): return self._state.current_track
+        @_current_track.setter
+        def _current_track(self, v): self._state.current_track = v
+        @property
+        def _config(self): return self._state.config
+        @property
+        def _selected_detector_overlays(self): return self._state.selected_detector_overlays
+        @property
+        def _pending_detector_visualization(self): return self._ctrl.pending_detector_visualization
+        @_pending_detector_visualization.setter
+        def _pending_detector_visualization(self, v): self._ctrl.pending_detector_visualization = v
+        @property
+        def _waveform_context_generation(self): return self._ctrl.waveform_context_generation
+        @_waveform_context_generation.setter
+        def _waveform_context_generation(self, v): self._ctrl.waveform_context_generation = v
+        @property
+        def _wf_worker(self): return self._ctrl.wf_worker
+        @_wf_worker.setter
+        def _wf_worker(self, v): self._ctrl.wf_worker = v
+        @property
+        def _audio_load_worker(self): return self._ctrl.audio_load_worker
+        @_audio_load_worker.setter
+        def _audio_load_worker(self, v): self._ctrl.audio_load_worker = v
+
+        def _visualize_detector(self, key): self._ctrl.visualize_detector(key)
+        def _on_file_report_context_changed(self): self._ctrl.on_file_report_context_changed()
+        def _on_waveform_loaded(self, *a, **kw): self._ctrl.on_waveform_loaded(*a, **kw)
+        def _on_audio_loaded(self, *a, **kw): self._ctrl.on_audio_loaded(*a, **kw)
+        def _on_audio_load_error(self, *a, **kw): self._ctrl.on_audio_load_error(*a, **kw)
+        def _load_waveform(self, track): self._ctrl.load_waveform(track)
+        def _refresh_waveform_issues(self): self._ctrl.refresh_waveform_issues()
+        def _start_wf_worker(self, track): self._ctrl.start_wf_worker(track)
 
     owner = Host()
-    owner._session, owner._current_track = session_with_issues()
-    owner._file_report = pane.report
-    owner._wf_panel = WaveformPanel()
-    owner._wf_container = owner._wf_panel
-    owner._waveform = owner._wf_panel.waveform
-    owner._overlay_menu = owner._wf_panel.overlay_menu
-    owner._overlay_btn = owner._wf_panel.overlay_btn
-    owner._cmap_group = owner._wf_panel.cmap_group
-    owner._play_btn = owner._wf_panel.play_btn
-    owner._config = {}
-    owner._peak_cache = {}
-    owner._selected_detector_overlays = {"tail-region", "unavailable"}
-    owner._pending_detector_visualization = None
-    owner._waveform_context_generation = None
-    owner._wf_worker = None
-    owner._audio_load_worker = None
-    owner._update_time_label = lambda value: None
-    owner._status_bar = SimpleNamespace(showMessage=lambda message: None)
-    owner._file_report.visualizeRequested.connect(owner._visualize_detector)
-    owner._file_report.reportChanged.connect(owner._on_file_report_context_changed)
-    owner._file_report.present_track(owner._current_track, owner._session)
-    owner._waveform_context_generation = owner._file_report.context_generation
+    owner._file_report.visualizeRequested.connect(ctrl.visualize_detector)
+    owner._file_report.reportChanged.connect(ctrl.on_file_report_context_changed)
+    owner._file_report.present_track(track, session)
+    ctrl.waveform_context_generation = owner._file_report.context_generation
     samples = np.zeros(96000, dtype=np.float32)
     owner._waveform.set_audio(samples, 48000)
     owner._waveform._view_start = 20000
@@ -269,7 +326,7 @@ def test_stale_audio_completion_and_error_do_not_clear_current_load(host, monkey
     old, current = object(), object()
     host._audio_load_worker = current
     calls = []
-    monkeypatch.setattr(host, "_load_waveform", calls.append)
+    monkeypatch.setattr(host._ctrl, "load_waveform", calls.append)
     host._on_audio_loaded(host._current_track, host._current_track, old)
     host._on_audio_load_error("old failure", host._current_track, old)
     assert host._audio_load_worker is current
@@ -295,40 +352,52 @@ def test_real_session_detector_results_without_locations_do_not_break_waveform(
 
 @pytest.mark.parametrize("refresh", ["file", "presentation"])
 def test_real_refresh_callers_keep_suppressed_custom_labels_out(host, monkeypatch, refresh):
-    from sessionprepgui.analysis.mixin import AnalysisMixin
-    from sessionprepgui.tracks.columns_mixin import TrackColumnsMixin
-    import sessionpreplib.rendering as rendering
+    from sessionprepgui.analysis.config_controller import SessionConfigController
+    from sessionprepgui.tracks.table_controller import TrackTableController
+    import sessionprepgui.analysis.config_controller as config_ctrl_mod
 
     host._session.detectors[0].suppressed = True
     host._refresh_waveform_issues()
     host._refresh_file_report = lambda track: host._file_report.present_track(track, host._session)
     if refresh == "file":
-        TrackColumnsMixin._refresh_file_tab(host, host._current_track)
+        table_ctrl = TrackTableController(
+            host._state,
+            SimpleNamespace(),
+            track_table=None,
+            on_refresh_file_report=host._refresh_file_report,
+            on_refresh_waveform_issues=host._refresh_waveform_issues,
+        )
+        table_ctrl.refresh_file_tab(host._current_track)
     else:
         for detector in host._session.detectors:
             detector.configure = lambda config: None
-        host._flat_config = lambda: {}
-        host._render_summary = lambda: None
-        host._refresh_analysis_column = lambda: None
-        monkeypatch.setattr(rendering, "build_diagnostic_summary", lambda session, *, remaining: None)
-        AnalysisMixin._refresh_presentation(host)
+        host._state.flat_config = lambda: {}
+        monkeypatch.setattr(config_ctrl_mod, "build_diagnostic_summary", lambda session, *, remaining: None)
+        config_ctrl = SessionConfigController(
+            host._state,
+            SimpleNamespace(),
+            on_render_summary=lambda: None,
+            on_refresh_analysis_column=lambda: None,
+            on_refresh_file_report=host._refresh_file_report,
+            on_refresh_waveform_issues=host._refresh_waveform_issues,
+        )
+        config_ctrl.refresh_presentation()
     assert [action.data() for action in host._overlay_menu.actions()] == ["subsonic-region"]
     assert {issue.label for issue in host._waveform._issues} == {"subsonic-region"}
 
 
 @pytest.mark.parametrize("failure", ["error", "missing"])
 def test_terminal_unavailable_preview_does_not_queue_forever_and_reload_recovers(host, monkeypatch, failure):
-    from sessionprepgui.detail import mixin
+    from sessionprepgui.detail import controller
 
     messages = []
     host._status_bar.showMessage = messages.append
-    host._detail_tabs = SimpleNamespace(currentIndex=lambda: 1)
     if failure == "error":
         worker = object()
         host._audio_load_worker = worker
         host._on_audio_load_error("cannot read file", host._current_track, worker)
     else:
-        monkeypatch.setattr(mixin.os.path, "isfile", lambda path: False)
+        monkeypatch.setattr(controller.os.path, "isfile", lambda path: False)
         host._load_waveform(host._current_track)
     activate(host, "tail")
     assert not host._waveform._loading
@@ -339,7 +408,7 @@ def test_terminal_unavailable_preview_does_not_queue_forever_and_reload_recovers
     # Selecting/reloading the file again clears the terminal state. No real worker starts.
     host._current_track.audio_data = host.waveform_result["channels"][0]
     worker = object()
-    monkeypatch.setattr(host, "_start_wf_worker", lambda track: setattr(host, "_wf_worker", worker))
+    monkeypatch.setattr(host._ctrl, "start_wf_worker", lambda track: setattr(host._ctrl, "wf_worker", worker))
     host._load_waveform(host._current_track)
     activate(host, "subsonic")
     assert host._pending_detector_visualization is not None

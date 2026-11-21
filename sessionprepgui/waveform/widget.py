@@ -178,7 +178,8 @@ class WaveformWidget(QWidget):
     def set_preview_mode(self, channels_count: int, total_samples: int,
                          samplerate: int, peak_data: object) -> bool:
         """Instantly prepare widget for rendering using only peak cache metadata."""
-        import time, logging
+        import time
+        import logging
         t0 = time.perf_counter()
         log = logging.getLogger(__name__)
 
@@ -219,7 +220,8 @@ class WaveformWidget(QWidget):
 
     def set_precomputed(self, result: dict, *, preserve_view=False):
         """Apply pre-computed waveform data from a WaveformLoadWorker."""
-        import time, logging
+        import time
+        import logging
         t0 = time.perf_counter()
         log = logging.getLogger(__name__)
 
@@ -322,7 +324,8 @@ class WaveformWidget(QWidget):
     # ── paintEvent ─────────────────────────────────────────────────────────
 
     def _update_bg_pixmap(self, w: int, h: int):
-        import time, logging
+        import time
+        import logging
         t0 = time.perf_counter()
         log = logging.getLogger(__name__)
 
@@ -376,118 +379,109 @@ class WaveformWidget(QWidget):
         sz = self.size()
 
         if self._loading or not self._channels or self._total_samples == 0:
-            # Placeholders are cheap: paint them at the current size instead of
-            # stretching (or rebuilding) a cached image while resizing.
             painter = QPainter(self)
             painter.fillRect(self.rect(), QColor(COLORS["bg"]))
             painter.setPen(QPen(QColor(COLORS["dim"])))
-            painter.drawText(self.rect(), Qt.AlignCenter,
-                             "Loading waveform…" if self._loading else "No waveform")
+            painter.drawText(
+                self.rect(),
+                Qt.AlignCenter,
+                "Loading waveform…" if self._loading else "No waveform",
+            )
             painter.end()
             return
 
         if (not self._is_resizing or self._stale_pixmap is None) and (
-                self._bg_pixmap is None or getattr(self._bg_pixmap, "_logical_size", None) != sz):
+            self._bg_pixmap is None or getattr(self._bg_pixmap, "_logical_size", None) != sz
+        ):
             self._update_bg_pixmap(w, h)
 
         painter = QPainter(self)
-
         if self._is_resizing and self._stale_pixmap is not None:
-            # Draw the stale pixmap stretched to fit the current size (fast path)
             painter.drawPixmap(self.rect(), self._stale_pixmap)
         elif self._bg_pixmap is not None:
             painter.drawPixmap(0, 0, self._bg_pixmap)
 
         painter.setRenderHint(QPainter.Antialiasing, True)
-
-        if self._loading or not self._channels or self._total_samples == 0:
-            painter.end()
-            return
-
         x0, draw_w = self._draw_area()
         draw_h = h - self._MARGIN_BOTTOM
-
-        # Playback cursor
-        if self._total_samples > 0:
-            cursor_x = x0 + self._sample_to_x(self._cursor_sample, draw_w)
-            if x0 <= cursor_x <= x0 + draw_w:
-                painter.setPen(QPen(QColor("#ffffff"), 1))
-                painter.drawLine(cursor_x, 0, cursor_x, int(draw_h))
-
-                if self._cursor_y_value is not None:
-                    cursor_y = -1
-                    cursor_label = ""
-                    if self._display_mode == "spectrogram":
-                        mel_min = self._spec_renderer.mel_view_min
-                        mel_max = self._spec_renderer.mel_view_max
-                        mel_range = mel_max - mel_min
-                        if mel_range > 0 and draw_h > 0:
-                            frac = (self._cursor_y_value - mel_min) / mel_range
-                            cursor_y = int(draw_h * (1.0 - frac))
-                            freq = self._spec_renderer.hz_for_axis(self._cursor_y_value)
-                            cursor_label = (f"{freq / 1000:.1f} kHz" if freq >= 1000
-                                            else f"{freq:.0f} Hz")
-                    else:
-                        nch = self._num_channels
-                        if nch > 0 and draw_h > 0:
-                            lane_h = draw_h / nch
-                            ch = min(self._cursor_y_channel, nch - 1)
-                            mid_y = ch * lane_h + lane_h / 2.0
-                            scale = (lane_h / 2.0) * 0.85 * self._vscale
-                            cursor_y = int(mid_y - self._cursor_y_value * scale)
-                            amp = abs(self._cursor_y_value)
-                            cursor_label = (f"{20.0 * np.log10(amp):.1f} dBFS"
-                                            if amp > 0 else "-\u221e dBFS")
-                    if 0 <= cursor_y <= int(draw_h):
-                        painter.setPen(QPen(QColor(255, 255, 255, 80), 1, Qt.DotLine))
-                        painter.drawLine(x0, cursor_y, x0 + draw_w, cursor_y)
-                        if cursor_label:
-                            painter.setFont(QFont("Consolas", 7))
-                            painter.setPen(QColor(255, 255, 255, 180))
-                            cfm = painter.fontMetrics()
-                            clw = cfm.horizontalAdvance(cursor_label)
-                            lx = cursor_x + 6
-                            ly = cursor_y - 4
-                            if lx + clw > x0 + draw_w:
-                                lx = cursor_x - 6 - clw
-                            if ly - cfm.ascent() < 0:
-                                ly = cursor_y + cfm.ascent() + 4
-                            painter.drawText(int(lx), int(ly), cursor_label)
-
-        # Crosshair mouse guide
+        self._paint_playback_cursor(painter, x0, draw_w, draw_h)
         if self._mouse_y >= 0:
-            mx = self._mouse_x
-            my = self._mouse_y
-            guide_color = QColor(200, 200, 200, 60)
-            painter.setPen(QPen(guide_color, 1, Qt.DashLine))
-            painter.drawLine(0, my, w, my)
-            if mx >= 0:
-                painter.drawLine(mx, 0, mx, int(draw_h))
-                sample = self._x_to_sample(mx - x0, draw_w)
-                if self._samplerate > 0:
-                    secs = sample / self._samplerate
-                    m = int(secs) // 60
-                    s = secs - m * 60
-                    time_label = f"{m}:{s:05.2f} ({sample:,})"
-                    painter.setFont(QFont("Consolas", 7))
-                    painter.setPen(QColor(200, 200, 200, 180))
-                    tfm = painter.fontMetrics()
-                    ttw = tfm.horizontalAdvance(time_label)
-                    lx = max(x0, min(mx - ttw // 2, x0 + draw_w - ttw))
-                    painter.drawText(int(lx), tfm.ascent() + 2, time_label)
-
-            if self._display_mode == "spectrogram":
-                self._spec_renderer.draw_freq_guide(
-                    painter, self._make_spec_ctx(x0, draw_w, draw_h), my)
-            else:
-                nch = self._num_channels
-                if nch > 0:
-                    lane_h = draw_h / nch
-                    self._wf_renderer.draw_db_guide(
-                        painter, self._make_wf_ctx(x0, draw_w, draw_h),
-                        nch, lane_h, my)
-
+            self._paint_mouse_crosshair(painter, w, x0, draw_w, draw_h)
         painter.end()
+
+    def _paint_playback_cursor(self, painter: QPainter, x0: int, draw_w: int, draw_h: float) -> None:
+        if self._total_samples <= 0:
+            return
+        cursor_x = x0 + self._sample_to_x(self._cursor_sample, draw_w)
+        if not (x0 <= cursor_x <= x0 + draw_w):
+            return
+        painter.setPen(QPen(QColor("#ffffff"), 1))
+        painter.drawLine(cursor_x, 0, cursor_x, int(draw_h))
+        if self._cursor_y_value is None:
+            return
+        cursor_y, cursor_label = self._cursor_y_readout(draw_h)
+        if not (0 <= cursor_y <= int(draw_h)):
+            return
+        painter.setPen(QPen(QColor(255, 255, 255, 80), 1, Qt.DotLine))
+        painter.drawLine(x0, cursor_y, x0 + draw_w, cursor_y)
+        if not cursor_label:
+            return
+        painter.setFont(QFont("Consolas", 7))
+        painter.setPen(QColor(255, 255, 255, 180))
+        cfm = painter.fontMetrics()
+        clw = cfm.horizontalAdvance(cursor_label)
+        lx = cursor_x + 6 if cursor_x + 6 + clw <= x0 + draw_w else cursor_x - 6 - clw
+        ly = cursor_y - 4 if cursor_y - 4 - cfm.ascent() >= 0 else cursor_y + cfm.ascent() + 4
+        painter.drawText(int(lx), int(ly), cursor_label)
+
+    def _cursor_y_readout(self, draw_h: float) -> tuple[int, str]:
+        if self._display_mode == "spectrogram":
+            mel_min = self._spec_renderer.mel_view_min
+            mel_range = self._spec_renderer.mel_view_max - mel_min
+            if mel_range > 0 and draw_h > 0:
+                frac = (self._cursor_y_value - mel_min) / mel_range
+                freq = self._spec_renderer.hz_for_axis(self._cursor_y_value)
+                label = f"{freq / 1000:.1f} kHz" if freq >= 1000 else f"{freq:.0f} Hz"
+                return int(draw_h * (1.0 - frac)), label
+            return -1, ""
+        nch = self._num_channels
+        if nch > 0 and draw_h > 0:
+            lane_h = draw_h / nch
+            ch = min(self._cursor_y_channel, nch - 1)
+            mid_y = ch * lane_h + lane_h / 2.0
+            scale = (lane_h / 2.0) * 0.85 * self._vscale
+            amp = abs(self._cursor_y_value)
+            label = f"{20.0 * np.log10(amp):.1f} dBFS" if amp > 0 else "-\u221e dBFS"
+            return int(mid_y - self._cursor_y_value * scale), label
+        return -1, ""
+
+    def _paint_mouse_crosshair(
+        self, painter: QPainter, w: int, x0: int, draw_w: int, draw_h: float
+    ) -> None:
+        mx, my = self._mouse_x, self._mouse_y
+        painter.setPen(QPen(QColor(200, 200, 200, 60), 1, Qt.DashLine))
+        painter.drawLine(0, my, w, my)
+        if mx >= 0:
+            painter.drawLine(mx, 0, mx, int(draw_h))
+            sample = self._x_to_sample(mx - x0, draw_w)
+            if self._samplerate > 0:
+                secs = sample / self._samplerate
+                m = int(secs) // 60
+                s = secs - m * 60
+                time_label = f"{m}:{s:05.2f} ({sample:,})"
+                painter.setFont(QFont("Consolas", 7))
+                painter.setPen(QColor(200, 200, 200, 180))
+                tfm = painter.fontMetrics()
+                ttw = tfm.horizontalAdvance(time_label)
+                lx = max(x0, min(mx - ttw // 2, x0 + draw_w - ttw))
+                painter.drawText(int(lx), tfm.ascent() + 2, time_label)
+        if self._display_mode == "spectrogram":
+            self._spec_renderer.draw_freq_guide(painter, self._make_spec_ctx(x0, draw_w, draw_h), my)
+        elif self._num_channels > 0:
+            lane_h = draw_h / self._num_channels
+            self._wf_renderer.draw_db_guide(
+                painter, self._make_wf_ctx(x0, draw_w, draw_h), self._num_channels, lane_h, my
+            )
 
     # ── Qt event handlers ──────────────────────────────────────────────────
 
@@ -609,81 +603,88 @@ class WaveformWidget(QWidget):
         shift = bool(mods & Qt.ShiftModifier)
         alt = bool(mods & Qt.AltModifier)
         if ctrl and shift:
-            if self._display_mode == "spectrogram":
-                draw_h = self.height() - self._MARGIN_BOTTOM
-                my = event.position().y()
-                mel_range = self._spec_renderer.mel_view_max - self._spec_renderer.mel_view_min
-                anchor_mel = None
-                if draw_h > 0 and mel_range > 0:
-                    frac = max(0.0, min(1.0 - my / draw_h, 1.0))
-                    anchor_mel = self._spec_renderer.mel_view_min + frac * mel_range
-                self._spec_renderer.freq_zoom(2 / 3 if delta > 0 else 3 / 2,
-                                              anchor_mel, self._samplerate)
-            else:
-                self._vscale = (min(self._vscale * 1.25, 20.0) if delta > 0
-                                else max(self._vscale / 1.25, 0.1))
-            self._invalidate_bg()
-            event.accept()
+            self._wheel_vertical_zoom(event, delta)
         elif ctrl:
-            x0, draw_w = self._draw_area()
-            mx = event.position().x()
-            frac = max(0.0, min((mx - x0) / max(draw_w, 1), 1.0))
-            anchor_sample = max(self._view_start,
-                                min(self._x_to_sample(mx - x0, draw_w), self._view_end))
-            view_len = self._view_end - self._view_start
-            new_len = (max(view_len * 2 // 3, 100) if delta > 0
-                       else min(view_len * 3 // 2, self._total_samples))
-            if new_len == view_len:
-                event.accept()
-                return
-            new_start = int(anchor_sample - frac * new_len)
-            new_end = new_start + new_len
-            if new_start < 0:
-                new_start = 0
-                new_end = min(new_len, self._total_samples)
-            if new_end > self._total_samples:
-                new_end = self._total_samples
-                new_start = max(0, new_end - new_len)
-            self._view_start = new_start
-            self._view_end = new_end
-            self._wf_renderer.invalidate()
-            self._invalidate_bg()
-            event.accept()
+            self._wheel_horizontal_zoom(event, delta)
         elif shift and alt:
-            if self._display_mode == "spectrogram":
-                mel_range = self._spec_renderer.mel_view_max - self._spec_renderer.mel_view_min
-                scroll = mel_range / 8
-                if delta < 0:
-                    scroll = -scroll
-                if self._invert_v:
-                    scroll = -scroll
-                self._spec_renderer.scroll_freq(scroll, self._samplerate)
-                self._invalidate_bg()
-            event.accept()
+            self._wheel_freq_scroll(delta)
         elif shift:
-            view_len = self._view_end - self._view_start
-            scroll_amount = max(1, view_len // 8)
-            if delta < 0:
-                scroll_amount = -scroll_amount
-            if self._invert_h:
-                scroll_amount = -scroll_amount
-            new_start = self._view_start + scroll_amount
-            new_end = self._view_end + scroll_amount
-            if new_start < 0:
-                new_start = 0
-                new_end = min(view_len, self._total_samples)
-            if new_end > self._total_samples:
-                new_end = self._total_samples
-                new_start = max(0, new_end - view_len)
-            self._view_start = new_start
-            self._view_end = new_end
-            self._wf_renderer.invalidate_rms_only()
-            if not self._scroll_pending:
-                self._scroll_pending = True
-                self._scroll_timer.start()
-            event.accept()
+            self._wheel_horizontal_scroll(delta)
         else:
             event.ignore()
+            return
+        event.accept()
+
+    def _wheel_vertical_zoom(self, event, delta: int) -> None:
+        if self._display_mode == "spectrogram":
+            draw_h = self.height() - self._MARGIN_BOTTOM
+            mel_range = self._spec_renderer.mel_view_max - self._spec_renderer.mel_view_min
+            anchor_mel = None
+            if draw_h > 0 and mel_range > 0:
+                frac = max(0.0, min(1.0 - event.position().y() / draw_h, 1.0))
+                anchor_mel = self._spec_renderer.mel_view_min + frac * mel_range
+            self._spec_renderer.freq_zoom(2 / 3 if delta > 0 else 3 / 2, anchor_mel, self._samplerate)
+        else:
+            self._vscale = min(self._vscale * 1.25, 20.0) if delta > 0 else max(self._vscale / 1.25, 0.1)
+        self._invalidate_bg()
+
+    def _wheel_horizontal_zoom(self, event, delta: int) -> None:
+        x0, draw_w = self._draw_area()
+        mx = event.position().x()
+        frac = max(0.0, min((mx - x0) / max(draw_w, 1), 1.0))
+        anchor_sample = max(self._view_start, min(self._x_to_sample(mx - x0, draw_w), self._view_end))
+        view_len = self._view_end - self._view_start
+        new_len = (
+            max(view_len * 2 // 3, 100)
+            if delta > 0
+            else min(view_len * 3 // 2, self._total_samples)
+        )
+        if new_len == view_len:
+            return
+        new_start = int(anchor_sample - frac * new_len)
+        new_end = new_start + new_len
+        if new_start < 0:
+            new_start, new_end = 0, min(new_len, self._total_samples)
+        if new_end > self._total_samples:
+            new_end = self._total_samples
+            new_start = max(0, new_end - new_len)
+        self._view_start = new_start
+        self._view_end = new_end
+        self._wf_renderer.invalidate()
+        self._invalidate_bg()
+
+    def _wheel_freq_scroll(self, delta: int) -> None:
+        if self._display_mode != "spectrogram":
+            return
+        mel_range = self._spec_renderer.mel_view_max - self._spec_renderer.mel_view_min
+        scroll = mel_range / 8
+        if delta < 0:
+            scroll = -scroll
+        if self._invert_v:
+            scroll = -scroll
+        self._spec_renderer.scroll_freq(scroll, self._samplerate)
+        self._invalidate_bg()
+
+    def _wheel_horizontal_scroll(self, delta: int) -> None:
+        view_len = self._view_end - self._view_start
+        scroll_amount = max(1, view_len // 8)
+        if delta < 0:
+            scroll_amount = -scroll_amount
+        if self._invert_h:
+            scroll_amount = -scroll_amount
+        new_start = self._view_start + scroll_amount
+        new_end = self._view_end + scroll_amount
+        if new_start < 0:
+            new_start, new_end = 0, min(view_len, self._total_samples)
+        if new_end > self._total_samples:
+            new_end = self._total_samples
+            new_start = max(0, new_end - view_len)
+        self._view_start = new_start
+        self._view_end = new_end
+        self._wf_renderer.invalidate_rms_only()
+        if not self._scroll_pending:
+            self._scroll_pending = True
+            self._scroll_timer.start()
 
     def _flush_scroll(self):
         self._scroll_pending = False

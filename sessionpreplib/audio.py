@@ -12,7 +12,7 @@ from scipy import fft
 from scipy.signal import ZoomFFT, stft as scipy_stft
 
 from .models import TrackContext
-from .config import DEFAULT_STEREO_WINDOW_MS
+from .paths import DEFAULT_STEREO_WINDOW_MS
 from .chunks import chunk_ids as _chunk_ids
 
 
@@ -438,9 +438,9 @@ def get_stereo_channels_dc_removed(
             track._cache[key] = None
         else:
             l_raw, r_raw, step = raw
-            l = l_raw - np.mean(l_raw)
-            r = r_raw - np.mean(r_raw)
-            track._cache[key] = (l, r, step)
+            left_ac = l_raw - np.mean(l_raw)
+            right_ac = r_raw - np.mean(r_raw)
+            track._cache[key] = (left_ac, right_ac, step)
     return track._cache[key]
 
 
@@ -458,9 +458,9 @@ def get_stereo_rms(
         if dc_removed is None:
             track._cache[key] = None
         else:
-            l, r, _step = dc_removed
-            l_rms_lin = float(np.sqrt(np.mean(l ** 2)))
-            r_rms_lin = float(np.sqrt(np.mean(r ** 2)))
+            left_ac, right_ac, _step = dc_removed
+            l_rms_lin = float(np.sqrt(np.mean(left_ac ** 2)))
+            r_rms_lin = float(np.sqrt(np.mean(right_ac ** 2)))
             l_rms_db = linear_to_db(l_rms_lin)
             r_rms_db = linear_to_db(r_rms_lin)
             track._cache[key] = (l_rms_lin, r_rms_lin, l_rms_db, r_rms_db)
@@ -548,6 +548,59 @@ def _whole_subsonic_ratio(ac: np.ndarray, samplerate: int, cutoff_hz: float, sil
     return min(0.0, 10 * (math.log10(band) - math.log10(total))) if band > 0 else -math.inf
 
 
+def _windowed_subsonic_ratios(
+    padded: np.ndarray,
+    ac: np.ndarray,
+    original_size: int,
+    samplerate: int,
+    cutoff_hz: float,
+    nperseg: int,
+    hop_samples: int,
+    n_frames: int,
+    abs_gate_db: float,
+    silence_rms: float,
+) -> list[tuple[int, int, float]]:
+    """Compute per-window STFT subsonic ratios with silence and absolute-power gates."""
+    noverlap = nperseg - hop_samples
+    nfft = 1 << (nperseg - 1).bit_length()
+
+    # Gate on the real, DC-free samples contributing to each STFT frame.
+    rms_arr = np.empty(n_frames, dtype=np.float64)
+    for i in range(n_frames):
+        s = i * hop_samples
+        e = min(s + nperseg, original_size)
+        rms_arr[i] = np.sqrt(np.mean(ac[s:e] ** 2))
+
+    _f, _t, Zxx = scipy_stft(
+        padded, fs=samplerate, nperseg=nperseg, nfft=nfft,
+        noverlap=noverlap, window='hann', boundary=None,
+    )
+    power = np.abs(Zxx) ** 2
+    power[[0, -1]] *= 0.5
+    cutoff_bin = _band_stop(nfft, samplerate, cutoff_hz)
+
+    band = np.sum(power[:cutoff_bin], axis=0)
+    total = np.sum(power, axis=0)
+
+    with np.errstate(divide='ignore', invalid='ignore'):
+        ratios = np.where(
+            (band > 0) & (total > 0),
+            10.0 * np.log10(band / total),
+            -np.inf,
+        )
+
+    ratios[rms_arr < silence_rms] = -np.inf
+    with np.errstate(divide='ignore', invalid='ignore'):
+        rms_db = np.where(rms_arr > 0, 20.0 * np.log10(rms_arr), -200.0)
+    abs_mask = np.isfinite(ratios) & ((rms_db + ratios) < abs_gate_db)
+    ratios[abs_mask] = -np.inf
+
+    return [
+        (i * hop_samples, min(i * hop_samples + nperseg, original_size) - 1, float(ratios[i]))
+        for i in range(n_frames)
+    ]
+
+
 def subsonic_stft_analysis(
     signal: np.ndarray,
     samplerate: int,
@@ -562,31 +615,8 @@ def subsonic_stft_analysis(
 ) -> tuple[float, list[tuple[int, int, float]]]:
     """Whole-record AC band energy and local Hann-window spectral evidence.
 
-    Parameters
-    ----------
-    signal : 1-D ndarray
-        Single-channel audio samples.
-    samplerate : int
-        Sample rate in Hz.
-    cutoff_hz : float
-        Frequency below which energy is considered subsonic.
-    window_ms : int
-        Analysis window length in milliseconds.
-    hop_ms : int or None
-        Hop between windows in milliseconds.  Defaults to *window_ms* (no
-        overlap).
-    abs_gate_db : float
-        Absolute subsonic power gate.  Windows where the estimated subsonic
-        level (``rms_db + ratio_db``) is below this are set to ``-inf``.
-    silence_rms : float
-        RMS threshold below which a window is considered silent.
-
-    Returns
-    -------
-    whole_file_ratio_db : float
-        Subsonic-to-total energy ratio for the entire signal (dB).
-    per_window_ratios : list of (sample_start, sample_end, ratio_db)
-        Per-window subsonic ratios.  Silent or gated windows have ``-inf``.
+    Returns ``(whole_file_ratio_db, per_window_ratios)`` where each per-window
+    tuple is ``(sample_start, sample_end, ratio_db)``.
     """
     _NEG_INF = float(-np.inf)
 
@@ -596,12 +626,9 @@ def subsonic_stft_analysis(
     original_size = signal.size
     nperseg = max(8, int(samplerate * window_ms / 1000))
     hop_samples = min(nperseg, max(1, int(samplerate * (hop_ms or window_ms) / 1000)))
-    noverlap = nperseg - hop_samples
 
     # Pad signal so scipy.signal.stft (boundary=None) includes the tail.
-    # Without padding, partial last windows are dropped.
     # Remove the channel's stationary bias before tapering or zero padding.
-    # Per-window detrending would also remove genuine low-frequency variation.
     n_frames = 1 + (max(0, original_size - nperseg) + hop_samples - 1) // hop_samples
     padded = np.zeros(nperseg + (n_frames - 1) * hop_samples, dtype=np.float64)
     ac = padded[:original_size]
@@ -611,57 +638,10 @@ def subsonic_stft_analysis(
     if not include_windows or whole_ratio < minimum_whole_ratio_db:
         return whole_ratio, []
 
-    # Power-of-2 FFT size for speed (does not change window shape or overlap)
-    nfft = 1 << (nperseg - 1).bit_length()
-
-    # Gate on the real, DC-free samples contributing to each STFT frame.
-    rms_arr = np.empty(n_frames, dtype=np.float64)
-    for i in range(n_frames):
-        s = i * hop_samples
-        e = min(s + nperseg, original_size)
-        rms_arr[i] = np.sqrt(np.mean(ac[s:e] ** 2))
-
-    # --- STFT ---
-    _f, _t, Zxx = scipy_stft(
-        padded, fs=samplerate, nperseg=nperseg, nfft=nfft,
-        noverlap=noverlap, window='hann', boundary=None,
+    results = _windowed_subsonic_ratios(
+        padded, ac, original_size, samplerate, cutoff_hz,
+        nperseg, hop_samples, n_frames, abs_gate_db, silence_rms,
     )
-    power = np.abs(Zxx) ** 2  # (n_freq_bins, n_frames)
-    # Fold the negative-frequency power into the one-sided spectrum. The
-    # common factor of two cancels in the ratio. After global centering the
-    # tapered zero bin can contain genuine AC below one bin's bandwidth.
-    power[[0, -1]] *= 0.5
-    cutoff_bin = _band_stop(nfft, samplerate, cutoff_hz)
-
-    # --- Vectorised band / total power ---
-    band = np.sum(power[:cutoff_bin], axis=0)
-    total = np.sum(power, axis=0)
-
-    # Per-window ratio
-    with np.errstate(divide='ignore', invalid='ignore'):
-        ratios = np.where(
-            (band > 0) & (total > 0),
-            10.0 * np.log10(band / total),
-            -np.inf,
-        )
-
-    # --- Vectorised gates ---
-    # Silence gate
-    ratios[rms_arr < silence_rms] = -np.inf
-
-    # Absolute power gate: subsonic_abs = rms_db + ratio
-    with np.errstate(divide='ignore', invalid='ignore'):
-        rms_db = np.where(rms_arr > 0, 20.0 * np.log10(rms_arr), -200.0)
-    abs_mask = np.isfinite(ratios) & ((rms_db + ratios) < abs_gate_db)
-    ratios[abs_mask] = -np.inf
-
-    # --- Build result tuples ---
-    results: list[tuple[int, int, float]] = []
-    for i in range(n_frames):
-        s = i * hop_samples
-        e = min(s + nperseg, original_size) - 1
-        results.append((s, e, float(ratios[i])))
-
     return whole_ratio, results
 
 
@@ -694,9 +674,9 @@ def _stereo_readings(left: np.ndarray, right: np.ndarray):
     for start in range(0, folded.shape[1], 65536):
         sl = slice(start, start + 65536)
         high = folded[:, sl]
-        l, r = left[:, sl], right[:, sl]
-        virtual_r = high - l
-        low = (l - (high - virtual_r)) + (r - virtual_r)
+        left_blk, right_blk = left[:, sl], right[:, sl]
+        virtual_r = high - left_blk
+        low = (left_blk - (high - virtual_r)) + (right_blk - virtual_r)
         high -= reference
         high += low
     _, log_fold = _centered_energy(folded)

@@ -51,8 +51,10 @@ def messages(monkeypatch):
 @pytest.fixture
 def phase3_project(qapp, messages, monkeypatch, tmp_path):
     app_dir = tmp_path / "settings"
+    from sessionpreplib import paths
     monkeypatch.setattr(settings, "get_app_dir", lambda: str(app_dir))
     monkeypatch.setattr(config, "get_app_dir", lambda: str(app_dir))
+    monkeypatch.setattr(paths, "get_app_dir", lambda: str(app_dir))
     app_config = settings.build_defaults()
     preset = app_config["config_presets"]["Default"]
     preset["daw_processors"]["protools"].update(
@@ -65,7 +67,7 @@ def phase3_project(qapp, messages, monkeypatch, tmp_path):
     source.mkdir()
     window = SessionPrepWindow()
     try:
-        window._restore_session_state({
+        window.lifecycle_controller.restore_session_state({
             "source_dir": str(source),
             "active_config_preset": "Default",
             "session_config": preset,
@@ -127,28 +129,28 @@ def test_create_retries_with_phase2_project_directory_correction(
 ):
     window = phase3_project
     checked_ports, transfers = create_transport
-    assert window._transfer_action.isEnabled()
+    assert window.daw_controller.page.transfer_action.isEnabled()
 
-    window._transfer_action.trigger()
+    window.daw_controller.page.transfer_action.trigger()
 
     assert [title for title, _message in messages] == ["Project Directory Not Found"]
     assert str(tmp_path / "projects") in messages[0][1]
     assert checked_ports == []
     assert transfers == []
-    assert window._transfer_action.isEnabled()
-    assert window._fetch_action.isEnabled()
+    assert window.daw_controller.page.transfer_action.isEnabled()
+    assert window.daw_controller.page.fetch_action.isEnabled()
 
     corrected = tmp_path / "corrected-projects"
     corrected.mkdir()
-    _field(window._session_widgets, "protools_project_dir").set_value(str(corrected))
-    window._transfer_action.trigger()
+    _field(window.config_controller.session_widgets, "protools_project_dir").set_value(str(corrected))
+    window.daw_controller.page.transfer_action.trigger()
 
     assert checked_ports == [31416]
     assert transfers == [(str(corrected), str(corrected), 31416)]
     assert len(messages) == 1
-    assert window._transfer_action.isEnabled()
-    assert window._fetch_action.isEnabled()
-    assert window._session.prepare_state == "ready"
+    assert window.daw_controller.page.transfer_action.isEnabled()
+    assert window.daw_controller.page.fetch_action.isEnabled()
+    assert window.state.session.prepare_state == "ready"
 
 
 def test_fetch_retries_with_inherited_temporary_directory_correction(
@@ -184,12 +186,12 @@ def test_fetch_retries_with_inherited_temporary_directory_correction(
 
     monkeypatch.setattr(protools.ProToolsDawProcessor, "_open_engine", unexpected_engine)
 
-    window._fetch_action.click()
+    window.daw_controller.page.fetch_action.click()
 
     assert [title for title, _message in messages] == ["Fetch Failed"]
     assert str(tmp_path / "temporary-projects") in messages[0][1]
-    assert window._transfer_action.isEnabled()
-    assert window._fetch_action.isEnabled()
+    assert window.daw_controller.page.transfer_action.isEnabled()
+    assert window.daw_controller.page.fetch_action.isEnabled()
 
     corrected = tmp_path / "corrected-temporary-projects"
     corrected.mkdir()
@@ -197,14 +199,14 @@ def test_fetch_retries_with_inherited_temporary_directory_correction(
         window, monkeypatch,
         lambda dialog: _field(dialog._cfg_widgets, "protools_temp_dir").set_value(str(corrected)),
     )
-    window._fetch_action.click()
+    window.daw_controller.page.fetch_action.click()
 
     assert len(messages) == 1
-    assert window._folder_tree.topLevelItem(0).text(0) == "Drums"
-    assert window._session.daw_state["protools_0"]["assignments"] == {"kick": "drums"}
-    assert window._session.prepare_state == "ready"
-    assert window._transfer_action.isEnabled()
-    assert window._fetch_action.isEnabled()
+    assert window.daw_controller.page.folder_tree.topLevelItem(0).text(0) == "Drums"
+    assert window.state.session.daw_state["protools_0"]["assignments"] == {"kick": "drums"}
+    assert window.state.session.prepare_state == "ready"
+    assert window.daw_controller.page.transfer_action.isEnabled()
+    assert window.daw_controller.page.fetch_action.isEnabled()
 
 
 def test_reordered_templates_keep_selection_and_assignments_until_replacement(
@@ -236,10 +238,10 @@ def test_reordered_templates_keep_selection_and_assignments_until_replacement(
 
     monkeypatch.setattr(protools.ProToolsDawProcessor, "fetch", fetch_folders)
     monkeypatch.setattr(DawFetchWorker, "start", DawFetchWorker.run)
-    window._fetch_action.click()
+    window.daw_controller.page.fetch_action.click()
 
-    assert window._active_daw_processor.id == "protools_0"
-    assert window._folder_tree.topLevelItem(0).text(0) == "Drums"
+    assert window.state.active_daw_processor.id == "protools_0"
+    assert window.daw_controller.page.folder_tree.topLevelItem(0).text(0) == "Drums"
 
     def reorder(dialog):
         table = dialog._cfg_daw_custom_widgets["protools"]._table
@@ -248,27 +250,27 @@ def test_reordered_templates_keep_selection_and_assignments_until_replacement(
 
     _save_preferences(window, monkeypatch, reorder)
 
-    assert window._daw_combo.currentText().endswith(" / Template")
-    assert window._active_daw_processor.id == "protools_1"
-    assert window._session.daw_state["protools_1"]["assignments"] == {"kick": "drums"}
-    assert "protools_0" not in window._session.daw_state
-    assert window._folder_tree.topLevelItem(0).text(0) == "Drums"
-    assert window._transfer_action.isEnabled()
+    assert window.daw_controller.page.daw_combo.currentText().endswith(" / Template")
+    assert window.state.active_daw_processor.id == "protools_1"
+    assert window.state.session.daw_state["protools_1"]["assignments"] == {"kick": "drums"}
+    assert "protools_0" not in window.state.session.daw_state
+    assert window.daw_controller.page.folder_tree.topLevelItem(0).text(0) == "Drums"
+    assert window.daw_controller.page.transfer_action.isEnabled()
 
     def replace(dialog):
         table = dialog._cfg_daw_custom_widgets["protools"]._table
         table.item(1, 1).setText("Replacement")
 
     _save_preferences(window, monkeypatch, replace)
-    window._daw_combo.setCurrentIndex(1)
+    window.daw_controller.page.daw_combo.setCurrentIndex(1)
 
-    assert window._daw_combo.currentText().endswith(" / Replacement")
-    assert window._active_daw_processor.id == "protools_1"
-    assert not window._session.daw_state.get("protools_1")
-    assert window._folder_tree.topLevelItemCount() == 0
-    assert not window._transfer_action.isEnabled()
-    assert window._fetch_action.isEnabled()
-    assert window._session.prepare_state == "ready"
+    assert window.daw_controller.page.daw_combo.currentText().endswith(" / Replacement")
+    assert window.state.active_daw_processor.id == "protools_1"
+    assert not window.state.session.daw_state.get("protools_1")
+    assert window.daw_controller.page.folder_tree.topLevelItemCount() == 0
+    assert not window.daw_controller.page.transfer_action.isEnabled()
+    assert window.daw_controller.page.fetch_action.isEnabled()
+    assert window.state.session.prepare_state == "ready"
     assert messages == []
 
 
@@ -285,16 +287,16 @@ def test_pending_create_keeps_validated_config_and_next_attempt_uses_the_edit(
     corrected = tmp_path / "corrected-projects"
     corrected.mkdir()
 
-    window._transfer_action.trigger()
+    window.daw_controller.page.transfer_action.trigger()
 
     assert len(pending_checks) == 1
-    assert not window._transfer_action.isEnabled()
-    assert not window._fetch_action.isEnabled()
+    assert not window.daw_controller.page.transfer_action.isEnabled()
+    assert not window.daw_controller.page.fetch_action.isEnabled()
     assert transfers == []
 
     if change_source == "phase2":
-        _field(window._session_widgets, "protools_project_dir").set_value(str(corrected))
-        _field(window._session_widgets, "protools_port").setValue(32416)
+        _field(window.config_controller.session_widgets, "protools_project_dir").set_value(str(corrected))
+        _field(window.config_controller.session_widgets, "protools_port").setValue(32416)
     else:
         def edit(dialog):
             _field(dialog._cfg_widgets, "protools_project_dir").set_value(str(corrected))
@@ -302,23 +304,23 @@ def test_pending_create_keeps_validated_config_and_next_attempt_uses_the_edit(
 
         _save_preferences(window, monkeypatch, edit)
 
-    assert not window._transfer_action.isEnabled()
-    assert not window._fetch_action.isEnabled()
+    assert not window.daw_controller.page.transfer_action.isEnabled()
+    assert not window.daw_controller.page.fetch_action.isEnabled()
     pending_checks.pop().run()
 
     assert checked_ports == [31416]
     assert transfers == [(str(original), str(original), 31416)]
-    assert window._transfer_action.isEnabled()
-    assert window._fetch_action.isEnabled()
+    assert window.daw_controller.page.transfer_action.isEnabled()
+    assert window.daw_controller.page.fetch_action.isEnabled()
 
-    window._transfer_action.trigger()
+    window.daw_controller.page.transfer_action.trigger()
     assert len(pending_checks) == 1
     pending_checks.pop().run()
 
     assert checked_ports == [31416, 32416]
     assert transfers[-1] == (str(corrected), str(corrected), 32416)
     assert messages == []
-    assert window._session.prepare_state == "ready"
+    assert window.state.session.prepare_state == "ready"
 
 
 @pytest.mark.parametrize("workspace_change", ["open-empty-folder", "load-session", "close-window"])
@@ -330,11 +332,11 @@ def test_pending_create_cannot_transfer_after_leaving_the_original_project(
     pending_checks = []
     monkeypatch.setattr(DawCheckWorker, "start", lambda worker: pending_checks.append(worker))
     (tmp_path / "projects").mkdir()
-    original = window._session
+    original = window.state.session
 
-    window._transfer_action.trigger()
+    window.daw_controller.page.transfer_action.trigger()
     assert len(pending_checks) == 1
-    assert not window._transfer_action.isEnabled()
+    assert not window.daw_controller.page.transfer_action.isEnabled()
 
     if workspace_change == "close-window":
         assert window.close()
@@ -345,17 +347,17 @@ def test_pending_create_cannot_transfer_after_leaving_the_original_project(
             monkeypatch.setattr(
                 QFileDialog, "getExistingDirectory", lambda *args: str(next_source),
             )
-            window._on_open_path()
-            assert window._session is None
+            window.lifecycle_controller.open_directory_dialog()
+            assert window.state.session is None
         else:
-            replacement = window._capture_session_state()
+            replacement = window.lifecycle_controller.capture_session_state()
             replacement.update(source_dir=str(next_source), project_name="Replacement")
             path = str(tmp_path / "replacement.spsession")
             save_session(path, replacement)
             monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *args: (path, ""))
-            window._on_load_session()
-            assert window._session is not original
-            assert window._project_name_edit.text() == "Replacement"
+            window.lifecycle_controller.load_session_dialog()
+            assert window.state.session is not original
+            assert window.daw_controller.page.project_name_edit.text() == "Replacement"
 
     pending_checks.pop().run()
 
@@ -375,12 +377,12 @@ def test_pending_fetch_failure_reports_the_processor_that_started_it(
         raise RuntimeError("Temporary project is unavailable")
 
     monkeypatch.setattr(protools.ProToolsDawProcessor, "fetch", fail)
-    window._fetch_action.click()
+    window.daw_controller.page.fetch_action.click()
     _save_preferences(
         window, monkeypatch,
         lambda dialog: _field(dialog._cfg_widgets, "protools_enabled").setChecked(False),
     )
-    assert window._active_daw_processor is None
+    assert window.state.active_daw_processor is None
 
     pending.pop().run()
 
@@ -389,8 +391,8 @@ def test_pending_fetch_failure_reports_the_processor_that_started_it(
     assert title == "Fetch Failed"
     assert "SessionPrep / Template" in detail
     assert "Temporary project is unavailable" in detail
-    assert not window._fetch_action.isEnabled()
-    assert window._session.daw_state["protools_0"]["assignments"] == {"kick": "drums"}
+    assert not window.daw_controller.page.fetch_action.isEnabled()
+    assert window.state.session.daw_state["protools_0"]["assignments"] == {"kick": "drums"}
 
 
 def test_pending_fetch_uses_captured_temp_directory_and_retry_uses_edited_default(
@@ -406,20 +408,20 @@ def test_pending_fetch_uses_captured_temp_directory_and_retry_uses_edited_defaul
         return session
 
     monkeypatch.setattr(protools.ProToolsDawProcessor, "fetch", fetch)
-    window._fetch_action.click()
+    window.daw_controller.page.fetch_action.click()
     corrected = str(tmp_path / "new-scratch")
     _save_preferences(
         window, monkeypatch,
         lambda dialog: _field(dialog._cfg_widgets, "protools_temp_dir").set_value(corrected),
     )
-    assert not window._fetch_action.isEnabled()
+    assert not window.daw_controller.page.fetch_action.isEnabled()
     pending.pop().run()
-    window._fetch_action.click()
+    window.daw_controller.page.fetch_action.click()
     pending.pop().run()
 
     assert reads == [str(tmp_path / "temporary-projects"), corrected]
     assert messages == []
-    assert window._session.prepare_state == "ready"
+    assert window.state.session.prepare_state == "ready"
 
 
 @pytest.mark.parametrize("change", ["template", "workspace"])
@@ -438,7 +440,7 @@ def test_pending_fetch_does_not_write_folders_to_a_replaced_target(
         return session
 
     monkeypatch.setattr(protools.ProToolsDawProcessor, "fetch", fetch)
-    window._fetch_action.click()
+    window.daw_controller.page.fetch_action.click()
     if change == "template":
         _save_preferences(
             window, monkeypatch,
@@ -446,15 +448,15 @@ def test_pending_fetch_does_not_write_folders_to_a_replaced_target(
                 0, 1).setText("Replacement"),
         )
     else:
-        replacement = window._capture_session_state()
+        replacement = window.lifecycle_controller.capture_session_state()
         source = tmp_path / "new-audio"
         source.mkdir()
         replacement.update(source_dir=str(source), project_name="Replacement", daw_state={})
-        window._restore_session_state(replacement)
+        window.lifecycle_controller.restore_session_state(replacement)
 
     pending.pop().run()
 
-    assert not window._session.daw_state.get("protools_0")
-    assert not window._transfer_action.isEnabled()
-    assert window._fetch_action.isEnabled()
+    assert not window.state.session.daw_state.get("protools_0")
+    assert not window.daw_controller.page.transfer_action.isEnabled()
+    assert window.daw_controller.page.fetch_action.isEnabled()
     assert messages == []

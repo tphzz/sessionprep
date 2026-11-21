@@ -30,8 +30,8 @@ def format_boundary_settling(regions):
 
 def _processing_outcomes(session: SessionContext) -> dict[str, dict[str, Any]]:
     """Report the last execution receipt separately from the current plan."""
-    receipts = session.config.get("_executed_files", {})
-    failures = dict(session.config.get("_execute_errors", []))
+    receipts = session.execution_receipts.executed_files or session.config.get("_executed_files", {})
+    failures = dict(session.execution_receipts.execute_errors or session.config.get("_execute_errors", []))
     outcomes = {}
     for track in session.tracks:
         result = track.processor_results.get("bimodal_normalize")
@@ -64,6 +64,113 @@ def _processing_outcomes(session: SessionContext) -> dict[str, dict[str, Any]]:
     return outcomes
 
 
+def _report_group_lines(session: SessionContext, outcomes: dict[str, dict[str, Any]]) -> list[str]:
+    grouped: dict[str, list[tuple[str, float | None]]] = {}
+    for t in session.tracks:
+        if t.group is not None:
+            grouped.setdefault(t.group, []).append((t.filename, outcomes[t.filename]["gain_applied_db"]))
+    if not grouped:
+        return []
+    lines = ["-" * 80, "TRACK GROUPS", "-" * 80, ""]
+    for gid in sorted(grouped):
+        members = grouped[gid]
+        gains = {gain for _, gain in members}
+        gain = next(iter(gains)) if len(gains) == 1 else None
+        lines.append(f"{gid} | Group level {gain:+.2f} dB" if gain is not None else gid)
+        lines.extend(f"  - {name}" for name in sorted((name for name, _ in members), key=protools_sort_key))
+        lines.append("")
+    return lines
+
+
+def _report_fader_lines(session: SessionContext, outcomes: dict[str, dict[str, Any]]) -> list[str]:
+    lines = [
+        "-" * 80,
+        "FADER POSITIONS (Set these in your DAW to restore original balance)",
+        "-" * 80, "",
+        f"{'TRACK':<32} {'STATUS':<8} {'APPLIED GAIN':>12} {'FADER':>12}  TYPE / REPAIRS",
+        "-" * 80,
+    ]
+    for t in session.tracks:
+        outcome = outcomes[t.filename]
+        gain, fader = outcome["gain_applied_db"], outcome["fader_db"]
+        gain_str = f"{gain:+.2f} dB" if gain is not None else "—"
+        fader_str = f"{fader:+.2f} dB" if fader is not None else "—"
+        repairs = outcome["applied_repairs"] if outcome["status"] == "written" else outcome["planned_repairs"]
+        detail = ", ".join([outcome["classification"], *repairs])
+        lines.append(f"{t.filename:<32} {outcome['status']:<8} {gain_str:>12} {fader_str:>12}  {detail}")
+        lines.extend(f"  {warning}" for warning in format_boundary_settling(outcome["boundary_settling"]))
+    return lines
+
+
+def _report_tail_lines(session: SessionContext, config: dict[str, Any]) -> list[str]:
+    rms_anchor = config.get("rms_anchor", "percentile")
+    window = config.get("window", 400)
+    rms_percentile = config.get("rms_percentile", 95.0)
+    lines = [
+        "", "-" * 80,
+        "MOMENTARY RMS UPPER TAIL (Expected Windows Above Anchor)", "-" * 80,
+        f"Default Anchor Mode: {rms_anchor} | Window: {window} ms"
+        + (f" | Percentile: P{rms_percentile:g}" if rms_anchor == "percentile" else ""),
+        f"Report Limit: {config.get('tail_max_regions', 20)} regions per file | "
+        f"Min Exceed: {config.get('tail_min_exceed_db', 3.0)} dB | Hop: {config.get('tail_hop_ms', 10)} ms", "",
+    ]
+    measured = [
+        (t, tail) for t in session.tracks
+        if t.status == "OK" and (tail := t.detector_results.get("tail_exceedance")) and tail.applicable and not tail.error
+    ]
+    if not measured:
+        return [*lines, "No applicable tail measurements. Tail reporting requires percentile anchoring.", ""]
+
+    any_reported = False
+    for t, tail_r in measured:
+        regions = tail_r.data.get("tail_regions") or []
+        if not regions:
+            continue
+        summary = tail_r.data.get("tail_summary") or {}
+        classifier = t.detector_results.get("audio_classifier")
+        anchor_label = classifier.data.get("rms_anchor_label") if classifier else None
+        anchor_note = f" ({anchor_label})" if anchor_label else ""
+        lines.extend([
+            f"{t.filename}",
+            f"  Anchor RMS: {summary.get('anchor_db', float('-inf')):.2f} dBFS{anchor_note}",
+            f"  Tail Regions Reported: {int(summary.get('regions', 0))} | "
+            f"Total Tail Duration: {summary.get('total_duration_sec', 0.0):.3f}s | "
+            f"Max Exceed: +{summary.get('max_exceed_db', 0.0):.2f} dB",
+        ])
+        any_reported = True
+        for i, reg in enumerate(regions, start=1):
+            lines.append(
+                f"  {i:>2}. {reg['start_time']} - {reg['end_time']} | "
+                f"samples {reg['start_sample']}-{reg['end_sample'] - 1} | "
+                f"max +{reg['max_exceed_db']:.2f} dB (RMS {reg['max_rms_db']:.2f} dBFS)"
+            )
+        lines.append("")
+    if not any_reported:
+        lines.extend(["No significant tail exceedances above threshold were found.", ""])
+    return lines
+
+
+def _report_overview_lines(session: SessionContext, outcomes: dict[str, dict[str, Any]]) -> list[str]:
+    lines = [
+        "", "-" * 80, "FILE OVERVIEW", "-" * 80, "",
+        f"{'TRACK':<25} {'SR(kHz)':>8} {'BIT':>8} {'DUR':>10}", "-" * 80,
+    ]
+    errors = []
+    for t in session.tracks:
+        if outcomes[t.filename]["error"]:
+            errors.append((t.filename, outcomes[t.filename]["error"]))
+        if t.status != "OK":
+            continue
+        lines.append(
+            f"{t.filename[:23]:<25} {t.samplerate / 1000:>8.1f} {t.bitdepth:>8} "
+            f"{format_duration(t.total_samples, t.samplerate):>10}"
+        )
+    if errors:
+        lines.extend(["", "-" * 80, "FILES WITH ERRORS", "-" * 80])
+        lines.extend(f"{name}: {status}" for name, status in errors)
+    return lines
+
+
 def generate_report(
     session: SessionContext,
     config: dict[str, Any],
@@ -73,180 +180,32 @@ def generate_report(
 ) -> str:
     """Generate a text report with fader positions and diagnostics."""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    source_dir = config.get("_source_dir", "")
     outcomes = _processing_outcomes(session)
-
     lines = [
-        "=" * 80,
-        "SessionPrep Report",
-        "=" * 80,
+        "=" * 80, "SessionPrep Report", "=" * 80,
         f"Generated: {timestamp}",
-        f"Source Directory: {os.path.abspath(source_dir)}",
+        f"Source Directory: {os.path.abspath(config.get('_source_dir', ''))}",
         f"Output Directory: {os.path.dirname(output_path)}",
         f"Target RMS: {config.get('target_rms', -18.0)} dBFS | Target Peak: {config.get('target_peak', -6.0)} dBFS",
         f"Clipping Detection Threshold: {config.get('clip_consecutive', 3)} consecutive near-full-scale samples",
         "",
     ]
-
     if diagnostic_summary_text:
-        lines.extend([
-            diagnostic_summary_text,
-            "",
-        ])
-
-    # Track groups section
-    grouped = {}
-    for t in session.tracks:
-        outcome = outcomes[t.filename]
-        if t.group is None:
-            continue
-        gain = outcome["gain_applied_db"]
-        grouped.setdefault(t.group, []).append((t.filename, gain))
-
-    if grouped:
-        lines.extend([
-            "-" * 80,
-            "TRACK GROUPS",
-            "-" * 80,
-            "",
-        ])
-        for gid in sorted(grouped.keys()):
-            members = grouped[gid]
-            gains = {gain for _, gain in members}
-            gain = next(iter(gains)) if len(gains) == 1 else None
-            lines.append(f"{gid} | Group level {gain:+.2f} dB" if gain is not None else gid)
-            for name in sorted((name for name, _ in members), key=protools_sort_key):
-                lines.append(f"  - {name}")
-            lines.append("")
-
-    # Fader positions
+        lines.extend([diagnostic_summary_text, ""])
+    lines.extend(_report_group_lines(session, outcomes))
+    lines.extend(_report_fader_lines(session, outcomes))
+    lines.extend(_report_tail_lines(session, config))
+    lines.extend(_report_overview_lines(session, outcomes))
     lines.extend([
-        "-" * 80,
-        "FADER POSITIONS (Set these in your DAW to restore original balance)",
-        "-" * 80,
-        "",
-        f"{'TRACK':<32} {'STATUS':<8} {'APPLIED GAIN':>12} {'FADER':>12}  TYPE / REPAIRS",
-        "-" * 80,
-    ])
-
-    for t in session.tracks:
-        outcome = outcomes[t.filename]
-        gain = outcome["gain_applied_db"]
-        fader = outcome["fader_db"]
-        gain_str = f"{gain:+.2f} dB" if gain is not None else "—"
-        fader_str = f"{fader:+.2f} dB" if fader is not None else "—"
-        repairs = outcome["applied_repairs"] if outcome["status"] == "written" else outcome["planned_repairs"]
-        detail = ", ".join([outcome["classification"], *repairs])
-        lines.append(f"{t.filename:<32} {outcome['status']:<8} {gain_str:>12} {fader_str:>12}  {detail}")
-        lines.extend(f"  {warning}" for warning in format_boundary_settling(outcome["boundary_settling"]))
-
-    # Tail report
-    rms_anchor = config.get("rms_anchor", "percentile")
-    window = config.get("window", 400)
-    rms_percentile = config.get("rms_percentile", 95.0)
-    tail_max_regions = config.get("tail_max_regions", 20)
-    tail_min_exceed_db = config.get("tail_min_exceed_db", 3.0)
-    tail_hop_ms = config.get("tail_hop_ms", 10)
-
-    lines.extend([
-        "",
-        "-" * 80,
-        "MOMENTARY RMS UPPER TAIL (Expected Windows Above Anchor)",
-        "-" * 80,
-        f"Default Anchor Mode: {rms_anchor} | Window: {window} ms" + (
-            f" | Percentile: P{rms_percentile:g}" if rms_anchor == "percentile" else ""
-        ),
-        f"Report Limit: {tail_max_regions} regions per file | Min Exceed: {tail_min_exceed_db} dB | Hop: {tail_hop_ms} ms",
-        "",
-    ])
-
-    measured_tails = []
-    for track in session.tracks:
-        tail = track.detector_results.get("tail_exceedance")
-        if track.status == "OK" and tail and tail.applicable and not tail.error:
-            measured_tails.append((track, tail))
-    if not measured_tails:
-        lines.append("No applicable tail measurements. Tail reporting requires percentile anchoring.")
-        lines.append("")
-    else:
-        any_tail_reported = False
-        for t, tail_r in measured_tails:
-            regions = tail_r.data.get("tail_regions") or []
-            if not regions:
-                continue
-
-            summary = tail_r.data.get("tail_summary") or {}
-            anchor_db = summary.get("anchor_db", float('-inf'))
-            total_dur = summary.get("total_duration_sec", 0.0)
-            max_exceed = summary.get("max_exceed_db", 0.0)
-
-            lines.append(f"{t.filename}")
-            classifier = t.detector_results.get("audio_classifier")
-            anchor_label = classifier.data.get("rms_anchor_label") if classifier else None
-            anchor_note = f" ({anchor_label})" if anchor_label else ""
-            lines.append(f"  Anchor RMS: {anchor_db:.2f} dBFS{anchor_note}")
-            lines.append(f"  Tail Regions Reported: {int(summary.get('regions', 0))} | Total Tail Duration: {total_dur:.3f}s | Max Exceed: +{max_exceed:.2f} dB")
-
-            any_tail_reported = True
-            for i, reg in enumerate(regions, start=1):
-                lines.append(
-                    f"  {i:>2}. {reg['start_time']} - {reg['end_time']} | "
-                    f"samples {reg['start_sample']}-{reg['end_sample'] - 1} | "
-                    f"max +{reg['max_exceed_db']:.2f} dB (RMS {reg['max_rms_db']:.2f} dBFS)"
-                )
-            lines.append("")
-
-        if not any_tail_reported:
-            lines.append("No significant tail exceedances above threshold were found.")
-            lines.append("")
-
-    # File overview
-    lines.extend([
-        "",
-        "-" * 80,
-        "FILE OVERVIEW",
-        "-" * 80,
-        "",
-        f"{'TRACK':<25} {'SR(kHz)':>8} {'BIT':>8} {'DUR':>10}",
-        "-" * 80,
-    ])
-
-    errors = []
-    for t in session.tracks:
-        if outcomes[t.filename]["error"]:
-            errors.append((t.filename, outcomes[t.filename]["error"]))
-        if t.status != "OK":
-            continue
-
-        sr_khz = f"{t.samplerate/1000:.1f}"
-        dur_fmt = format_duration(t.total_samples, t.samplerate)
-        lines.append(f"{t.filename[:23]:<25} {sr_khz:>8} {t.bitdepth:>8} {dur_fmt:>10}")
-
-    if errors:
-        lines.extend([
-            "",
-            "-" * 80,
-            "FILES WITH ERRORS",
-            "-" * 80,
-        ])
-        for name, status in errors:
-            lines.append(f"{name}: {status}")
-
-    lines.extend([
-        "",
-        "=" * 80,
-        "HOW TO USE:",
+        "", "=" * 80, "HOW TO USE:",
         "1. Import the files marked written into your DAW",
         "2. Apply the fader offsets (manually or via automation from the JSON export)",
         "3. These offsets compensate the normalization gain applied to the prepared audio",
         "=" * 80,
     ])
-
     report_text = "\n".join(lines)
-
     with atomic_writer(output_path) as f:
         f.write(report_text)
-
     return report_text
 
 

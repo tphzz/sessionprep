@@ -41,7 +41,7 @@ class ProToolsConnectionSettings:
         return f"{self.host}:{self.port}"
 
     @classmethod
-    def from_config(cls, config: dict[str, Any] | None) -> "ProToolsConnectionSettings":
+    def from_config(cls, config: dict[str, Any] | None) -> ProToolsConnectionSettings:
         """Build settings from either flat or structured SessionPrep config."""
         values = _protools_config_values(config or {})
         return cls(

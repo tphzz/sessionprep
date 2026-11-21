@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import builtins
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -8,6 +9,10 @@ from typing import Any
 import numpy as np
 
 from .repairs import RepairRecipe
+
+
+class ConfigError(Exception):
+    """Raised when configuration validation fails."""
 
 
 @dataclass(frozen=True)
@@ -19,7 +24,7 @@ class ParamSpec:
     valid range, allowed values, and human-readable labels.
     """
     key: str
-    type: type | tuple              # expected Python type(s)
+    type: builtins.type | tuple[builtins.type, ...]  # expected Python type(s)
     default: Any
     label: str                       # short UI label
     description: str = ""            # longer tooltip / help text
@@ -27,8 +32,8 @@ class ParamSpec:
     max: float | int | None = None   # inclusive upper bound (unless max_exclusive)
     min_exclusive: bool = False
     max_exclusive: bool = False
-    choices: list | None = None      # allowed string values
-    item_type: type | None = None    # element type for list fields
+    choices: list[Any] | None = None      # allowed string values
+    item_type: builtins.type | None = None    # element type for list fields
     nullable: bool = False           # True if None is valid
     presentation_only: bool = False  # True → changing this key never requires re-analysis
     widget_hint: str | None = None   # rendering hint for the GUI widget factory (never read by the library)
@@ -187,6 +192,30 @@ class TransferEntry:
 
 
 @dataclass
+class FormatConsensus:
+    """Session-wide dominant format and length consensus."""
+    most_common_sr: int | None = None
+    most_common_bd: str | None = None
+    most_common_len: int | None = None
+    most_common_len_fmt: str | None = None
+
+
+@dataclass
+class GainStagingSummary:
+    """Session-wide fader rebalance and anchor offsets for one audio processor."""
+    fader_rebalance_shift: float = 0.0
+    anchor_offset: float = 0.0
+
+
+@dataclass
+class ExecutionReceipts:
+    """Runtime receipts and error records from Prepare / Execute passes."""
+    executed_files: dict[str, dict[str, Any]] = field(default_factory=dict)
+    execute_errors: list[tuple[str, str]] = field(default_factory=list)
+    prepared_files: list[str] = field(default_factory=list)
+
+
+@dataclass
 class SessionContext:
     tracks: list[TrackContext]
     config: dict[str, Any]
@@ -203,6 +232,10 @@ class SessionContext:
     transfer_manifest: list[TransferEntry] = field(default_factory=list)
     base_transfer_manifest: list[TransferEntry] = field(default_factory=list)
     project_name: str = ""
+    session_detector_results: dict[str, list[DetectorResult]] = field(default_factory=dict)
+    format_consensus: FormatConsensus = field(default_factory=FormatConsensus)
+    gain_staging: dict[str, GainStagingSummary] = field(default_factory=dict)
+    execution_receipts: ExecutionReceipts = field(default_factory=ExecutionReceipts)
 
 
 @dataclass

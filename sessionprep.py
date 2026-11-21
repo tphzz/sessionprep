@@ -5,7 +5,6 @@ from io import TextIOWrapper
 from pathlib import Path
 
 from sessionpreplib.logging_setup import setup_logging
-setup_logging()
 
 try:
     from rich.console import Console
@@ -40,26 +39,7 @@ def positive_int(value):
     return ivalue
 
 
-def parse_arguments():
-    parser = argparse.ArgumentParser(
-        description="SessionPrep",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
-    )
-    parser.add_argument("--version", action="version",
-                        version=f"sessionprep {__version__}")
-
-    parser.add_argument("directory", type=str,
-                        help="Source directory containing audio tracks (.wav, .aif, .aiff)")
-
-    # Targets
-    parser.add_argument("--target_rms", type=float, default=-18.0,
-                        help="Target RMS for sustained sources (dBFS)")
-    parser.add_argument("--target_peak", type=float, default=-6.0,
-                        help="Target/max peak level (dBFS)")
-    parser.add_argument("--crest_threshold", type=float, default=12.0,
-                        help="Crest factor threshold for transient detection (dB)")
-
-    # Diagnostics & Detection
+def _add_detection_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--clip_consecutive", type=int, default=3,
                         help="Minimum consecutive near-full-scale samples to flag as clipped")
     parser.add_argument("--clip_report_max_ranges", type=positive_int, default=10,
@@ -72,10 +52,8 @@ def parse_arguments():
                         help="Warn if stereo file appears dual-mono (max |L-R| <= eps)")
     parser.add_argument("--mono_loss_warn_db", type=float, default=6.0,
                         help="Warn if stereo file loses more than this many dB when folded to mono")
-
     parser.add_argument("--one_sided_silence_db", type=float, default=-80.0,
                         help="Warn if a stereo file has one channel at or below this RMS level (dBFS) while the other is not")
-
     parser.add_argument("--subsonic_hz", type=float, default=30.0,
                         help="Subsonic detector cutoff frequency (Hz)")
     parser.add_argument("--subsonic_warn_ratio_db", type=float, default=-20.0,
@@ -85,15 +63,12 @@ def parse_arguments():
     parser.add_argument("--low-cut-hz", type=float, default=10.0, metavar="HZ",
                         help="High-pass corner when subsonic filtering is selected (5–40 Hz)")
 
-    # Analysis
-    parser.add_argument("--window", type=positive_int, default=400,
-                        help="RMS analysis window (ms)")
-    parser.add_argument("--stereo_mode", type=str, choices=["avg", "sum"],
-                        default="avg", help="Stereo RMS calculation mode")
 
-    # RMS Anchor (momentary window statistics)
-    parser.add_argument("--rms_anchor", type=str, choices=["percentile", "max"],
-                        default="percentile",
+def _add_analysis_and_output_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--window", type=positive_int, default=400, help="RMS analysis window (ms)")
+    parser.add_argument("--stereo_mode", type=str, choices=["avg", "sum"], default="avg",
+                        help="Stereo RMS calculation mode")
+    parser.add_argument("--rms_anchor", type=str, choices=["percentile", "max"], default="percentile",
                         help="Momentary RMS anchor strategy used for gain calculations")
     parser.add_argument("--rms_percentile", type=float, default=95.0,
                         help="Percentile used when --rms_anchor percentile (0-100)")
@@ -105,62 +80,55 @@ def parse_arguments():
                         help="Only report tail regions exceeding the anchor by at least this many dB")
     parser.add_argument("--tail_hop_ms", type=positive_int, default=10,
                         help="Hop size for tail region reporting (ms). Larger values reduce the number of reported regions.")
-
-    # Balance restoration
-    parser.add_argument("--anchor", type=str, default=None,
-                        help="Anchor track filename (fader stays at 0dB)")
+    parser.add_argument("--anchor", type=str, default=None, help="Anchor track filename (fader stays at 0dB)")
     parser.add_argument("--fader_headroom_db", type=float, default=8.0,
                         help="Minimum dB of headroom at top of DAW fader range (default: 8.0, 0=disable)")
-
     parser.add_argument("--force_transient", nargs='+', default=[], action='extend',
-        help="Keywords to force TRANSIENT mode. Supports: substring ('kick'), "
-             "glob patterns ('Kick*.wav'), or exact match ('Kick_01.wav$')")
+                        help="Keywords to force TRANSIENT mode. Supports: substring ('kick'), glob patterns ('Kick*.wav'), or exact match ('Kick_01.wav$')")
     parser.add_argument("--force_sustained", nargs='+', default=[], action='extend',
-        help="Keywords to force SUSTAINED mode. Supports: substring ('pad'), "
-             "glob patterns ('Synth_*.wav'), or exact match ('Bass_01.wav$')")
-
+                        help="Keywords to force SUSTAINED mode. Supports: substring ('pad'), glob patterns ('Synth_*.wav'), or exact match ('Bass_01.wav$')")
     parser.add_argument("--group", action="append", default=[],
-                        help="Named gain-linked group. Syntax: Name:pattern1,pattern2  "
-                             "(e.g. --group Kick:kick,kick_sub). Patterns support "
-                             "substring, glob (*/?), or exact match (suffix $). "
-                             "First match wins; overlaps produce a warning.")
-
-    # Output Configuration
+                        help="Named gain-linked group. Syntax: Name:pattern1,pattern2  (e.g. --group Kick:kick,kick_sub). Patterns support substring, glob (*/?), or exact match (suffix $). First match wins; overlaps produce a warning.")
     parser.add_argument("--overwrite", action="store_true",
                         help="Overwrite source WAV files in-place (creates backups)")
     parser.add_argument("-x", "--execute", action="store_true",
                         help="Execute processing (write processed WAVs and reports). Without -x this runs in analysis-only mode.")
-    parser.add_argument("--output_folder", type=str, default="processed",
-                        help="Subfolder name for processed files")
+    parser.add_argument("--output_folder", type=str, default="processed", help="Subfolder name for processed files")
     parser.add_argument("--backup", type=str, default="_originals",
                         help="Backup folder name (Only used if overwriting files)")
+    parser.add_argument("--report", type=str, default="sessionprep.txt", help="Output report filename")
+    parser.add_argument("--json", type=str, default="sessionprep.json", help="Output JSON filename for automation")
 
-    # Reporting
-    parser.add_argument("--report", type=str, default="sessionprep.txt",
-                        help="Output report filename")
-    parser.add_argument("--json", type=str, default="sessionprep.json",
-                        help="Output JSON filename for automation")
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(
+        description="SessionPrep",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("--version", action="version", version=f"sessionprep {__version__}")
+    parser.add_argument("directory", type=str, help="Source directory containing audio tracks (.wav, .aif, .aiff)")
+    parser.add_argument("--target_rms", type=float, default=-18.0, help="Target RMS for sustained sources (dBFS)")
+    parser.add_argument("--target_peak", type=float, default=-6.0, help="Target/max peak level (dBFS)")
+    parser.add_argument("--crest_threshold", type=float, default=12.0,
+                        help="Crest factor threshold for transient detection (dB)")
+    _add_detection_args(parser)
+    _add_analysis_and_output_args(parser)
 
     if len(sys.argv) == 1:
         parser.print_help(sys.stderr)
         sys.exit(1)
 
     args = parser.parse_args()
-
     if not 0.0 < args.rms_percentile < 100.0:
         parser.error("--rms_percentile must be between 0 and 100 (exclusive)")
-
     if args.gate_relative_db < 0.0:
         parser.error("--gate_relative_db must be >= 0")
-
     if args.subsonic_hz <= 0.0:
         parser.error("--subsonic_hz must be > 0")
     if not 5 <= args.low_cut_hz <= 40:
         parser.error("--low-cut-hz must be between 5 and 40 Hz")
-
     if args.one_sided_silence_db > 0.0:
         parser.error("--one_sided_silence_db must be <= 0")
-
     return args
 
 
@@ -173,8 +141,6 @@ def print_diagnostic_summary(summary):
     attention = summary.get("attention") or []
     information = summary.get("information") or []
     clean = summary.get("clean") or []
-    clean_count = int(summary.get("clean_count", 0) or 0)
-    total_ok = int(summary.get("total_ok", 0) or 0)
 
     def item_count(groups):
         return sum(len(g.get("items") or []) for g in groups)
@@ -288,24 +254,7 @@ def _prepare_cli_destinations(source, output, backup, filenames, report, json_re
         directory.mkdir(parents=True, exist_ok=True)
 
 
-def process_files():
-    # Redirected Windows output can use a legacy code page. Preserve its encoding
-    # and escape unrepresentable filenames and status symbols in the console log.
-    if (isinstance(sys.stdout, TextIOWrapper) and not sys.stdout.isatty()
-            and sys.stdout.errors in {"strict", "surrogateescape", "surrogatepass"}):
-        sys.stdout.reconfigure(errors="backslashreplace")
-    args = parse_arguments()
-    source_dir = args.directory
-
-    if not os.path.isdir(source_dir):
-        console.print(f"Input directory does not exist. {source_dir}", style="bold red", markup=False)
-        return 1
-    is_overwriting = args.execute and args.overwrite
-    output_dir = source_dir if is_overwriting else os.path.join(source_dir, args.output_folder)
-    backup_dir = os.path.join(source_dir, args.backup) if is_overwriting else None
-
-    # --- BUILD CONFIG FROM CLI ARGS ---
-    config = default_config()
+def _build_cli_config(args, source_dir: str) -> dict:
     cli_overrides = {
         "target_rms": args.target_rms,
         "target_peak": args.target_peak,
@@ -344,123 +293,197 @@ def process_files():
         "json": args.json,
         "_source_dir": source_dir,
     }
-    config = merge_configs(config, cli_overrides)
+    return merge_configs(default_config(), cli_overrides)
+
+
+def _print_header_and_groups(args, is_overwriting: bool, session=None) -> None:
+    if session is None:
+        rms_anchor_label = f"{args.rms_anchor}" + (
+            f" P{args.rms_percentile:g}" if args.rms_anchor == "percentile" else ""
+        )
+        mode_label = "EXECUTE" if args.execute else "DRY-RUN"
+        output_label = "(overwrite)" if is_overwriting else f"{args.output_folder}/"
+        console.print(Panel.fit(
+            f"[bold]SessionPrep[/]\n"
+            f"Mode: [cyan]{mode_label}[/]\n"
+            f"Target: [cyan]{args.target_rms} dB RMS[/] | [cyan]{args.target_peak} dB Peak[/]\n"
+            f"RMS Anchor: [cyan]{rms_anchor_label}[/] | Window: [cyan]{args.window} ms[/]\n"
+            f"Output: [green]{output_label}[/]",
+            title="Configuration",
+        ))
+        return
+
+    if not session.groups:
+        return
+    grouped: dict[str, list] = {}
+    for t in session.tracks:
+        if t.group is not None:
+            grouped.setdefault(t.group, []).append(t)
+    console.print("")
+    group_table = Table(box=box.ROUNDED, title="Gain-Linked Groups", title_justify="left")
+    group_table.add_column("Group", style="bold cyan")
+    group_table.add_column("Gain", justify="right", style="bold green")
+    group_table.add_column("Members", style="dim")
+    for gname in sorted(grouped):
+        members = grouped[gname]
+        pr = members[0].processor_results.get("bimodal_normalize")
+        gain_str = f"{pr.gain_db:+.1f} dB" if pr else "—"
+        group_table.add_row(gname, gain_str, ", ".join(m.filename for m in members))
+    console.print(group_table)
+    console.print("")
+
+
+def _load_and_analyze_cli_session(
+    args, source_dir: str, output_dir: str, backup_dir: str | None, config: dict, pipeline: Pipeline, event_bus: EventBus,
+):
+    with Progress(
+        SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
+        BarColumn(), TextColumn("{task.completed}/{task.total}"), console=console,
+    ) as progress:
+        try:
+            wav_files = discover_audio_files(source_dir)
+        except OSError as exc:
+            console.print(str(exc), style="bold red", markup=False)
+            return None
+        if not wav_files:
+            console.print(f"No audio files found in {source_dir}", style="red", markup=False)
+            return None
+
+        task_id = progress.add_task("[cyan]Loading & analyzing tracks...", total=len(wav_files) * 2)
+        on_done = lambda **data: progress.advance(task_id)  # noqa: E731
+        event_bus.subscribe("track.analyze_complete", on_done)
+        try:
+            session = load_session(source_dir, config, event_bus=event_bus)
+            if not session.tracks:
+                raise ValueError(f"No audio files found in {source_dir}")
+            if args.execute:
+                _prepare_cli_destinations(
+                    source_dir, output_dir, backup_dir,
+                    [track.filename for track in session.tracks], args.report, args.json,
+                )
+        except (OSError, ValueError) as exc:
+            console.print(str(exc), style="bold red", markup=False)
+            return None
+
+        session = pipeline.analyze_phase1(session)
+        session = pipeline.analyze_phase2(session)
+        event_bus.unsubscribe("track.analyze_complete", on_done)
+    return session
+
+
+def _print_repair_notices(session) -> None:
+    flags = {"dc_remove": "dc", "low_cut": "subsonic", "ultrasonic": "ultrasonic"}
+    for track in session.tracks:
+        if track.repair_recipe.active:
+            console.print("Repairs", track.filename, "·", ", ".join(track.repair_recipe.applied_ids()), markup=False)
+            for warning in format_boundary_settling(track.repair_measurements.get("boundary_settling", [])):
+                console.print(warning, style="yellow", markup=False)
+        suggestions = track.repair_measurements.get("suggested", {})
+        available = [
+            f"--fix {flag}" for key, flag in flags.items()
+            if suggestions.get(key) and key not in track.repair_recipe.applied_ids()
+        ]
+        if available:
+            console.print("Suggested repairs", track.filename, "·", ", ".join(available), markup=False)
+
+
+def _print_fader_table(session, write_errors: dict[str, str]) -> None:
+    table = Table(box=box.ROUNDED, title="Fader Offsets")
+    table.add_column("Track", style="cyan", max_width=30)
+    table.add_column("Format", style="dim")
+    table.add_column("Type", justify="center")
+    table.add_column("Gain", justify="right")
+    table.add_column("Fader", justify="right", style="bold green")
+    table.add_column("Status", justify="right")
+    receipts = session.execution_receipts.executed_files or session.config.get("_executed_files", {})
+    for t in session.tracks:
+        if t.status != "OK" or t.filename in write_errors:
+            table.add_row(t.filename, "Error", "\u2014", "\u2014", "\u2014", "[red]ERR[/]")
+            continue
+        fmt_str = f"{t.samplerate / 1000:.0f}k/{t.bitdepth}"
+        pr = t.processor_results.get("bimodal_normalize")
+        if pr and pr.classification == "Silent":
+            table.add_row(t.filename, fmt_str, "Silent", "0.0 dB", "0.0 dB", "[yellow]SILENT[/]")
+            continue
+        classification = pr.classification if pr else "Unknown"
+        receipt = receipts[t.filename]
+        clip_r = t.detector_results.get("clipping")
+        is_clipped = bool(clip_r.data.get("is_clipped")) if clip_r else False
+        type_color = "magenta" if "Transient" in classification else "cyan"
+        table.add_row(
+            t.filename, fmt_str, f"[{type_color}]{classification}[/]",
+            f"{receipt['gain_db']:+.1f} dB", f"{receipt['fader_db']:+.1f} dB",
+            "[red]CLIP[/]" if is_clipped else "[green]OK[/]",
+        )
+    console.print(table)
+
+
+def _execute_cli_session(args, session, pipeline: Pipeline, event_bus: EventBus, output_dir: str, backup_dir: str | None, is_overwriting: bool, config: dict, diagnostic_summary: dict) -> int:
+    with Progress(
+        SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
+        BarColumn(), TextColumn("{task.completed}/{task.total}"), console=console,
+    ) as progress:
+        task_id = progress.add_task("[cyan]Processing tracks...", total=len(session.tracks))
+        on_write = lambda **data: progress.advance(task_id)  # noqa: E731
+        event_bus.subscribe("track.write_complete", on_write)
+        session = pipeline.execute(session, output_dir=output_dir, backup_dir=backup_dir, is_overwriting=is_overwriting)
+        event_bus.unsubscribe("track.write_complete", on_write)
+
+    write_errors = dict(session.execution_receipts.execute_errors or session.config.get("_execute_errors", []))
+    for filename, reason in write_errors.items():
+        console.print(f"{filename}: {reason}", style="red", markup=False)
+
+    print_diagnostic_summary(diagnostic_summary)
+    _print_fader_table(session, write_errors)
+
+    warnings = build_warnings(session, config)
+    diagnostic_summary_text = render_diagnostic_summary_text(diagnostic_summary)
+    report_path = os.path.join(output_dir, args.report)
+    json_path = os.path.join(output_dir, args.json)
+    try:
+        generate_report(session, config, report_path, warnings, diagnostic_summary_text=diagnostic_summary_text)
+        save_json(session, config, json_path, warnings)
+    except OSError as exc:
+        console.print(f"Could not save the processing reports. {exc}", style="bold red", markup=False)
+        return 1
+    console.print(f"\n[dim]Report saved to: {report_path}[/]")
+    return 1 if write_errors else 0
+
+
+def process_files():
+    if (isinstance(sys.stdout, TextIOWrapper) and not sys.stdout.isatty()
+            and sys.stdout.errors in {"strict", "surrogateescape", "surrogatepass"}):
+        sys.stdout.reconfigure(errors="backslashreplace")
+    args = parse_arguments()
+    setup_logging()
+    source_dir = args.directory
+    if not os.path.isdir(source_dir):
+        console.print(f"Input directory does not exist. {source_dir}", style="bold red", markup=False)
+        return 1
+
+    is_overwriting = args.execute and args.overwrite
+    output_dir = source_dir if is_overwriting else os.path.join(source_dir, args.output_folder)
+    backup_dir = os.path.join(source_dir, args.backup) if is_overwriting else None
+    config = _build_cli_config(args, source_dir)
     errors = validate_config_fields(config)
     if errors:
         for error in errors:
             print(f"{error.key}: {error.message}", file=sys.stderr)
         return 2
 
-    # --- HEADER PANEL ---
-    rms_anchor_label = f"{args.rms_anchor}" + (f" P{args.rms_percentile:g}" if args.rms_anchor == "percentile" else "")
-    mode_label = "EXECUTE" if args.execute else "DRY-RUN"
-    output_label = "(overwrite)" if is_overwriting else f"{args.output_folder}/"
-    console.print(Panel.fit(
-        f"[bold]SessionPrep[/]\n"
-        f"Mode: [cyan]{mode_label}[/]\n"
-        f"Target: [cyan]{args.target_rms} dB RMS[/] | [cyan]{args.target_peak} dB Peak[/]\n"
-        f"RMS Anchor: [cyan]{rms_anchor_label}[/] | Window: [cyan]{args.window} ms[/]\n"
-        f"Output: [green]{output_label}[/]",
-        title="Configuration"
-    ))
-
-    # --- BUILD PIPELINE ---
+    _print_header_and_groups(args, is_overwriting)
     event_bus = EventBus()
-    pipeline = Pipeline(
-        detectors=default_detectors(),
-        audio_processors=default_processors(),
-        config=config,
-        event_bus=event_bus,
-    )
+    pipeline = Pipeline(detectors=default_detectors(), audio_processors=default_processors(), config=config, event_bus=event_bus)
+    session = _load_and_analyze_cli_session(args, source_dir, output_dir, backup_dir, config, pipeline, event_bus)
+    if session is None:
+        return 1
 
-    # --- LOAD SESSION ---
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TextColumn("{task.completed}/{task.total}"),
-        console=console,
-    ) as progress:
-        # Count files first for the progress bar
-        try:
-            wav_files = discover_audio_files(source_dir)
-        except OSError as exc:
-            console.print(str(exc), style="bold red", markup=False)
-            return 1
-        if not wav_files:
-            console.print(f"No audio files found in {source_dir}", style="red", markup=False)
-            return 1
-
-        task_id = progress.add_task("[cyan]Loading & analyzing tracks...", total=len(wav_files) * 2)
-
-        # Wire up progress callback
-        def on_track_analyze_complete(**data):
-            progress.advance(task_id)
-        event_bus.subscribe("track.analyze_complete", on_track_analyze_complete)
-
-        try:
-            session = load_session(source_dir, config, event_bus=event_bus)
-            if not session.tracks:
-                raise ValueError(f"No audio files found in {source_dir}")
-            if args.execute:
-                _prepare_cli_destinations(source_dir, output_dir, backup_dir,
-                                          [track.filename for track in session.tracks], args.report, args.json)
-        except (OSError, ValueError) as exc:
-            console.print(str(exc), style="bold red", markup=False)
-            return 1
-
-        # --- ANALYZE ---
-        session = pipeline.analyze_phase1(session)
-        session = pipeline.analyze_phase2(session)
-
-        event_bus.unsubscribe("track.analyze_complete", on_track_analyze_complete)
-
-    # --- PLAN (compute gains, groups, fader offsets) ---
     session = pipeline.plan(session)
-
-    # --- SORT by Pro Tools order ---
     session.tracks.sort(key=lambda t: protools_sort_key(t.filename))
-
-    # --- PRINT GROUP ASSIGNMENTS (if any) ---
-    if session.groups:
-        grouped: dict[str, list] = {}
-        for t in session.tracks:
-            if t.group is not None:
-                grouped.setdefault(t.group, []).append(t)
-
-        console.print("")
-        group_table = Table(box=box.ROUNDED, title="Gain-Linked Groups", title_justify="left")
-        group_table.add_column("Group", style="bold cyan")
-        group_table.add_column("Gain", justify="right", style="bold green")
-        group_table.add_column("Members", style="dim")
-
-        for gname in sorted(grouped.keys()):
-            members = grouped[gname]
-            pr = members[0].processor_results.get("bimodal_normalize")
-            gain_str = f"{pr.gain_db:+.1f} dB" if pr else "—"
-            member_list = ", ".join(m.filename for m in members)
-            group_table.add_row(gname, gain_str, member_list)
-
-        console.print(group_table)
-
-        console.print("")
-
-    # --- BUILD DIAGNOSTIC SUMMARY ---
+    _print_header_and_groups(args, is_overwriting, session)
     diagnostic_summary = build_diagnostic_summary(session)
-    for track in session.tracks:
-        if track.repair_recipe.active:
-            console.print("Repairs", track.filename, "·", ", ".join(track.repair_recipe.applied_ids()),
-                          markup=False)
-            for warning in format_boundary_settling(track.repair_measurements.get("boundary_settling", [])):
-                console.print(warning, style="yellow", markup=False)
-        suggestions = track.repair_measurements.get("suggested", {})
-        flags = {"dc_remove": "dc", "low_cut": "subsonic", "ultrasonic": "ultrasonic"}
-        available = [f"--fix {flag}" for key, flag in flags.items()
-                     if suggestions.get(key) and key not in track.repair_recipe.applied_ids()]
-        if available:
-            console.print("Suggested repairs", track.filename, "·", ", ".join(available), markup=False)
+    _print_repair_notices(session)
 
-    # --- DRY-RUN: print diagnostics and exit ---
     if not args.execute:
         print_diagnostic_summary(diagnostic_summary)
         failed = False
@@ -473,94 +496,9 @@ def process_files():
                 failed = True
         return int(failed)
 
-    # --- EXECUTE: write processed files ---
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TextColumn("{task.completed}/{task.total}"),
-        console=console,
-    ) as progress:
-        task_id = progress.add_task("[cyan]Processing tracks...", total=len(session.tracks))
-
-        def on_track_write_complete(**data):
-            progress.advance(task_id)
-        event_bus.subscribe("track.write_complete", on_track_write_complete)
-
-        session = pipeline.execute(
-            session,
-            output_dir=output_dir,
-            backup_dir=backup_dir,
-            is_overwriting=is_overwriting,
-        )
-
-        event_bus.unsubscribe("track.write_complete", on_track_write_complete)
-    write_errors = dict(session.config.get("_execute_errors", []))
-    for filename, reason in write_errors.items():
-        console.print(f"{filename}: {reason}", style="red", markup=False)
-
-    # --- PRINT DIAGNOSTICS ---
-    print_diagnostic_summary(diagnostic_summary)
-
-    # --- DISPLAY FADER TABLE ---
-    table = Table(box=box.ROUNDED, title="Fader Offsets")
-    table.add_column("Track", style="cyan", max_width=30)
-    table.add_column("Format", style="dim")
-    table.add_column("Type", justify="center")
-    table.add_column("Gain", justify="right")
-    table.add_column("Fader", justify="right", style="bold green")
-    table.add_column("Status", justify="right")
-
-    for t in session.tracks:
-        if t.status != "OK" or t.filename in write_errors:
-            table.add_row(t.filename, "Error", "\u2014", "\u2014", "\u2014", "[red]ERR[/]")
-            continue
-
-        fmt_str = f"{t.samplerate/1000:.0f}k/{t.bitdepth}"
-        pr = t.processor_results.get("bimodal_normalize")
-
-        if pr and pr.classification == "Silent":
-            table.add_row(t.filename, fmt_str, "Silent", "0.0 dB", "0.0 dB", "[yellow]SILENT[/]")
-            continue
-
-        classification = pr.classification if pr else "Unknown"
-        receipt = session.config["_executed_files"][t.filename]
-        gain_db = receipt["gain_db"]
-        fader_offset = receipt["fader_db"]
-        is_clipped = False
-        clip_r = t.detector_results.get("clipping")
-        if clip_r:
-            is_clipped = bool(clip_r.data.get("is_clipped"))
-
-        type_color = "magenta" if "Transient" in classification else "cyan"
-        status_str = "[red]CLIP[/]" if is_clipped else "[green]OK[/]"
-
-        table.add_row(
-            t.filename,
-            fmt_str,
-            f"[{type_color}]{classification}[/]",
-            f"{gain_db:+.1f} dB",
-            f"{fader_offset:+.1f} dB",
-            status_str,
-        )
-
-    console.print(table)
-
-    # --- BUILD WARNINGS & SAVE REPORTS ---
-    warnings = build_warnings(session, config)
-    diagnostic_summary_text = render_diagnostic_summary_text(diagnostic_summary)
-
-    report_path = os.path.join(output_dir, args.report)
-    json_path = os.path.join(output_dir, args.json)
-    try:
-        generate_report(session, config, report_path, warnings, diagnostic_summary_text=diagnostic_summary_text)
-        save_json(session, config, json_path, warnings)
-    except OSError as exc:
-        console.print(f"Could not save the processing reports. {exc}", style="bold red", markup=False)
-        return 1
-
-    console.print(f"\n[dim]Report saved to: {report_path}[/]")
-    return 1 if write_errors else 0
+    return _execute_cli_session(
+        args, session, pipeline, event_bus, output_dir, backup_dir, is_overwriting, config, diagnostic_summary,
+    )
 
 
 if __name__ == "__main__":

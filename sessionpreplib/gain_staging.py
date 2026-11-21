@@ -4,7 +4,7 @@ import logging
 from collections import defaultdict
 from collections.abc import Collection
 
-from .models import ProcessorResult, SessionContext
+from .models import GainStagingSummary, ProcessorResult, SessionContext
 
 log = logging.getLogger(__name__)
 
@@ -56,5 +56,8 @@ def apply_group_gains(
                     break
             for _, result in eligible:
                 result.data["fader_offset"] -= anchor_offset
+        session.gain_staging[proc.id] = GainStagingSummary(
+            fader_rebalance_shift=shift, anchor_offset=anchor_offset,
+        )
         session.config[f"_fader_rebalance_{proc.id}"] = shift
         session.config[f"_anchor_offset_{proc.id}"] = anchor_offset

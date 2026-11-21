@@ -126,6 +126,75 @@ class SubsonicDetector(TrackDetector):
         self.window_ms = config.get("subsonic_window_ms", 500)
         self.max_regions = config.get("subsonic_max_regions", 20)
 
+    def _analyze_channels(
+        self,
+        track: TrackContext,
+        cutoff: float,
+        threshold: float,
+    ) -> tuple[
+        list[tuple[int | None, np.ndarray]],
+        dict[int, float],
+        dict[int, bool],
+        dict[int | None, list[tuple[int, int, float]]],
+    ]:
+        data = track.audio_data
+        nch = track.channels
+        channels_to_analyze: list[tuple[int | None, np.ndarray]] = (
+            [(ch, data[:, ch]) for ch in range(nch)]
+            if nch >= 2 and data.ndim == 2
+            else [(None, data if data.ndim == 1 else data[:, 0])]
+        )
+        ch_ratios: dict[int, float] = {}
+        ch_warn: dict[int, bool] = {}
+        ch_win_ratios: dict[int | None, list[tuple[int, int, float]]] = {}
+        for ch, signal in channels_to_analyze:
+            whole_ratio, win_ratios = subsonic_stft_analysis(
+                signal, track.samplerate, cutoff,
+                window_ms=int(self.window_ms), include_windows=self.windowed,
+                minimum_whole_ratio_db=threshold,
+            )
+            ch_key = ch if ch is not None else 0
+            ch_ratios[ch_key] = whole_ratio
+            ch_warn[ch_key] = bool(np.isfinite(whole_ratio) and whole_ratio >= threshold)
+            ch_win_ratios[ch] = win_ratios
+        return channels_to_analyze, ch_ratios, ch_warn, ch_win_ratios
+
+    def _build_fallback_issues(
+        self,
+        track: TrackContext,
+        summary: str,
+        ch_ratios: dict[int, float],
+        warn_channels: list[int],
+        all_channels_warn: bool,
+    ) -> list[IssueLocation]:
+        if all_channels_warn or track.channels == 1:
+            return [IssueLocation(
+                sample_start=0,
+                sample_end=track.total_samples - 1,
+                channel=None,
+                severity=Severity.INFO,
+                label="subsonic",
+                description=summary,
+                freq_min_hz=0.0,
+                freq_max_hz=float(self.cutoff_hz),
+            )]
+        return [
+            IssueLocation(
+                sample_start=0,
+                sample_end=track.total_samples - 1,
+                channel=ch,
+                severity=Severity.INFO,
+                label="subsonic",
+                description=(
+                    f"subsonic energy ch {ch}: {ch_ratios[ch]:.1f} dB "
+                    f"(<= {self.cutoff_hz:g} Hz)"
+                ),
+                freq_min_hz=0.0,
+                freq_max_hz=float(self.cutoff_hz),
+            )
+            for ch in warn_channels
+        ]
+
     def analyze(self, track: TrackContext) -> DetectorResult:
         if is_silent(track):
             return DetectorResult(
@@ -139,55 +208,21 @@ class SubsonicDetector(TrackDetector):
 
         cutoff = float(self.cutoff_hz)
         threshold = float(self.warn_ratio_db)
-        data = track.audio_data
-        nch = track.channels
-
-        # --- Single-pass STFT per channel ---
-        channels_to_analyze: list[tuple[int | None, np.ndarray]] = []
-        if nch >= 2 and data.ndim == 2:
-            for ch in range(nch):
-                channels_to_analyze.append((ch, data[:, ch]))
-        else:
-            channels_to_analyze.append(
-                (None, data if data.ndim == 1 else data[:, 0])
-            )
-
-        ch_ratios: dict[int, float] = {}
-        ch_warn: dict[int, bool] = {}
-        ch_win_ratios: dict[int | None, list[tuple[int, int, float]]] = {}
-
-        for ch, signal in channels_to_analyze:
-            whole_ratio, win_ratios = subsonic_stft_analysis(
-                signal, track.samplerate, cutoff,
-                window_ms=int(self.window_ms), include_windows=self.windowed,
-                minimum_whole_ratio_db=threshold,
-            )
-            ch_key = ch if ch is not None else 0
-            ch_ratios[ch_key] = whole_ratio
-            ch_warn[ch_key] = bool(np.isfinite(whole_ratio) and whole_ratio >= threshold)
-            ch_win_ratios[ch] = win_ratios
-
-        # Combined ratio: worst (highest) per-channel ratio — more
-        # conservative than mono-downmix (no phase-cancellation masking).
-        combined_ratio = max(ch_ratios.values()) if ch_ratios else float(-np.inf)
-        any_ch_warn = any(ch_warn.values())
-        combined_warn = bool(
-            np.isfinite(combined_ratio) and combined_ratio >= threshold
+        channels_to_analyze, ch_ratios, ch_warn, ch_win_ratios = self._analyze_channels(
+            track, cutoff, threshold
         )
 
-        # Build per-channel data dict for result
-        per_channel_data = {
-            ch: {"ratio_db": ch_ratios[ch], "warn": ch_warn[ch]}
-            for ch in sorted(ch_ratios)
-        }
-
+        combined_ratio = max(ch_ratios.values()) if ch_ratios else float(-np.inf)
+        any_ch_warn = any(ch_warn.values())
+        combined_warn = bool(np.isfinite(combined_ratio) and combined_ratio >= threshold)
         result_data: dict = {
             "subsonic_ratio_db": float(combined_ratio),
             "subsonic_warn": combined_warn or any_ch_warn,
-            "per_channel": per_channel_data,
+            "per_channel": {
+                ch: {"ratio_db": ch_ratios[ch], "warn": ch_warn[ch]}
+                for ch in sorted(ch_ratios)
+            },
         }
-
-        # --- Determine if we should warn ---
         if not (combined_warn or any_ch_warn):
             return DetectorResult(
                 detector_id=self.id,
@@ -196,81 +231,38 @@ class SubsonicDetector(TrackDetector):
                 data=result_data,
             )
 
-        # --- Build summary and issues ---
         issues: list[IssueLocation] = []
         detail_lines: list[str] = []
         warn_channels = [ch for ch, w in ch_warn.items() if w]
-        all_channels_warn = len(warn_channels) == nch
-
-        # Summary text
         if combined_warn:
-            summary = (
-                f"subsonic energy {float(combined_ratio):.1f} dB "
-                f"(<= {self.cutoff_hz:g} Hz)"
-            )
+            summary = f"subsonic energy {float(combined_ratio):.1f} dB (<= {self.cutoff_hz:g} Hz)"
         else:
-            parts = []
-            for ch in warn_channels:
-                parts.append(f"ch {ch}: {ch_ratios[ch]:.1f} dB")
-            summary = (
-                f"subsonic energy on {', '.join(parts)} "
-                f"(<= {self.cutoff_hz:g} Hz)"
-            )
+            parts = [f"ch {ch}: {ch_ratios[ch]:.1f} dB" for ch in warn_channels]
+            summary = f"subsonic energy on {', '.join(parts)} (<= {self.cutoff_hz:g} Hz)"
 
-        # Per-channel detail lines
-        if nch >= 2:
+        if track.channels >= 2:
             for ch in sorted(ch_ratios):
                 r = ch_ratios[ch]
                 tag = " ⚠" if ch_warn.get(ch) else ""
                 if np.isfinite(r):
                     detail_lines.append(f"Channel {ch}: {r:.1f} dB{tag}")
 
-        # --- Windowed analysis or whole-file issues ---
-        windowed_regions: list[dict] = []
         if self.windowed:
-            windowed_regions = self._windowed_analysis(
-                track, threshold, issues, detail_lines, ch_win_ratios,
-                [(ch, signal) for ch, signal in channels_to_analyze if ch_warn[ch or 0]],
+            flagged = [(ch, sig) for ch, sig in channels_to_analyze if ch_warn[ch or 0]]
+            result_data["windowed_regions"] = self._windowed_analysis(
+                track, threshold, issues, detail_lines, ch_win_ratios, flagged
             )
-            result_data["windowed_regions"] = windowed_regions
-
-        # If windowed produced no regions (or windowed is off), fall back to
-        # a whole-file issue span so INFO always has at least one overlay.
         if not issues:
-            if all_channels_warn or nch == 1:
-                issues.append(IssueLocation(
-                    sample_start=0,
-                    sample_end=track.total_samples - 1,
-                    channel=None,
-                    severity=Severity.INFO,
-                    label="subsonic",
-                    description=summary,
-                    freq_min_hz=0.0,
-                    freq_max_hz=float(self.cutoff_hz),
-                ))
-            else:
-                for ch in warn_channels:
-                    desc = (
-                        f"subsonic energy ch {ch}: {ch_ratios[ch]:.1f} dB "
-                        f"(<= {self.cutoff_hz:g} Hz)"
-                    )
-                    issues.append(IssueLocation(
-                        sample_start=0,
-                        sample_end=track.total_samples - 1,
-                        channel=ch,
-                        severity=Severity.INFO,
-                        label="subsonic",
-                        description=desc,
-                        freq_min_hz=0.0,
-                        freq_max_hz=float(self.cutoff_hz),
-                    ))
+            issues = self._build_fallback_issues(
+                track, summary, ch_ratios, warn_channels, len(warn_channels) == track.channels
+            )
 
         return DetectorResult(
             detector_id=self.id,
             severity=Severity.INFO,
             summary=summary,
             data=result_data,
-            detail_lines=detail_lines if detail_lines else [],
+            detail_lines=detail_lines,
             hint=f"consider HPF ~{self.cutoff_hz:g} Hz",
             issues=issues,
         )

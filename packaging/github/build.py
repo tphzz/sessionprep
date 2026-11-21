@@ -14,8 +14,8 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
-from build_conf import get_platform_suffix
-from sessionpreplib._version import resolve_ref_version
+from build_conf import get_platform_suffix  # noqa: E402
+from sessionpreplib._version import resolve_ref_version  # noqa: E402
 
 PLATFORMS = ("linux-x64", "linux-arm64", "win-x64", "win-arm64", "macos-arm64", "macos-x64")
 MANIFEST = "build-manifest.json"

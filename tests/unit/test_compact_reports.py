@@ -192,8 +192,7 @@ def test_external_clear_releases_session_and_disclosure_state(qapp):
 
 def test_review_selects_identity_after_sort_and_refreshes_selected_widgets(qapp):
     from PySide6.QtCore import Qt
-    from PySide6.QtWidgets import QTableWidgetItem, QTabWidget
-    from sessionprepgui.detail.mixin import DetailMixin
+    from PySide6.QtWidgets import QTableWidgetItem
     from sessionprepgui.widgets import BatchEditTableWidget
     from sessionprepgui.tracks.table_widgets import _make_analysis_cell
     session, current = session_with_findings()
@@ -212,18 +211,32 @@ def test_review_selects_identity_after_sort_and_refreshes_selected_widgets(qapp)
     table.selectRow(0)
     summary = ReportBrowser({})
     summary.present_summary({"problems": []}, session)
+    from sessionprepgui.detail.controller import TrackDetailController
+    from sessionprepgui.state import WorkspaceState
+
+    state = WorkspaceState()
+    state.session = session
     called = []
-    owner = SimpleNamespace(_session=session, _summary_view=summary,
-                            _track_table=table, _file_report=ReportBrowser({}),
-                            _file_review=SimpleNamespace(back_to_findings=lambda: None),
-                            _show_track_detail=called.append)
-    DetailMixin._review_summary_file(owner, current.filename)
+    ctrl = TrackDetailController(
+        state,
+        SimpleNamespace(),
+        summary_view=summary,
+        file_report=ReportBrowser({}),
+        file_review=SimpleNamespace(back_to_findings=lambda: None),
+        repair_editor=None,
+        detail_tabs=None,
+        track_table=table,
+        wf_panel=None,
+        playback=None,
+    )
+    ctrl.show_track_detail = called.append
+    ctrl.review_summary_file(current.filename)
     assert called == [current]
     assert table.currentItem().text() == current.filename
     assert table.cellWidget(0, 1).text().startswith("<span")
     assert table.cellWidget(1, 1).text() == "1A"
-    owner._session = SessionContext([other], {})
-    DetailMixin._review_summary_file(owner, current.filename)
+    state.session = SessionContext([other], {})
+    ctrl.review_summary_file(current.filename)
     assert called == [current]
 
 

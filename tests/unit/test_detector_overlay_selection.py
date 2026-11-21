@@ -5,7 +5,8 @@ from types import SimpleNamespace
 import pytest
 from PySide6.QtWidgets import QApplication, QMenu
 
-from sessionprepgui.detail.mixin import DetailMixin
+from sessionprepgui.detail.controller import TrackDetailController
+from sessionprepgui.state import WorkspaceState
 
 
 @pytest.fixture
@@ -32,14 +33,41 @@ class _FakeWaveform:
         self.enabled_overlays = set(labels)
 
 
-class _OverlayHost(DetailMixin):
+class _OverlayHost:
     def __init__(self):
         self._overlay_menu = QMenu()
         self._overlay_btn = _FakeButton()
         self._waveform = _FakeWaveform()
-        self._selected_detector_overlays: set[str] = set()
-        self._session = None
-        self._current_track = SimpleNamespace(detector_results={})
+        self._state = WorkspaceState()
+        self._state.current_track = SimpleNamespace(detector_results={})
+        wf_panel = SimpleNamespace(
+            overlay_menu=self._overlay_menu,
+            overlay_btn=self._overlay_btn,
+            waveform=self._waveform,
+        )
+        self._ctrl = TrackDetailController(
+            self._state,
+            SimpleNamespace(),
+            summary_view=None,
+            file_report=None,
+            file_review=None,
+            repair_editor=None,
+            detail_tabs=None,
+            track_table=None,
+            wf_panel=wf_panel,
+            playback=None,
+        )
+
+    @property
+    def _selected_detector_overlays(self):
+        return self._state.selected_detector_overlays
+
+    @_selected_detector_overlays.setter
+    def _selected_detector_overlays(self, value):
+        self._state.selected_detector_overlays = value
+
+    def _update_overlay_menu(self, issues):
+        self._ctrl.update_overlay_menu(issues)
 
 
 def _issue(label: str):

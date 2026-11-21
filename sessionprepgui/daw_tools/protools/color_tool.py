@@ -211,10 +211,11 @@ class ColorTool(QWidget):
         if not selected:
             self._set_status("No tracks selected in Pro Tools", "#ff9800")
             return
+        selected_count = len(selected)
         self._client.request(
             "set_track_color",
             {"color_index": color_index, "track_names": selected},
-            lambda apply_response, count=len(selected), text=label: (
+            lambda apply_response, count=selected_count, text=label: (
                 self._on_color_applied(apply_response, count, text)
             ),
             timeout_ms=PTSL_MUTATION_TIMEOUT_MS,

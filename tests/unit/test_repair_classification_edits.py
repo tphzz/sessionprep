@@ -48,12 +48,12 @@ def project(app, tmp_path, monkeypatch):
         if bias:
             track.repair_overrides["dc_remove"] = True
         tracks.append(track)
-    config = window._flat_config()
+    config = window.state.flat_config()
     session = SessionContext(tracks, config)
     pipeline = Pipeline(default_detectors(), default_processors(), config, max_workers=1)
     pipeline.analyze_phase2(session)
     pipeline.plan(session)
-    window._restore_session_state({"source_dir": str(source), "tracks": tracks,
+    window.lifecycle_controller.restore_session_state({"source_dir": str(source), "tracks": tracks,
                                    "active_config_preset": "Default", "session_config_overrides": {}})
     try:
         yield window
@@ -63,14 +63,14 @@ def project(app, tmp_path, monkeypatch):
 
 def wait_for_edits(window):
     deadline = monotonic() + 8
-    while window._repair_plan_worker is not None or window._repair_plan_pending:
+    while window.lifecycle_controller.repair_plan_worker is not None or window.lifecycle_controller.repair_plan_pending:
         QApplication.processEvents()
         assert monotonic() < deadline, "The classification/anchor edit did not finish"
         sleep(0.005)
 
 
 def choose(window, source, column, value, *, batch=False):
-    combo = window._track_table.cellWidget(window._find_table_row(source.filename), column)
+    combo = window._track_table.cellWidget(window.track_table_controller.find_table_row(source.filename), column)
     assert combo.findText(value) >= 0
     # These are the flags that the table combobox sets on an Alt+Shift press.
     combo.batch_mode = batch
@@ -116,14 +116,14 @@ def assert_plan(track, anchor, classification):
 def test_individual_edits_rehydrate_source_and_keep_original_anchor(project, tmp_path):
     window = project
     saved = tmp_path / "classifications.spsession"
-    save_session(str(saved), window._capture_session_state())
+    save_session(str(saved), window.lifecycle_controller.capture_session_state())
     restored = load_session(str(saved))
     assert all(track.audio_data is None for track in restored["tracks"])
-    window._restore_session_state(restored)
-    first, other, _ = window._session.tracks
+    window.lifecycle_controller.restore_session_state(restored)
+    first, other, _ = window.state.session.tracks
     assert first.repair_recipe.dc_remove and first.classification_override is None
     assert first.audio_data is None
-    row = window._find_table_row(first.filename)
+    row = window.track_table_controller.find_table_row(first.filename)
     displayed = window._track_table.cellWidget(row, 3).currentText()
     choose(window, first, 3, displayed)
     assert first.classification_override == displayed
@@ -140,7 +140,7 @@ def test_individual_edits_rehydrate_source_and_keep_original_anchor(project, tmp
 
 def test_batch_edits_replan_each_selected_row_and_preserve_selection(project):
     window = project
-    first, second, plain = window._session.tracks
+    first, second, plain = window.state.session.tracks
     assert first.repair_recipe.dc_remove and second.repair_recipe.dc_remove and not plain.repair_recipe.active
     window._track_table.restore_selection({first.filename, second.filename})
     choose(window, first, 5, "P85", batch=True)
@@ -162,10 +162,10 @@ def test_batch_edits_replan_each_selected_row_and_preserve_selection(project):
 
 def test_single_plain_classification_and_bypass_update_linked_gain_and_faders(project):
     window = project
-    repaired, _, plain = window._session.tracks
-    window._session_groups = [{"name": "Pair", "gain_linked": True}]
+    repaired, _, plain = window.state.session.tracks
+    window.state.session_groups = [{"name": "Pair", "gain_linked": True}]
     repaired.group = plain.group = "Pair"
-    window._apply_linked_group_levels()
+    window.groups_controller.apply_linked_group_levels()
     selected = "bimodal_normalize"
     shared = repaired.processor_results[selected].gain_db
     assert shared == plain.processor_results[selected].gain_db
@@ -177,7 +177,7 @@ def test_single_plain_classification_and_bypass_update_linked_gain_and_faders(pr
     assert result.gain_db == pytest.approx(shared)
     assert result.data["fader_offset"] == pytest.approx(-shared)
 
-    button = window._track_table.cellWidget(window._find_table_row(repaired.filename), 7)
+    button = window._track_table.cellWidget(window.track_table_controller.find_table_row(repaired.filename), 7)
     toggle = next(action for action in button.menu().actions() if action.data() == selected)
     toggle.setChecked(False)
     wait_for_edits(window)
@@ -189,18 +189,18 @@ def test_single_plain_classification_and_bypass_update_linked_gain_and_faders(pr
 
 def test_group_link_recomputes_named_anchor_after_edits_and_reopen(project, tmp_path):
     window = project
-    session = window._session
+    session = window.state.session
     anchor, peer, _ = session.tracks
-    window._session_overrides.update({"analysis.anchor": anchor.filename, "analysis.fader_headroom_db": 0})
-    session.config.update(window._flat_config())
+    window.state.session_overrides.update({"analysis.anchor": anchor.filename, "analysis.fader_headroom_db": 0})
+    session.config.update(window.state.flat_config())
     session.config["_gain_linked_groups"] = set()
     for track, gain in zip(session.tracks, (6.0, -2.0, 1.0)):
         track.manual_gain_db = gain
     pipeline = Pipeline(default_detectors(), default_processors(), session.config, max_workers=1)
     pipeline.plan(session)
-    window._session_groups = [{"name": "Pair", "gain_linked": False}]
-    window._populate_groups_tab()
-    window._refresh_group_combos()
+    window.state.session_groups = [{"name": "Pair", "gain_linked": False}]
+    window.groups_controller.populate_groups_tab()
+    window.groups_controller.refresh_group_combos()
     for track in (anchor, peer):
         choose(window, track, 6, "Pair")
 
@@ -210,7 +210,7 @@ def test_group_link_recomputes_named_anchor_after_edits_and_reopen(project, tmp_
         assert [r.data["fader_offset"] for r in results] == pytest.approx(faders)
 
     check(session, [6, -2, 1], [0, 8, 5])
-    link = window._groups_tab_table.cellWidget(0, 2).findChild(QCheckBox)
+    link = window.groups_controller.page.table.cellWidget(0, 2).findChild(QCheckBox)
     link.click()
     check(session, [-2, -2, 1], [0, 0, -3])
     session.config["_gain_linked_groups"] = {"Pair"}
@@ -221,43 +221,43 @@ def test_group_link_recomputes_named_anchor_after_edits_and_reopen(project, tmp_
     link.click()
 
     saved = tmp_path / "linked.spsession"
-    save_session(str(saved), window._capture_session_state())
-    window._restore_session_state(load_session(str(saved)))
-    check(window._session, [-2, -2, 1], [0, 0, -3])
-    restored_anchor = window._session.tracks[0]
+    save_session(str(saved), window.lifecycle_controller.capture_session_state())
+    window.lifecycle_controller.restore_session_state(load_session(str(saved)))
+    check(window.state.session, [-2, -2, 1], [0, 0, -3])
+    restored_anchor = window.state.session.tracks[0]
     choose(window, restored_anchor, 3, "Transient")
     assert restored_anchor.classification_override == "Transient"
-    check(window._session, [-2, -2, 1], [0, 0, -3])
-    button = window._track_table.cellWidget(window._find_table_row(restored_anchor.filename), 7)
+    check(window.state.session, [-2, -2, 1], [0, 0, -3])
+    button = window._track_table.cellWidget(window.track_table_controller.find_table_row(restored_anchor.filename), 7)
     toggle = next(action for action in button.menu().actions() if action.data() == "bimodal_normalize")
     toggle.setChecked(False)
     wait_for_edits(window)
     assert [t.processor_results["bimodal_normalize"].data["fader_offset"]
-            for t in window._session.tracks] == pytest.approx([0, 2, -1])
+            for t in window.state.session.tracks] == pytest.approx([0, 2, -1])
     toggle.setChecked(True)
     wait_for_edits(window)
-    check(window._session, [-2, -2, 1], [0, 0, -3])
-    link = window._groups_tab_table.cellWidget(0, 2).findChild(QCheckBox)
+    check(window.state.session, [-2, -2, 1], [0, 0, -3])
+    link = window.groups_controller.page.table.cellWidget(0, 2).findChild(QCheckBox)
     link.click()
-    check(window._session, [6, -2, 1], [0, 8, 5])
+    check(window.state.session, [6, -2, 1], [0, 8, 5])
 
 
 def test_reopened_group_edit_uses_the_selected_template_fader_ceiling(project, tmp_path):
     window = project
-    window._config["config_presets"]["Default"]["daw_processors"]["dawproject"].update(
+    window.state.config["config_presets"]["Default"]["daw_processors"]["dawproject"].update(
         dawproject_templates=[{"name": "Studio", "template_path": str(tmp_path / "studio.dawproject"),
                                "fader_ceiling_db": 6.0}],
     )
-    window._configure_daw_processors()
-    daw = next(dp for dp in window._daw_processors if dp.fader_ceiling_db == 6.0)
-    window._populate_daw_combo(daw.id)
+    window.daw_controller.configure_daw_processors()
+    daw = next(dp for dp in window.state.daw_processors if dp.fader_ceiling_db == 6.0)
+    window.daw_controller.populate_daw_combo(daw.id)
     saved = tmp_path / "headroom.spsession"
-    save_session(str(saved), window._capture_session_state())
-    window._restore_session_state(load_session(str(saved)))
-    assert window._active_daw_processor.id == daw.id
+    save_session(str(saved), window.lifecycle_controller.capture_session_state())
+    window.lifecycle_controller.restore_session_state(load_session(str(saved)))
+    assert window.state.active_daw_processor.id == daw.id
     # With 8 dB of headroom on a +6 dB console, the highest fader is -2 dB.
-    for track, gain in zip(window._session.tracks, (-10.0, 0.0, 1.0)):
+    for track, gain in zip(window.state.session.tracks, (-10.0, 0.0, 1.0)):
         track.processor_results["bimodal_normalize"].data["original_gain_db"] = gain
-    window._apply_linked_group_levels()
+    window.groups_controller.apply_linked_group_levels()
     assert [t.processor_results["bimodal_normalize"].data["fader_offset"]
-            for t in window._session.tracks] == pytest.approx([-2.0, -12.0, -13.0])
+            for t in window.state.session.tracks] == pytest.approx([-2.0, -12.0, -13.0])

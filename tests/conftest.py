@@ -11,6 +11,17 @@ except ImportError:
     pt = None
 
 
+def pytest_addoption(parser):
+    parser.addoption(
+        "--ptsl-live", action="store_true",
+        help="Run tests that create disposable sessions in a running Pro Tools host",
+    )
+
+
+def pytest_configure(config):
+    config.addinivalue_line("markers", "ptsl_live: mark test to require a live Pro Tools connection")
+
+
 @pytest.fixture(scope="session")
 def _font_app():
     """Keep the fallback face registered for the lifetime of headless Qt tests."""

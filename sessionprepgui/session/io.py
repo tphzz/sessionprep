@@ -18,7 +18,8 @@ import math
 import os
 from copy import deepcopy
 from dataclasses import asdict
-from typing import Any, Callable
+from typing import Any
+from collections.abc import Callable
 
 from sessionpreplib.audio import file_revision
 from sessionpreplib.config import resolve_session_config, validate_structured_config
@@ -729,7 +730,7 @@ def load_session(path: str) -> dict:
     Raises ``ValueError`` on version mismatch or missing required fields.
     Raises ``json.JSONDecodeError`` / ``OSError`` on file errors.
     """
-    with open(path, "r", encoding="utf-8") as fh:
+    with open(path, encoding="utf-8") as fh:
         raw = json.load(fh)
 
     if not isinstance(raw, dict) or not raw.get("source_dir"):

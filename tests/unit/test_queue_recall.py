@@ -141,7 +141,7 @@ def test_failed_queue_load_preserves_complete_queue_and_workspace(tmp_path, wind
     for method in ("warning", "critical"):
         monkeypatch.setattr(QMessageBox, method, lambda _w, _t, message: messages.append(message))
     cleared = []
-    monkeypatch.setattr(window, "_clear_workspace", lambda: cleared.append(True))
+    monkeypatch.setattr(window.lifecycle_controller, "clear_workspace", lambda: cleared.append(True))
     window._on_load_batch_queue()
     assert dock.get_state() == original
     assert len(messages) == 1 and "2" in messages[0]
@@ -209,20 +209,20 @@ def test_authored_project_reopens_with_pinned_directory_latest_default_and_saved
     path = tmp_path / "mix.spsession"
     path.write_text(json.dumps(project))
     window = windows()
-    preset = settings.resolve_config_preset(window._config, "Default")
+    preset = settings.resolve_config_preset(window.state.config, "Default")
     preset["daw_processors"]["protools"].update(
         protools_project_dir="Studio projects", protools_temp_dir="New scratch",
         protools_templates=[{"group": "Mix", "name": "Stereo"}])
-    window._config["config_presets"]["Studio"] = preset
+    window.state.config["config_presets"]["Studio"] = preset
     monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *a: (str(path), ""))
-    window._on_load_session()
-    assert window._active_daw_processor.project_dir == "My projects"
-    assert window._active_daw_processor._temp_dir == "New scratch"
-    entry, = window._session.transfer_manifest
+    window.lifecycle_controller.load_session_dialog()
+    assert window.state.active_daw_processor.project_dir == "My projects"
+    assert window.state.active_daw_processor._temp_dir == "New scratch"
+    entry, = window.state.session.transfer_manifest
     assert (entry.entry_id, entry.output_filename) == ("keys-right", "Keys R.wav")
-    assert window._folder_tree.topLevelItem(0).text(0) == "Keys"
-    assert window._folder_tree.topLevelItem(0).child(0).text(0) == "keys-right"
-    route, = window._topo_topology.entries[0].sources[0].routes
+    assert window.daw_controller.page.folder_tree.topLevelItem(0).text(0) == "Keys"
+    assert window.daw_controller.page.folder_tree.topLevelItem(0).child(0).text(0) == "keys-right"
+    route, = window.state.topo_topology.entries[0].sources[0].routes
     assert (route.source_channel, route.target_channel, route.gain) == (1, 0, 1.0)
 
 
@@ -245,18 +245,18 @@ def test_rejected_session_load_preserves_open_workspace(tmp_path, windows, monke
     window = windows()
     original_folder = tmp_path / "original"
     original_folder.mkdir()
-    window._restore_session_state({"source_dir": str(original_folder), "tracks": []})
-    before = window._session
+    window.lifecycle_controller.restore_session_state({"source_dir": str(original_folder), "tracks": []})
+    before = window.state.session
     path = tmp_path / "broken.spsession"
     path.write_text(json.dumps({"version": CURRENT_VERSION, "source_dir": str(tmp_path), **invalid}))
     monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *a: (str(path), ""))
     messages = []
     monkeypatch.setattr(QMessageBox, "critical", lambda _w, _t, message: messages.append(message))
-    window._on_load_session()
-    assert messages and window._session is before and window._source_dir == str(original_folder)
+    window.lifecycle_controller.load_session_dialog()
+    assert messages and window.state.session is before and window.state.source_dir == str(original_folder)
     retained = tmp_path / "after-error.spsession"
     monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *a: (str(retained), ""))
-    window._on_save_session()
+    window.lifecycle_controller.save_session_dialog()
     assert json.loads(retained.read_text())["source_dir"] == str(original_folder)
 
 

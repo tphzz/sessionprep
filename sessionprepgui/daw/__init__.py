@@ -1,5 +1,6 @@
-"""DAW integration subpackage."""
+"""Phase 3 (DAW Transfer) subpackage."""
 
-from .mixin import DawMixin
+from .controller import DawTransferController
+from .page import DawSetupPage
 
-__all__ = ["DawMixin"]
+__all__ = ["DawTransferController", "DawSetupPage"]

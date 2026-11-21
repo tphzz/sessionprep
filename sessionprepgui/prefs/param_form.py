@@ -6,11 +6,11 @@ Uses shared desktop controls with any object satisfying the ParamSpec protocol.
 from __future__ import annotations
 
 import enum
-import re
 from decimal import Decimal
 from functools import partial
 from html import escape
-from typing import Any, Callable, Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
+from collections.abc import Callable
 
 from PySide6.QtCore import QEvent, QPoint, QRect, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap
@@ -114,101 +114,75 @@ def _spin_decimals(spec: Any, value: Any) -> int:
     return max(2, *map(_decimal_places, refs))
 
 
+_PATH_HINT_MODES = {
+    "path_picker_folder": PathPickerMode.FOLDER,
+    "path_picker_file": PathPickerMode.OPEN_FILE,
+    "path_picker_save": PathPickerMode.SAVE_FILE,
+}
+
+
+def _build_double_spin_widget(spec: Any, value: Any) -> QWidget:
+    w = FormDoubleSpinBox()
+    lo = float(spec.min) if spec.min is not None else -999999.0
+    hi = float(spec.max) if spec.max is not None else 999999.0
+    decimals = _spin_decimals(spec, value)
+    w.setDecimals(decimals)
+    w.setMinimum(lo)
+    w.setMaximum(hi)
+    span = hi - lo
+    if decimals >= 4:
+        w.setSingleStep(10 ** -decimals)
+    elif span <= 5:
+        w.setSingleStep(0.25)
+    elif span <= 20:
+        w.setSingleStep(0.5)
+    elif span <= 200:
+        w.setSingleStep(1.0)
+    else:
+        w.setSingleStep(5.0)
+    w.setValue(float(value) if value is not None else float(spec.default))
+    return w
+
+
 def _build_widget(
-    spec: Any, value: Any,
-    *, reset_to_preset: Callable[[QWidget], None] | None = None,
+    spec: Any,
+    value: Any,
+    *,
+    reset_to_preset: Callable[[QWidget], None] | None = None,
 ) -> QWidget:
-    """Create an appropriate input widget for a ParamSpec and set its value.
-
-    Resolution order
-    ----------------
-    1. ``widget_hint`` — explicit override; beats all type-based logic.
-    2. ``choices``     — QComboBox when an allowed-values list is provided.
-    3. ``type``        — bool → QCheckBox, int → QSpinBox, float → QDoubleSpinBox,
-                         list → QLineEdit (csv), str/fallback → QLineEdit.
-
-    Supported ``widget_hint`` values
-    ---------------------------------
-    ``"path_picker_folder"``  → PathPicker(mode=FOLDER)
-    ``"path_picker_file"``    → PathPicker(mode=OPEN_FILE)
-    ``"path_picker_save"``    → PathPicker(mode=SAVE_FILE)
-    """
-    # ── 1. widget_hint dispatch ───────────────────────────────────────────────
-    # getattr with default keeps third-party ParamSpec implementations working
-    # even when they pre-date this field.
+    """Create an appropriate input widget for a ParamSpec and set its value."""
     hint = getattr(spec, "widget_hint", None)
-    path_modes = {
-        "path_picker_folder": PathPickerMode.FOLDER,
-        "path_picker_file": PathPickerMode.OPEN_FILE,
-        "path_picker_save": PathPickerMode.SAVE_FILE,
-    }
-    if hint in path_modes:
-        picker = PathPicker(spec, mode=path_modes[hint], reset_to_preset=reset_to_preset)
+    if hint in _PATH_HINT_MODES:
+        picker = PathPicker(spec, mode=_PATH_HINT_MODES[hint], reset_to_preset=reset_to_preset)
         _set_widget_value(picker, value)
         return picker
 
-    # ── 2. choices → QComboBox ────────────────────────────────────────────────
     if spec.choices is not None:
-        w = QComboBox()
+        w: QWidget = QComboBox()
         for c in spec.choices:
             w.addItem(str(c), c)
         idx = w.findData(value)
         if idx >= 0:
             w.setCurrentIndex(idx)
-        w._param_spec = spec
-        return w
-
-    if spec.type is bool:
+    elif spec.type is bool:
         w = QCheckBox()
         w.setChecked(bool(value))
-        w._param_spec = spec
-        return w
-
-    if spec.type is int:
+    elif spec.type is int:
         w = FormSpinBox()
         w.setMinimum(int(spec.min) if spec.min is not None else -999999)
         w.setMaximum(int(spec.max) if spec.max is not None else 999999)
         w.setValue(int(value) if value is not None else int(spec.default))
-        w._param_spec = spec
-        return w
-
-    if spec.type in ((int, float), float):
-        w = FormDoubleSpinBox()
-        lo = float(spec.min) if spec.min is not None else -999999.0
-        hi = float(spec.max) if spec.max is not None else 999999.0
-        decimals = _spin_decimals(spec, value)
-        w.setDecimals(decimals)
-        w.setMinimum(lo)
-        w.setMaximum(hi)
-        span = hi - lo
-        if decimals >= 4:
-            w.setSingleStep(10 ** -decimals)
-        elif span <= 5:
-            w.setSingleStep(0.25)
-        elif span <= 20:
-            w.setSingleStep(0.5)
-        elif span <= 200:
-            w.setSingleStep(1.0)
-        else:
-            w.setSingleStep(5.0)
-        w.setValue(float(value) if value is not None else float(spec.default))
-        w._param_spec = spec
-        return w
-
-    if spec.type is list:
+    elif spec.type in ((int, float), float):
+        w = _build_double_spin_widget(spec, value)
+    elif spec.type is list:
         w = QLineEdit()
-        if isinstance(value, list):
-            w.setText(", ".join(str(x) for x in value))
-        else:
-            w.setText(str(value) if value else "")
+        w.setText(", ".join(str(x) for x in value) if isinstance(value, list) else (str(value) if value else ""))
         w.setPlaceholderText("comma-separated values")
         _fit_line_edit(w)
-        w._param_spec = spec
-        return w
-
-    w = QLineEdit()
-    w.setText(str(value) if value is not None else "")
-    _fit_line_edit(w)
+    else:
+        w = QLineEdit()
+        w.setText(str(value) if value is not None else "")
+        _fit_line_edit(w)
     w._param_spec = spec
     return w
 

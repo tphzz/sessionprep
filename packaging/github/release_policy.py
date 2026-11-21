@@ -285,4 +285,4 @@ if __name__ == "__main__":
         main()
     except (ValueError, RuntimeError, KeyError, OSError) as error:
         print(str(error), file=sys.stderr)
-        raise SystemExit(1)
+        raise SystemExit(1) from None

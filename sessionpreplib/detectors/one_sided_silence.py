@@ -49,35 +49,62 @@ class OneSidedSilenceDetector(TrackDetector):
         self.threshold_db = config.get("one_sided_silence_db", -80.0)
         self._db_offset = dbfs_offset(config)
 
+    def _non_applicable(self, summary: str) -> DetectorResult:
+        return DetectorResult(
+            detector_id=self.id,
+            severity=Severity.CLEAN,
+            summary=summary,
+            applicable=False,
+            data={
+                "one_sided_silence": False,
+                "one_sided_silence_side": None,
+                "l_rms_db": float(-np.inf),
+                "r_rms_db": float(-np.inf),
+            },
+        )
+
+    def _build_one_sided_result(
+        self,
+        track: TrackContext,
+        side: str | None,
+        l_rms_db: float,
+        r_rms_db: float,
+        data: dict,
+    ) -> DetectorResult:
+        data["topology_action"] = "extract_channel"
+        data["topology_channel"] = 1 if side == "L" else 0
+        off = self._db_offset
+
+        def fmt_db(x: float) -> str:
+            return f"{float(x) + off:.1f}" if np.isfinite(x) else "-inf"
+
+        side_prefix = f"one-sided silence ({side})" if side else "one-sided silence"
+        summary = f"{side_prefix} (L {fmt_db(l_rms_db)} dBFS, R {fmt_db(r_rms_db)} dBFS)"
+        ch_idx = 0 if side == "L" else 1 if side == "R" else None
+        issues = [IssueLocation(
+            sample_start=0,
+            sample_end=track.total_samples - 1,
+            channel=ch_idx,
+            severity=Severity.ATTENTION,
+            label="one_sided_silence",
+            description=f"channel {side} is silent",
+        )]
+        return DetectorResult(
+            detector_id=self.id,
+            severity=Severity.ATTENTION,
+            summary=summary,
+            data=data,
+            hint="check stereo export / channel routing",
+            issues=issues,
+        )
+
     def analyze(self, track: TrackContext) -> DetectorResult:
         if is_silent(track):
-            return DetectorResult(
-                detector_id=self.id,
-                severity=Severity.CLEAN,
-                summary="silent track",
-                applicable=False,
-                data={
-                    "one_sided_silence": False,
-                    "one_sided_silence_side": None,
-                    "l_rms_db": float(-np.inf),
-                    "r_rms_db": float(-np.inf),
-                },
-            )
+            return self._non_applicable("silent track")
 
         levels = stereo_layout_levels(track)
         if levels is None:
-            return DetectorResult(
-                detector_id=self.id,
-                severity=Severity.CLEAN,
-                summary="requires a stereo track",
-                applicable=False,
-                data={
-                    "one_sided_silence": False,
-                    "one_sided_silence_side": None,
-                    "l_rms_db": float(-np.inf),
-                    "r_rms_db": float(-np.inf),
-                },
-            )
+            return self._non_applicable("requires a stereo track")
 
         _, l_rms_lin, r_rms_lin = levels
         l_rms_db, r_rms_db = linear_to_db(l_rms_lin), linear_to_db(r_rms_lin)
@@ -86,13 +113,9 @@ class OneSidedSilenceDetector(TrackDetector):
         one_sided = False
         side = None
         if l_rms_lin <= silence_lin < r_rms_lin:
-            one_sided = True
-            side = "L"
+            one_sided, side = True, "L"
         elif r_rms_lin <= silence_lin < l_rms_lin:
-            one_sided = True
-            side = "R"
-
-        ch_idx = 0 if side == "L" else 1 if side == "R" else None
+            one_sided, side = True, "R"
 
         data = {
             "one_sided_silence": bool(one_sided),
@@ -100,42 +123,8 @@ class OneSidedSilenceDetector(TrackDetector):
             "l_rms_db": l_rms_db,
             "r_rms_db": r_rms_db,
         }
-
         if one_sided:
-            data["topology_action"] = "extract_channel"
-            data["topology_channel"] = 1 if side == "L" else 0  # If L is silent, extract R (1). If R is silent, extract L (0).
-            off = self._db_offset
-
-            def fmt_db(x):
-                v = float(x) + off
-                return f"{v:.1f}" if np.isfinite(x) else "-inf"
-
-            if side:
-                summary = (
-                    f"one-sided silence ({side}) "
-                    f"(L {fmt_db(l_rms_db)} dBFS, R {fmt_db(r_rms_db)} dBFS)"
-                )
-            else:
-                summary = (
-                    f"one-sided silence "
-                    f"(L {fmt_db(l_rms_db)} dBFS, R {fmt_db(r_rms_db)} dBFS)"
-                )
-            issues = [IssueLocation(
-                sample_start=0,
-                sample_end=track.total_samples - 1,
-                channel=ch_idx,
-                severity=Severity.ATTENTION,
-                label="one_sided_silence",
-                description=f"channel {side} is silent",
-            )]
-            return DetectorResult(
-                detector_id=self.id,
-                severity=Severity.ATTENTION,
-                summary=summary,
-                data=data,
-                hint="check stereo export / channel routing",
-                issues=issues,
-            )
+            return self._build_one_sided_result(track, side, l_rms_db, r_rms_db, data)
 
         return DetectorResult(
             detector_id=self.id,

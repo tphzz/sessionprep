@@ -1,5 +1,6 @@
 """Track Layout tab subpackage."""
 
-from .mixin import TopologyMixin
+from .controller import TopologyController
+from .page import TopologyPage
 
-__all__ = ["TopologyMixin"]
+__all__ = ["TopologyController", "TopologyPage"]
