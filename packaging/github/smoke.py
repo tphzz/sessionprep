@@ -1,6 +1,7 @@
 """Run the real CLI and Qt entry points with disposable audio and preferences."""
 
 import argparse
+import ctypes
 import hashlib
 import json
 import math
@@ -70,6 +71,33 @@ def check_gui(command, directory, env, version):
     print(f"Qt {version}: displayed main window, loaded icon, decoded {len(samples)} samples and closed")
 
 
+def check_portaudio_bundle(gui, platform):
+    """Verify the bundled PortAudio library exists and loads cleanly."""
+    if platform in ("linux-x64", "linux-arm64"):
+        return
+    expected = {
+        "win-x64": "libportaudio64bit.dll",
+        "win-arm64": "libportaudioarm64.dll",
+        "macos-x64": "libportaudio.dylib",
+        "macos-arm64": "libportaudio.dylib",
+    }.get(platform)
+    if expected is None:
+        raise ValueError(f"Unsupported platform for PortAudio bundle check: {platform}")
+    dll = gui.parent / "_sounddevice_data" / "portaudio-binaries" / expected
+    if not dll.is_file():
+        raise FileNotFoundError(f"Bundled PortAudio library missing from GUI payload: {dll}")
+    lib = ctypes.CDLL(str(dll))
+    try:
+        if not hasattr(lib, "Pa_GetVersion"):
+            raise RuntimeError(f"Bundled PortAudio library missing Pa_GetVersion symbol: {dll}")
+    finally:
+        if sys.platform == "win32":
+            import _ctypes
+
+            _ctypes.FreeLibrary(lib._handle)
+    print(f"PortAudio bundle verified: {dll.name}")
+
+
 def native_executables(dist, platform):
     if platform.startswith("macos-"):
         contents = dist / "SessionPrep.app/Contents"
@@ -128,6 +156,7 @@ def main():
             if cli is not None:
                 check_cli([cli], directory, env, args.version)
             check_gui([gui], directory, env, args.version)
+            check_portaudio_bundle(gui, args.platform)
             if args.platform != "win-arm64":
                 reply = json.loads(run([gui, "--ptsl-worker-self-test"], cwd=directory, env=env))
                 if not reply["ok"] or not reply["result"]["ptsl_imported"]:

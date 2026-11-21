@@ -1,0 +1,11 @@
+# Nuitka 4.0's built-in sounddevice package config covers win32+arch_amd64,
+# win32+arch_x86, and macos, but omits win32+arch_arm64. Attach the ARM64
+# PortAudio DLLs to _sounddevice_data (which has no built-in config entry)
+# so Nuitka merges this cleanly without colliding with the sounddevice entry.
+- module-name: '_sounddevice_data'
+  dlls:
+    - from_filenames:
+        relative_path: 'portaudio-binaries'
+        prefixes:
+          - 'libportaudioarm64'
+      when: 'win32 and arch_arm64'

@@ -126,6 +126,17 @@ NUITKA_BYTECODE_MODULES_BY_PLATFORM = {
     "win-arm64": ("scipy.integrate._lebedev",),
 }
 
+# Nuitka's built-in sounddevice DLL config omits Windows ARM64. Include
+# _sounddevice_data and attach libportaudioarm64*.dll via user package config.
+NUITKA_GUI_INCLUDE_PACKAGES_BY_PLATFORM = {
+    "win-arm64": ("_sounddevice_data",),
+}
+NUITKA_GUI_USER_PACKAGE_CONFIGS_BY_PLATFORM = {
+    "win-arm64": (
+        os.path.join(BASE_DIR, "packaging", "windows", "sounddevice-arm64.nuitka-package.config.yml"),
+    ),
+}
+
 # Target Definitions
 TARGETS = {
     "cli": {

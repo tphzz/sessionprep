@@ -2,11 +2,41 @@
 from __future__ import annotations
 
 import time
+from typing import Any
 
-import sounddevice as sd
 from PySide6.QtCore import QObject, Qt, QTimer, Signal, Slot
 
 from sessionpreplib.monitor import MonitorPlayback
+
+
+class _LazySoundDevice:
+    """Defer importing ``sounddevice`` (and PortAudio initialization) until playback."""
+
+    _module: Any = None
+
+    def _load(self) -> Any:
+        if self._module is None:
+            import sounddevice as sounddevice_mod
+            self._module = sounddevice_mod
+        return self._module
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._load(), name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name == "_module":
+            super().__setattr__(name, value)
+        else:
+            setattr(self._load(), name, value)
+
+    def __delattr__(self, name: str) -> None:
+        if name == "_module":
+            super().__delattr__(name)
+        else:
+            delattr(self._load(), name)
+
+
+sd: Any = _LazySoundDevice()
 
 
 class PlaybackController(QObject):
@@ -19,7 +49,7 @@ class PlaybackController(QObject):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._stream: sd.OutputStream | None = None
+        self._stream: Any = None
         self._monitor: MonitorPlayback | None = None
         self._pending: MonitorPlayback | None = None
         self._play_start_sample = 0
@@ -66,14 +96,16 @@ class PlaybackController(QObject):
         generation = self._generation
         self._monitor = monitor
 
-        def callback(outdata, frames, time_info, status):
-            if monitor.render(outdata):
-                raise sd.CallbackStop()
-
         def finished():
             self._stream_finished.emit(generation)
 
         try:
+            callback_stop = sd.CallbackStop
+
+            def callback(outdata, frames, time_info, status):
+                if monitor.render(outdata):
+                    raise callback_stop()
+
             self._stream = sd.OutputStream(
                 samplerate=monitor.sample_rate, channels=monitor.channels,
                 dtype="float32", callback=callback, finished_callback=finished)

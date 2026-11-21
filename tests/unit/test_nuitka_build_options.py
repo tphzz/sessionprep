@@ -134,3 +134,93 @@ def test_arm64_preserves_lebedev_as_bytecode(tmp_path, monkeypatch, target, debu
     assert [arg for arg in command if arg.startswith("--noinclude-custom-mode=")] == expected
     assert not any(arg.startswith("--nofollow-import-to=scipy") for arg in command)
     assert "--low-memory" in command
+    is_win_arm64_gui = native_platform == "win-arm64" and target == "gui"
+    assert ("--include-package=_sounddevice_data" in command) is is_win_arm64_gui
+    user_cfgs = [arg for arg in command if arg.startswith("--user-package-configuration-file=")]
+    assert len(user_cfgs) == (1 if is_win_arm64_gui else 0)
+    if is_win_arm64_gui:
+        assert user_cfgs[0].endswith("sounddevice-arm64.nuitka-package.config.yml")
+
+
+def test_sounddevice_arm64_nuitka_config_merges_cleanly():
+    from pathlib import Path
+    from nuitka.Tracing import plugins_logger
+    from nuitka.utils.Yaml import PackageConfigYaml, parsePackageYaml
+
+    cfg_path = Path(build_conf.NUITKA_GUI_USER_PACKAGE_CONFIGS_BY_PLATFORM["win-arm64"][0])
+    assert cfg_path.is_file()
+    base = parsePackageYaml(
+        logger=plugins_logger,
+        package_name="nuitka.plugins.standard",
+        filename="standard.nuitka-package.config.yml",
+        assume_yes_for_downloads=False,
+        check_checksums=False,
+    )
+    user = PackageConfigYaml(
+        logger=plugins_logger,
+        name=cfg_path.name,
+        file_data=cfg_path.read_bytes(),
+        assume_yes_for_downloads=False,
+        check_checksums=False,
+    )
+    base.update(user)
+    dlls = base.get("_sounddevice_data", "dlls")
+    assert len(dlls) == 1
+    assert dlls[0]["when"] == "win32 and arch_arm64"
+    assert dlls[0]["from_filenames"]["prefixes"] == ["libportaudioarm64"]
+
+
+def test_smoke_check_portaudio_bundle(tmp_path, monkeypatch):
+    import importlib.util
+    from pathlib import Path
+    import shutil
+
+    smoke_path = Path(build_conf.BASE_DIR) / "packaging" / "github" / "smoke.py"
+    spec = importlib.util.spec_from_file_location("sessionprep_smoke", smoke_path)
+    assert spec is not None and spec.loader is not None
+    smoke = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(smoke)
+
+    fake_gui = tmp_path / "sessionprep-gui.dist" / "sessionprep-gui.exe"
+    fake_gui.parent.mkdir(parents=True)
+    smoke.check_portaudio_bundle(fake_gui, "linux-x64")
+    smoke.check_portaudio_bundle(fake_gui, "linux-arm64")
+    with pytest.raises(ValueError, match="Unsupported platform"):
+        smoke.check_portaudio_bundle(fake_gui, "win-amd64")
+    with pytest.raises(FileNotFoundError, match="libportaudioarm64.dll"):
+        smoke.check_portaudio_bundle(fake_gui, "win-arm64")
+    with pytest.raises(FileNotFoundError, match="libportaudio.dylib"):
+        smoke.check_portaudio_bundle(fake_gui, "macos-arm64")
+
+    # Missing Pa_GetVersion symbol raises RuntimeError on all platforms
+    dummy_dll = fake_gui.parent / "_sounddevice_data" / "portaudio-binaries" / "libportaudioarm64.dll"
+    dummy_dll.parent.mkdir(parents=True, exist_ok=True)
+    dummy_dll.write_bytes(b"stub")
+    with monkeypatch.context() as mp:
+        mp.setattr(smoke.ctypes, "CDLL", lambda _p: type("_FakeLib", (), {"_handle": 0})())
+        if sys.platform == "win32":
+            import _ctypes
+
+            mp.setattr(_ctypes, "FreeLibrary", lambda _h: None)
+        with pytest.raises(RuntimeError, match="Pa_GetVersion"):
+            smoke.check_portaudio_bundle(fake_gui, "win-arm64")
+    dummy_dll.unlink()
+
+    # Positive real-DLL load + unload check using _sounddevice_data (never calls Pa_Initialize)
+    platform_suffix = build_conf.get_platform_suffix()
+    expected_name = {
+        "win-x64": "libportaudio64bit.dll",
+        "win-arm64": "libportaudioarm64.dll",
+        "macos-x64": "libportaudio.dylib",
+        "macos-arm64": "libportaudio.dylib",
+    }.get(platform_suffix)
+    if expected_name is not None:
+        import _sounddevice_data
+
+        src = Path(next(iter(_sounddevice_data.__path__))) / "portaudio-binaries" / expected_name
+        assert src.is_file(), f"Expected bundled PortAudio library at {src}"
+        dest = fake_gui.parent / "_sounddevice_data" / "portaudio-binaries" / expected_name
+        shutil.copy2(src, dest)
+        smoke.check_portaudio_bundle(fake_gui, platform_suffix)
+        # Verify Windows handle was released (no lingering file lock)
+        dest.unlink()

@@ -324,3 +324,36 @@ def test_device_failure_after_deferred_seek_releases_transport_controls(devices,
     app.processEvents()
     assert errors == ["Device disconnected"]
     assert finished and not player.is_playing
+
+
+def test_playback_defers_sounddevice_import_until_play_and_handles_init_failure(tmp_path):
+    import os
+    import subprocess
+    import sys
+
+    (tmp_path / "sounddevice.py").write_text(
+        "raise RuntimeError('Error initializing PortAudio: Internal PortAudio error [PaErrorCode -9986]')\n",
+        encoding="utf-8",
+    )
+    script = (
+        "import sys, numpy as np\n"
+        "from PySide6.QtWidgets import QApplication\n"
+        "from sessionprepgui.detail.playback import PlaybackController\n"
+        "assert 'sounddevice' not in sys.modules\n"
+        "app = QApplication([])\n"
+        "player = PlaybackController()\n"
+        "assert 'sounddevice' not in sys.modules\n"
+        "errors = []\n"
+        "player.error.connect(errors.append)\n"
+        "player.play(np.zeros(4800), 48000)\n"
+        "assert not player.is_playing\n"
+        "assert len(errors) == 1 and '-9986' in errors[0]\n"
+        "player.close()\n"
+    )
+    env = {
+        **os.environ,
+        "QT_QPA_PLATFORM": "offscreen",
+        "PYTHONPATH": str(tmp_path) + os.pathsep + os.environ.get("PYTHONPATH", ""),
+    }
+    result = subprocess.run([sys.executable, "-c", script], env=env, capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"

@@ -16,10 +16,27 @@ from build_conf import (
     DIST_NUITKA,
     MACOS_APP_NAME,
     NUITKA_BYTECODE_MODULES_BY_PLATFORM,
+    NUITKA_GUI_INCLUDE_PACKAGES_BY_PLATFORM,
+    NUITKA_GUI_USER_PACKAGE_CONFIGS_BY_PLATFORM,
     get_platform_suffix,
     remove_build_version_file,
     write_build_version_file,
 )
+
+
+def _platform_nuitka_args(target_key):
+    """Return platform-specific Nuitka flags for *target_key*."""
+    suffix = get_platform_suffix()
+    args = [
+        f"--noinclude-custom-mode={module}:bytecode"
+        for module in NUITKA_BYTECODE_MODULES_BY_PLATFORM.get(suffix, ())
+    ]
+    if target_key == "gui":
+        for package in NUITKA_GUI_INCLUDE_PACKAGES_BY_PLATFORM.get(suffix, ()):
+            args.append(f"--include-package={package}")
+        for config in NUITKA_GUI_USER_PACKAGE_CONFIGS_BY_PLATFORM.get(suffix, ()):
+            args.append(f"--user-package-configuration-file={config}")
+    return args
 
 def _check_dependencies(target_key):
     """Ensure required packages for the target are installed."""
@@ -96,8 +113,7 @@ def run_nuitka(target_key, clean=False, *, debug=False, build_version=None, low_
     for package in target.get("nuitka_include_packages", []):
         cmd.append(f"--include-package={package}")
 
-    for module in NUITKA_BYTECODE_MODULES_BY_PLATFORM.get(get_platform_suffix(), ()):
-        cmd.append(f"--noinclude-custom-mode={module}:bytecode")
+    cmd.extend(_platform_nuitka_args(target_key))
 
     # Exclusions (The "Clean Dependencies" Logic)
     for exclude in target.get("nuitka_exclude", []):
