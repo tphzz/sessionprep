@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+import sys
 from bisect import bisect_right
 from hashlib import file_digest, sha256
 from typing import Any
@@ -68,7 +69,7 @@ _SUBTYPE_MAP = {
 }
 
 
-if os.name == "nt":
+if sys.platform == "win32":
     import ctypes
     import msvcrt
     from ctypes import wintypes
@@ -84,7 +85,7 @@ class SourceChangedError(ValueError):
 
 def file_revision(path: str, stat: os.stat_result, *, allow_digest: bool = True) -> str | None:
     """Detect replacements and rewrites that preserve the WAV size and mtime."""
-    if os.name == "nt":
+    if sys.platform == "win32":
         with open(path, "rb") as stream:
             info = _FileBasicInfo()
             handle = wintypes.HANDLE(msvcrt.get_osfhandle(stream.fileno()))
