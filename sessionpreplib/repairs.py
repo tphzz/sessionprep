@@ -9,9 +9,10 @@ from hashlib import sha256
 import math
 from numbers import Real
 from threading import Lock
+from typing import Any
 
 import numpy as np
-from scipy import optimize, signal
+from scipy import signal
 
 
 @dataclass(frozen=True)
@@ -145,15 +146,86 @@ def check_output_headroom(audio: np.ndarray, subtype: str) -> None:
     raise OutputHeadroomError(peak_db, reduction, subtype, excess_db=exact_tenths / 10)
 
 
+def _rect_scalar(offset: float, width: int) -> complex:
+    f_int = round(offset)
+    df = offset - f_int
+    k = f_int % width
+    if k > width // 2:
+        k -= width
+    if abs(df) < 1e-15:
+        return 1.0 + 0.0j if k == 0 else 0.0 + 0.0j
+    d = k + df
+    pf_frac = math.pi * df
+    theta = (math.pi / width) * d
+    s = math.sin(theta)
+    num = math.sin(pf_frac) * complex(math.cos(pf_frac), math.sin(pf_frac))
+    return (num / (width * s)) * complex(math.cos(theta), -s)
+
+
+def _brent_bounded(func, a: float, b: float, xatol: float = 1e-10, maxiter: int = 500) -> float:
+    """Bounded Brent 1D minimizer matching SciPy's ``minimize_scalar(method='bounded')``."""
+    sqrt_eps = 1.4901161193847656e-08
+    golden_mean = 0.3819660112501051
+    x = w = v = a + golden_mean * (b - a)
+    fx = fw = fv = func(x)
+    d = e = 0.0
+    for _ in range(maxiter):
+        xm = 0.5 * (a + b)
+        tol1 = sqrt_eps * abs(x) + xatol / 3.0
+        tol2 = 2.0 * tol1
+        if abs(x - xm) <= tol2 - 0.5 * (b - a):
+            return x
+        use_golden = True
+        if abs(e) > tol1:
+            r = (x - w) * (fx - fv)
+            q = (x - v) * (fx - fw)
+            p = (x - v) * q - (x - w) * r
+            q = 2.0 * (q - r)
+            if q > 0.0:
+                p = -p
+            q = abs(q)
+            r = e
+            e = d
+            if abs(p) < abs(0.5 * q * r) and p > q * (a - x) and p < q * (b - x):
+                d = p / q
+                u = x + d
+                if (u - a) < tol2 or (b - u) < tol2:
+                    d = tol1 if x < xm else -tol1
+                use_golden = False
+        if use_golden:
+            e = (b - x) if x < xm else (a - x)
+            d = golden_mean * e
+        u = (x + d) if abs(d) >= tol1 else (x + (tol1 if d > 0 else -tol1))
+        fu = func(u)
+        if fu <= fx:
+            if u < x:
+                b = x
+            else:
+                a = x
+            v, fv, w, fw, x, fx = w, fw, x, fx, u, fu
+        else:
+            if u < x:
+                a = u
+            else:
+                b = u
+            if fu <= fw or w == x:
+                v, fv, w, fw = w, fw, u, fu
+            elif fu <= fv or v == x or v == w:
+                v, fv = u, fu
+    return x
+
+
 class _BoundaryPartial:
     """Resolve one stationary partial in the Hann main lobe at a decision edge."""
 
     def __init__(self, cycles, width, window_dc):
-        self.width = width
+        self.width = int(width)
+        self.inv_w = 1.0 / self.width
+        self.half_w = self.width * 0.5
         self.edge = float(cycles)
         self.bins = np.arange(max(0, math.ceil(cycles - 3)),
                               min(len(window_dc), math.floor(cycles + 3) + 1))
-        self.extended_bins = np.arange(self.bins[0] - 1, self.bins[-1] + 2)
+        self.extended_bins = np.arange(self.bins[0] - 1, self.bins[-1] + 2, dtype=np.int64)
         self.window_dc = window_dc[self.bins]
         self.dc_axis = None
         if self.bins[0] <= 1:
@@ -171,32 +243,72 @@ class _BoundaryPartial:
             self.background = np.eye(len(self.bins)) - columns @ np.linalg.pinv(columns)
         self.grid = np.unique(np.clip(self.edge + np.arange(-2, 2.25, 0.5),
                                       1e-8, self.width / 2))
-        self.bases = self._basis(self.grid)
+        self.bases = np.stack([self._basis_scalar(float(f)) for f in self.grid], axis=0)
         self.inverses = np.linalg.pinv(self.bases)
-        self._trial_bases = {}
+        self._trial_bases: dict[float, tuple[np.ndarray, float, float, float, float]] = {}
 
-    def _rect(self, offsets):
-        # Exact normalized finite geometric sum, periodic in DFT-bin units.
-        # Wrapping also covers the negative-frequency image near Nyquist.
-        d = np.remainder(offsets + self.width / 2, self.width) - self.width / 2
-        return np.exp(1j * np.pi * d * (1 - 1 / self.width)) * np.sinc(d) / np.sinc(d / self.width)
+    def _rect_ext(self, f: float) -> np.ndarray:
+        """Exact Dirichlet kernel at ``f - self.extended_bins`` without cancellation."""
+        w = self.width
+        f_int = round(f)
+        df = f - f_int
+        k = (f_int - self.extended_bins) % w
+        k = np.where(k > self.half_w, k - w, k)
+        if abs(df) < 1e-15:
+            return np.where(k == 0, 1.0 + 0.0j, 0.0 + 0.0j)
+        d = k + df
+        pf_frac = math.pi * df
+        num = math.sin(pf_frac) * complex(math.cos(pf_frac), math.sin(pf_frac))
+        theta = (math.pi * self.inv_w) * d
+        s = np.sin(theta)
+        return (num / (w * s)) * (np.cos(theta) - 1j * s)
 
-    def _basis(self, f):
+    def _basis_scalar(self, f: float) -> np.ndarray:
         # The measured frame has its arithmetic mean removed before windowing.
         # Fit both images of a real sinusoid, including the windowed mean.
-        cycles = np.stack((f, -f), axis=-1)[..., None]
-        rect = self._rect(cycles - self.extended_bins)
-        tones = 0.5 * rect[..., 1:-1] - 0.25 * (rect[..., :-2] + rect[..., 2:])
-        tones -= self._rect(cycles) * self.window_dc
-        cosine = (tones[..., 0, :] + tones[..., 1, :]) / 2
-        sine = (tones[..., 0, :] - tones[..., 1, :]) / (2j)
-        basis = np.stack((cosine, sine), axis=-1)
+        w = self.width
+        r_pos = self._rect_ext(f)
+        r_neg = self._rect_ext(-f)
+        t_pos = 0.5 * r_pos[1:-1] - 0.25 * (r_pos[:-2] + r_pos[2:]) - _rect_scalar(f, w) * self.window_dc
+        t_neg = 0.5 * r_neg[1:-1] - 0.25 * (r_neg[:-2] + r_neg[2:]) - _rect_scalar(-f, w) * self.window_dc
+        cosine = 0.5 * (t_pos + t_neg)
+        sine = -0.5j * (t_pos - t_neg)
         if self.background is not None:
-            basis = self.background @ basis
-        basis = np.concatenate((basis.real, basis.imag), axis=-2)
+            cosine = self.background @ cosine
+            sine = self.background @ sine
+        m = len(cosine)
+        basis = np.empty((2 * m, 2), dtype=np.float64)
+        basis[:m, 0] = cosine.real
+        basis[m:, 0] = cosine.imag
+        basis[:m, 1] = sine.real
+        basis[m:, 1] = sine.imag
         if self.dc_axis is not None:
-            basis -= self.dc_axis[:, None] * (self.dc_axis @ basis)[..., None, :]
+            proj = self.dc_axis @ basis
+            basis -= np.outer(self.dc_axis, proj)
         return basis
+
+    def _basis(self, f):
+        if np.ndim(f) == 0:
+            return self._basis_scalar(float(f))
+        return np.stack([self._basis_scalar(float(v)) for v in f], axis=0)
+
+    def _trial_entry(self, frequency: float) -> tuple[np.ndarray, float, float, float, float]:
+        entry = self._trial_bases.get(frequency)
+        if entry is None:
+            basis = self._basis_scalar(frequency)
+            b0 = basis[:, 0]
+            b1 = basis[:, 1]
+            g00 = float(b0 @ b0)
+            g01 = float(b0 @ b1)
+            g11 = float(b1 @ b1)
+            det = g00 * g11 - g01 * g01
+            # The bounded solver revisits the same trial frequencies in
+            # nearby audio frames. Keep a small, window-local working set.
+            if len(self._trial_bases) >= 96:
+                self._trial_bases.clear()
+            entry = (basis, g00, g01, g11, det)
+            self._trial_bases[frequency] = entry
+        return entry
 
     def observe(self, spectrum):
         local = spectrum[self.bins] / self.width
@@ -208,7 +320,7 @@ class _BoundaryPartial:
         return vector
 
     def fit(self, vector, noise_power):
-        power = vector @ vector
+        power = float(vector @ vector)
         if not power or len(self.bins) < 3:
             return None
         coeffs = self.inverses @ vector
@@ -217,58 +329,126 @@ class _BoundaryPartial:
         best = int(errors.argmin())
         if errors[best] > 0.25 * power:
             return None
-        centre = self.grid[best]
+        centre = float(self.grid[best])
         # The residual of a real line includes the source's spectral noise
         # floor. Cap its allowance so a noisy or blended lobe cannot qualify.
         tolerance = max(1e-12 * power, min(1e-5 * power, 12 * len(self.bins) * noise_power))
         if errors[best] <= 1e-12 * power or (centre == self.edge and errors[best] <= tolerance):
             return centre, coeffs[best], True
 
-        def fit_at(offset):
-            frequency = centre + offset
-            basis = self._trial_bases.get(frequency)
-            if basis is None:
-                basis = self._basis(frequency)
-                # The bounded solver revisits the same trial frequencies in
-                # nearby audio frames. Keep a small, window-local working set.
-                if len(self._trial_bases) >= 96:
-                    self._trial_bases.clear()
-                self._trial_bases[frequency] = basis
+        def fit_at(offset: float):
+            basis, g00, g01, g11, det = self._trial_entry(centre + offset)
+            if (
+                det > 1e-12 * g00 * g11
+                and min(g00, g11) > 1e-24 * max(g00, g11)
+            ):
+                b0 = basis[:, 0]
+                b1 = basis[:, 1]
+                r0 = float(b0 @ vector)
+                r1 = float(b1 @ vector)
+                inv_det = 1.0 / det
+                c0 = (g11 * r0 - g01 * r1) * inv_det
+                c1 = (g00 * r1 - g01 * r0) * inv_det
+                residual = vector - c0 * b0 - c1 * b1
+                return float(residual @ residual), np.array((c0, c1), dtype=np.float64)
             cs = np.linalg.lstsq(basis, vector, rcond=None)[0]
             residual = vector - basis @ cs
-            return residual @ residual, cs
+            return float(residual @ residual), cs
 
-        lower = self.grid[max(0, best - 1)] - centre
-        upper = self.grid[min(len(self.grid) - 1, best + 1)] - centre
-        optimum = optimize.minimize_scalar(lambda offset: fit_at(offset)[0], method="bounded",
-                                          bounds=(lower, upper), options={"xatol": 1e-10})
-        error, cs = fit_at(optimum.x)
+        lower = float(self.grid[max(0, best - 1)]) - centre
+        upper = float(self.grid[min(len(self.grid) - 1, best + 1)]) - centre
+        opt_x = _brent_bounded(lambda offset: fit_at(offset)[0], lower, upper, xatol=1e-10)
+        error, cs = fit_at(opt_x)
         if error > 0.02 * power:
             return None
-        return centre + optimum.x, cs, error <= tolerance
+        return centre + opt_x, cs, error <= tolerance
+
+
+@dataclass(frozen=True)
+class _BandGeometry:
+    """Immutable calibrated window arrays shared across tracks and threads."""
+
+    width: int
+    low: float
+    high: float
+    bin_hz: float
+    nyquist: float
+    freqs: np.ndarray
+    phase: np.ndarray
+    window: np.ndarray
+    window_energy: float
+    window_dc: np.ndarray
+    weights: np.ndarray
+
+
+def _build_band_geometry(width: int, rate: Any, low: Any, high: Any) -> _BandGeometry:
+    bin_hz = rate / width
+    nyquist = rate / 2
+    freqs = np.fft.rfftfreq(width, 1 / rate)
+    phase = 2 * np.pi * np.arange(width) / width
+    window = signal.windows.hann(width, sym=False)
+    window_energy = float(np.sum(window ** 2))
+    window_dc = np.fft.rfft(window) / width
+    weights = np.full(len(freqs), 2.0 / (width * window_energy))
+    # The signal's DC was removed before windowing. Tapering a real AC
+    # component can put legitimate energy in the DC bin (and at Nyquist).
+    weights[0] *= 0.5
+    if width % 2 == 0:
+        weights[-1] *= 0.5
+    for arr in (freqs, phase, window, window_dc, weights):
+        arr.flags.writeable = False
+    return _BandGeometry(
+        width=width, low=low, high=high, bin_hz=bin_hz, nyquist=nyquist,
+        freqs=freqs, phase=phase, window=window, window_energy=window_energy,
+        window_dc=window_dc, weights=weights,
+    )
+
+
+@lru_cache(maxsize=32)
+def _band_geometry_cached(
+    width: int,
+    rate_key: tuple[type, object],
+    low_key: tuple[type, object],
+    high_key: tuple[type, object],
+) -> _BandGeometry:
+    return _build_band_geometry(width, rate_key[1], low_key[1], high_key[1])
+
+
+def _find_local_peaks(powers: np.ndarray) -> np.ndarray:
+    """Return local maxima indices matching ``scipy.signal.find_peaks`` without overhead."""
+    if len(powers) < 3:
+        return np.empty(0, dtype=np.intp)
+    mid = powers[1:-1]
+    left = powers[:-2]
+    right = powers[2:]
+    if np.any(mid == right):
+        return signal.find_peaks(powers)[0]
+    return np.flatnonzero((mid > left) & (mid > right)) + 1
 
 
 class _BandWindow:
     """One calibrated Hann window reused for every channel and hop."""
 
     def __init__(self, width, rate, low, high):
-        self.low, self.high = low, high
-        self.bin_hz = rate / width
-        self.nyquist = rate / 2
-        self.freqs = np.fft.rfftfreq(width, 1 / rate)
-        self.phase = 2 * np.pi * np.arange(width) / width
-        self.window = signal.windows.hann(width, sym=False)
-        self.window_energy = np.sum(self.window ** 2)
-        window_dc = np.fft.rfft(self.window) / width
+        if all(isinstance(v, Hashable) for v in (rate, low, high)):
+            geom = _band_geometry_cached(
+                int(width), (type(rate), rate), (type(low), low), (type(high), high)
+            )
+        else:
+            geom = _build_band_geometry(int(width), rate, low, high)
+        self.low, self.high = geom.low, geom.high
+        self.bin_hz = geom.bin_hz
+        self.nyquist = geom.nyquist
+        self.freqs = geom.freqs
+        self.phase = geom.phase
+        self.window = geom.window
+        self.window_energy = geom.window_energy
+        self.weights = geom.weights
         # Adjacent hops and channels often resolve the same neighboring FFT bins.
         # Only the basis depends on the bin. Its fit still uses the current audio.
-        self._partial = lru_cache(maxsize=64)(partial(_BoundaryPartial, width=width, window_dc=window_dc))
-        self.weights = np.full(len(self.freqs), 2.0 / (width * self.window_energy))
-        # The signal's DC was removed before windowing. Tapering a real AC
-        # component can put legitimate energy in the DC bin (and at Nyquist).
-        self.weights[0] *= 0.5
-        if width % 2 == 0:
-            self.weights[-1] *= 0.5
+        self._partial = lru_cache(maxsize=64)(
+            partial(_BoundaryPartial, width=geom.width, window_dc=geom.window_dc)
+        )
         self.edges = [(hz, side, self._partial(hz / self.bin_hz))
                       for hz, side in ((low, 1), (high, -1)) if 0 < hz < self.nyquist]
         self.partials = [partial for _, _, partial in self.edges]
@@ -277,7 +457,49 @@ class _BandWindow:
             # here even when the upper decision edge is many bins away.
             self.partials.append(self._partial(0))
 
-    def _resolve(self, partial, spectrum, powers, noise):
+    def _top_neighbor_peaks(self, partial, powers, max_power, peaks_cache, local_peak, has_fit):
+        use_windowed = False
+        if not has_fit:
+            threshold = 1e-5 * local_peak
+            if threshold > 0.0:
+                ratio = max_power / threshold
+                if ratio < 1.0:
+                    return np.empty(0, dtype=np.intp), np.empty(0, dtype=np.float64)
+                max_dist = 3.0 + ratio ** (1.0 / 6.0)
+                if math.isfinite(max_dist) and max_dist < len(powers):
+                    lo = max(0, math.floor(partial.edge - max_dist) - 1)
+                    hi = min(len(powers), math.ceil(partial.edge + max_dist) + 2)
+                    sub_peaks = _find_local_peaks(powers[lo:hi])
+                    if not len(sub_peaks):
+                        return np.empty(0, dtype=np.intp), np.empty(0, dtype=np.float64)
+                    peaks = sub_peaks + lo
+                    use_windowed = True
+        if not use_windowed:
+            if peaks_cache[0] is None:
+                peaks_cache[0] = _find_local_peaks(powers)
+            peaks = peaks_cache[0]
+            if not len(peaks):
+                return np.empty(0, dtype=np.intp), np.empty(0, dtype=np.float64)
+        distance = np.abs(peaks - partial.edge)
+        eligible = (distance >= 4) & (powers[peaks] >= 0.01 * local_peak)
+        if not np.any(eligible):
+            return np.empty(0, dtype=np.intp), np.empty(0, dtype=np.float64)
+        peaks, distance = peaks[eligible], distance[eligible]
+        # The Hann sidelobe amplitude decays as inverse frequency cubed.
+        influence = powers[peaks] / (distance - 3) ** 6
+        if not has_fit:
+            strong = influence >= 1e-5 * local_peak
+            if not np.any(strong):
+                return np.empty(0, dtype=np.intp), np.empty(0, dtype=np.float64)
+            peaks, influence = peaks[strong], influence[strong]
+        if len(influence) > 3:
+            top = np.argpartition(influence, -3)[-3:]
+            order = top[np.argsort(influence[top])[::-1]]
+        else:
+            order = np.argsort(influence)[::-1]
+        return peaks[order], influence[order]
+
+    def _resolve(self, partial, spectrum, powers, max_power, noise, peaks_cache):
         vector = partial.observe(spectrum)
         if not np.any(vector):
             return None
@@ -291,32 +513,25 @@ class _BandWindow:
         # A separated program partial can leak into a quiet band-edge lobe.
         # Identify it at its own peak, subtract its predicted leakage only
         # from the coefficients being fitted, then check the edge fit again.
-        local_peak = powers[partial.bins].max()
-        peaks = signal.find_peaks(powers)[0]
-        distance = np.abs(peaks - partial.edge)
-        eligible = (distance >= 4) & (powers[peaks] >= 0.01 * local_peak)
-        peaks, distance = peaks[eligible], distance[eligible]
-        # The Hann sidelobe amplitude decays as inverse frequency cubed.
-        influence = powers[peaks] / (distance - 3) ** 6
-        order = np.argsort(influence)[-3:][::-1]
-        for index in order:
-            if fit is None and influence[index] < 1e-5 * local_peak:
-                break
-            k = peaks[index]
-            remote = self._partial(k)
+        local_peak = float(powers[partial.bins].max())
+        top_peaks, _top_inf = self._top_neighbor_peaks(
+            partial, powers, max_power, peaks_cache, local_peak, fit is not None
+        )
+        for k in top_peaks:
+            remote = self._partial(int(k))
             measured = remote.observe(spectrum)
             corrected = vector
             # Each initially fitted tone contains a little of the other's
             # sidelobe. Refine both estimates before trying another neighbor.
             for _ in range(3):
-                remote_vector = measured if cs is None else measured - remote._basis(cycles) @ cs
+                remote_vector = measured if cs is None else measured - remote._basis_scalar(cycles) @ cs
                 background = remote.fit(remote_vector, noise)
                 if background is None:
                     break
                 f, gains, _ = background
                 if abs(f - cycles) < 4:
                     break  # overlapping Hann main lobes
-                corrected = vector - partial._basis(f) @ gains
+                corrected = vector - partial._basis_scalar(f) @ gains
                 candidate = partial.fit(corrected, noise)
                 if candidate is None:
                     break
@@ -337,32 +552,31 @@ class _BandWindow:
             noise /= len(self.window) ** 2
         return noise
 
-    def _spectrum(self, ac):
-        raw = np.fft.rfft(ac)
+    def _spectrum_from_raw(self, raw: np.ndarray, length: int):
         # Multiplication by a periodic Hann or its derivative is a three-bin
         # convolution. Reflect the one-sided real FFT at DC and Nyquist.
-        last = -2 if len(ac) % 2 == 0 else -1
+        last = -2 if length % 2 == 0 else -1
         padded = np.concatenate((raw[1:2].conj(), raw, [raw[last].conj()]))
         left, right = padded[:-2], padded[2:]
         sides = (left + right) * 0.25
         return 0.5 * raw - sides, self.bin_hz / (4j) * (left - right), sides
 
-    def levels(self, block):
-        scale = np.max(np.abs(block))
-        if not scale:
-            return -math.inf, -math.inf, -math.inf
-        ac = np.asarray(block, dtype=np.float64) / scale
-        ac -= ac.mean()
-        spectrum, derivative, sides = self._spectrum(ac)
-        powers = np.abs(spectrum) ** 2
-        total = np.sum(powers * self.weights)
+    def _spectrum(self, ac):
+        return self._spectrum_from_raw(np.fft.rfft(ac), len(ac))
+
+    def levels_from_raw(self, ac: np.ndarray, raw: np.ndarray, scale: float):
+        spectrum, derivative, sides = self._spectrum_from_raw(raw, len(ac))
+        powers = spectrum.real * spectrum.real + spectrum.imag * spectrum.imag
+        total = float(np.dot(powers, self.weights))
         if not total:
             return -math.inf, -math.inf, -math.inf
         tol = 1e-7 * self.bin_hz
         partial_power = 0.0
         noise = self._noise_power(powers)
+        max_power = float(powers.max())
+        peaks_cache: list[np.ndarray | None] = [None]
         for boundary in self.partials:
-            fit = self._resolve(boundary, spectrum, powers, noise)
+            fit = self._resolve(boundary, spectrum, powers, max_power, noise, peaks_cache)
             if fit is None:
                 continue
             cycles, (cosine, sine) = fit
@@ -370,11 +584,13 @@ class _BandWindow:
             line = cosine * np.cos(phase) + sine * np.sin(phase)
             line -= line.mean()
             if self.low - tol <= cycles * self.bin_hz <= self.high + tol:
-                partial_power += np.sum((line * self.window) ** 2) / self.window_energy
-            ac -= line
+                partial_power += float(np.sum((line * self.window) ** 2)) / self.window_energy
+            ac = ac - line
             spectrum, derivative, sides = self._spectrum(ac)
-            powers = np.abs(spectrum) ** 2
+            powers = spectrum.real * spectrum.real + spectrum.imag * spectrum.imag
             noise = self._noise_power(powers)
+            max_power = float(powers.max())
+            peaks_cache[0] = None
 
         # Diffuse energy and overlapping lines use the local phase derivative
         # (Flandrin et al., Time-frequency reassignment, eq. 5.20).
@@ -382,7 +598,11 @@ class _BandWindow:
         shift = np.divide(derivative, spectrum, out=derivative, where=spectrum != 0)
         frequency = np.clip(self.freqs - shift.imag, 0, self.nyquist)
         inside = (frequency > 0) & (frequency >= self.low - tol) & (frequency <= self.high + tol)
-        confirmed = inside.copy()
+        inside_power = float(powers[inside].sum())
+        power = inside_power + partial_power
+        if not power:
+            return -math.inf, -math.inf, -math.inf
+        any_rejected = False
         for hz, direction, edge_partial in self.edges:
             bins = edge_partial.bins
             local = spectrum[bins]
@@ -391,17 +611,48 @@ class _BandWindow:
             second = self.bin_hz ** 2 * sides[bins]
             np.divide(second, local, out=second, where=local != 0)
             spread = np.sqrt(np.abs(shift[bins] ** 2 - second))
-            confirmed[bins] &= direction * (frequency[bins] - hz) >= spread - tol
-
-        power = powers[inside].sum() + partial_power
-        if not power:
-            return -math.inf, -math.inf, -math.inf
-        confident = powers[confirmed].sum() + partial_power
+            rejected = inside[bins] & ~(direction * (frequency[bins] - hz) >= spread - tol)
+            if np.any(rejected):
+                inside[bins[rejected]] = False
+                any_rejected = True
+        confident = (float(powers[inside].sum()) if any_rejected else inside_power) + partial_power
         level = 10 * math.log10(power) + 20 * math.log10(scale)
         ratio = min(0.0, 10 * math.log10(power / total))
         confidence_db = 10 * math.log10(confident / power) if confident else -math.inf
         return level, ratio, confidence_db
 
+    def levels(self, block):
+        scale = float(np.max(np.abs(block)))
+        if not scale:
+            return -math.inf, -math.inf, -math.inf
+        ac = np.asarray(block, dtype=np.float64) / scale
+        ac -= ac.mean()
+        return self.levels_from_raw(ac, np.fft.rfft(ac), scale)
+
+    def measure_chunk(self, samples: np.ndarray, count: int, width: int, hop: int):
+        """Measure *count* overlapping windows in one batched rfft pass."""
+        if count <= 0:
+            return ()
+        if count == 1:
+            return (self.levels(samples[:width]),)
+        windows = np.lib.stride_tricks.sliding_window_view(samples, width)[::hop][:count]
+        scales = np.max(np.abs(windows), axis=1).astype(np.float64)
+        active = np.flatnonzero(scales > 0)
+        results: list[tuple[float, float, float]] = [(-math.inf, -math.inf, -math.inf)] * count
+        if not len(active):
+            return tuple(results)
+        ac_batch = windows[active].astype(np.float64, copy=True)
+        ac_batch /= scales[active, None]
+        ac_batch -= ac_batch.mean(axis=1, keepdims=True)
+        raw_batch = np.fft.rfft(ac_batch, axis=1)
+        for batch_idx, win_idx in enumerate(active):
+            results[int(win_idx)] = self.levels_from_raw(
+                ac_batch[batch_idx], raw_batch[batch_idx], float(scales[win_idx])
+            )
+        return tuple(results)
+
+
+_DEFAULT_BAND_LEVELS = _BandWindow.levels
 
 # Cache window readings only. Each entry holds at most 32 triples of numbers.
 _band_readings: OrderedDict[tuple[object, ...], list[tuple[int, float, float, float]]] = OrderedDict()
@@ -434,7 +685,10 @@ def _channel_readings(channel, meter, sample_rate, width, hop):
             if readings is not None:
                 _band_readings.move_to_end(key)
         if readings is None:
-            readings = tuple(meter.levels(samples[i * hop:i * hop + width]) for i in range(count))
+            if type(meter).levels is _DEFAULT_BAND_LEVELS and "levels" not in vars(meter):
+                readings = meter.measure_chunk(samples, count, width, hop)
+            else:
+                readings = tuple(meter.levels(samples[i * hop:i * hop + width]) for i in range(count))
             with _band_readings_lock:
                 _band_readings[key] = readings
                 _band_readings.move_to_end(key)

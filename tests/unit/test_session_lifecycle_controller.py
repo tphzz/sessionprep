@@ -280,3 +280,242 @@ def test_persistence_parents_peak_worker_and_drains_on_dispose(_font_app, tmp_pa
         for w in widgets:
             w.deleteLater()
         _font_app.processEvents()
+
+
+def test_default_project_name_helper_handles_edges(tmp_path):
+    import os
+    from sessionprepgui.analysis.persistence_controller import _default_project_name
+
+    assert _default_project_name(str(tmp_path / "My_Song") + os.sep) == "My_Song"
+    assert _default_project_name(os.path.join(str(tmp_path), "Spektakulatius_Full")) == "Spektakulatius_Full"
+    if os.name == "nt":
+        assert _default_project_name(r"D:\multitracks\Spektakulatius_Full") == "Spektakulatius_Full"
+    assert _default_project_name(os.path.join(str(tmp_path), "Bad:Name?Test")) == "BadNameTest"
+    assert _default_project_name("") == ""
+    assert _default_project_name("   ") == ""
+    assert _default_project_name(os.path.abspath(os.sep)) == ""
+    assert _default_project_name("..") == _default_project_name(os.path.abspath(".."))
+    assert _default_project_name(".") == _default_project_name(os.path.abspath("."))
+    assert _default_project_name(os.path.join(str(tmp_path), "...")) == ""
+
+
+def test_load_directory_defaults_phase3_project_name_and_preserves_on_reanalyze(_font_app, tmp_path):
+    from PySide6.QtWidgets import QLineEdit
+
+    song_dir = tmp_path / "OurLoveIsHereToStay"
+    song_dir.mkdir()
+    sf.write(song_dir / "kick.wav", np.zeros(4800), 48000)
+
+    state = WorkspaceState(config=build_defaults())
+    shell = _StubShell()
+    persistence, analysis, _phase2, widgets = _make_controllers(state, shell)
+    edit = QLineEdit()
+    persistence._daw_ctrl.page.project_name_edit = edit
+    # Mirror MainWindow wiring so clear_workspace clears the edit field
+    persistence.workspace_cleared.connect(lambda _k: edit.clear())
+    widgets.append(edit)
+    try:
+        persistence.load_directory(str(song_dir))
+        assert edit.text() == "OurLoveIsHereToStay"
+        assert state.session is not None
+        assert state.session.project_name == "OurLoveIsHereToStay"
+
+        # User edits project name -> Reanalyze (keep_session_config=True) preserves custom name
+        edit.setText("Custom Mix Name")
+        persistence.load_directory(str(song_dir), keep_session_config=True)
+        assert edit.text() == "Custom Mix Name"
+        assert state.session.project_name == "Custom Mix Name"
+
+        # Opening a different folder resets to the new directory's basename
+        other_dir = tmp_path / "AnotherTrack"
+        other_dir.mkdir()
+        sf.write(other_dir / "snare.wav", np.zeros(4800), 48000)
+        persistence.load_directory(str(other_dir))
+        assert edit.text() == "AnotherTrack"
+        assert state.session.project_name == "AnotherTrack"
+
+        # Opening an empty directory leaves project_name_edit cleared
+        empty_dir = tmp_path / "EmptySong"
+        empty_dir.mkdir()
+        persistence.load_directory(str(empty_dir))
+        assert edit.text() == ""
+    finally:
+        analysis.dispose()
+        persistence.dispose()
+        analysis.deleteLater()
+        persistence.deleteLater()
+        for w in widgets:
+            w.deleteLater()
+        _font_app.processEvents()
+
+
+def test_prepare_and_analyze_stop_phase2_playback(_font_app, tmp_path, monkeypatch):
+    from sessionprepgui.analysis import analysis_controller as ac_mod
+
+    state = WorkspaceState(config=build_defaults())
+    shell = _StubShell()
+    persistence, analysis, _phase2, widgets = _make_controllers(state, shell)
+    stops: list[bool] = []
+    analysis._detail_ctrl.stop = lambda: stops.append(True)
+
+    class _NoopWorker:
+        def __init__(self, *args, **kwargs):
+            self.progress = SimpleNamespace(connect=lambda *a, **k: None)
+            self.progress_value = SimpleNamespace(connect=lambda *a, **k: None)
+            self.track_analyzed = SimpleNamespace(connect=lambda *a, **k: None)
+            self.track_planned = SimpleNamespace(connect=lambda *a, **k: None)
+            self.completed = SimpleNamespace(connect=lambda *a, **k: None)
+            self.error = SimpleNamespace(connect=lambda *a, **k: None)
+            self.finished = SimpleNamespace(connect=lambda *a, **k: None)
+            self.layout_files = None
+            self.interrupted_repairs = None
+
+        def start(self):
+            pass
+
+        def cancel(self):
+            pass
+
+        def disconnect(self, *_args):
+            pass
+
+        def isRunning(self):
+            return False
+
+        def deleteLater(self):
+            pass
+
+    monkeypatch.setattr(ac_mod, "PrepareWorker", _NoopWorker)
+    monkeypatch.setattr(ac_mod, "AnalyzeWorker", _NoopWorker)
+    try:
+        state.source_dir = str(tmp_path)
+        state.session = SessionContext(tracks=[], config={})
+
+        analysis.prepare()
+        assert len(stops) == 1
+        analysis.prepare_worker = None
+
+        analysis.analyze()
+        assert len(stops) == 2
+        analysis.analyze_worker = None
+    finally:
+        analysis.dispose()
+        persistence.dispose()
+        analysis.deleteLater()
+        persistence.deleteLater()
+        for w in widgets:
+            w.deleteLater()
+        _font_app.processEvents()
+
+
+def test_phase_switches_stop_active_playback(_font_app, monkeypatch):
+    from sessionprepgui.mainwindow import SessionPrepWindow
+    from sessionprepgui.tracks.table_widgets import _PHASE_ANALYSIS, _PHASE_SETUP, _PHASE_TOPOLOGY
+
+    win = SessionPrepWindow()
+    try:
+        win.set_phase_enabled(_PHASE_ANALYSIS, True)
+        win.set_phase_enabled(_PHASE_SETUP, True)
+
+        playing = [False]
+        stop_calls: list[str] = []
+
+        monkeypatch.setattr(type(win._playback), "is_playing", property(lambda _self: playing[0]))
+        monkeypatch.setattr(
+            win._playback,
+            "stop",
+            lambda: (playing.__setitem__(0, False), stop_calls.append("playback")),
+        )
+
+        # Phase 1 -> Phase 2 stops Phase 1 preview without touching Phase 2 cursor
+        dummy = np.zeros(4800, dtype=np.float32)
+        win.phase2_page.wf_panel.waveform.set_audio(dummy, 48000)
+        win.topology_controller.page.wf_panel.waveform.set_audio(dummy, 48000)
+        win.phase2_page.wf_panel.waveform.set_cursor(1234)
+        playing[0] = True
+        win.switch_to_phase(_PHASE_ANALYSIS)
+        assert not playing[0] and len(stop_calls) == 1
+        assert win.phase2_page.wf_panel.waveform._cursor_sample == 1234
+        assert win._space_shortcut.isEnabled()
+
+        # Phase 2 -> Phase 3 stops Phase 2 playback, clears pending_play, disables Space shortcut
+        win.topology_controller.page.wf_panel.waveform.set_cursor(567)
+        win._repair_preview.pending_play = (100, "as_is", None)
+        playing[0] = True
+        win.switch_to_phase(_PHASE_SETUP)
+        assert not playing[0] and len(stop_calls) == 2
+        assert win._repair_preview.pending_play is None
+        assert win.topology_controller.page.wf_panel.waveform._cursor_sample == 567
+        assert not win._space_shortcut.isEnabled()
+
+        # Back to Phase 2 from Phase 3, play again, return to Phase 3 -> stops again
+        win.switch_to_phase(_PHASE_ANALYSIS)
+        assert win._space_shortcut.isEnabled()
+        playing[0] = True
+        win.switch_to_phase(_PHASE_SETUP)
+        assert not playing[0] and len(stop_calls) == 3
+
+        # Phase 2 -> Phase 1 and direct Phase 1 -> Phase 3 both stop playback
+        win.switch_to_phase(_PHASE_ANALYSIS)
+        playing[0] = True
+        win.switch_to_phase(_PHASE_TOPOLOGY)
+        assert not playing[0] and len(stop_calls) == 4
+        playing[0] = True
+        win.switch_to_phase(_PHASE_SETUP)
+        assert not playing[0] and len(stop_calls) == 5
+    finally:
+        win.close()
+        win.deleteLater()
+        _font_app.processEvents()
+
+
+def test_topology_apply_overwrite_and_clear_stop_preview(_font_app, tmp_path, monkeypatch):
+    from sessionprepgui.analysis import worker as worker_mod
+    from sessionprepgui.mainwindow import SessionPrepWindow
+
+    win = SessionPrepWindow()
+    try:
+        playing = [False]
+        monkeypatch.setattr(type(win._playback), "is_playing", property(lambda _self: playing[0]))
+        monkeypatch.setattr(win._playback, "stop", lambda: playing.__setitem__(0, False))
+
+        class _NoopApplyWorker:
+            def __init__(self, *args, **kwargs):
+                for name in ("finished", "progress", "progress_value",
+                             "overwrite_confirmation_required", "apply_finished", "error"):
+                    setattr(self, name, SimpleNamespace(connect=lambda *a, **k: None))
+
+            def setParent(self, _p): pass
+            def start(self): pass
+            def cancel(self): pass
+            def deleteLater(self): pass
+
+        monkeypatch.setattr(worker_mod, "TopologyApplyWorker", _NoopApplyWorker)
+        win.state.source_dir = str(tmp_path)
+        win.state.session = SessionContext(tracks=[], config={})
+
+        # Initial Apply stops Phase 1 preview
+        playing[0] = True
+        win.topology_controller.apply_topology()
+        assert not playing[0]
+        win.topology_controller.apply_worker = None
+
+        # Overwrite confirmation retry also stops Phase 1 preview
+        out_dir, _ = win.topology_controller._layout_output_dir()
+        win.topology_controller._pending_overwrite = (out_dir, {"a.wav": "rev1"})
+        playing[0] = True
+        win.topology_controller._confirm_overwrite_apply()
+        assert not playing[0]
+        win.topology_controller.apply_worker = None
+
+        # clear_workspace stops playback and resets Phase 1 stop_btn/play_btn
+        win.topology_controller.page.wf_panel.stop_btn.setEnabled(True)
+        playing[0] = True
+        win.topology_controller.clear_workspace()
+        assert not playing[0]
+        assert not win.topology_controller.page.wf_panel.stop_btn.isEnabled()
+        assert not win.topology_controller.page.wf_panel.play_btn.isEnabled()
+    finally:
+        win.close()
+        win.deleteLater()
+        _font_app.processEvents()

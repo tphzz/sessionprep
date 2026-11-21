@@ -439,6 +439,7 @@ class SessionPrepWindow(QMainWindow):
         self._phase_tabs.setTabEnabled(_PHASE_ANALYSIS, False)
         self._phase_tabs.addTab(self._daw_ctrl.page, "Phase 3: DAW Transfer")
         self._phase_tabs.setTabEnabled(_PHASE_SETUP, False)
+        self._active_phase: int = self._phase_tabs.currentIndex()
         self._phase_tabs.currentChanged.connect(self._on_phase_tab_changed)
 
         self.setCentralWidget(self._phase_tabs)
@@ -803,8 +804,16 @@ class SessionPrepWindow(QMainWindow):
 
     @Slot(int)
     def _on_phase_tab_changed(self, index: int) -> None:
+        prev_phase = self._active_phase
+        self._active_phase = index
+        if prev_phase == _PHASE_TOPOLOGY and index != _PHASE_TOPOLOGY:
+            self._topology_ctrl.stop_preview()
+        elif prev_phase == _PHASE_ANALYSIS and index != _PHASE_ANALYSIS:
+            self._detail_ctrl.stop()
         if index != _PHASE_TOPOLOGY:
             self._topology_ctrl.dismiss_overwrite_prompt()
+        if hasattr(self, "_space_shortcut"):
+            self._space_shortcut.setEnabled(index != _PHASE_SETUP)
         if index == _PHASE_TOPOLOGY and self._topology_ctrl.pending_sources:
             self._analysis_ctrl.check_reopened_layout_sources()
         self._progress.on_phase_changed(index)

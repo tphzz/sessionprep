@@ -154,3 +154,38 @@ def test_detail_controller_audio_load_error_marks_generation_unavailable(_font_a
         for w in widgets:
             w.deleteLater()
         _font_app.processEvents()
+
+
+def test_toggle_play_ignores_phase3_and_allows_phase2(_font_app):
+    state = WorkspaceState(config=build_defaults())
+    shell = _StubShell()
+    phase = [2]  # _PHASE_SETUP (Phase 3)
+    shell.current_phase = lambda: phase[0]
+    ctrl, widgets = _make_controller(state, shell)
+    try:
+        samples = np.zeros(4800, dtype=np.float32)
+        track = TrackContext("vox.wav", "vox.wav", samples, 48000, 1, 4800, "24-bit", "PCM_24", 0.1)
+        state.current_track = track
+
+        # Space on Phase 3 must NOT start Phase 2 playback
+        ctrl.toggle_play()
+        assert not ctrl._playback.is_playing
+
+        # Space on Phase 2 toggles playback on and off
+        phase[0] = 1  # _PHASE_ANALYSIS (Phase 2)
+        ctrl.toggle_play()
+        assert ctrl._playback.is_playing
+        ctrl.toggle_play()
+        assert not ctrl._playback.is_playing
+
+        # Defensive stop: if playback is somehow active on Phase 3, toggle_play stops it
+        ctrl.toggle_play()
+        assert ctrl._playback.is_playing
+        phase[0] = 2
+        ctrl.toggle_play()
+        assert not ctrl._playback.is_playing
+    finally:
+        ctrl.dispose()
+        for w in widgets:
+            w.deleteLater()
+        _font_app.processEvents()

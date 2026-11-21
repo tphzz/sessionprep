@@ -315,3 +315,57 @@ def test_out_of_band_modulation_and_low_noise_do_not_trigger_an_automatic_repair
     plan_repairs(track, {"repair_auto_ultrasonic": high, "repair_auto_low_cut": not high})
     evidence = track.repair_measurements["original"]["ultrasonic" if high else "low_band"]
     assert evidence["regions"] == [] and not track.repair_recipe.active
+
+
+@pytest.mark.parametrize("width", [48000, 50001, 96000, 192000])
+def test_boundary_partial_dirichlet_kernel_matches_exact_reference_across_bins_and_nyquist(width):
+    from sessionpreplib.repairs import _BoundaryPartial, _rect_scalar
+
+    window = np.sin(np.pi * np.arange(width) / width) ** 2
+    window_dc = np.fft.rfft(window) / width
+    nyq = width // 2
+    centres = sorted({20, nyq - 1, nyq, min(nyq, 2410), min(nyq, 4820), min(nyq, 24121)})
+    for centre in centres:
+        bp = _BoundaryPartial(centre, width, window_dc)
+        for delta in (0.0, 2e-12, 1e-10, 1e-5, 0.37, -1e-10, -2e-12):
+            f = float(centre) + delta
+            if f < 0 or f > width / 2:
+                continue
+            for signed_f in (f, -f):
+                f_int = round(signed_f)
+                df = signed_f - f_int
+                k = (f_int - bp.extended_bins) % width
+                k = np.where(k > width / 2, k - width, k)
+                d = k + df
+                ref = np.exp(1j * np.pi * d * (1 - 1 / width)) * np.sinc(d) / np.sinc(d / width)
+                actual = bp._rect_ext(signed_f)
+                assert np.max(np.abs(actual - ref)) < 1e-12
+
+                k0 = f_int % width
+                if k0 > width // 2:
+                    k0 -= width
+                d0 = k0 + df
+                ref0 = np.exp(1j * np.pi * d0 * (1 - 1 / width)) * np.sinc(d0) / np.sinc(d0 / width)
+                assert abs(_rect_scalar(signed_f, width) - ref0) < 1e-12
+
+
+def test_inband_tone_near_nyquist_resolves_accurately():
+    rate = 48000
+    window = np.sin(np.pi * np.arange(rate) / rate) ** 2
+    in_band = tone(rate, 23999.0, -14.55, 2.0)
+    frame = in_band[:rate] - np.mean(in_band[:rate])
+    expected_db = 10.0 * np.log10(np.sum((window * frame) ** 2) / np.sum(window ** 2))
+    measured = band_evidence(
+        in_band, rate, low_hz=0, high_hz=23999.3, window_sec=1.0,
+        level_db=-50, ratio_db=-20, consecutive=1,
+    )
+    assert measured["band_dbfs"] == pytest.approx(expected_db, abs=1e-4)
+    assert measured["ratio_db"] == pytest.approx(0.0, abs=1e-4)
+
+    out_of_band = tone(rate, 23999.7, -14.55, 2.0)
+    excluded = band_evidence(
+        out_of_band, rate, low_hz=0, high_hz=23999.3, window_sec=1.0,
+        level_db=-50, ratio_db=-20, consecutive=1,
+    )
+    assert excluded["band_dbfs"] < -50.0
+    assert excluded["regions"] == []

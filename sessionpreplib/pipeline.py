@@ -247,6 +247,7 @@ class Pipeline:
                    index=idx, total=total)
         t_track_start = time.perf_counter()
         track._cache.pop("repair_error", None)
+        track._cache.pop("_repair_emitted", None)
         for detector_id in self.repair_verification.disabled_ids:
             track.detector_results.pop(detector_id, None)
         try:
@@ -269,8 +270,14 @@ class Pipeline:
             track.corrected_analysis = None
             track._cache["repair_error"] = str(exc)
             track.processor_results.clear()
+            track._cache["_repair_emitted"] = True
+            self._emit("track.repair_complete", filename=track.filename,
+                       index=idx, total=total)
             self._emit("track.plan_complete", filename=track.filename, index=idx, total=total)
             return
+        track._cache["_repair_emitted"] = True
+        self._emit("track.repair_complete", filename=track.filename,
+                   index=idx, total=total)
         for proc in self.audio_processors:
             try:
                 self._emit("processor.start", processor_id=proc.id,
@@ -342,6 +349,10 @@ class Pipeline:
                 exc = future.exception()
                 if exc:
                     track = futures[future]
+                    if not track._cache.pop("_repair_emitted", False):
+                        self._emit("track.repair_complete",
+                                   filename=track.filename,
+                                   index=0, total=total)
                     self._emit("track.plan_complete",
                                filename=track.filename,
                                index=0, total=total)
@@ -358,11 +369,13 @@ class Pipeline:
                         track.processor_skip.add(proc.id)
 
         session.processors = list(self.audio_processors)
+        self._emit("session.group_gains_start")
         apply_group_gains(
             session, linked_groups=session.config.get("_gain_linked_groups"),
             headroom_db=self.config.get("fader_headroom_db", 8.0),
             anchor=self.config.get("anchor"),
         )
+        self._emit("session.group_gains_complete")
         return session
 
     # ------------------------------------------------------------------

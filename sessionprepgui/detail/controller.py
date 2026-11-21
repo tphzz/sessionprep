@@ -24,7 +24,7 @@ from ..analysis.worker import AudioLoadWorker
 from ..helpers import fmt_time
 from ..shell import MainWindowShell
 from ..state import WorkspaceState
-from ..tracks.table_widgets import TrackCol, _PHASE_TOPOLOGY, _TAB_FILE
+from ..tracks.table_widgets import TrackCol, _PHASE_ANALYSIS, _PHASE_TOPOLOGY, _TAB_FILE
 from ..waveform.compute import WaveformLoadWorker
 from ..waveform.peakcache import peak_source_key
 from .report import visualizable_issues
@@ -721,6 +721,10 @@ class TrackDetailController(QObject):
 
     # ── Playback coordination ────────────────────────────────────────────
 
+    def is_phase_active(self) -> bool:
+        """Return True when Phase 2 (Analysis & Preparation) is the active tab."""
+        return self._shell.current_phase() == _PHASE_ANALYSIS
+
     @Slot()
     def toggle_play(self) -> None:
         preview = self._repair_preview
@@ -741,7 +745,7 @@ class TrackDetailController(QObject):
         if self._shell.current_phase() == _PHASE_TOPOLOGY:
             if self._topology_ctrl is not None and self._topology_ctrl.cached_audio is not None:
                 self._topology_ctrl.play_preview()
-        elif self._state.current_track is not None:
+        elif self._shell.current_phase() == _PHASE_ANALYSIS and self._state.current_track is not None:
             self.play()
 
     @Slot()

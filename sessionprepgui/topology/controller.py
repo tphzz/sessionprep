@@ -166,6 +166,7 @@ class TopologyController(QObject):
         self.begin_waveform_request("none")
         self.cancel_preview_workers()
         self.cached_audio = None
+        self.stop_preview(return_to_start=False)
         self.pending_sources = []
         self.page.wf_panel.waveform.set_audio(None, 44100)
         self.page.wf_panel.play_btn.setEnabled(False)
@@ -271,6 +272,7 @@ class TopologyController(QObject):
 
     def _start_apply_worker(self, *, allowed_unverified: dict[str, str] | None) -> None:
         assert self._state.session is not None and self._state.source_dir is not None
+        self.stop_preview()
         n_entries = len(self._state.topo_topology.entries) if self._state.topo_topology else 0
         log.info("Apply topology: %d entries", n_entries)
 

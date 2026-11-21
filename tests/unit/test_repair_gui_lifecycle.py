@@ -51,7 +51,10 @@ def test_analysis_names_repair_work_while_the_planner_is_running(tmp_path, monke
     worker.run()
     assert not errors
     assert len(during_scan) == len(planned) == 1
-    assert during_scan[0] == ("Checking track repairs and planning gains…", planned[0][0] - 1)
+    assert during_scan[0] == ("Checking track repairs and planning gains…", planned[0][0] - 2)
+    assert any("Checking track repairs" in m and "Tone.wav" in m for m in messages)
+    assert any("Planning gains" in m and "Tone.wav" in m for m in messages)
+    assert "Computing group gains\u2026" in messages
     assert bool(planned[0][1]._cache.get("repair_error")) == fail_repair
     assert counts[-1][0] == counts[-1][1] > 0
 

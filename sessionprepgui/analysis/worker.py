@@ -332,19 +332,41 @@ class AnalyzeWorker(QThread):
             if track:
                 self.track_analyzed.emit(self, filename, track)
 
+        def on_track_repair_complete(filename, **_kw):
+            with self._step_lock:
+                self._step += 1
+                self._repaired_count += 1
+                step, done = self._step, self._repaired_count
+            self.progress.emit(self, f"Checking track repairs \u2014 {filename} ({done}/{self._num_ok})")
+            self.progress_value.emit(self, step, self._total)
+
         def on_track_plan_complete(filename, **_kw):
             with self._step_lock:
                 self._step += 1
-                step = self._step
+                self._planned_count += 1
+                step, done = self._step, self._planned_count
+            self.progress.emit(self, f"Planning gains \u2014 {filename} ({done}/{self._num_ok})")
             self.progress_value.emit(self, step, self._total)
             track = track_map.get(filename)
             if track:
                 self.track_planned.emit(self, filename, track)
 
+        def on_group_gains_start(**_kw):
+            self.progress.emit(self, "Computing group gains\u2026")
+
+        def on_group_gains_complete(**_kw):
+            with self._step_lock:
+                self._step += 1
+                step = self._step
+            self.progress_value.emit(self, step, self._total)
+
         event_bus.subscribe("detector.complete", on_detector_complete)
         event_bus.subscribe("session_detector.complete", on_session_detector_complete)
         event_bus.subscribe("track.analyze_complete", on_track_analyze_complete)
+        event_bus.subscribe("track.repair_complete", on_track_repair_complete)
         event_bus.subscribe("track.plan_complete", on_track_plan_complete)
+        event_bus.subscribe("session.group_gains_start", on_group_gains_start)
+        event_bus.subscribe("session.group_gains_complete", on_group_gains_complete)
 
     def run(self):
         try:
@@ -383,7 +405,10 @@ class AnalyzeWorker(QThread):
                 for d in pipeline.session_detectors
             )
             self._step = 0
-            self._total = max(num_ok * num_track_det + num_session_det + num_ok + 1, 1)
+            self._num_ok = num_ok
+            self._repaired_count = 0
+            self._planned_count = 0
+            self._total = max(num_ok * num_track_det + num_session_det + 2 * num_ok + 2, 1)
             self._step_lock = threading.Lock()
             self._subscribe_phase2_events(event_bus, {t.filename: t for t in session.tracks})
 

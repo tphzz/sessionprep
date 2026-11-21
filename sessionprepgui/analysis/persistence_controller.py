@@ -6,6 +6,7 @@ from collections.abc import Callable
 import copy
 import logging
 import os
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from PySide6.QtCore import QObject, QThread, Qt, Signal, Slot
@@ -62,6 +63,20 @@ if TYPE_CHECKING:
     from .config_controller import SessionConfigController
 
 log = logging.getLogger(__name__)
+
+
+def _default_project_name(directory: str) -> str:
+    """Derive a sanitized default Phase 3 project name from a working directory path."""
+    cleaned = directory.strip()
+    if not cleaned:
+        return ""
+    raw_name = Path(cleaned).name
+    if raw_name in ("", ".", ".."):
+        raw_name = Path(os.path.abspath(cleaned)).name
+    sanitized = "".join(c for c in raw_name if c not in '<>:"/\\|?*').strip()
+    if not sanitized or not sanitized.strip("."):
+        return ""
+    return sanitized
 
 
 class SessionPersistenceController(QObject):
@@ -186,6 +201,11 @@ class SessionPersistenceController(QObject):
 
     def load_directory(self, path: str, *, keep_session_config: bool = False) -> None:
         log.info("Open folder: %s", path)
+        previous_name = (
+            self._daw_ctrl.page.project_name_edit.text().strip()
+            if keep_session_config
+            else ""
+        )
         self.clear_workspace(keep_session_config=keep_session_config)
         self._state.source_dir = path
         self._phase2.track_table.set_source_dir(path)
@@ -201,9 +221,17 @@ class SessionPersistenceController(QObject):
             self._phase2.analyze_action.setEnabled(False)
             return
 
+        project_name = previous_name or _default_project_name(path)
+        edit = self._daw_ctrl.page.project_name_edit
+        edit.blockSignals(True)
+        edit.setText(project_name)
+        edit.blockSignals(False)
+
         self._state.topo_source_tracks = list(tracks)
         self._state.topo_topology = None
-        self._state.session = SessionContext(tracks=tracks, config={})
+        self._state.session = SessionContext(
+            tracks=tracks, config={}, project_name=project_name
+        )
         self.workspace_opened.emit(path)
         self.phase1_analysis_requested.emit()
 

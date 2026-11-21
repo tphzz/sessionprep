@@ -381,6 +381,7 @@ class AnalysisPrepareController(QObject):
     def analyze(self) -> None:
         if self.prepare_worker is not None or not self._state.source_dir:
             return
+        self._detail_ctrl.stop()
         analyze_dir = self._state.topology_dir or self._state.source_dir
         log.info("Analyze: %s", analyze_dir)
         if self.repair_plan_worker is not None:
@@ -770,6 +771,7 @@ class AnalysisPrepareController(QObject):
             return
         if self.prepare_worker is not None or self.repair_plan_worker is not None:
             return
+        self._detail_ctrl.stop()
         log.info("Prepare: %s", self._state.source_dir)
         output_folder = self._state.config.get("app", {}).get("phase2_output_folder", "sp_02_prepared")
         output_dir = os.path.join(self._state.source_dir, output_folder)

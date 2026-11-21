@@ -216,7 +216,8 @@ class RepairPreview(QObject):
                 audition=self.audition,
                 corrected=worker.corrected,
             )
-        playing = self._playback.is_playing
+        detail_ctrl = self._get_detail_ctrl()
+        playing = self._playback.is_playing and detail_ctrl.is_phase_active()
         self.panel.set_content_available(True)
         self.panel.play_btn.setEnabled(not playing)
         self.panel.stop_btn.setEnabled(playing)
@@ -245,7 +246,8 @@ class RepairPreview(QObject):
         self.audition = None
         self.pending_play = None
         self.cache.clear()
-        self._playback.stop()
+        if detail_ctrl.is_phase_active():
+            self._playback.stop()
         self.panel.waveform.set_unavailable()
         detail_ctrl.pending_detector_visualization = None
         detail_ctrl.waveform_context_generation = None
