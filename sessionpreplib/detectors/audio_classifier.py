@@ -14,6 +14,30 @@ from ..audio import (
 from ..utils import matches_keywords
 
 
+_PEAK_TIE_DB = 0.001
+_DECAY_LIMIT_DB = 120.0
+
+
+def _decay_envelope(power: np.ndarray, width: int) -> np.ndarray:
+    """Mean power in every 10 ms window, including quiet tails after loud notes."""
+    if len(power) <= width:
+        return np.array([power.mean()])
+    # A window straddles at most two width-sized blocks. Add their suffix
+    # and prefix sums so a quiet tail never subtracts two large track totals.
+    count = len(power) - width + 1
+    envelope = np.empty(count)
+    batch = width * max(1, 65536 // width)
+    for start in range(0, count, batch):
+        chunk = power[start:start + batch + width]
+        padding = -len(chunk) % width
+        blocks = (np.pad(chunk, (0, padding)) if padding else chunk).reshape(-1, width)
+        sums = np.cumsum(blocks[:, ::-1], axis=1)[:, ::-1]
+        sums[:-1, 1:] += np.cumsum(blocks[1:, :-1], axis=1)
+        end = min(start + batch, count)
+        envelope[start:end] = sums.ravel()[:end - start] / width
+    return envelope
+
+
 class AudioClassifierDetector(TrackDetector):
     id = "audio_classifier"
     name = "Audio Classifier"
@@ -173,17 +197,11 @@ class AudioClassifierDetector(TrackDetector):
         else:
             mono_sq = (audio.flatten().astype(np.float64)) ** 2
 
-        n = len(mono_sq)
-        if n > decay_env_samples:
-            cs = np.empty(n + 1, dtype=np.float64)
-            cs[0] = 0.0
-            np.cumsum(mono_sq, out=cs[1:])
-            env = (cs[decay_env_samples:] - cs[: n - decay_env_samples + 1]) / decay_env_samples
-        else:
-            env = np.array([np.mean(mono_sq)], dtype=np.float64)
-
-        floor = np.finfo(np.float64).tiny
-        peak_env_idx = int(np.argmax(env))
+        env = _decay_envelope(mono_sq, decay_env_samples)
+        peak_power = float(np.max(env))
+        # Prefer the beginning of an equal-energy sustain. Numerical noise
+        # on the plateau must not move the lookahead into the note's release.
+        peak_env_idx = int(np.argmax(env >= peak_power * 10**(-_PEAK_TIE_DB / 10)))
         lookahead_env = max(1, int((self.decay_lookahead_ms / 1000.0) * sr))
         decay_end = min(len(env), peak_env_idx + 1 + lookahead_env)
 
@@ -195,9 +213,12 @@ class AudioClassifierDetector(TrackDetector):
         else:
             tail_median = float(env[peak_env_idx])
 
-        peak_env_db = 10.0 * np.log10(max(float(env[peak_env_idx]), floor))
-        tail_env_db = 10.0 * np.log10(max(tail_median, floor))
-        decay_db = float(peak_env_db - tail_env_db)  # positive = energy dropped
+        decay_db = 0.0
+        if peak_power > 0:
+            decay_db = (float(10 * np.log10(peak_power) - 10 * np.log10(tail_median))
+                        if tail_median > 0 else _DECAY_LIMIT_DB)
+        decay_at_floor = decay_db >= _DECAY_LIMIT_DB
+        decay_db = min(decay_db, _DECAY_LIMIT_DB)
 
         # --- Density: fraction of windows above the relative gate ---
         density = (
@@ -248,7 +269,7 @@ class AudioClassifierDetector(TrackDetector):
         )
 
         summary = (
-            f"crest {crest:.1f} dB, decay {decay_db:.1f} dB, "
+            f"crest {crest:.1f} dB, decay {'≥' if decay_at_floor else ''}{decay_db:.1f} dB, "
             f"density {density:.0%}, {classification}"
         )
 
@@ -266,6 +287,7 @@ class AudioClassifierDetector(TrackDetector):
                 "rms_anchor_label": anchor_label,
                 "crest": float(crest),
                 "decay_db": float(decay_db),
+                "decay_at_floor": decay_at_floor,
                 "density": float(density),
                 "classification": classification,
                 "is_transient": bool(is_transient),

@@ -159,7 +159,8 @@ class SubsonicDetector(TrackDetector):
         for ch, signal in channels_to_analyze:
             whole_ratio, win_ratios = subsonic_stft_analysis(
                 signal, track.samplerate, cutoff,
-                window_ms=int(self.window_ms),
+                window_ms=int(self.window_ms), include_windows=self.windowed,
+                minimum_whole_ratio_db=threshold,
             )
             ch_key = ch if ch is not None else 0
             ch_ratios[ch_key] = whole_ratio
@@ -228,8 +229,8 @@ class SubsonicDetector(TrackDetector):
         windowed_regions: list[dict] = []
         if self.windowed:
             windowed_regions = self._windowed_analysis(
-                track, cutoff, threshold, issues, detail_lines,
-                ch_win_ratios, channels_to_analyze,
+                track, threshold, issues, detail_lines, ch_win_ratios,
+                [(ch, signal) for ch, signal in channels_to_analyze if ch_warn[ch or 0]],
             )
             result_data["windowed_regions"] = windowed_regions
 
@@ -281,7 +282,6 @@ class SubsonicDetector(TrackDetector):
     def _windowed_analysis(  # pylint: disable=too-many-positional-arguments
         self,
         track: TrackContext,
-        cutoff: float,
         threshold: float,
         issues: list[IssueLocation],
         detail_lines: list[str],
@@ -296,12 +296,8 @@ class SubsonicDetector(TrackDetector):
         1. Try to find windows where the subsonic ratio exceeds a relaxed
            threshold (6 dB below configured).  These are concentrated subsonic
            problems.
-        2. If no ratio-based regions are found, fall back to marking all
-           windows that have *any* measurable signal (finite ratio — i.e. they
-           passed the absolute subsonic power gate in the DSP function).
-           Since the whole-file analysis already confirmed subsonic content,
-           these active-signal windows are where that content lives.  This
-           avoids painting silent gaps between notes.
+        2. For a flagged channel without local band evidence, mark active
+           AC audio relative to its loudest window and label it as such.
         """
         _WINDOWED_RELAX_DB = 6.0
         windowed_threshold = threshold - _WINDOWED_RELAX_DB
@@ -309,37 +305,26 @@ class SubsonicDetector(TrackDetector):
         max_reg = int(self.max_regions)
         all_regions: list[dict] = []
 
-        for ch, _signal in channels_to_analyze:
+        for ch, signal in channels_to_analyze:
             ratios = ch_win_ratios.get(ch, [])
             regions = self._merge_regions(ratios, windowed_threshold)
+            if not regions:
+                regions = self._find_active_regions(signal, track.samplerate, int(self.window_ms))
             for reg in regions:
                 reg["channel"] = ch
             all_regions.extend(regions)
 
-        # Fallback: if no ratio-based regions found, mark active-signal
-        # windows using an RMS envelope gate.  The whole-file analysis already
-        # confirmed subsonic content; the active regions are where it lives.
-        # This reliably separates musical content from amp noise/silence.
-        if not all_regions:
-            for ch, signal in channels_to_analyze:
-                regions = self._find_active_regions(
-                    signal, track.samplerate, int(self.window_ms),
-                )
-                for reg in regions:
-                    reg["channel"] = ch
-                all_regions.extend(regions)
-
-        # Sort by worst ratio (descending) and cap
-        all_regions.sort(key=lambda r: -r["max_ratio_db"])
+        # Prefer measured band evidence over activity-only fallback locations.
+        all_regions.sort(key=lambda r: r.get("max_ratio_db", -np.inf), reverse=True)
         all_regions = all_regions[:max_reg]
 
         # Build issues and detail lines from regions
         for reg in all_regions:
             ch = reg["channel"]
-            desc = (
-                f"subsonic region {reg['max_ratio_db']:.1f} dB "
-                f"(<= {self.cutoff_hz:g} Hz)"
-            )
+            if "max_ratio_db" in reg:
+                desc = f"subsonic region {reg['max_ratio_db']:.1f} dB (<= {self.cutoff_hz:g} Hz)"
+            else:
+                desc = "active audio in channel with whole-file subsonic finding"
             if ch is not None:
                 desc = f"ch {ch}: {desc}"
             issues.append(IssueLocation(
@@ -355,8 +340,7 @@ class SubsonicDetector(TrackDetector):
 
         if all_regions:
             detail_lines.append(
-                f"Windowed analysis: {len(all_regions)} region(s) "
-                f"exceeding {self.warn_ratio_db:g} dB"
+                f"Windowed analysis: {len(all_regions)} region(s)"
             )
 
         return all_regions
@@ -412,11 +396,14 @@ class SubsonicDetector(TrackDetector):
         n = signal.size
         win_samples = max(8, int(samplerate * window_ms / 1000))
         n_win = (n + win_samples - 1) // win_samples
-        padded = np.pad(
-            signal.astype(np.float64), (0, n_win * win_samples - n),
-        )
+        padded = np.zeros(n_win * win_samples)
+        ac = padded[:n]
+        np.subtract(signal, signal[0], out=ac, dtype=np.float64)
+        ac -= ac.mean()
         frames = padded.reshape(n_win, win_samples)
-        rms = np.sqrt(np.mean(frames ** 2, axis=1))
+        counts = np.full(n_win, win_samples)
+        counts[-1] = n - (n_win - 1) * win_samples
+        rms = np.sqrt(np.einsum("ij,ij->i", frames, frames) / counts)
 
         with np.errstate(divide='ignore'):
             rms_db = np.where(rms > 1e-10, 20.0 * np.log10(rms), -200.0)
@@ -434,11 +421,9 @@ class SubsonicDetector(TrackDetector):
         for s_idx, e_idx in zip(starts, ends):
             s_sample = int(s_idx * win_samples)
             e_sample = min(int((e_idx + 1) * win_samples), n) - 1
-            max_r = float(np.max(rms_db[s_idx:e_idx + 1]))
             regions.append({
                 "sample_start": s_sample,
                 "sample_end": e_sample,
-                "max_ratio_db": max_r,
             })
         return regions
 

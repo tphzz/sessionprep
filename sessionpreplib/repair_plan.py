@@ -194,7 +194,9 @@ def plan_repairs(track, config, verification=None):
     checked = None
     if recipe.active:
         audio = dc_audio if dc_audio is not None and not low_on and not high_on else render_corrected(data, rate, recipe)
-        gain_track = replace(source, audio_data=audio, _cache={}, detector_results={}, processor_results={})
+        # Corrected samples reach the meters before output quantization.
+        gain_track = replace(source, audio_data=audio, subtype="DOUBLE", bitdepth="64-bit float",
+                             _cache={}, detector_results={}, processor_results={})
         checked = verification.corrected(source, gain_track, recipe)
         most_recent = repair_levels(audio)
         measurements["boundary_settling"] = boundary_settling(data, audio, rate)

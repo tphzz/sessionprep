@@ -64,7 +64,7 @@ A detector earns its place if it meets at least one of these criteria:
 
 ### 2.4 Digital clipping
 
-- **What it means:** consecutive near-full-scale samples were detected (close to +/-1.0). For stereo files this is checked per channel.
+- **What it means:** consecutive samples reach a decoded magnitude of 0.9999 or higher on the same channel. For signed or unsigned 8-bit PCM, the positive rail is 127/128 and the negative rail is −1. Corrected audio is checked before output encoding.
 - **Why it matters:** clipped prints are often unrecoverable and will distort downstream processing.
 - **Controls:** `--clip_consecutive`, `--clip_report_max_ranges` (the report threshold is the run length: how many consecutive near-full-scale samples are required to count as clipping)
 - **Categorization:**
@@ -88,6 +88,7 @@ A detector earns its place if it meets at least one of these criteria:
 - **Why it matters:** low or negative correlation indicates phase differences between channels that cause level loss or cancellation in mono playback (phone speakers, mono PA systems).
 - **Controls:** `--corr_warn`, `--mono_loss_warn_db`, `--corr_windowed`, `--corr_window_ms` (default 250 ms), `--corr_max_regions`
 - **Windowed analysis:** when enabled, per-window Pearson correlation and mono folddown loss are computed. Contiguous windows exceeding either threshold are merged into regions with waveform overlays.
+- Whole-file readings use all frames with the channel means removed over the entire track. Changing the local window or disabling localization preserves those readings. A channel with no AC signal makes correlation unavailable. A hard-panned signal still has a measurable 3.01 dB mono loss.
 - Complete cancellation in mono is reported as `∞ dB` loss. The JSON export records `mono_fully_cancelled: true` and `mono_loss_db: null` for this case. Finite losses keep their numeric dB value.
 - **Categorization:**
   - ATTENTION: localized regions with poor stereo compatibility detected.
@@ -132,17 +133,17 @@ A detector earns its place if it meets at least one of these criteria:
   `subsonic_windowed`, `subsonic_window_ms`, `subsonic_max_regions`
 - **Categorization:**
   - CLEAN: `No significant subsonic content detected`.
-  - ATTENTION: `Subsonic content` with per-file details (consider an HPF).
+  - INFORMATION: `Subsonic content` with per-file details (consider an HPF).
 
 **How detection works:**
 
-The detector performs a single `scipy.signal.stft` call per channel with Hann
-windowing, then computes vectorised band/total power ratios: `power below
-cutoff / total power` (excluding DC), expressed in dB.  A ratio of −20 dB
-means 1 % of the signal's energy is subsonic.  The configured threshold
-(default `−20 dB`) determines when this becomes an ATTENTION.  Both the
-whole-file ratio and per-window ratios are derived from the same STFT pass
-— no redundant FFT calls.
+The detector subtracts each channel's whole-file mean before Hann windowing,
+padding or gating. The whole-file ratio compares energy in positive Fourier
+bins at or below the cutoff with total AC energy. Bin spacing is the inverse
+of the recording duration. A constant offset alone cannot trigger the advisory.
+A ratio of −20 dB means 1 % of the signal's AC energy is subsonic, the default
+threshold for an Information finding. Local Hann windows locate evidence on
+flagged channels. Changing their length leaves the whole-file ratio intact.
 
 **Per-channel analysis (always active for stereo+):**
 
@@ -186,12 +187,11 @@ energy is concentrated still produce visible regions.
 If no windows exceed the relaxed threshold (the subsonic energy is spread
 evenly across the file rather than concentrated), the detector falls back to
 marking **active-signal regions** — windows whose RMS is within 20 dB of the
-loudest window.  Since the whole-file analysis already confirmed subsonic
-content, these active windows are where it lives.  This avoids painting
-silent gaps between notes while still showing meaningful overlays.
+loudest AC window on the flagged channel. These fallback locations identify
+active audio. Only measured band locations report a local subsonic ratio.
 
 If even the active-signal approach produces no regions, a whole-file overlay
-is shown as a last resort — an ATTENTION result always has at least one
+is shown as a last resort — an Information result always has at least one
 visible issue.
 
 ### 2.11 Tail regions exceeded anchor
@@ -358,6 +358,9 @@ The anchor is then used to:
     and plucked instruments (high crest but sustained). The decay metric acts as
     a tiebreaker when the two metrics disagree. Density catches sparse percussion
     (toms, crashes, FX hits) that may have ambiguous crest and decay values.
+  - Decay uses the first 10 ms window within 0.001 dB of the maximum energy.
+    This anchors repeated, held notes consistently across input trims.
+    A tail at least 120 dB below the peak is reported as ≥120 dB.
 
 **Classification logic (in priority order):**
   1. Keyword overrides (`--force_transient`, `--force_sustained`)
@@ -410,7 +413,7 @@ insert on each channel.
 
 **DC removal** uses a first-order 2 Hz high-pass. **Subsonic filter** uses a second-order high-pass with a 10 Hz default and a 5–40 Hz range. Selecting both applies the stronger high-pass once. Automatic low-cut selection looks for sustained infrasonic energy on individual channels after any selected DC removal. The broader subsonic advisory can also describe intentional bass. **Ultrasonic filter** preserves the band through 20 kHz and attenuates frequencies from 24 kHz by at least 80 dB on eligible sources. Its FIR delay is compensated. All three preserve the sample count and channel layout.
 
-Automatic low-cut selection uses three consecutive 1 s windows at 50% overlap and considers AC energy up to the smaller of 20 Hz and the configured subsonic frequency. Both meters subtract the frame mean before applying a Hann window. An isolated stationary tone at or inside a band edge contributes its full windowed RMS, including the energy that tapering a very low tone places in the zero-frequency bin. Other energy is assigned by local frequency estimates. Only confidently in-band energy can qualify an automatic repair when components overlap at the edge.
+Automatic low-cut selection uses three consecutive 1 s windows at 50% overlap and considers AC energy up to the smaller of 20 Hz and the configured subsonic frequency. The repair's local meter subtracts the frame mean before applying a Hann window. An isolated stationary tone at or inside a band edge contributes its full windowed RMS, including the energy that tapering a very low tone places in the zero-frequency bin. Other energy is assigned by local frequency estimates. Only confidently in-band energy can qualify an automatic repair when components overlap at the edge.
 
 Use **Preferences → Config Presets → Processors → Corrective processing** for automatic selection defaults. Phase 2 Config can override these for one project. File and the track’s Processing menu offer **Track repairs…** when a detector finds a matching issue, a track has an applied repair or saved repair setting, or an output needs recovery. Expand a finding and choose **Review repair** to open its controls. If DC removal also clears Subsonic Content, both findings point to DC removal. Remaining local rumble can still offer the subsonic filter. **Use preset** releases a track override. A Stereo Compatibility finding on its own offers **Visualize** and **Help**.
 

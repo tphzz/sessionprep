@@ -11,6 +11,7 @@ from typing import Any
 from .models import ParamSpec
 
 PRESET_SCHEMA_VERSION = "1.0"
+DEFAULT_STEREO_WINDOW_MS = 250
 
 # Keys that are internal/CLI-only and should not be saved in presets
 _INTERNAL_KEYS = {
@@ -120,6 +121,7 @@ def default_config() -> dict[str, Any]:
         "repair_auto_ultrasonic": False,
         "repair_low_cut_hz": 10.0,
         "corr_warn": -0.3,
+        "corr_window_ms": DEFAULT_STEREO_WINDOW_MS,
         "dual_mono_eps": 1e-5,
         "mono_loss_warn_db": 6.0,
         "one_sided_silence_db": -80.0,

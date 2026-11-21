@@ -120,6 +120,9 @@ class BimodalNormalizeProcessor(AudioProcessor):
                 "detected_peak_db": peak_db,
                 "detected_rms_db": rms_anchor_db,
                 "rms_anchor_label": anchor_label,
+                "classifier_metrics": {key: crest_result.data[key] for key in
+                                       ("crest", "decay_db", "decay_at_floor", "density")
+                                       if key in crest_result.data},
                 "gain_for_peak": float(gain_for_peak),
                 "gain_for_rms": float(gain_for_rms),
             },
@@ -283,16 +286,25 @@ class BimodalNormalizeProcessor(AudioProcessor):
             )
 
         # Verbose: append classification analysis metrics
-        if verbose and track is not None:
-            cr = track.detector_results.get("audio_classifier")
-            if cr is not None:
-                crest = cr.data.get("crest", 0.0)
-                decay = cr.data.get("decay_db", 0.0)
-                density = cr.data.get("density", 0.0)
+        if verbose:
+            metrics = d.get("classifier_metrics")
+            if metrics is None and track is not None:
+                # Older plans kept the classifier in detector evidence only.
+                cr = track.detector_results.get("audio_classifier")
+                if track.repair_recipe.active:
+                    checked = track.corrected_analysis
+                    cr = (checked.results.get("audio_classifier") or checked.support_results.get("audio_classifier")
+                          if checked else None)
+                metrics = cr.data if cr and not cr.error else {}
+            if metrics and {"crest", "decay_db", "density"} <= metrics.keys():
+                crest = metrics["crest"]
+                decay = metrics["decay_db"]
+                decay_prefix = "≥" if metrics.get("decay_at_floor") else ""
+                density = metrics["density"]
                 html += (
                     f'<div style="margin-top:8px; color:{metadata};">'
                     f'Analysis: Crest {crest:.1f} dB'
-                    f' &middot; Decay {decay:.1f} dB'
+                    f' &middot; Decay {decay_prefix}{decay:.1f} dB'
                     f' &middot; Density {density:.0%}'
                     f'</div>'
                 )

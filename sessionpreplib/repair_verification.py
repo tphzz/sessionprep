@@ -247,7 +247,7 @@ class RepairVerification:
         implementations = [(d.id, type(d).__module__, type(d).__qualname__, d.depends_on)
                            for d in self.detectors]
         # Bump the evidence version when detector or render semantics change.
-        self.settings_key = _digest([5, implementations, settings])
+        self.settings_key = _digest([6, implementations, settings])
         # Source layout evidence survives Apply. Bind it only to settings that
         # affect these measurements, independently of repairs and normalization.
         layout = [d for d in detectors if d.phase == LifecyclePhase.PHASE1 and d.id in self.required_ids]

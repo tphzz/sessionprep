@@ -8,6 +8,7 @@ from ..models import ParamSpec
 from ..detector import TrackDetector, detector_badge_cell_html
 from ..models import DetectorResult, IssueLocation, Severity, TrackContext
 from ..audio import is_silent, windowed_stereo_correlation
+from ..config import DEFAULT_STEREO_WINDOW_MS
 
 
 class StereoCompatDetector(TrackDetector):
@@ -50,7 +51,7 @@ class StereoCompatDetector(TrackDetector):
                 ),
             ),
             ParamSpec(
-                key="corr_window_ms", type=int, default=250,
+                key="corr_window_ms", type=int, default=DEFAULT_STEREO_WINDOW_MS,
                 min=100, max=5000,
                 label="Analysis window (ms)",
                 description=(
@@ -118,7 +119,7 @@ class StereoCompatDetector(TrackDetector):
         self.corr_warn = config.get("corr_warn", -0.3)
         self.mono_loss_warn_db = config.get("mono_loss_warn_db", 6.0)
         self.windowed = config.get("corr_windowed", True)
-        self.window_ms = config.get("corr_window_ms", 500)
+        self.window_ms = config.get("corr_window_ms", DEFAULT_STEREO_WINDOW_MS)
         self.max_regions = config.get("corr_max_regions", 20)
 
     def analyze(self, track: TrackContext) -> DetectorResult:
@@ -158,7 +159,7 @@ class StereoCompatDetector(TrackDetector):
 
         whole_corr, whole_mono_loss, win_results = windowed_stereo_correlation(
             left, right, track.samplerate,
-            window_ms=int(self.window_ms),
+            window_ms=int(self.window_ms), include_windows=self.windowed,
         )
 
         corr_threshold = float(self.corr_warn)
@@ -188,7 +189,7 @@ class StereoCompatDetector(TrackDetector):
         if self.windowed and win_results:
             result_data.update(self._windowed_analysis(
                 track, win_results, corr_threshold, mono_threshold,
-                issues, detail_lines, any_whole_warn,
+                issues, detail_lines,
             ))
             has_attention_regions = bool(issues)
 
@@ -261,16 +262,12 @@ class StereoCompatDetector(TrackDetector):
         mono_threshold: float,
         issues: list[IssueLocation],
         detail_lines: list[str],
-        any_whole_warn: bool = False,
     ) -> dict:
         """Merge per-window results into contiguous regions.
 
         A window is flagged if its correlation is below *corr_threshold*
         **or** its mono loss exceeds *mono_threshold*.
 
-        If no threshold-based regions are found but the whole-file analysis
-        triggered a warning, falls back to marking active-signal windows
-        so ATTENTION always has at least one overlay.
         """
         max_reg = int(self.max_regions)
 
@@ -278,24 +275,20 @@ class StereoCompatDetector(TrackDetector):
         regions = self._merge_regions(
             win_results, corr_threshold, mono_threshold)
 
-        # Fallback: if no regions found but whole-file warned,
-        # mark active-signal windows so ATTENTION has at least one overlay
-        if not regions and any_whole_warn:
-            regions = self._merge_regions(win_results, corr_threshold, mono_threshold, all_active=True)
-
         if not regions:
             return {"windowed_regions": []}
-        min_corr = min(r["min_corr"] for r in regions)
+        min_corr = min((r["min_corr"] for r in regions if r["min_corr"] is not None), default=None)
         max_loss = max(r["max_mono_loss_db"] for r in regions)
         # Complete cancellations come first. For equal correlations prefer
         # the greater mono loss. The display cap never changes the extrema.
         regions.sort(key=lambda r: (r["max_mono_loss_db"] != math.inf,
-                                    r["min_corr"], -r["max_mono_loss_db"]))
+                                    r["min_corr"] if r["min_corr"] is not None else math.inf,
+                                    -r["max_mono_loss_db"]))
         regions = regions[:max_reg]
 
         # Build issues and detail lines
         for reg in regions:
-            corr_str = f"corr {reg['min_corr']:.2f}"
+            corr_str = _format_correlation(reg["min_corr"])
             loss = reg["max_mono_loss_db"]
             if loss > 0.01:
                 loss_str = f" / mono loss {format_mono_loss(loss)}"
@@ -325,7 +318,7 @@ class StereoCompatDetector(TrackDetector):
             t_s = worst["sample_start"] / track.samplerate
             t_e = worst["sample_end"] / track.samplerate
             detail_lines.append(
-                f"Worst: corr {worst['min_corr']:.2f}{loss_part} "
+                f"Worst: {_format_correlation(worst['min_corr'])}{loss_part} "
                 f"at {_fmt_time(t_s)}\u2013{_fmt_time(t_e)}")
 
         return {"windowed_regions": regions, "min_window_corr": min_corr,
@@ -336,30 +329,23 @@ class StereoCompatDetector(TrackDetector):
         win_results: list[tuple[int, int, float, float]],
         corr_threshold: float,
         mono_threshold: float,
-        *,
-        all_active: bool = False,
     ) -> list[dict]:
         """Merge contiguous windows that exceed either threshold."""
         regions: list[dict] = []
         current: dict | None = None
         for s_start, s_end, corr, mono_loss in win_results:
-            if math.isnan(corr):
-                # Silent window — close current region
-                if current is not None:
-                    regions.append(current)
-                    current = None
-                continue
-            if all_active or corr < corr_threshold or mono_loss > mono_threshold:
+            if corr < corr_threshold or mono_loss > mono_threshold:
                 if current is None:
                     current = {
                         "sample_start": s_start,
                         "sample_end": s_end,
-                        "min_corr": corr,
+                        "min_corr": None if math.isnan(corr) else corr,
                         "max_mono_loss_db": mono_loss,
                     }
                 else:
                     current["sample_end"] = s_end
-                    current["min_corr"] = min(current["min_corr"], corr)
+                    if not math.isnan(corr) and (current["min_corr"] is None or corr < current["min_corr"]):
+                        current["min_corr"] = corr
                     current["max_mono_loss_db"] = max(current["max_mono_loss_db"], mono_loss)
             else:
                 if current is not None:
@@ -424,6 +410,10 @@ class StereoCompatDetector(TrackDetector):
 
 def format_mono_loss(value: float) -> str:
     return "∞ dB" if value == math.inf else f"{value:.1f} dB"
+
+
+def _format_correlation(value: float | None) -> str:
+    return "correlation unavailable" if value is None else f"corr {value:.2f}"
 
 
 def _fmt_time(seconds: float) -> str:

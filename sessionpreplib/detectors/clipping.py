@@ -18,7 +18,7 @@ class ClippingDetector(TrackDetector):
             ParamSpec(
                 key="clip_consecutive", type=int, default=3, min=1,
                 label="Consecutive clipped samples",
-                description="Minimum consecutive samples at full scale to count as a clipping run.",
+                description="Minimum consecutive near-full-scale samples to count as a clipping run.",
             ),
             ParamSpec(
                 key="clip_report_max_ranges", type=int, default=10, min=1,
@@ -31,8 +31,8 @@ class ClippingDetector(TrackDetector):
     def html_help(cls) -> str:
         return (
             "<b>Description</b><br/>"
-            "Detects digital clipping — runs of consecutive samples at full "
-            "scale (0 dBFS). A configurable minimum run length avoids false "
+            "Detects runs of samples at or near full scale, including either rail "
+            "of an 8-bit PCM file. A configurable minimum run length avoids false "
             "positives from isolated full-scale samples."
             "<br/><br/>"
             "<b>Results</b><br/>"
@@ -61,7 +61,7 @@ class ClippingDetector(TrackDetector):
             )
 
         runs, ranges, channels = clipping_evidence(
-            track.audio_data, self.consecutive, self.max_ranges
+            track.audio_data, self.consecutive, self.max_ranges, subtype=track.subtype
         )
 
         if runs == 0:

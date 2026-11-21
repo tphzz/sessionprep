@@ -27,6 +27,65 @@ def classify(samples, rate, **settings):
     return detector.analyze(track).data
 
 
+@pytest.mark.parametrize("trim_db", [-6, -7])
+def test_held_pcm_note_keeps_rms_normalization_across_input_trims(tmp_path, trim_db):
+    rate = 48000
+    frames = np.arange(62400)
+    t = frames / rate
+    cycle = np.sin(2 * np.pi * (frames % 480) / 480)
+    held = cycle * np.minimum(1, t / .010) * np.clip((1 - t) / .040, 0, 1)
+    path = tmp_path / "Note.wav"
+    sf.write(path, held * 10**(trim_db / 20), rate, subtype="PCM_24")
+    source, _ = sf.read(path)
+    rms = np.sqrt(np.mean(source[480:960]**2))
+    gain = 10**(-18 / 20) / rms
+    track = load_track(str(path))
+    pipeline = Pipeline([SilenceDetector(), AudioClassifierDetector()], [BimodalNormalizeProcessor()])
+    session = SessionContext([track], {})
+    pipeline.analyze_phase1(session)
+    pipeline.analyze_phase2(session)
+    pipeline.plan(session)
+    metrics = track.detector_results["audio_classifier"].data
+    assert metrics["classification"] == "Sustained"
+    assert abs(metrics["decay_db"]) < 0.001
+    pipeline.execute(session, str(tmp_path / "printed"))
+    printed, _ = sf.read(tmp_path / "printed" / path.name)
+    np.testing.assert_allclose(printed, source * gain, atol=2**-23, rtol=0)
+    assert 20 * np.log10(max(abs(printed))) == pytest.approx(-18 + 10 * np.log10(2), abs=.0001)
+
+
+def test_decay_of_a_louder_late_burst_into_silence_has_a_measurement_limit():
+    samples = np.zeros(3000)
+    samples[:1000] = 0.25
+    samples[1600:1700] = 0.26
+    samples[::2] *= -1
+    metrics = classify(samples, 2000)
+    assert metrics["decay_at_floor"]
+    assert metrics["decay_db"] == 120
+
+
+@pytest.mark.parametrize("classifier_enabled", [True, False])
+def test_verbose_decay_uses_the_signal_that_determined_gain(tmp_path, classifier_enabled):
+    rate = 48000
+    samples = np.zeros(rate)
+    samples[2400:8160] = 0.25
+    path = tmp_path / "Pulse.wav"
+    sf.write(path, samples, rate, subtype="PCM_24")
+    track = load_track(str(path))
+    track.repair_overrides["dc_remove"] = True
+    config = {"audio_classifier_enabled": classifier_enabled}
+    proc = BimodalNormalizeProcessor()
+    pipeline = Pipeline([SilenceDetector(), AudioClassifierDetector()], [proc], config)
+    session = SessionContext([track], config)
+    pipeline.analyze_phase1(session)
+    pipeline.analyze_phase2(session)
+    pipeline.plan(session)
+    result = track.processor_results[proc.id]
+    assert result.classification == "Sustained"
+    assert track.detector_results["audio_classifier"].data["decay_at_floor"]
+    assert "Decay 8.2 dB" in proc.render_html(result, track, verbose=True)
+
+
 @pytest.mark.parametrize("shape,padding,expected", [
     ("attack", 0, "Sustained"), ("attack", 4, "Transient"),
     ("flat", 4, "Sustained"), ("burst", 0, "Transient"),

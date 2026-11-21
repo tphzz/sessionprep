@@ -84,7 +84,7 @@ def generate_report(
         f"Source Directory: {os.path.abspath(source_dir)}",
         f"Output Directory: {os.path.dirname(output_path)}",
         f"Target RMS: {config.get('target_rms', -18.0)} dBFS | Target Peak: {config.get('target_peak', -6.0)} dBFS",
-        f"Clipping Detection Threshold: {config.get('clip_consecutive', 3)} consecutive samples @ \u00b11.0",
+        f"Clipping Detection Threshold: {config.get('clip_consecutive', 3)} consecutive near-full-scale samples",
         "",
     ]
 
@@ -346,7 +346,7 @@ def build_warnings(
                    type('', (), {"data": {}})()).data.get("is_clipped")]
     if clipped:
         clip_consec = config.get("clip_consecutive", 3)
-        warnings.append(f"Digital Clipping detected in source (>{clip_consec} samples @ \u00b11.0):")
+        warnings.append(f"Digital Clipping detected in source ({clip_consec} or more consecutive near-full-scale samples):")
         for t in clipped:
             warnings.append(f"  - {t.filename}")
 

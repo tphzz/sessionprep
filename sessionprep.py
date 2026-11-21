@@ -61,7 +61,7 @@ def parse_arguments():
 
     # Diagnostics & Detection
     parser.add_argument("--clip_consecutive", type=int, default=3,
-                        help="Number of consecutive samples at ±1.0 to flag as clipped")
+                        help="Minimum consecutive near-full-scale samples to flag as clipped")
     parser.add_argument("--clip_report_max_ranges", type=positive_int, default=10,
                         help="Max clipped sample ranges to include in reports per file")
     parser.add_argument("--dc_offset_warn_db", type=float, default=-40.0,

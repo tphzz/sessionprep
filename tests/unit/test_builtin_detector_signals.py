@@ -1,12 +1,14 @@
 """Signal and metadata examples with known outcomes for the built-in detectors."""
 
 import json
+from fractions import Fraction
 
 import numpy as np
 import pytest
 import soundfile as sf
 
-from sessionpreplib.audio import discover_track
+from sessionpreplib.audio import discover_track, load_track, subsonic_stft_analysis, windowed_stereo_correlation
+from sessionpreplib.config import build_structured_defaults, default_config, flatten_structured_config
 from sessionpreplib.detectors import (
     AudioClassifierDetector,
     ClippingDetector,
@@ -206,6 +208,31 @@ def test_region_limit_keeps_the_full_null_when_two_passages_have_equal_correlati
     assert (issue.sample_start, issue.sample_end) == (1600, 2399)
 
 
+@pytest.mark.parametrize("both_active", [False, True])
+def test_float_stereo_with_a_large_dc_sum_preserves_the_exact_fold_residual(tmp_path, both_active):
+    cycle = ([[0, .5], [.25, .25], [-.25, .75], [1e-17, .5]] if both_active
+             else [[1e-17, .5], [-1e-17, .5]])
+    path = tmp_path / "Deep fold.wav"
+    sf.write(path, np.tile(cycle, (12000 // len(cycle), 1)), 48000, subtype="FLOAT")
+    track = load_track(str(path))
+    left, right = [[Fraction(float(v)) for v in side] for side in track.audio_data[:len(cycle)].T]
+
+    def variance(values):
+        mean = sum(values) / len(values)
+        return sum((x - mean)**2 for x in values) / len(values)
+
+    folded = [(l + r) / 2 for l, r in zip(left, right)]
+    expected = 10 * np.log10(float((variance(left) + variance(right)) / (2 * variance(folded))))
+    detector = StereoCompatDetector()
+    detector.configure({})
+    result = detector.analyze(track)
+    assert result.data["mono_loss_db"] == pytest.approx(expected, abs=1e-8)
+    if both_active:
+        assert result.data["max_window_mono_loss_db"] == pytest.approx(expected, abs=1e-8)
+    else:
+        assert result.severity == Severity.CLEAN and result.data["lr_corr"] is None
+
+
 def test_nulls_separated_by_silence_keep_each_span_and_use_the_same_loss_in_summary():
     tone = np.tile([0.25, -0.25], 400)
     gap = np.zeros_like(tone)
@@ -253,7 +280,114 @@ def test_short_antiphase_and_dc_only_final_window():
     right[-29:] = -0.5
     result = _measure(StereoCompatDetector(), np.column_stack((left, right)), corr_window_ms=100)
     assert result.severity == Severity.CLEAN
-    assert result.data["mono_loss_db"] == pytest.approx(0.0)
+    expected_corr = np.corrcoef(left, right)[0, 1]
+    stereo_power = (np.var(left) + np.var(right)) / 2
+    expected_loss = 10 * np.log10(stereo_power / np.var((left + right) / 2))
+    assert result.data["lr_corr"] == pytest.approx(expected_corr)
+    assert result.data["mono_loss_db"] == pytest.approx(expected_loss)
+    _, _, windows = windowed_stereo_correlation(left, right, 8000, window_ms=100)
+    start, end, corr, loss = windows[-1]
+    assert (start, end) == (800, 828)
+    assert np.isnan(corr) and np.isnan(loss)
+
+
+def test_default_stereo_windows_localize_each_quarter_second_of_cancellation():
+    left = np.tile([0.25, 0, -0.25, 0], 12000)
+    stereo = np.column_stack((left, left * np.repeat([1, -1, 1, -1], 12000)))
+    for config in ({}, default_config(), flatten_structured_config(build_structured_defaults())):
+        result = _measure(StereoCompatDetector(), stereo, 48000, **config)
+        assert result.data["lr_corr"] == pytest.approx(0, abs=1e-12)
+        assert result.data["mono_loss_db"] == pytest.approx(10 * np.log10(2))
+        assert [(i.sample_start, i.sample_end) for i in result.issues] == [(12000, 23999), (36000, 47999)]
+    assert _measure(StereoCompatDetector(), stereo, 48000, corr_window_ms=500).severity == Severity.CLEAN
+
+
+@pytest.mark.parametrize("window_ms", [100, 250, 500])
+@pytest.mark.parametrize("windowed", [True, False])
+def test_whole_file_loss_includes_low_side_energy_independently_of_local_windows(window_ms, windowed):
+    rate = 48000
+    t = np.arange(2 * rate) / rate
+    mid = 0.1 * np.sin(2 * np.pi * 300 * t)
+    side_ratio = 10**0.605 - 1
+    side = 0.1 * np.sqrt(side_ratio) * np.sin(2 * np.pi * 25 * t)
+    result = _measure(StereoCompatDetector(), np.column_stack((mid + side, mid - side)), rate,
+                      corr_warn=-1.0, corr_window_ms=window_ms, corr_windowed=windowed)
+    assert result.data["lr_corr"] == pytest.approx((1 - side_ratio) / (1 + side_ratio))
+    assert result.data["mono_loss_db"] == pytest.approx(6.05)
+    assert result.data["mono_warn"]
+    if not windowed or window_ms == 100:
+        assert result.severity == Severity.INFO
+
+
+@pytest.mark.parametrize("active", [0, 1])
+def test_hard_pan_only_warns_when_its_measured_mono_loss_exceeds_the_threshold(active):
+    t = np.arange(96000) / 48000
+    stereo = np.full((len(t), 2), 0.04)
+    stereo[:, active] = 0.1 * np.sin(2 * np.pi * 1000 * t)
+    for limit in (6, 2):
+        result = _measure(StereoCompatDetector(), stereo, 48000, corr_warn=0.2, mono_loss_warn_db=limit)
+        assert result.data["lr_corr"] is None and not result.data["corr_warn"]
+        assert result.data["mono_loss_db"] == pytest.approx(10 * np.log10(2))
+        if limit == 6:
+            assert result.severity == Severity.CLEAN and not result.issues
+        else:
+            region, = result.data["windowed_regions"]
+            assert region["min_corr"] is None
+            assert region["max_mono_loss_db"] == pytest.approx(10 * np.log10(2))
+            assert (region["sample_start"], region["sample_end"]) == (0, len(t) - 1)
+            assert "unavailable" in result.issues[0].description
+    stereo[:, 1 - active] = 0.1 * np.cos(2 * np.pi * 1000 * t)
+    orthogonal = _measure(StereoCompatDetector(), stereo, 48000, corr_warn=0.2)
+    assert orthogonal.severity == Severity.ATTENTION
+    assert orthogonal.data["min_window_corr"] == pytest.approx(0, abs=1e-12)
+
+
+@pytest.mark.parametrize("frequency", [None, 2, 12])
+def test_broad_subsonic_meter_ignores_bias_and_retains_real_low_frequencies(frequency):
+    rate = 48000
+    t = np.arange(2 * rate) / rate
+    signal = 0.1 * np.sin(2 * np.pi * 1000 * t)
+    if frequency:
+        signal += 0.04 * np.sin(2 * np.pi * frequency * t + np.pi / 4)
+    for bias in (0.0, 0.04, -0.05):
+        result = _measure(SubsonicDetector(), signal + bias, rate)
+        if frequency:
+            assert result.severity == Severity.INFO
+            assert result.data["subsonic_ratio_db"] == pytest.approx(10 * np.log10(.04**2 / (.04**2 + .1**2)), abs=0.1)
+        else:
+            assert result.severity == Severity.CLEAN and not result.issues
+            assert result.data["subsonic_ratio_db"] < -100
+        assert (_measure(DCOffsetDetector(), signal + bias, rate).severity == Severity.ATTENTION) == bool(bias)
+
+
+@pytest.mark.parametrize("frames", [1001, 24000, 48517])
+def test_dc_is_removed_before_padding_overlapping_subsonic_windows(frames):
+    rate = 48000
+    ac = np.sin(2 * np.pi * 12 * np.arange(frames) / rate) / 8
+    ratio, windows = subsonic_stft_analysis(ac, rate, 30, window_ms=500, hop_ms=250)
+    biased, shifted = subsonic_stft_analysis(ac + .05, rate, 30, window_ms=500, hop_ms=250)
+    assert biased == pytest.approx(ratio, abs=1e-10)
+    np.testing.assert_allclose(shifted, windows, rtol=0, atol=1e-10)
+    assert windows[-1][1] == frames - 1
+    constant, gated = subsonic_stft_analysis(np.full(frames, .05), rate, 30, window_ms=500, hop_ms=250)
+    assert constant == -np.inf
+    assert all(level == -np.inf for _, _, level in gated)
+
+
+@pytest.mark.parametrize(("subtype", "suffix"), [("PCM_U8", ".wav"), ("PCM_S8", ".aiff")])
+@pytest.mark.parametrize(("code", "runs"), [(127, 4000), (-128, 4000), (126, 0), (-127, 0)])
+def test_encoded_eight_bit_clipping_uses_each_polaritys_rail(tmp_path, subtype, suffix, code, runs):
+    samples = np.tile(np.array([0, 38, 89, code, code, code, 89, 38, 0, -25, -51, -25]) / 128, 4000)
+    path = tmp_path / ("rail" + suffix)
+    sf.write(path, samples, 48000, subtype=subtype)
+    track = load_track(str(path))
+    np.testing.assert_array_equal(track.audio_data.ravel(), samples)
+    detector = ClippingDetector()
+    detector.configure({})
+    result = detector.analyze(track)
+    assert result.data["runs"] == runs
+    if runs:
+        assert (result.issues[0].sample_start, result.issues[0].sample_end) == (3, 5)
 
 
 def test_subsonic_finding_identifies_the_channel_containing_low_band_energy():
@@ -267,6 +401,74 @@ def test_subsonic_finding_identifies_the_channel_containing_low_band_energy():
     assert not finding.data["per_channel"][0]["warn"]
     assert finding.data["per_channel"][1]["ratio_db"] == pytest.approx(10 * np.log10(0.5), abs=0.1)
     assert {(i.channel, i.freq_min_hz, i.freq_max_hz) for i in finding.issues} == {(1, 0.0, 30.0)}
+
+
+def test_quiet_subsonic_fallback_ignores_bias_in_the_other_channel_and_silent_gaps():
+    rate = 48000
+    t = np.arange(2 * rate) / rate
+    rumble = .001 * np.sin(2 * np.pi * 12 * t)
+    rumble[rate // 2:rate] = 0
+    stereo = np.column_stack((np.full(t.size, .05), rumble + .05))
+    result = _measure(SubsonicDetector(), stereo, rate)
+    assert [(i.sample_start, i.sample_end, i.channel) for i in result.issues] == [
+        (0, 23999, 1), (48000, 95999, 1),
+    ]
+    assert all("active audio" in i.description for i in result.issues)
+
+
+def test_long_non_fft_friendly_track_keeps_the_whole_record_frequency_grid():
+    n, rate = 300007, 48000
+    phase = 2 * np.pi * np.arange(n) / n
+    last_in_band = int(30 * n / rate)
+    # Adjacent coherent DFT bins straddle the cutoff. The final incomplete
+    # processing block must contribute with the same phase as the first.
+    samples = .05 + .03 * np.cos(last_in_band * phase) + .1 * np.sin((last_in_band + 1) * phase)
+    expected = 10 * np.log10(.03**2 / (.03**2 + .1**2))
+    for window in (100, 500):
+        ratio, _ = subsonic_stft_analysis(samples, rate, 30, window_ms=window)
+        assert ratio == pytest.approx(expected, abs=1e-8)
+
+
+@pytest.mark.parametrize("rate", [44100, 48000, 96000])
+def test_decimal_cutoff_includes_the_boundary_bin_and_excludes_its_lower_neighbor(rate):
+    frames = 5 * rate // 2
+    phase = 2 * np.pi * np.arange(frames) / frames
+    samples = .04 * np.sin(41 * phase) + .1 * np.cos(2500 * phase)
+    cutoff = 16.4  # bin 41 of a 2.5-second recording
+    expected = 10 * np.log10(.04**2 / (.04**2 + .1**2))
+    for hz in (cutoff, np.nextafter(cutoff, np.inf)):
+        result = _measure(SubsonicDetector(), samples, rate, subsonic_hz=hz)
+        assert result.severity == Severity.INFO
+        assert result.data["subsonic_ratio_db"] == pytest.approx(expected, abs=1e-8)
+    result = _measure(SubsonicDetector(), samples, rate, subsonic_hz=np.nextafter(cutoff, -np.inf))
+    assert result.severity == Severity.CLEAN and result.data["subsonic_ratio_db"] < -120
+
+
+@pytest.mark.parametrize("phase", [0, np.pi / 4, np.pi / 2])
+@pytest.mark.parametrize(("hz", "level"), [(1, -20.5), (1, -19.5), (2, -19.8), (29, -19.5), (30, -19.5), (31, -8)])
+def test_whole_subsonic_reading_matches_coherent_band_energy_at_every_phase(hz, level, phase):
+    rate = 48000
+    t = np.arange(4 * rate) / rate
+    share = 10**(level / 10)
+    low = 0.1 * np.sqrt(share / (1 - share)) * np.sin(2 * np.pi * hz * t + phase)
+    samples = 0.05 + 0.1 * np.cos(2 * np.pi * 1000 * t) + low
+    result = _measure(SubsonicDetector(), samples, rate)
+    ratio = result.data["subsonic_ratio_db"]
+    if hz <= 30:
+        assert ratio == pytest.approx(level, abs=1e-8)
+    else:
+        assert ratio < -120
+    assert (result.severity == Severity.INFO) == (hz <= 30 and level >= -20)
+
+
+@pytest.mark.parametrize("subtype", ["PCM_16", "PCM_24", "PCM_32", "FLOAT"])
+def test_higher_resolution_clipping_retains_its_near_full_scale_threshold(tmp_path, subtype):
+    path = tmp_path / "limits.wav"
+    sf.write(path, np.repeat([.99995, .9998, -.99995, -.9998], 3), 48000, subtype=subtype)
+    detector = ClippingDetector()
+    detector.configure({})
+    result = detector.analyze(load_track(str(path)))
+    assert [(i.sample_start, i.sample_end) for i in result.issues] == [(0, 2), (6, 8)]
 
 
 def test_ultrasonic_requires_sustained_energy_at_an_eligible_sample_rate():

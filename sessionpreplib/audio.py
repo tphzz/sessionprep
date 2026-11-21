@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import math
 import os
+from bisect import bisect_right
 from hashlib import file_digest, sha256
 from typing import Any
 
 import numpy as np
 import soundfile as sf
-from scipy.signal import stft as scipy_stft
+from scipy import fft
+from scipy.signal import ZoomFFT, stft as scipy_stft
 
 from .models import TrackContext
+from .config import DEFAULT_STEREO_WINDOW_MS
 from .chunks import chunk_ids as _chunk_ids
 
 
@@ -472,23 +475,27 @@ def detect_clipping_ranges(
     data: np.ndarray,
     threshold_count: int,
     max_ranges: int = 10,
+    *,
+    subtype: str | None = None,
 ) -> tuple[int, list[tuple[int, int, int | None]]]:
     """Return (count, ranges) where ranges are (start_sample, end_sample, channel).
 
     ``channel`` is an int (0-based) for multi-channel data or ``None`` for mono.
     """
-    total, ranges, _channels = clipping_evidence(data, threshold_count, max_ranges)
+    total, ranges, _channels = clipping_evidence(data, threshold_count, max_ranges, subtype=subtype)
     return total, ranges
 
 
-def clipping_evidence(data: np.ndarray, threshold_count: int, max_ranges: int):
+def clipping_evidence(data: np.ndarray, threshold_count: int, max_ranges: int, *, subtype: str | None = None):
     """Measure all channels but materialize only the requested number of overlay locations."""
     channels = data.T if data.ndim == 2 else (data,)
     total = 0
     affected = []
     ranges = []
+    # The largest 8-bit PCM code decodes below the usual near-full-scale threshold.
+    positive_limit = 127 / 128 if subtype in {"PCM_U8", "PCM_S8"} else 0.9999
     for ch, samples in enumerate(channels):
-        idx = np.flatnonzero(np.abs(samples) >= 0.9999)
+        idx = np.flatnonzero((samples >= positive_limit) | (samples <= -0.9999))
         if not idx.size:
             continue
         splits = np.flatnonzero(np.diff(idx) > 1)
@@ -504,6 +511,43 @@ def clipping_evidence(data: np.ndarray, threshold_count: int, max_ranges: int):
     return total, ranges, affected
 
 
+def _band_stop(length: int, samplerate: int, cutoff_hz: float) -> int:
+    """First bin above the inclusive cutoff, compared in the user's Hz units."""
+    return bisect_right(range(length // 2 + 1), cutoff_hz, key=lambda k: k * samplerate / length)
+
+
+def _whole_subsonic_ratio(ac: np.ndarray, samplerate: int, cutoff_hz: float, silence_rms: float) -> float:
+    """Power in whole-record DFT bins through the cutoff, relative to all AC power."""
+    n = len(ac)
+    last = _band_stop(n, samplerate, cutoff_hz) - 1
+    total = np.einsum("i,i->", ac, ac) / n
+    if last < 1 or total == 0 or total < silence_rms**2:
+        return -math.inf
+    if last == n // 2:
+        return 0.0
+
+    if n <= 262144 or fft.next_fast_len(n, real=True) == n or last > n // 16:
+        bins = fft.rfft(ac, norm="forward")[1:last + 1]
+    else:
+        # An exact-length FFT of a multi-minute, prime-length stem can need
+        # several times the source's memory. Evaluate only the low-frequency
+        # DFT bins in bounded blocks on the same whole-file frequency grid.
+        width = 65536
+        transform = ZoomFFT(width, [1 / n, (last + 1) / n], m=last, fs=1)
+        radians = -2j * np.pi * np.arange(1, last + 1) / n
+        bins = np.zeros(last, dtype=np.complex128)
+        for start in range(0, n, width):
+            block = ac[start:start + width]
+            if block.size < width:
+                block = np.pad(block, (0, width - block.size))
+            bins += transform(block) * np.exp(start * radians)
+        bins /= n
+    # The real signal's negative-frequency bins have the same energy. The
+    # all-bin shortcut above already handles Nyquist and the excluded DC.
+    band = 2 * np.vdot(bins, bins).real
+    return min(0.0, 10 * (math.log10(band) - math.log10(total))) if band > 0 else -math.inf
+
+
 def subsonic_stft_analysis(
     signal: np.ndarray,
     samplerate: int,
@@ -513,12 +557,10 @@ def subsonic_stft_analysis(
     hop_ms: int | None = None,
     abs_gate_db: float = -40.0,
     silence_rms: float = 1e-7,
+    include_windows: bool = True,
+    minimum_whole_ratio_db: float = -math.inf,
 ) -> tuple[float, list[tuple[int, int, float]]]:
-    """Single-pass STFT subsonic analysis on a 1-D signal.
-
-    Uses :func:`scipy.signal.stft` to compute the short-time Fourier transform
-    in one vectorised call, then derives both per-window and whole-file
-    subsonic-to-total energy ratios from the resulting power spectrum.
+    """Whole-record AC band energy and local Hann-window spectral evidence.
 
     Parameters
     ----------
@@ -553,35 +595,31 @@ def subsonic_stft_analysis(
 
     original_size = signal.size
     nperseg = max(8, int(samplerate * window_ms / 1000))
-    hop_samples = max(1, int(samplerate * ((hop_ms or window_ms)) / 1000))
+    hop_samples = min(nperseg, max(1, int(samplerate * (hop_ms or window_ms) / 1000)))
     noverlap = nperseg - hop_samples
 
     # Pad signal so scipy.signal.stft (boundary=None) includes the tail.
     # Without padding, partial last windows are dropped.
-    remainder = (original_size - nperseg) % hop_samples if original_size > nperseg else original_size
-    if remainder != 0:
-        pad_len = hop_samples - remainder
-        padded = np.pad(signal, (0, pad_len)).astype(np.float64)
-    else:
-        padded = signal.astype(np.float64)
+    # Remove the channel's stationary bias before tapering or zero padding.
+    # Per-window detrending would also remove genuine low-frequency variation.
+    n_frames = 1 + (max(0, original_size - nperseg) + hop_samples - 1) // hop_samples
+    padded = np.zeros(nperseg + (n_frames - 1) * hop_samples, dtype=np.float64)
+    ac = padded[:original_size]
+    np.subtract(signal, signal[0], dtype=np.float64, out=ac)
+    ac -= ac.mean()
+    whole_ratio = _whole_subsonic_ratio(ac, samplerate, cutoff_hz, silence_rms)
+    if not include_windows or whole_ratio < minimum_whole_ratio_db:
+        return whole_ratio, []
 
     # Power-of-2 FFT size for speed (does not change window shape or overlap)
     nfft = 1 << (nperseg - 1).bit_length()
 
-    # --- Vectorised per-window RMS (for silence + absolute power gates) ---
-    # Compute RMS on hop-aligned non-overlapping chunks of the original signal
-    # to match the STFT frame positions.
-    n_frames = (padded.size - noverlap) // hop_samples
-    # Build RMS from hop-aligned windows (same start positions as STFT frames)
+    # Gate on the real, DC-free samples contributing to each STFT frame.
     rms_arr = np.empty(n_frames, dtype=np.float64)
     for i in range(n_frames):
         s = i * hop_samples
         e = min(s + nperseg, original_size)
-        if e <= s:
-            rms_arr[i] = 0.0
-        else:
-            chunk = padded[s:e]
-            rms_arr[i] = float(np.sqrt(np.mean(chunk ** 2)))
+        rms_arr[i] = np.sqrt(np.mean(ac[s:e] ** 2))
 
     # --- STFT ---
     _f, _t, Zxx = scipy_stft(
@@ -589,24 +627,15 @@ def subsonic_stft_analysis(
         noverlap=noverlap, window='hann', boundary=None,
     )
     power = np.abs(Zxx) ** 2  # (n_freq_bins, n_frames)
-    actual_frames = power.shape[1]
-
-    # Trim RMS array if frame counts diverge (shouldn't happen, but be safe)
-    if rms_arr.size > actual_frames:
-        rms_arr = rms_arr[:actual_frames]
-    elif rms_arr.size < actual_frames:
-        rms_arr = np.pad(rms_arr, (0, actual_frames - rms_arr.size))
-
-    # --- Frequency bin indices (integer slicing, computed once) ---
-    dc_bin = 1  # skip DC at index 0
-    cutoff_bin = min(
-        int(np.floor(cutoff_hz * nfft / samplerate)) + 1,
-        power.shape[0],
-    )
+    # Fold the negative-frequency power into the one-sided spectrum. The
+    # common factor of two cancels in the ratio. After global centering the
+    # tapered zero bin can contain genuine AC below one bin's bandwidth.
+    power[[0, -1]] *= 0.5
+    cutoff_bin = _band_stop(nfft, samplerate, cutoff_hz)
 
     # --- Vectorised band / total power ---
-    band = np.sum(power[dc_bin:cutoff_bin, :], axis=0)   # (n_frames,)
-    total = np.sum(power[dc_bin:, :], axis=0)             # (n_frames,)
+    band = np.sum(power[:cutoff_bin], axis=0)
+    total = np.sum(power, axis=0)
 
     # Per-window ratio
     with np.errstate(divide='ignore', invalid='ignore'):
@@ -626,18 +655,9 @@ def subsonic_stft_analysis(
     abs_mask = np.isfinite(ratios) & ((rms_db + ratios) < abs_gate_db)
     ratios[abs_mask] = -np.inf
 
-    # --- Whole-file ratio (aggregated from per-frame power) ---
-    valid = rms_arr >= silence_rms
-    total_band = float(np.sum(band[valid]))
-    total_all = float(np.sum(total[valid]))
-    if total_band > 0 and total_all > 0:
-        whole_ratio = float(10.0 * np.log10(total_band / total_all))
-    else:
-        whole_ratio = _NEG_INF
-
     # --- Build result tuples ---
     results: list[tuple[int, int, float]] = []
-    for i in range(actual_frames):
+    for i in range(n_frames):
         s = i * hop_samples
         e = min(s + nperseg, original_size) - 1
         results.append((s, e, float(ratios[i])))
@@ -649,134 +669,93 @@ def subsonic_stft_analysis(
 # Windowed stereo correlation + mono folddown
 # ---------------------------------------------------------------------------
 
+def _centered_energy(rows: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Center and scale owned rows in place. Return their scaled norm² and log energy."""
+    # Keep constant rows exactly silent and tiny fold residuals above underflow.
+    rows -= rows[:, :1].copy()
+    scale = np.maximum(rows.max(axis=1), -rows.min(axis=1))
+    scale[scale == 0] = 1.0
+    rows /= scale[:, None]
+    rows -= rows.mean(axis=1, keepdims=True)
+    power = np.einsum("ij,ij->i", rows, rows)
+    with np.errstate(divide="ignore"):
+        return power, np.log(power) + 2 * np.log(scale)
+
+
+def _stereo_readings(left: np.ndarray, right: np.ndarray):
+    """Measure each row independently over its real samples (no padding)."""
+    # Fold before centering the channels. Separate centering can lose a real
+    # residual, and forming the average here can underflow at a deep null.
+    folded = np.add(left, right, dtype=np.float64)
+    reference = folded[:, :1].copy()
+    # TwoSum recovers the rounding residual of L+R. Remove the large
+    # common DC term before adding the residual back. This preserves small
+    # AC alongside a DC offset, as well as a deep null in the stereo fold.
+    for start in range(0, folded.shape[1], 65536):
+        sl = slice(start, start + 65536)
+        high = folded[:, sl]
+        l, r = left[:, sl], right[:, sl]
+        virtual_r = high - l
+        low = (l - (high - virtual_r)) + (r - virtual_r)
+        high -= reference
+        high += low
+    _, log_fold = _centered_energy(folded)
+    del folded, high
+    l_ac = left.astype(np.float64)
+    r_ac = right.astype(np.float64)
+    norm_l, log_l = _centered_energy(l_ac)
+    norm_r, log_r = _centered_energy(r_ac)
+    denom = np.sqrt(norm_l) * np.sqrt(norm_r)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        corr = np.clip(np.einsum("ij,ij->i", l_ac, r_ac) / denom, -1, 1)
+        log_stereo = np.logaddexp(log_l, log_r)
+        loss = (10 / math.log(10)) * (log_stereo + math.log(2) - log_fold)
+    loss = np.where(np.isneginf(log_stereo), 0.0, np.maximum(loss, 0.0))
+    return corr, loss, np.maximum(log_l, log_r)
+
+
 def windowed_stereo_correlation(
     left: np.ndarray,
     right: np.ndarray,
     samplerate: int,
-    window_ms: int = 500,
+    window_ms: int = DEFAULT_STEREO_WINDOW_MS,
     silence_rms: float = 1e-7,
-) -> tuple[
-    float, float,
-    list[tuple[int, int, float, float]],
-]:
-    """Windowed Pearson correlation and mono folddown loss for stereo L/R.
+    *,
+    include_windows: bool = True,
+) -> tuple[float, float, list[tuple[int, int, float, float]]]:
+    """Whole-file AC Pearson correlation and mono fold-down loss, plus local readings.
 
-    Parameters
-    ----------
-    left, right : 1-D float arrays
-        Full-resolution left and right channel samples.
-    samplerate : int
-        Sample rate in Hz.
-    window_ms : int
-        Analysis window length in milliseconds.
-    silence_rms : float
-        RMS threshold below which a window is considered silent.
-
-    Returns
-    -------
-    whole_corr : float
-        Whole-file Pearson correlation (NaN if silent/invalid).
-    whole_mono_loss_db : float
-        Whole-file mono folddown loss in dB (0.0 if no loss, inf if total
-        cancellation).
-    per_window : list of (sample_start, sample_end, corr, mono_loss_db)
-        Per-window results.  Silent windows have (NaN, NaN).
+    Local windows have inclusive sample bounds and their own silence gate.
+    Correlation is undefined when either channel has zero variance. Loss can
+    still be measured on a hard-panned signal and is infinite at a full null.
     """
-    _NAN = float('nan')
+    if (left.ndim != 1 or right.ndim != 1 or not left.size
+            or left.size != right.size or samplerate <= 0):
+        return math.nan, 0.0, []
 
-    if (left.ndim != 1 or right.ndim != 1
-            or left.size == 0 or left.size != right.size
-            or samplerate <= 0):
-        return _NAN, 0.0, []
+    whole = _stereo_readings(left[None, :], right[None, :])
+    results = []
+    whole_corr, whole_loss = float(whole[0][0]), float(whole[1][0])
+    if not include_windows:
+        return whole_corr, whole_loss, results
 
-    n = left.size
-    win_samples = max(8, int(samplerate * window_ms / 1000))
-    n_win = (n + win_samples - 1) // win_samples
-
-    # Pad to exact multiple of win_samples
-    padded_len = n_win * win_samples
-    if padded_len != n:
-        l = np.pad(left.astype(np.float64), (0, padded_len - n))
-        r = np.pad(right.astype(np.float64), (0, padded_len - n))
-    else:
-        l = left.astype(np.float64)
-        r = right.astype(np.float64)
-
-    # Reshape to (n_win, win_samples)
-    L = l.reshape(n_win, win_samples)
-    R = r.reshape(n_win, win_samples)
-
-    counts = np.full(n_win, win_samples)
-    counts[-1] = n - (n_win - 1) * win_samples
-
-    # Fold first: independently centering L and R can create or erase a
-    # residual. Subtracting a reference sample gives any constant fold an
-    # exact AC norm of zero. Scale before squaring to retain very small nulls.
-    folded = L + R
-    folded -= folded[:, :1].copy()
-    folded[-1, counts[-1]:] = 0.0
-    scales = np.maximum(folded.max(axis=1), -folded.min(axis=1))
-    scales[scales == 0] = 1.0
-    folded /= scales[:, None]
-    folded -= folded.sum(axis=1, keepdims=True) / counts[:, None]
-    folded[-1, counts[-1]:] = 0.0
-    # Keep the scaling factor in log power. Reconstructing a very small
-    # norm in linear units would round away part of a measurable residual.
-    with np.errstate(divide='ignore'):
-        mono_log_power = (np.log(np.einsum('ij,ij->i', folded, folded))
-                          + 2.0 * (np.log(scales) - math.log(2.0)))
-    del folded
-
-    # Center L and R independently for Pearson correlation and stereo RMS.
-    L -= L.sum(axis=1, keepdims=True) / counts[:, None]
-    R -= R.sum(axis=1, keepdims=True) / counts[:, None]
-    L[-1, counts[-1]:] = 0.0
-    R[-1, counts[-1]:] = 0.0
-
-    # Per-window dot products (vectorized)
-    dot_ll = np.sum(L * L, axis=1)
-    dot_rr = np.sum(R * R, axis=1)
-    dot_lr = np.sum(L * R, axis=1)
-
-    # Per-window RMS for silence gating
-    rms_l = np.sqrt(dot_ll / counts)
-    rms_r = np.sqrt(dot_rr / counts)
-    active = np.maximum(rms_l, rms_r) >= silence_rms
-
-    # --- Per-window correlation ---
-    denom = np.sqrt(dot_ll) * np.sqrt(dot_rr)
-    with np.errstate(divide='ignore', invalid='ignore'):
-        corr = np.clip(np.where(denom > 0, dot_lr / denom, 0.0), -1.0, 1.0)
-    corr[~active] = _NAN
-
-    # --- Per-window mono folddown loss ---
-    stereo_p = (dot_ll + dot_rr) / 2.0
-    to_db = 10.0 / math.log(10.0)
-    with np.errstate(divide='ignore', invalid='ignore'):
-        mono_loss = np.maximum(0.0, to_db * (np.log(stereo_p) - mono_log_power))
-    mono_loss[stereo_p == 0] = 0.0
-    mono_loss[~active] = _NAN
-
-    # --- Whole-file aggregation (from cumulative dot products) ---
-    sum_ll = float(np.sum(dot_ll[active]))
-    sum_rr = float(np.sum(dot_rr[active]))
-    sum_lr = float(np.sum(dot_lr[active]))
-
-    whole_denom = np.sqrt(sum_ll) * np.sqrt(sum_rr)
-    whole_corr = float(np.clip(sum_lr / whole_denom, -1.0, 1.0)) if whole_denom > 0 else _NAN
-
-    whole_stereo_p = (sum_ll + sum_rr) / 2.0
-    if whole_stereo_p > 0:
-        whole_mono_log_power = float(np.logaddexp.reduce(mono_log_power[active], initial=-np.inf))
-        whole_mono_loss = max(0.0, to_db * (math.log(whole_stereo_p) - whole_mono_log_power))
-    else:
-        whole_mono_loss = 0.0
-
-    # --- Build result tuples ---
-    results: list[tuple[int, int, float, float]] = []
-    for i in range(n_win):
-        s = i * win_samples
-        e = min(s + win_samples, n) - 1
-        results.append((s, e, float(corr[i]), float(mono_loss[i])))
-
-    return whole_corr, whole_mono_loss, results
+    width = max(8, int(samplerate * window_ms / 1000))
+    start = 0
+    while start < left.size:
+        # Group equal-length windows. The final partial window uses only its real frames.
+        size = min(width, left.size - start)
+        count = min(max(1, 65536 // size), (left.size - start) // size)
+        end = start + count * size
+        if size == left.size:
+            readings = whole
+        else:
+            readings = _stereo_readings(left[start:end].reshape(count, size),
+                                        right[start:end].reshape(count, size))
+        corr, loss, log_energy = readings
+        gate = 2 * math.log(silence_rms) + math.log(size) if silence_rms > 0 else -math.inf
+        for pos, c, db, energy in zip(range(start, end, size), corr, loss, log_energy):
+            if energy < gate:
+                c = db = math.nan
+            results.append((pos, pos + size - 1, float(c), float(db)))
+        start = end
+    return whole_corr, whole_loss, results

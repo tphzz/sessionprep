@@ -875,9 +875,9 @@ Contains audio I/O, cached DSP helpers, and stateless DSP functions.
 
 **Stateless DSP functions:**
 
-- `detect_clipping_ranges(data, threshold_count, max_ranges) -> (int, list[tuple[int, int, int|None]])` — ranges are `(start, end, channel)`
-- `subsonic_stft_analysis(signal, samplerate, cutoff_hz, *, window_ms, hop_ms, abs_gate_db, silence_rms) -> (float, list[tuple[int, int, float]])` — single-pass STFT subsonic analysis on a 1-D signal; returns `(whole_file_ratio_db, per_window_ratios)`. Uses `scipy.signal.stft` with Hann windowing, vectorised band/total power computation, and silence + absolute power gates.
-- `windowed_stereo_correlation(left, right, samplerate, window_ms, silence_rms)` returns `(whole_corr, whole_mono_loss_db, per_window_results)`. The active windows contribute their centered stereo energy and the energy of their actual mono fold-down. Positive infinity denotes exact cancellation. A partial window uses its actual frame count for centering and gating.
+- `detect_clipping_ranges(data, threshold_count, max_ranges, *, subtype=None)` returns a count and inclusive `(start, end, channel)` ranges. Pass the encoding of the measured signal to recognize the positive 8-bit PCM rail.
+- `subsonic_stft_analysis` returns a whole-record AC band ratio in dB and optional local Hann-window readings for one channel. The global DFT uses the original sample count. For long, narrow-band transforms on awkward lengths, block transforms accumulate complex values on that same frequency grid. The detector requests local readings only for flagged channels.
+- `windowed_stereo_correlation` measures whole-file Pearson correlation and mono fold-down loss over every real sample. Optional local windows are separately centered and gated. Correlation is unavailable when either channel has no AC energy. Infinite loss denotes complete AC cancellation.
 - `linear_to_db(linear) -> float`
 - `db_to_linear(db) -> float`
 - `format_duration(samples, samplerate) -> str`
@@ -994,21 +994,21 @@ cycles.
 - **ID:** `subsonic` | **Depends on:** `["silence"]`
 - **Config:** `subsonic_hz`, `subsonic_warn_ratio_db`, `subsonic_windowed` (default `True`), `subsonic_window_ms`, `subsonic_max_regions`
 - **Data:** `{"subsonic_ratio_db": float, "subsonic_warn": bool, "per_channel": {ch: {"ratio_db", "warn"}}, "windowed_regions"?: list[dict]}`
-- **Per-channel analysis** (always active for stereo+): Each channel is analyzed independently via `subsonic_stft_analysis` (one `scipy.signal.stft` call per channel). The combined ratio is the **maximum** (worst) of all per-channel ratios — more conservative than the previous mono-downmix approach, which could mask subsonic content through phase cancellation. If only one channel triggers the warning, the issue is reported per-channel with `channel` set to the offending channel index; if all channels trigger, a whole-file issue is reported.
-- **Windowed analysis** (default on via `subsonic_windowed`): Per-window ratios are derived from the same STFT pass (vectorised, no Python loop). Contiguous exceeding windows are merged into regions reported as `IssueLocation` objects with precise `sample_start`/`sample_end` and frequency bounds (`freq_min_hz=0`, `freq_max_hz=cutoff`). Capped by `subsonic_max_regions`. Safeguards:
+- **Per-channel analysis.** Subtract the stationary channel mean. Sum positive DFT-bin energy through the inclusive cutoff and divide by total AC energy. The combined reading is the highest channel ratio. Whole-record RMS below the silence gate yields no measurable ratio.
+- **Windowed analysis.** With `subsonic_windowed` enabled, local STFT windows on each flagged channel yield frequency-bounded `IssueLocation` regions with inclusive sample bounds. `subsonic_max_regions` caps the number displayed.
   1. **Absolute subsonic power gate:** Each window's absolute subsonic energy level is checked (`window_rms_db + ratio_db`). Windows where this is below −40 dBFS are suppressed — their subsonic content is too quiet to matter regardless of the ratio. Prevents amp hum/noise in quiet gaps from producing false positives.
   2. **Threshold relaxation:** The windowed threshold is relaxed by 6 dB below the configured threshold. Short windows have less frequency resolution, so borderline subsonic content that triggers the whole-file check may not reach the same threshold per-window.
-  3. **Active-signal fallback:** If no windows exceed the relaxed threshold, the detector falls back to marking windows that have significant signal (RMS within 20 dB of the loudest window, vectorised via NumPy reshape + `np.diff` contiguous merging). Since the whole-file analysis already confirmed subsonic content, the active-signal windows are where it lives.
-  4. **Whole-file fallback:** If even the active-signal approach produces no regions, a whole-file `IssueLocation` is emitted so ATTENTION always has at least one visible overlay.
+  3. **Active-signal fallback.** If no windows qualify on a flagged channel, mark windows within 20 dB of its loudest AC window. These locations carry an activity description with no measured local band ratio.
+  4. **Whole-file fallback.** A finding without local regions receives a whole-file location.
 - **Issues:** Per-region `IssueLocation` (with frequency bounds) in windowed mode; falls back to active-signal regions or whole-file span
-- **Severity:** `ATTENTION` if exceeds threshold (whole-file or any channel), `CLEAN` otherwise
+- **Severity:** `INFO` if a channel meets the threshold, `CLEAN` otherwise.
 - **Hint:** `"consider HPF ~{cutoff_hz} Hz"`
 
 #### 6.3.9 AudioClassifierDetector (`audio_classifier.py`)
 
 - **ID:** `audio_classifier` | **Depends on:** `["silence"]`
 - **Config:** `window`, `stereo_mode`, `rms_anchor`, `rms_percentile`, `gate_relative_db`, `crest_threshold`, `decay_lookahead_ms`, `decay_db_threshold`, `sparse_density_threshold`, `force_transient`, `force_sustained`
-- **Data:** `{"peak_db", "rms_max_db", "rms_anchor_db", "rms_anchor_mean", "crest", "decay_db", "density", "classification", "is_transient", "near_threshold"}`
+- **Data:** `peak_db`, `rms_max_db`, `rms_anchor_db`, `rms_anchor_mean`, `crest`, `decay_db`, `density`, `classification`, `is_transient`, and `near_threshold`. When `decay_at_floor` is true, the decay reading is a lower bound. Normalization stores the classifier metrics used for the gain decision in its processor result.
 - **Classification logic:** Three-metric system — crest factor (peak-to-RMS ratio), envelope decay rate (energy drop after loudest moment), and density (fraction of active RMS windows). Sparse tracks with at least one agreeing dynamic metric are classified as Transient (catches toms, crashes, FX hits). For non-sparse tracks, crest and decay vote together with decay as tiebreaker: high crest + slow decay → Sustained (plucked/piano); low crest + fast decay → Transient (compressed drums).
 - **Severity:** Always `INFO`
 
