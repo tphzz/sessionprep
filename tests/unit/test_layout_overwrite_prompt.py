@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import replace
 import os
 from pathlib import Path
-import time
 
 import numpy as np
 from PySide6.QtCore import QSizeF, Qt
@@ -27,6 +26,7 @@ from sessionpreplib.layout_files import (
 )
 from sessionpreplib.models import SessionContext
 from sessionpreplib.topology import build_default_topology
+from tests.fs_helpers import rewrite_past_revision_tick as _rewrite_past_revision_tick
 
 
 @pytest.fixture
@@ -43,18 +43,6 @@ def _write_wav(path: Path, value: float, *, channels: int = 1, sr: int = 48000) 
     sf.write(path, data, sr, subtype="PCM_24")
 
 
-def _rewrite_past_revision_tick(path: Path, write_fn) -> None:
-    """Rewrite *path* in place until its filesystem revision advances past a coarse clock tick."""
-    before_rev = file_revision(str(path), path.stat())
-    deadline = time.monotonic() + 1.0
-    while True:
-        write_fn()
-        if file_revision(str(path), path.stat()) != before_rev:
-            return
-        assert time.monotonic() < deadline, f"file_revision did not advance for {path}"
-        time.sleep(0.005)
-
-
 def _wait_until(qapp, predicate, *, timeout_ms: int = 5000) -> None:
     elapsed = 0
     while elapsed < timeout_ms:
@@ -64,6 +52,21 @@ def _wait_until(qapp, predicate, *, timeout_ms: int = 5000) -> None:
         QTest.qWait(15)
         elapsed += 15
     assert predicate(), "Timed out waiting for condition"
+
+
+def _show_and_activate(qapp, window) -> None:
+    window.show()
+    window.resize(1920, 1080)
+    window.activateWindow()
+    _wait_until(
+        qapp,
+        lambda: (
+            window.windowHandle() is not None
+            and window.windowHandle().isExposed()
+            and window.isActiveWindow()
+        ),
+    )
+    qapp.processEvents()
 
 
 # ── Library contract tests ───────────────────────────────────────────────────
@@ -218,10 +221,7 @@ def test_status_prompt_space_cancels_and_suppresses_status_messages(qapp, monkey
     apply_dark_theme(qapp)
     window = SessionPrepWindow()
     try:
-        window.show()
-        window.resize(1920, 1080)
-        QTest.qWait(30)
-        qapp.processEvents()
+        _show_and_activate(qapp, window)
 
         play_toggles: list[bool] = []
         monkeypatch.setattr(window.detail_controller, "toggle_play", lambda: play_toggles.append(True))
@@ -270,10 +270,7 @@ def test_status_prompt_enter_accepts_and_escape_cancels(qapp, monkeypatch):
     apply_dark_theme(qapp)
     window = SessionPrepWindow()
     try:
-        window.show()
-        window.resize(1920, 1080)
-        QTest.qWait(30)
-        qapp.processEvents()
+        _show_and_activate(qapp, window)
 
         play_toggles: list[bool] = []
         monkeypatch.setattr(window.detail_controller, "toggle_play", lambda: play_toggles.append(True))

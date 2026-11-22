@@ -1,7 +1,5 @@
 """Phase 1 must analyze each source's decoded samples before suggesting a layout."""
 
-import time
-
 import numpy as np
 import pytest
 import soundfile as sf
@@ -10,12 +8,13 @@ pytest.importorskip("PySide6")
 
 from sessionprepgui.analysis.worker import AudioLoadWorker, Phase1AnalyzeWorker, TopologyApplyWorker
 from sessionprepgui.session.io import capture_phase1_sources
-from sessionpreplib.audio import discover_track, file_revision, get_peak, load_track
+from sessionpreplib.audio import discover_track, get_peak, load_track
 from sessionpreplib.models import SessionContext
 from sessionpreplib.topology import (
     ChannelRoute, TopologyEntry, TopologyMapping, TopologySource, build_default_topology,
     extract_channel, passthrough_routes,
 )
+from tests.fs_helpers import rewrite_past_revision_tick as _rewrite_past_revision_tick
 
 
 def _write_stereo(path, *, identical=True):
@@ -23,18 +22,6 @@ def _write_stereo(path, *, identical=True):
     left = np.tile([0.25, -0.125], 256)
     sf.write(path, np.column_stack((left, left if identical else -left)), 48_000,
              subtype="PCM_24")
-
-
-def _rewrite_past_revision_tick(path, write_fn):
-    """Rewrite *path* in place until its filesystem revision advances past a coarse clock tick."""
-    before_rev = file_revision(str(path), path.stat())
-    deadline = time.monotonic() + 1.0
-    while True:
-        write_fn()
-        if file_revision(str(path), path.stat()) != before_rev:
-            return
-        assert time.monotonic() < deadline, f"file_revision did not advance for {path}"
-        time.sleep(0.005)
 
 
 def _analyze(tracks):

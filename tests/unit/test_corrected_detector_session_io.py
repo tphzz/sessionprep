@@ -2,19 +2,19 @@
 import json
 import math
 import os
-import time
 
 import numpy as np
 import pytest
 import soundfile as sf
 
 from sessionprepgui.session.io import load_session, save_session
-from sessionpreplib.audio import SourceChangedError, file_revision, load_track
+from sessionpreplib.audio import SourceChangedError, load_track
 from sessionpreplib.detectors import ClippingDetector, StereoCompatDetector, default_detectors
 from sessionpreplib.models import SessionContext, Severity
 from sessionpreplib.pipeline import Pipeline
 from sessionpreplib.processors import default_processors
 from sessionpreplib.reports import save_json
+from tests.fs_helpers import rewrite_preserving_mtime
 
 
 def _pipeline():
@@ -167,16 +167,11 @@ def test_saved_check_is_withheld_when_the_source_at_the_same_path_was_replaced(t
     track, pipeline, session = analyzed
     pipeline.plan(session)
     project = _write_project(tmp_path, track)
-    old_stat = os.stat(track.filepath)
-    before_rev = file_revision(track.filepath, old_stat)
-    deadline = time.monotonic() + 1.0
-    while True:
-        sf.write(track.filepath, -track.audio_data, track.samplerate, subtype="DOUBLE")
-        os.utime(track.filepath, ns=(old_stat.st_atime_ns, old_stat.st_mtime_ns + mtime_change))
-        if mtime_change != 0 or file_revision(track.filepath, os.stat(track.filepath)) != before_rev:
-            break
-        assert time.monotonic() < deadline, f"file_revision did not advance for {track.filepath}"
-        time.sleep(0.005)
+    rewrite_preserving_mtime(
+        track.filepath,
+        lambda: sf.write(track.filepath, -track.audio_data, track.samplerate, subtype="DOUBLE"),
+        mtime_offset_ns=mtime_change,
+    )
 
     reopened = load_session(str(project))["tracks"][0]
     assert reopened.corrected_analysis is None

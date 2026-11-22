@@ -1,15 +1,13 @@
 """Verify the two detector records against measurements of the actual signals."""
 from dataclasses import asdict, replace
-import os
 from pathlib import Path
-import time
 
 import numpy as np
 import pytest
 import soundfile as sf
 from scipy.signal import periodogram
 
-from sessionpreplib.audio import file_revision, load_track
+from sessionpreplib.audio import load_track
 from sessionpreplib.detector import TrackDetector
 from sessionpreplib.detectors import ClippingDetector, default_detectors
 from sessionpreplib.models import DetectorResult, SessionContext, Severity
@@ -17,22 +15,7 @@ from sessionpreplib.pipeline import Pipeline
 from sessionpreplib.processors import default_processors
 from sessionpreplib.repairs import RepairRecipe, render_corrected
 from sessionpreplib.topology import TopologyEntry, TopologyMapping, TopologySource, extract_channel
-
-
-def _rewrite_same_stamp(path: Path, write_fn) -> None:
-    """Rewrite *path* in place with identical mtime after its filesystem revision tick advances."""
-    stat = path.stat()
-    before_rev = file_revision(str(path), stat)
-    deadline = time.monotonic() + 1.0
-    while True:
-        write_fn()
-        os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
-        updated = path.stat()
-        if file_revision(str(path), updated) != before_rev:
-            assert (updated.st_size, updated.st_mtime_ns) == (stat.st_size, stat.st_mtime_ns)
-            return
-        assert time.monotonic() < deadline, f"file_revision did not advance for {path}"
-        time.sleep(0.005)
+from tests.fs_helpers import rewrite_preserving_mtime as _rewrite_same_stamp
 
 
 def _plan(tmp_path, audio, rate, choices, *, config=None, manual_gain_db=None):

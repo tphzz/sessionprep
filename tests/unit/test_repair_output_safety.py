@@ -1,7 +1,6 @@
 """Regression coverage for repair source identity, encoding and output retirement."""
 import math
 import os
-import time
 from dataclasses import replace
 
 import numpy as np
@@ -9,27 +8,12 @@ import pytest
 import soundfile as sf
 
 from sessionpreplib import repair_plan
-from sessionpreplib.audio import file_revision, load_track
+from sessionpreplib.audio import load_track
 from sessionpreplib.models import SessionContext
 from sessionpreplib.pipeline import Pipeline
 from sessionpreplib.repairs import OutputHeadroomError, RepairRecipe, check_output_headroom
 from sessionpreplib.topology import ChannelRoute, TopologyEntry, TopologySource, build_default_topology
-
-
-def _rewrite_same_stamp(path, write_fn):
-    """Rewrite *path* in place with identical mtime after its filesystem revision tick advances."""
-    stamp = path.stat()
-    before_rev = file_revision(str(path), stamp)
-    deadline = time.monotonic() + 1.0
-    while True:
-        write_fn()
-        os.utime(path, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
-        after = path.stat()
-        if file_revision(str(path), after) != before_rev:
-            assert after.st_size == stamp.st_size
-            return
-        assert time.monotonic() < deadline, f"file_revision did not advance for {path}"
-        time.sleep(0.005)
+from tests.fs_helpers import rewrite_preserving_mtime as _rewrite_same_stamp
 
 
 def source_session(tmp_path, subtype="PCM_16"):

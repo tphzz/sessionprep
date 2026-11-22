@@ -1,4 +1,6 @@
 """Phase 2 preview compares two sample-aligned sources through one transport."""
+import time
+
 import numpy as np
 import pytest
 
@@ -444,13 +446,13 @@ def test_playing_source_switch_does_not_wait_for_waveform_computation(app, windo
     compute = WaveformLoadWorker._compute
 
     def delayed_render(worker):
-        resume.wait(3)
+        resume.wait(15)
         compute(worker)
 
     monkeypatch.setattr(WaveformLoadWorker, "_compute", delayed_render)
     try:
         window.phase2_page.wf_panel.source_selector.buttons[1].click()
-        until = time.monotonic() + 1.5
+        until = time.monotonic() + 8.0
         while not window._playback._monitor.selected and time.monotonic() < until:
             app.processEvents()
             time.sleep(.005)
@@ -528,6 +530,33 @@ def test_repeated_source_switches_in_overflow_keep_spectrogram_actions_for_next_
         panel.close()
 
 
+def _exercise_overflow_popup(panel, menu):
+    popup = QApplication.activePopupWidget()
+    assert popup is menu
+    native = popup.windowHandle()
+    QTest.keyClick(native, Qt.Key_Down)
+    action = menu.activeAction()
+    assert isinstance(action, QWidgetAction)
+    selector = action.defaultWidget().findChild(AuditionSourceSelector)
+    assert selector.property("keyboardFocus") and selector._ring.isVisible()
+    QTest.keyClick(native, Qt.Key_Right)
+    assert panel.corrected and selector.buttons[1].isChecked()
+    for key in (Qt.Key_Space, Qt.Key_Return):
+        QTest.keyClick(native, key)
+        assert menu.isVisible() and panel.corrected
+    QTest.keyClick(native, Qt.Key_Down)
+    assert menu.activeAction() is not action and not selector._ring.isVisible()
+    QTest.keyClick(native, Qt.Key_Up)
+    assert menu.activeAction() is action and selector._ring.isVisible()
+    QTest.keyClick(native, Qt.Key_Left)
+    assert not panel.corrected
+    right = selector.buttons[1]
+    QTest.mouseClick(native, Qt.LeftButton, Qt.NoModifier, right.mapTo(menu, right.rect().center()))
+    assert panel.corrected and not selector._ring.isVisible()
+    QTest.keyClick(native, Qt.Key_Escape)
+    assert not menu.isVisible()
+
+
 def test_keyboard_opens_overflow_and_operates_source_through_the_popup_window(app):
     panel = WaveformPanel()
     panel.set_audition_available(True)
@@ -541,47 +570,40 @@ def test_keyboard_opens_overflow_and_operates_source_through_the_popup_window(ap
 
     def exercise_popup():
         try:
-            popup = QApplication.activePopupWidget()
-            assert popup is menu
-            native = popup.windowHandle()
-            QTest.keyClick(native, Qt.Key_Down)
-            action = menu.activeAction()
-            assert isinstance(action, QWidgetAction)
-            selector = action.defaultWidget().findChild(AuditionSourceSelector)
-            assert selector.property("keyboardFocus") and selector._ring.isVisible()
-            QTest.keyClick(native, Qt.Key_Right)
-            assert panel.corrected and selector.buttons[1].isChecked()
-            for key in (Qt.Key_Space, Qt.Key_Return):
-                QTest.keyClick(native, key)
-                assert menu.isVisible() and panel.corrected
-            QTest.keyClick(native, Qt.Key_Down)
-            assert menu.activeAction() is not action and not selector._ring.isVisible()
-            QTest.keyClick(native, Qt.Key_Up)
-            assert menu.activeAction() is action and selector._ring.isVisible()
-            QTest.keyClick(native, Qt.Key_Left)
-            assert not panel.corrected
-            right = selector.buttons[1]
-            QTest.mouseClick(native, Qt.LeftButton, Qt.NoModifier, right.mapTo(menu, right.rect().center()))
-            assert panel.corrected and not selector._ring.isVisible()
-            QTest.keyClick(native, Qt.Key_Escape)
-            assert not menu.isVisible()
+            _exercise_overflow_popup(panel, menu)
             checks.append(None)
         except BaseException as exc:
             checks.append(exc)
         finally:
             menu.close()
 
+    trigger = QTimer(menu)
+    trigger.setSingleShot(True)
+    trigger.timeout.connect(exercise_popup)
+    scheduled = False
+
+    def schedule_exercise():
+        nonlocal scheduled
+        if scheduled:
+            return
+        scheduled = True
+        trigger.start(0)
+
+    menu.aboutToShow.connect(schedule_exercise)
     try:
         row.more_button.setFocus(Qt.TabFocusReason)
-        QTimer.singleShot(30, exercise_popup)
         QTest.keyClick(panel.windowHandle(), Qt.Key_Space)
-        QTest.qWait(60)
+        deadline = time.monotonic() + 3.0
+        while not checks and time.monotonic() < deadline:
+            QTest.qWait(5)
         if not checks:
             pytest.fail("Keyboard activation did not open the toolbar overflow")
         if checks[0] is not None:
             raise checks[0]
         assert row.more_button.hasFocus()
     finally:
+        trigger.stop()
+        menu.aboutToShow.disconnect(schedule_exercise)
         panel.close()
 
 

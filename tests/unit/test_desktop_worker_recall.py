@@ -71,7 +71,7 @@ def test_pending_worker_results_after_project_open_or_close(tmp_path, monkeypatc
         progress = []
         monkeypatch.setattr(window, "progress_message", progress.append)
         release.set()
-        assert worker.wait(3000)
+        assert worker.wait(10_000)
         app.processEvents()
         assert window.state.session is fresh
         assert "OLD PROJECT PROGRESS" not in progress

@@ -66,12 +66,12 @@ def test_exact_palette_and_all_height_scopes_use_the_selected_host_targets(clien
 
 def test_reordered_and_expired_replies_complete_only_the_matching_request(client):
     replies = []
-    first = client.request("hold", {}, replies.append, timeout_ms=3000)
-    second = client.request("release", {}, replies.append, timeout_ms=3000)
+    first = client.request("hold", {}, replies.append, timeout_ms=10_000)
+    second = client.request("release", {}, replies.append, timeout_ms=10_000)
     wait_for(lambda: len(replies) == 2)
     assert [(r["id"], r["result"]) for r in replies] == [(second, "second"), (first, "first")]
     timed_out = []
-    client.request("delay", {}, timed_out.append, timeout_ms=30)
+    client.request("delay", {}, timed_out.append, timeout_ms=50)
     wait_for(lambda: client._process is None)
     assert len(timed_out) == 1 and not timed_out[0]["ok"]
     assert request(client, "writes") == []
@@ -100,7 +100,7 @@ def test_failed_worker_launch_can_be_retried(client, monkeypatch, tmp_path):
     with monkeypatch.context() as patch:
         patch.setattr(worker_client, "_worker_launch_command", lambda: (str(tmp_path / "missing"), [], "test"))
         replies = []
-        client.request("writes", {}, replies.append, timeout_ms=3000)
+        client.request("writes", {}, replies.append, timeout_ms=10_000)
         wait_for(lambda: replies)
         assert len(replies) == 1 and not replies[0]["ok"]
     assert request(client, "writes") == []

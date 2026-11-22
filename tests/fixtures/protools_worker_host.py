@@ -56,7 +56,7 @@ def main():
             reply(request, "second")
             reply(deferred, "first")
         elif method == "delay":
-            time.sleep(.18)
+            time.sleep(0.5)
             reply(request, "late")
         elif method == "arm_exit":
             exit_on_inventory = True
