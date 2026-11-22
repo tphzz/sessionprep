@@ -30,8 +30,83 @@ def _with_model_registry(method):
     return locked
 
 
-def _save_template(source, root, output_path, project, additions, replace_existing):
-    """Append new tracks to the original XML, retaining template assets and routing."""
+def _is_folder_track(track) -> bool:
+    """Return True when *track* is a DAWproject folder (``contentType`` includes ``tracks``)."""
+    from dawproject import ContentType, Track
+
+    if not isinstance(track, Track):
+        return False
+    for ct in getattr(track, "content_type", ()):
+        if isinstance(ct, ContentType) and ct == ContentType.TRACKS:
+            return True
+        if not isinstance(ct, ContentType):
+            try:
+                if ContentType(ct) == ContentType.TRACKS:
+                    return True
+            except ValueError:
+                pass
+    return False
+
+
+def _load_template_project(template: zipfile.ZipFile):
+    """Parse ``project.xml`` after reserving all existing numeric ``id<N>`` attributes."""
+    from dawproject import Project, Referenceable
+    from lxml import etree
+
+    root = etree.fromstring(template.read("project.xml"))
+    Referenceable.reset_id()
+    reserved = (n[2:] for n in root.xpath("//@id") if n.startswith("id") and n[2:].isdecimal())
+    Referenceable.ID = max(map(int, reserved), default=-1) + 1
+    project = Project.from_xml(root)
+    return root, project
+
+
+def _index_structure_elements(root, project) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Map deserialized Track and Channel IDs back to their original XML elements."""
+    from dawproject import Channel, Track
+
+    folders: dict[str, Any] = {}
+    channels: dict[str, Any] = {}
+
+    def walk(elements, tracks):
+        for element, track in zip(elements, tracks, strict=True):
+            folders[track.id] = element
+            if track.channel is not None:
+                ch_elem = element.find("Channel")
+                if ch_elem is not None:
+                    channels[track.channel.id] = ch_elem
+            walk(element.findall("Track"), [t for t in track.tracks if isinstance(t, Track)])
+
+    walk(root.findall("Structure/Track"), [t for t in project.structure if isinstance(t, Track)])
+    for ch_elem, ch in zip(
+        root.findall("Structure/Channel"),
+        [c for c in project.structure if isinstance(c, Channel)],
+        strict=True,
+    ):
+        channels[ch.id] = ch_elem
+    return folders, channels
+
+
+def _copy_zip_member(source: zipfile.ZipFile, archive: zipfile.ZipFile, member: zipfile.ZipInfo) -> None:
+    """Copy a template archive member using a fresh ``ZipInfo`` (no stale extra/header state)."""
+    dt = member.date_time
+    if dt[0] < 1980:
+        dt = (1980, 1, 1, 0, 0, 0)
+    elif dt[0] > 2107:
+        dt = (2107, 12, 31, 23, 59, 58)
+    info = zipfile.ZipInfo(member.filename, date_time=dt)
+    info.compress_type = member.compress_type
+    info.external_attr = member.external_attr
+    info.comment = member.comment
+    info.file_size = member.file_size
+    with source.open(member) as old, archive.open(info, "w") as new:
+        shutil.copyfileobj(old, new)
+
+
+def _save_template(
+    source, root, output_path, project, additions, embedded_files, replace_existing,
+):
+    """Append new tracks and embed audio into a self-contained DAWproject archive."""
     from lxml import etree
 
     template = Path(source.filename)
@@ -43,14 +118,7 @@ def _save_template(source, root, output_path, project, additions, replace_existi
                     and not Path(path).is_absolute() and not PureWindowsPath(path).is_absolute()):
                 item.set("path", (template.parent / path).resolve().as_posix())
 
-        folders = {}
-
-        def index_tracks(elements, tracks):
-            for element, track in zip(elements, tracks, strict=True):
-                folders[track.id] = element
-                index_tracks(element.findall("Track"), track.tracks)
-
-        index_tracks(root.findall("Structure/Track"), (t for t in project.structure if hasattr(t, "tracks")))
+        folders, channels = _index_structure_elements(root, project)
         arrangement = root.find("Arrangement")
         if arrangement is None:
             arrangement = etree.Element("Arrangement")
@@ -59,23 +127,87 @@ def _save_template(source, root, output_path, project, additions, replace_existi
         if lanes is None:
             lanes = etree.Element("Lanes", timeUnit="seconds")
             arrangement.insert(0, lanes)
-        for folder, track, lane in additions:
+        for folder, track, lane, dest_channel in additions:
             element = folders[folder.id]
-            if folder.channel is not None:
-                element.find("Channel").set("id", folder.channel.id)
+            if dest_channel is not None and dest_channel.id in channels:
+                channels[dest_channel.id].set("id", dest_channel.id)
             element.append(track.to_xml())
             lanes.append(lane.to_xml())
 
-        with zipfile.ZipFile(stream, "w", allowZip64=True) as archive:
+        with zipfile.ZipFile(stream, "w", allowZip64=True, strict_timestamps=False) as archive:
             archive.comment = source.comment
-            archive.writestr("project.xml", etree.tostring(root, xml_declaration=True, encoding="UTF-8"))
+            archive.writestr(
+                "project.xml",
+                etree.tostring(root, xml_declaration=True, encoding="UTF-8"),
+                compress_type=zipfile.ZIP_DEFLATED,
+            )
             if "metadata.xml" not in source.namelist():
-                archive.writestr("metadata.xml", "<MetaData/>")
+                archive.writestr("metadata.xml", "<MetaData/>", compress_type=zipfile.ZIP_DEFLATED)
             for member in source.infolist():
                 if member.filename == "project.xml":
                     continue
-                with source.open(member) as old, archive.open(member, "w") as new:
-                    shutil.copyfileobj(old, new)
+                _copy_zip_member(source, archive, member)
+            for src_filepath, arcname in embedded_files:
+                archive.write(src_filepath, arcname=arcname, compress_type=zipfile.ZIP_STORED)
+
+
+def _allocate_archive_audio_path(
+    source_path: str,
+    used_members: set[str],
+    embedded_by_source: dict[str, str],
+) -> tuple[str, bool]:
+    """Return ``(archive_path, needs_write)`` inside ``audio/`` without collisions."""
+    key = os.path.normcase(os.path.realpath(source_path))
+    existing = embedded_by_source.get(key)
+    if existing is not None:
+        return existing, False
+    base = (Path(source_path).name or "audio.wav").replace("\\", "_")
+    stem, ext = os.path.splitext(base)
+    candidate = f"audio/{base}"
+    suffix = 2
+    while candidate.lower() in used_members:
+        candidate = f"audio/{stem}_{suffix}{ext}"
+        suffix += 1
+    used_members.add(candidate.lower())
+    embedded_by_source[key] = candidate
+    return candidate, True
+
+
+def _find_master_channel(root, project) -> Any:
+    """Return the template's main output master channel (Cubase standalone or Bitwig Track)."""
+    from dawproject import Channel, MixerRole, Track
+
+    _, channel_elements = _index_structure_elements(root, project)
+    targeted_ids = set(root.xpath("//Channel/@destination"))
+    candidates: list[Any] = []
+    for item in getattr(project, "structure", ()):
+        if isinstance(item, Channel):
+            ch = item
+        elif isinstance(item, Track) and not _is_folder_track(item) and item.channel is not None:
+            ch = item.channel
+        else:
+            continue
+        role = getattr(ch, "role", None)
+        if role != MixerRole.MASTER and str(role) != "master":
+            continue
+        ch_elem = channel_elements.get(ch.id)
+        if getattr(ch, "destination", None) is not None or (ch_elem is not None and ch_elem.get("destination")):
+            continue
+        candidates.append(ch)
+    for ch in candidates:
+        if getattr(ch, "id", None) in targeted_ids:
+            return ch
+    return candidates[0] if candidates else None
+
+
+def _resolve_channel_destination(folder_track, folder_parent_map: dict[str, Any], master_channel) -> Any:
+    """Resolve routing target: folder bus → nearest ancestor routing folder → master bus."""
+    current = folder_track
+    while current is not None:
+        if getattr(current, "channel", None) is not None:
+            return current.channel
+        current = folder_parent_map.get(current.id)
+    return master_channel
 
 
 def _db_to_linear(db: float) -> float:
@@ -197,17 +329,15 @@ class DawProjectDawProcessor(DawProcessor):
         ignore_cache: bool = False,
     ) -> SessionContext:
         try:
-            from dawproject import (  # noqa: F401
-                ContentType, DawProject, Referenceable,
-            )
+            import dawproject as _dp  # noqa: F401
         except ImportError as exc:
             raise RuntimeError(
                 "dawproject package not installed. "
                 "Install SessionPrep with its gui extra."
             ) from exc
 
-        Referenceable.reset_id()
-        project = DawProject.load_project(self._template_path)
+        with zipfile.ZipFile(self._template_path) as template:
+            _, project = _load_template_project(template)
 
         folders: list[dict[str, Any]] = []
         self._walk_structure(
@@ -236,20 +366,8 @@ class DawProjectDawProcessor(DawProcessor):
         counter: list[int],
     ) -> None:
         """Recursively collect folder tracks from the project structure."""
-        from dawproject import ContentType
-
         for track in tracks:
-            ct_values = set()
-            for ct in getattr(track, "content_type", []):
-                if isinstance(ct, ContentType):
-                    ct_values.add(ct)
-                else:
-                    try:
-                        ct_values.add(ContentType(ct))
-                    except ValueError:
-                        pass
-
-            if ContentType.TRACKS in ct_values:
+            if _is_folder_track(track):
                 folder_type = "routing" if track.channel else "basic"
                 folders.append({
                     "id": track.id,
@@ -259,7 +377,6 @@ class DawProjectDawProcessor(DawProcessor):
                     "parent_id": parent_id,
                 })
                 counter[0] += 1
-                # Recurse into nested tracks
                 self._walk_structure(
                     track.tracks, folders, parent_id=track.id,
                     counter=counter)
@@ -292,8 +409,7 @@ class DawProjectDawProcessor(DawProcessor):
         if not session.daw_state.get(self.id, {}).get("assignments"):
             return []
         try:
-            from dawproject import Project, Referenceable
-            from lxml import etree
+            import dawproject as _dp  # noqa: F401
         except ImportError:
             return [DawCommandResult(
                 command=DawCommand("transfer", "", {}),
@@ -307,13 +423,7 @@ class DawProjectDawProcessor(DawProcessor):
             return [DawCommandResult(DawCommand("load_template", "", {}), False, str(exc))]
         with template:
             try:
-                root = etree.fromstring(template.read("project.xml"))
-                Referenceable.reset_id()
-                project = Project.from_xml(root)
-                # The template may contain device or automation IDs that the
-                # library does not deserialize. Reserve those IDs as well.
-                reserved = (n[2:] for n in root.xpath("//@id") if n.startswith("id") and n[2:].isdecimal())
-                Referenceable.ID = max(Referenceable.ID, max(map(int, reserved), default=-1) + 1)
+                root, project = _load_template_project(template)
             except Exception as exc:
                 return [DawCommandResult(DawCommand("load_template", "", {}), False, f"Failed to load template: {exc}")]
             return self._add_tracks(session, output_path, progress_cb, template, root, project)
@@ -332,41 +442,65 @@ class DawProjectDawProcessor(DawProcessor):
                 work.append((eid, fid))
         return work
 
-    def _build_track_addition(self, session, folder_track, entry, out_tc, media):
-        from dawproject import Audio, ContentType, FileReference, Lanes, MixerRole, TimeUnit, Utility
+    def _build_track_addition(
+        self, session, folder_track, dest_channel, entry, out_tc, media, archive_audio_path: str,
+    ):
+        from dawproject import (
+            Audio, BoolParameter, Channel, Clip, Clips, ContentType,
+            FileReference, Lanes, MixerRole, RealParameter, TimeUnit, Track, Unit,
+        )
 
         track_name = os.path.splitext(entry.daw_track_name)[0]
-        new_track = Utility.create_track(
-            name=track_name,
-            content_types={ContentType.AUDIO},
-            mixer_role=MixerRole.REGULAR,
-            volume=_db_to_linear(media.fader_db),
-            pan=0.5,
-        )
         track_color = self._resolve_track_color(entry.group, session)
-        if track_color:
-            new_track.color = track_color
-        if folder_track.channel is not None:
-            new_track.channel.destination = folder_track.channel
+        volume = _db_to_linear(media.fader_db)
+        audio_channels = out_tc.channels if (out_tc.channels and out_tc.channels > 0) else 2
+        channel = Channel(
+            role=MixerRole.REGULAR,
+            audio_channels=audio_channels,
+            name=track_name,
+            color=track_color,
+            destination=dest_channel,
+            mute=BoolParameter(value=False, name="Mute"),
+            pan=RealParameter(value=0.5, unit=Unit.NORMALIZED, min_value=0.0, max_value=1.0, name="Pan"),
+            volume=RealParameter(
+                value=volume, unit=Unit.LINEAR, min_value=0.0, max_value=max(2.0, volume), name="Volume",
+            ),
+        )
+        new_track = Track(
+            name=track_name,
+            color=track_color,
+            content_type={ContentType.AUDIO},
+            loaded=True,
+            channel=channel,
+        )
         audio = Audio(
             time_unit=TimeUnit.SECONDS,
-            file=FileReference(path=media.filepath.replace("\\", "/"), external=True),
+            file=FileReference(path=archive_audio_path, external=False),
             sample_rate=out_tc.samplerate,
-            channels=out_tc.channels,
+            channels=audio_channels,
             duration=out_tc.duration_sec,
         )
-        clips = Utility.create_clips(Utility.create_clip(content=audio, time=0.0, duration=out_tc.duration_sec))
-        track_lane = Lanes(track=new_track, time_unit=TimeUnit.SECONDS, lanes=[clips])
-        return track_name, (folder_track, new_track, track_lane)
+        clip = Clip(
+            content=audio,
+            time=0.0,
+            duration=out_tc.duration_sec,
+            content_time_unit=TimeUnit.SECONDS,
+            name=track_name,
+            color=track_color,
+        )
+        track_lane = Lanes(track=new_track, time_unit=TimeUnit.SECONDS, lanes=[Clips(clips=[clip])])
+        return track_name, (folder_track, new_track, track_lane, dest_channel)
 
-    def _save_dawproject_output(self, session, output_path, template, root, project, additions, results) -> None:
+    def _save_dawproject_output(
+        self, session, output_path, template, root, project, additions, embedded_files, results,
+    ) -> None:
         try:
             path = Path(output_path)
             if path.resolve() == Path(template.filename).resolve():
                 raise ValueError("Choose a different output path to preserve the DAWproject template.")
             path.parent.mkdir(parents=True, exist_ok=True)
             _save_template(
-                template, root, path, project, additions,
+                template, root, path, project, additions, embedded_files,
                 replace_existing=not session.config.get("_batch_transfer", False),
             )
             results.append(DawCommandResult(DawCommand("save_project", output_path, {}), True))
@@ -381,10 +515,15 @@ class DawProjectDawProcessor(DawProcessor):
     def _add_tracks(self, session, output_path, progress_cb, template, root, project):
         dp_state = session.daw_state.get(self.id, {})
         folder_track_map: dict[str, Any] = {}
-        self._build_folder_map(project.structure, folder_track_map)
+        folder_parent_map: dict[str, Any] = {}
+        self._build_folder_map(project.structure, folder_track_map, folder_parent_map)
+        master_channel = _find_master_channel(root, project)
         folder_dict_map = {f["id"]: f for f in dp_state.get("folders", [])}
         manifest_map = {e.entry_id: e for e in session.transfer_manifest}
         out_track_map = {t.filename: t for t in session.output_tracks}
+        used_members = {m.replace("\\", "/").lower() for m in template.namelist()}
+        embedded_by_source: dict[str, str] = {}
+        embedded_files: list[tuple[str, str]] = []
 
         work = self._ordered_assignments(dp_state.get("assignments", {}), dp_state.get("track_order", {}))
         total = len(work)
@@ -409,8 +548,14 @@ class DawProjectDawProcessor(DawProcessor):
             except ValueError as exc:
                 results.append(DawCommandResult(DawCommand("add_track", eid, {"folder_id": fid}), False, str(exc)))
                 continue
-            log.debug("%s: file=%s, fader=%+.2f dB", eid, media.filepath, media.fader_db)
-            track_name, addition = self._build_track_addition(session, folder_track, entry, out_tc, media)
+            arcname, needs_write = _allocate_archive_audio_path(media.filepath, used_members, embedded_by_source)
+            if needs_write:
+                embedded_files.append((media.filepath, arcname))
+            dest_channel = _resolve_channel_destination(folder_track, folder_parent_map, master_channel)
+            log.debug("%s: file=%s -> %s, fader=%+.2f dB", eid, media.filepath, arcname, media.fader_db)
+            track_name, addition = self._build_track_addition(
+                session, folder_track, dest_channel, entry, out_tc, media, arcname,
+            )
             additions.append(addition)
             results.append(DawCommandResult(
                 DawCommand("add_track", eid, {"folder": folder_dict.get("name", ""), "fader_db": media.fader_db}), True,
@@ -419,29 +564,26 @@ class DawProjectDawProcessor(DawProcessor):
                 progress_cb(step + 1, total, f"Added {track_name} ({step + 1}/{total})")
 
         if not (results and not any(result.success for result in results)):
-            self._save_dawproject_output(session, output_path, template, root, project, additions, results)
+            self._save_dawproject_output(
+                session, output_path, template, root, project, additions, embedded_files, results,
+            )
         session.daw_command_log.extend(results)
         return results
 
     def _build_folder_map(
-        self, tracks: list, folder_map: dict[str, Any],
+        self,
+        tracks: list,
+        folder_map: dict[str, Any],
+        parent_map: dict[str, Any] | None = None,
+        parent: Any = None,
     ) -> None:
-        """Recursively build a mapping of folder ID → Track object."""
-        from dawproject import ContentType
-
+        """Recursively build folder ID → Track and folder ID → parent Track mappings."""
         for track in tracks:
-            ct_values = set()
-            for ct in getattr(track, "content_type", []):
-                if isinstance(ct, ContentType):
-                    ct_values.add(ct)
-                else:
-                    try:
-                        ct_values.add(ContentType(ct))
-                    except ValueError:
-                        pass
-            if ContentType.TRACKS in ct_values:
+            if _is_folder_track(track):
                 folder_map[track.id] = track
-                self._build_folder_map(track.tracks, folder_map)
+                if parent_map is not None and parent is not None:
+                    parent_map[track.id] = parent
+                self._build_folder_map(track.tracks, folder_map, parent_map, parent=track)
 
     def _resolve_track_color(
         self, group_name: str | None, session: SessionContext,

@@ -62,10 +62,14 @@ def test_dawproject_references_selected_file_and_only_compensates_rendered_gain(
     session.config["_use_processed"] = processed
     results = export()
     assert all(result.success for result in results)
-    expected = media.processed_filepath if processed else media.filepath
+    expected = Path(media.processed_filepath if processed else media.filepath)
     with ZipFile(output) as archive:
         project = ElementTree.fromstring(archive.read("project.xml"))
-    assert Path(project.find(".//Audio/File").get("path")) == Path(expected)
+        file_elem = project.find(".//Audio/File")
+        assert file_elem.get("external") == "false"
+        arc_path = file_elem.get("path")
+        assert arc_path == f"audio/{expected.name}"
+        assert archive.read(arc_path) == expected.read_bytes()
     assert float(project.find(".//Channel/Volume").get("value")) == pytest.approx(10 ** (-2.5 / 20) if processed else 1.0)
 
 
