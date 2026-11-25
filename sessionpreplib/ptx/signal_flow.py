@@ -15,8 +15,9 @@ from scipy.signal import resample_poly
 from ..detectors.audio_classifier import AudioClassifierDetector
 from ..detectors.silence import SilenceDetector
 from ..models import TrackContext
-from .models import PtxTrack
+from .models import PtxInsert, PtxTrack, SlotATrimInfo
 from .parser import PtxSession
+from .plugin_trim import select_preferred_slot_a_trim_donor
 
 log = logging.getLogger(__name__)
 
@@ -77,6 +78,7 @@ class SignalFlowNode:
     slot_a_trim_plugin: str | None = None
     slot_a_trim_active: bool = False
     slot_a_trim_bypassed: bool = False
+    slot_a_trim_auto_insert: bool = False
     slot_a_trim_min_db: float | None = None
     slot_a_trim_max_db: float | None = None
     template_trim_db: float = 0.0
@@ -459,17 +461,81 @@ def _has_usable_slot_a_trim(trk: PtxTrack) -> bool:
     )
 
 
+def _has_active_unbypassed_inserts(trk: PtxTrack) -> bool:
+    return any(ins.is_active and not ins.is_bypassed for ins in trk.inserts)
+
+
+def _has_empty_slot_a(trk: PtxTrack) -> bool:
+    return not any(ins.slot_index == 0 for ins in trk.inserts)
+
+
+def _bfs_active_nodes(
+    start: str,
+    main_adj: Mapping[str, list[str]],
+    audio_tracks: Mapping[str, PtxTrack],
+    stop_set: set[str] | None = None,
+) -> set[str]:
+    visited: set[str] = {start}
+    hits: set[str] = set()
+    queue: deque[str] = deque(main_adj[start])
+    while queue:
+        nxt = queue.popleft()
+        if nxt in visited:
+            continue
+        visited.add(nxt)
+        trk = audio_tracks[nxt]
+        if trk.is_inactive or trk.is_muted:
+            continue
+        if trk.track_type in ("RoutingFolder", "Aux") and not _is_active_stageable_bus(trk):
+            continue
+        hits.add(nxt)
+        if stop_set is not None and nxt in stop_set:
+            continue
+        queue.extend(main_adj[nxt])
+    return hits
+
+
+def _elect_terminal_nodes(
+    audio_tracks: Mapping[str, PtxTrack],
+    main_adj: Mapping[str, list[str]],
+    main_in_deg: Mapping[str, int],
+    trim_nodes: set[str],
+    raw_downstream_trim: set[str],
+) -> set[str]:
+    conv_nodes = {
+        name for name, trk in audio_tracks.items()
+        if _is_active_stageable_bus(trk) and main_in_deg[name] >= 2
+    }
+    terminal: set[str] = set()
+    for name in conv_nodes:
+        if _bfs_active_nodes(name, main_adj, audio_tracks) & (conv_nodes - {name}):
+            continue
+        if name in trim_nodes or name not in raw_downstream_trim:
+            terminal.add(name)
+        else:
+            terminal.update(_bfs_active_nodes(name, main_adj, audio_tracks, trim_nodes) & trim_nodes)
+    if terminal or not trim_nodes:
+        return terminal
+    eligible = {
+        name for name, trk in audio_tracks.items()
+        if _is_active_stageable_bus(trk) and main_in_deg[name] >= 1
+        and (name in trim_nodes or _has_empty_slot_a(trk))
+    }
+    sinks = {
+        name for name in eligible
+        if not any(nxt in eligible for nxt in main_adj[name])
+    }
+    return {
+        name for name in sinks
+        if not any(name in _bfs_active_nodes(other, main_adj, audio_tracks) for other in sinks - {name})
+    }
+
+
 def _analyze_trim_topology(
     audio_tracks: dict[str, PtxTrack],
     edges: list[SignalFlowEdge],
-) -> tuple[set[str], set[str]]:
-    """Return ``(has_downstream_trim, terminal_nodes)`` over active main-output paths.
-
-    - ``has_downstream_trim``: busses that feed at least one active usable Slot A Trim bus
-      downstream (so pure summing folders on that branch stay at unity rather than fader-staging).
-    - ``terminal_nodes``: final convergence busses (or the nearest active Slot A Trim bus
-      downstream of a trim-less final convergence bus) where single-point headroom staging runs.
-    """
+) -> tuple[set[str], set[str], set[str], bool]:
+    """Return ``(has_downstream_trim, terminal_nodes, post_terminal_nodes, has_template_trims)``."""
     main_in_deg: dict[str, int] = {name: 0 for name in audio_tracks}
     main_adj: dict[str, list[str]] = {name: [] for name in audio_tracks}
     for edge in edges:
@@ -477,48 +543,101 @@ def _analyze_trim_topology(
             src_trk = audio_tracks[edge.source]
             if src_trk.is_inactive or src_trk.is_muted:
                 continue
+            if src_trk.track_type in ("RoutingFolder", "Aux") and not _is_active_stageable_bus(src_trk):
+                continue
             main_adj[edge.source].append(edge.target)
             main_in_deg[edge.target] += 1
 
-    def _bfs_active(start: str, stop_set: set[str] | None = None) -> set[str]:
-        visited: set[str] = {start}
-        hits: set[str] = set()
-        queue: deque[str] = deque(main_adj[start])
-        while queue:
-            nxt = queue.popleft()
-            if nxt in visited:
-                continue
-            visited.add(nxt)
-            trk = audio_tracks[nxt]
-            if trk.is_inactive or trk.is_muted:
-                continue
-            if trk.track_type in ("RoutingFolder", "Aux") and not _is_active_stageable_bus(trk):
-                continue
-            if stop_set is not None and nxt in stop_set:
-                hits.add(nxt)
-                continue
-            hits.add(nxt)
-            queue.extend(main_adj[nxt])
-        return hits
-
     trim_nodes = {name for name, trk in audio_tracks.items() if _has_usable_slot_a_trim(trk)}
+    raw_downstream = {
+        name for name in audio_tracks
+        if bool(_bfs_active_nodes(name, main_adj, audio_tracks) & (trim_nodes - {name}))
+    }
+    terminal_nodes = _elect_terminal_nodes(audio_tracks, main_adj, main_in_deg, trim_nodes, raw_downstream)
+    post_terminal_nodes = {
+        nxt for term in terminal_nodes
+        for nxt in _bfs_active_nodes(term, main_adj, audio_tracks)
+        if nxt not in terminal_nodes
+    }
+    effective_trim = set(trim_nodes)
+    if trim_nodes:
+        for name, trk in audio_tracks.items():
+            if not _is_active_stageable_bus(trk) or name in post_terminal_nodes:
+                continue
+            if trk.slot_a_trim is not None and trk.slot_a_trim.is_bypassed:
+                continue
+            if name in terminal_nodes or (trk.track_type == "Aux" and _has_active_unbypassed_inserts(trk)):
+                effective_trim.add(name)
     has_downstream_trim = {
         name for name in audio_tracks
-        if bool(_bfs_active(name) & (trim_nodes - {name}))
+        if bool(_bfs_active_nodes(name, main_adj, audio_tracks) & (effective_trim - {name}))
     }
-    conv_nodes = {
-        name for name, trk in audio_tracks.items()
-        if _is_active_stageable_bus(trk) and main_in_deg[name] >= 2
-    }
-    terminal_nodes: set[str] = set()
-    for name in conv_nodes:
-        if _bfs_active(name) & (conv_nodes - {name}):
-            continue
-        if name in trim_nodes or name not in has_downstream_trim:
-            terminal_nodes.add(name)
-        else:
-            terminal_nodes.update(_bfs_active(name, stop_set=trim_nodes) & trim_nodes)
-    return has_downstream_trim, terminal_nodes
+    return has_downstream_trim, terminal_nodes, post_terminal_nodes, bool(trim_nodes)
+
+
+def _slot_a_blocked_message(trk: PtxTrack, slot_a_ins: PtxInsert) -> str:
+    plug = slot_a_ins.plugin_name or slot_a_ins.fourcc or "unknown plugin"
+    if slot_a_ins.plugin_name in ("TrackControl", "Trim", "Protility"):
+        return (
+            f"Cannot apply Slot A gain staging on bus {trk.name!r}: Insert Slot A plugin {plug!r} "
+            f"could not be validated (unsupported channel format, multi-mono, or non-default "
+            f"switches such as +12 dB/Mute/Phase). Reset it to default or replace it."
+        )
+    return (
+        f"Cannot apply Slot A gain staging on bus {trk.name!r}: Insert Slot A is occupied by "
+        f"non-trim plugin {plug!r}. Move it to Slot B (or later) or disable bus staging."
+    )
+
+
+def _bus_requires_slot_a_trim(
+    trk: PtxTrack,
+    *,
+    has_template_trims: bool,
+    is_terminal: bool,
+    is_post_terminal: bool,
+) -> bool:
+    if not has_template_trims or is_post_terminal or trk.track_type not in ("RoutingFolder", "Aux"):
+        return False
+    if trk.slot_a_trim is not None and trk.slot_a_trim.is_bypassed:
+        return False
+    return is_terminal or (trk.track_type == "Aux" and _has_active_unbypassed_inserts(trk))
+
+
+def _resolve_bus_slot_a_trim(
+    trk: PtxTrack,
+    node: SignalFlowNode,
+    *,
+    needed_trim_db: float,
+    has_template_trims: bool,
+    is_terminal: bool,
+    is_post_terminal: bool,
+    donor_trim_by_format: Mapping[str, SlotATrimInfo],
+) -> SlotATrimInfo | None:
+    """Return existing or auto-inserted Slot A Trim spec for *trk*, raising on blocked Slot A."""
+    if is_post_terminal:
+        return None
+    if _has_usable_slot_a_trim(trk) and trk.slot_a_trim is not None:
+        return trk.slot_a_trim
+    if not _bus_requires_slot_a_trim(
+        trk, has_template_trims=has_template_trims, is_terminal=is_terminal, is_post_terminal=is_post_terminal,
+    ):
+        return None
+    if abs(needed_trim_db) < 0.05:
+        return None
+    slot_a_ins = next((ins for ins in trk.inserts if ins.slot_index == 0), None)
+    if slot_a_ins is not None:
+        raise ValueError(_slot_a_blocked_message(trk, slot_a_ins))
+    donor_trim = donor_trim_by_format.get(trk.format)
+    if donor_trim is None:
+        raise ValueError(
+            f"Cannot auto-insert Slot A Trim on {trk.format} bus {trk.name!r}: "
+            f"no matching {trk.format} Slot A Trim donor exists in this template."
+        )
+    node.slot_a_trim_plugin = donor_trim.plugin_name
+    node.slot_a_trim_auto_insert = True
+    node.slot_a_trim_min_db = donor_trim.min_db
+    node.slot_a_trim_max_db = donor_trim.max_db
+    return donor_trim
 
 
 def _should_stage_fader_only_bus(
@@ -546,6 +665,38 @@ def _apply_fader_override(auto_fader_db: float, bus_override_db: float | None) -
     return auto_fader_db, False
 
 
+def _apply_trim_staging(
+    node: SignalFlowNode,
+    trim_spec: SlotATrimInfo,
+    raw: float,
+    base_fader: float,
+    *,
+    attenuate_only: bool,
+    is_terminal: bool,
+    bus_override_db: float | None,
+) -> None:
+    smin, smax = trim_spec.min_db, trim_spec.max_db
+    node.staged = True
+    if attenuate_only and not is_terminal:
+        lo = max(smin, base_fader - _FADER_MAX_DB)
+        hi = min(smax, base_fader - _FADER_MIN_DB)
+        auto_trim = _norm_zero(round(max(lo, min(hi, raw)), 1))
+        auto_fader = _norm_zero(round(base_fader - auto_trim, 1))
+        node.staging_strategy = "trim_and_fader"
+    elif attenuate_only and is_terminal:
+        auto_trim = _norm_zero(round(max(smin, min(0.0, raw)), 1))
+        auto_fader = base_fader
+        node.staging_strategy = "trim_only"
+    else:
+        auto_trim = _norm_zero(round(max(smin, min(smax, raw)), 1))
+        auto_fader = base_fader
+        node.staging_strategy = "trim_only"
+    node.auto_trim_db = auto_trim
+    node.recommended_trim_db = auto_trim
+    node.auto_fader_db = auto_fader
+    node.recommended_fader_db, node.is_overridden = _apply_fader_override(auto_fader, bus_override_db)
+
+
 def _plan_bus_node_staging(
     trk: PtxTrack,
     node: SignalFlowNode,
@@ -558,6 +709,9 @@ def _plan_bus_node_staging(
     max_bus_fader_db: float,
     has_downstream_trim: bool,
     is_terminal: bool,
+    is_post_terminal: bool,
+    has_template_trims: bool,
+    donor_trim_by_format: Mapping[str, SlotATrimInfo],
     target_peak_db: float,
     target_rms_db: float,
     bus_override_db: float | None,
@@ -572,34 +726,34 @@ def _plan_bus_node_staging(
     ):
         return
     active_feeders = len(node.upstream_tracks)
-    if _has_usable_slot_a_trim(trk) and active_feeders >= 1 and trk.slot_a_trim is not None:
-        raw = _compute_unconstrained_bus_gain(is_trans, pre_in_pk, pre_in_rms, target_peak_db, target_rms_db)
-        smin, smax = trk.slot_a_trim.min_db, trk.slot_a_trim.max_db
-        base_fader = _norm_zero(round(node.template_fader_db, 1))
-        node.staged = True
-        if attenuate_only and not is_terminal:
-            lo = max(smin, base_fader - _FADER_MAX_DB)
-            hi = min(smax, base_fader - _FADER_MIN_DB)
-            auto_trim = _norm_zero(round(max(lo, min(hi, raw)), 1))
-            auto_fader = _norm_zero(round(base_fader - auto_trim, 1))
-            node.staging_strategy = "trim_and_fader"
-        elif attenuate_only and is_terminal:
-            auto_trim = _norm_zero(round(max(smin, min(0.0, raw)), 1))
-            auto_fader = base_fader
-            node.staging_strategy = "trim_only"
-        else:
-            auto_trim = _norm_zero(round(max(smin, min(smax, raw)), 1))
-            auto_fader = base_fader
-            node.staging_strategy = "trim_only"
-        node.auto_trim_db = auto_trim
-        node.recommended_trim_db = auto_trim
-        node.auto_fader_db = auto_fader
-        node.recommended_fader_db, node.is_overridden = _apply_fader_override(auto_fader, bus_override_db)
+    raw = _compute_unconstrained_bus_gain(is_trans, pre_in_pk, pre_in_rms, target_peak_db, target_rms_db)
+    base_fader = _norm_zero(round(node.template_fader_db, 1))
+    if attenuate_only and is_terminal:
+        needed_trim = _norm_zero(round(min(0.0, raw), 1))
+    elif attenuate_only:
+        needed_trim = _norm_zero(round(max(base_fader - _FADER_MAX_DB, min(base_fader - _FADER_MIN_DB, raw)), 1))
+    else:
+        needed_trim = _norm_zero(round(raw, 1))
+    trim_spec = (
+        _resolve_bus_slot_a_trim(
+            trk, node, needed_trim_db=needed_trim, has_template_trims=has_template_trims,
+            is_terminal=is_terminal, is_post_terminal=is_post_terminal, donor_trim_by_format=donor_trim_by_format,
+        )
+        if active_feeders >= 1
+        else None
+    )
+    if trim_spec is not None:
+        _apply_trim_staging(
+            node, trim_spec, raw, base_fader,
+            attenuate_only=attenuate_only, is_terminal=is_terminal, bus_override_db=bus_override_db,
+        )
         return
-
+    if _bus_requires_slot_a_trim(
+        trk, has_template_trims=has_template_trims, is_terminal=is_terminal, is_post_terminal=is_post_terminal,
+    ):
+        return
     if _should_stage_fader_only_bus(
-        node, active_feeders,
-        has_downstream_trim=has_downstream_trim, is_terminal=is_terminal,
+        node, active_feeders, has_downstream_trim=has_downstream_trim, is_terminal=is_terminal,
     ):
         node.staged = True
         node.staging_strategy = "fader_only"
@@ -697,6 +851,9 @@ def _evaluate_bus_node(
     max_bus_fader_db: float,
     has_downstream_trim: bool,
     is_terminal: bool,
+    is_post_terminal: bool,
+    has_template_trims: bool,
+    donor_trim_by_format: Mapping[str, SlotATrimInfo],
     silence_det: SilenceDetector,
     classifier_det: AudioClassifierDetector,
     bus_override_db: float | None = None,
@@ -713,8 +870,9 @@ def _evaluate_bus_node(
         trk, node, pre_in_pk, pre_in_rms, is_trans,
         stage_bus_faders=stage_bus_faders, attenuate_only=attenuate_only,
         max_bus_fader_db=max_bus_fader_db, has_downstream_trim=has_downstream_trim,
-        is_terminal=is_terminal, target_peak_db=target_peak_db,
-        target_rms_db=target_rms_db, bus_override_db=bus_override_db,
+        is_terminal=is_terminal, is_post_terminal=is_post_terminal,
+        has_template_trims=has_template_trims, donor_trim_by_format=donor_trim_by_format,
+        target_peak_db=target_peak_db, target_rms_db=target_rms_db, bus_override_db=bus_override_db,
     )
     if node.staged and node.staging_strategy in ("trim_and_fader", "trim_only"):
         eff_trim_db = node.recommended_trim_db
@@ -807,6 +965,9 @@ def _run_dag_traversal(
     max_bus_fader_db: float,
     downstream_trim_nodes: set[str],
     terminal_nodes: set[str],
+    post_terminal_nodes: set[str],
+    has_template_trims: bool,
+    donor_trim_by_format: Mapping[str, SlotATrimInfo],
     silence_det: SilenceDetector,
     classifier_det: AudioClassifierDetector,
     leaf_loader: Callable[[str], LeafAudioInput | None] | None,
@@ -831,7 +992,9 @@ def _run_dag_traversal(
             pre_buf, post_buf = _evaluate_bus_node(
                 trk, node, acc, session_sr, pan_law_db, target_peak_db, target_rms_db,
                 stage_bus_faders, attenuate_only, max_bus_fader_db,
-                name in downstream_trim_nodes, name in terminal_nodes, silence_det, classifier_det,
+                name in downstream_trim_nodes, name in terminal_nodes,
+                name in post_terminal_nodes, has_template_trims, donor_trim_by_format,
+                silence_det, classifier_det,
                 bus_override_db=overrides_map.get(name.lower()),
             )
         _propagate_outgoing(name, trk, pre_buf, post_buf, outgoing[name], audio_tracks, nodes, accumulators, pan_law_db)
@@ -893,13 +1056,22 @@ def build_annotated_signal_flow(
     for edge in edges:
         outgoing[edge.source].append(edge)
 
-    downstream_trim_nodes, terminal_nodes = _analyze_trim_topology(audio_tracks, edges)
+    downstream_trim_nodes, terminal_nodes, post_terminal_nodes, has_template_trims = _analyze_trim_topology(
+        audio_tracks, edges,
+    )
+    donor_trim_by_format: dict[str, SlotATrimInfo] = {}
+    if has_template_trims:
+        for fmt in {t.format for t in audio_tracks.values()}:
+            donor = select_preferred_slot_a_trim_donor(ptx, fmt)
+            if donor is not None and donor.slot_a_trim is not None:
+                donor_trim_by_format[fmt] = donor.slot_a_trim
 
     _run_dag_traversal(
         order, audio_tracks, nodes, outgoing, leaf_map, gains_map, overrides_map,
         session_sr, pan_law_db, target_peak_db, target_rms_db,
         stage_bus_faders, attenuate_only, max_bus_fader_db,
-        downstream_trim_nodes, terminal_nodes, silence_det, classifier_det,
+        downstream_trim_nodes, terminal_nodes, post_terminal_nodes,
+        has_template_trims, donor_trim_by_format, silence_det, classifier_det,
         leaf_loader, progress_cb, cancel_cb,
     )
     return SignalFlowGraph(session_sr, target_peak_db, target_rms_db, pan_law_db, dbfs_conv, order, nodes, edges, cycles)

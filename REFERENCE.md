@@ -15,6 +15,10 @@ For usage and quick start, see [README.md](README.md).
 3. [Analysis Metrics (Stage B)](#3-analysis-metrics-stage-b)
 4. [Processing (Stage C)](#4-processing-stage-c)
 5. [Fader Restoration (Stage D)](#5-fader-restoration-stage-d)
+6. [GUI Waveform Controls](#6-gui-waveform-controls)
+7. [GUI Track Table Controls](#7-gui-track-table-controls)
+8. [Pro Tools Utils Window](#8-pro-tools-utils-window)
+9. [Pro Tools Transfer Automation (`.ptx` / PTSL)](#9-pro-tools-transfer-automation-ptx--ptsl)
 
 ---
 
@@ -666,12 +670,15 @@ When creating a Pro Tools session from a template, SessionPrep combines PTSL
 commands with validated, atomic `.ptx` session-file updates (applied in a single
 post-close pass with automatic rollback if Pro Tools fails to reopen the session):
 
-- **Automatic Folder Output Routing (`protools_auto_route_folders`, default `true`), Empty Folder/VCA Cleanup & Audio Track `No Input` Clearing:**
+- **Automatic Folder Output Routing (`protools_auto_route_folders`, default `true`), Empty Folder/VCA & Orphaned Aux Cleanup (`protools_remove_unused_aux_tracks`, default `true`), and Audio Track `No Input` Clearing:**
   Routes each newly created audio track's Main Output to its parent Routing
   Folder's input bus (walking up through nested Basic Folders when necessary),
-  removes empty template folders and unused pre-created VCAs (including
-  cascading super-VCAs that no longer control any surviving tracks, while
-  keeping FX folders, active bus folders, and downstream Aux busses intact),
+  removes empty template folders, unused pre-created VCAs (including cascading
+  super-VCAs that no longer control any surviving tracks), and — when
+  `protools_remove_unused_aux_tracks` is enabled — causally orphaned downstream
+  Aux busses whose upstream feeders were all pruned (plus any folders/VCAs
+  emptied as a result, while keeping FX return busses, live parallel auxes,
+  hardware-input auxes, active bus folders, and the Mix Bus chain intact),
   and clears each newly created audio track's auto-assigned hardware input to
   `No Input` during the atomic post-close `.ptx` pass. DAWproject export
   likewise prunes empty template folder tracks (and their dangling lanes) while
@@ -699,15 +706,22 @@ post-close pass with automatic rollback if Pro Tools fails to reopen the session
   active RMS dBFS, and Transient/Sustained classification at every folder/bus
   node. When template busses carry a validated Insert Slot A gain-trim plugin
   (**DMG Audio TrackControl**, **Avid Trim** in default `+6 dB` mode, or
-  **Process.Audio Protility**), SessionPrep applies recursive two-level bus
-  staging: pure summing folders stay at `0.0 dB` unity, intermediate
+  **Process.Audio Protility**), SessionPrep applies recursive multi-stage
+  bimodal gain staging: pure summing folders stay at `0.0 dB` unity, intermediate
   insert-bearing busses receive pre-insert Slot A Trim gain (`+g`, activating an
   inactive Slot A Trim automatically while respecting bypassed inserts) paired
   with an inverse post-insert Bus Fader offset (`-g` relative to the template
   fader) so downstream analog-emulated insert chains hit their target sweet spot
   while rough-mix balance stays intact across unequal bus depths (or Slot A Trim
   only with unity faders in `clip_gain_unity` mode), and the terminal
-  convergence Mix Bus applies a single headroom trim protecting Master. On
+  convergence Mix Bus applies a single headroom trim protecting Master while
+  keeping its fader at unity. If a required staged bus (such as the terminal Mix
+  Bus or an active-insert intermediate Aux needing non-zero staging) has an
+  empty Insert Slot A, SessionPrep automatically inserts the template's
+  most-used clean matching-format (`Mono`/`Stereo`) Slot A Trim plugin; if Slot
+  A is occupied by a non-trim or unvalidated plugin, SessionPrep stops with an
+  error rather than silently falling back to post-insert fader staging (post-terminal
+  serial Mix Busses, quiet `0.0 dB` busses, and `Master` are exempt). On
   templates or branches without Slot A Trim plugins, SessionPrep stages Routing
   Folders and multi-input Subgroup/Stem Auxes via bus faders while leaving
   single-input insert Auxes, Master Faders, and `-∞ dB` parallel auxes

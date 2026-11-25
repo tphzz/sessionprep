@@ -989,10 +989,7 @@ class SessionPrepWindow(QMainWindow):
         QMessageBox.about(
             self,
             "About SessionPrep",
-            f"<h2>SessionPrep</h2>"
-            f"<p>Version {ver}</p>"
-            f"<p>Batch audio analyzer and normalizer<br/>"
-            f"for mix session preparation.</p>",
+            f"<h2>SessionPrep</h2><p>Version {ver}</p>",
         )
 
     @Slot()

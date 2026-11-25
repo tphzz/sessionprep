@@ -491,8 +491,18 @@ sessionpreplib/
         mono_downmix.py          # MonoDownmixProcessor (stub)
     daw_processors/
         __init__.py              # Exports all DAW processors; provides default_daw_processors()
-        protools.py              # ProToolsDawProcessor — Pro Tools integration via py-ptsl gRPC SDK
-        dawproject.py            # DawProjectDawProcessor — .dawproject file generation from templates
+        protools.py              # ProToolsDawProcessor — Pro Tools integration via py-ptsl + .ptx orchestration
+        protools_ptx.py          # Pro Tools .ptx routing, cleanup (folders/VCAs/orphaned Auxes), & post-close patching
+        protools_ptx_preview.py  # Offline .ptxt template topology inspection & Signal Flow preview engine
+        dawproject.py            # DawProjectDawProcessor — self-contained .dawproject archive generation
+    ptx/
+        __init__.py              # Public .ptx parser, patcher, Slot A trim & signal-flow exports
+        codec.py                 # 4 KB rolling-XOR decrypt/encrypt, Z-chunk traversal, 0x0002 index shifting
+        models.py                # Dataclasses for PtxSession, tracks, signal paths, inserts, SlotATrimInfo, groups
+        parser.py                # Pure-Python stdlib .ptx/.ptxt binary parser
+        plugin_trim.py           # Validated Slot A trim reader, clean-donor selector & 0x2625->0x2616 auto-insert/patcher
+        patcher.py               # Atomic .ptx patchers (No Input, 0x2637 Clip Gain, faders, groups/VCAs, Slot A trims)
+        signal_flow.py           # Signal-flow DAG reconstruction, float64 summing & recursive multi-stage bus staging
 
 sessionprepgui/                  # GUI package (PySide6)
     __init__.py                  # Exports main()
@@ -516,8 +526,10 @@ sessionprepgui/                  # GUI package (PySide6)
         manager.py               # BatchManager — queued DAW transfer execution and session rehydration
         panel.py                 # BatchQueueDock & BatchItem — batch queue dock UI and data model
     daw/
-        page.py                  # DawSetupPage — Phase 3 DAW Transfer widgets
+        page.py                  # DawSetupPage — Phase 3 DAW Transfer widgets (incl. Pro Tools Routing & Signal Flow tabs)
         controller.py            # DawTransferController — DAW selection, fetch, transfer, folder tree, assignments
+        signal_flow_panel.py     # SignalFlowPanel & BusFaderSpinBox — Phase 3 Signal Flow table & override controls
+        signal_flow_controller.py # SignalFlowController & SignalFlowWorker — async offline preview & debounced overrides
     detail/
         controller.py            # TrackDetailController — file detail view, waveform display, overlays, playback
         repair_preview.py        # RepairPreview — async original/corrected audition & preview coordinator

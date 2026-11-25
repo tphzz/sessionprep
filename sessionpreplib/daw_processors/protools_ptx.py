@@ -92,6 +92,14 @@ def ptx_config_params() -> list[ParamSpec]:
             label="Signal-Flow Pan Law (dB)",
             description="Pro Tools pan depth used when summing mono/panned tracks through the signal-flow DAG.",
         ),
+        ParamSpec(
+            key="protools_remove_unused_aux_tracks", type=bool, default=True,
+            label="Remove Orphaned Downstream Aux Busses",
+            description=(
+                "Automatically delete template Aux busses that have no surviving upstream tracks or "
+                "sends feeding them after empty folder cleanup."
+            ),
+        ),
     ]
 
 
@@ -131,11 +139,12 @@ class FolderGroupAction:
 
 @dataclass(frozen=True)
 class EmptyTrackCleanupPlan:
-    """Empty template folders (deepest-first) and unused VCAs planned for removal."""
+    """Empty template folders (deepest-first), unused VCAs, and orphaned Auxes planned for removal."""
 
     empty_folders: tuple[PtxTrack, ...]
     unused_vcas: tuple[PtxTrack, ...]
     folder_depths: dict[str, int]
+    orphaned_auxes: tuple[PtxTrack, ...] = ()
 
 
 def _planned_normalization_gains(session: SessionContext, track: TrackContext) -> tuple[float, float]:
@@ -400,12 +409,41 @@ def _mark_ancestors(folder_low: str, parent_of: dict[str, str], keep: set[str]) 
         cur = parent_of.get(cur, "")
 
 
-def _collect_non_empty_folders(ptx: PtxSession) -> tuple[set[str], dict[str, str]]:
+def _build_bus_family_map(ptx: PtxSession) -> dict[str, set[str]]:
+    """Map each bus name (lowercase) to itself plus its parent bus or child subpaths."""
+    family: dict[str, set[str]] = {}
+    for sp in getattr(ptx, "signal_paths", ()):
+        sp_low = sp.name.lower()
+        family.setdefault(sp_low, {sp_low})
+        if sp.parent_name:
+            p_low = sp.parent_name.lower()
+            family[sp_low].add(p_low)
+            family.setdefault(p_low, {p_low}).add(sp_low)
+        for sub in sp.subpaths:
+            sub_low = sub.lower()
+            family[sp_low].add(sub_low)
+            family.setdefault(sub_low, {sub_low}).add(sp_low)
+    return family
+
+
+def _expand_bus(bus_low: str, bus_family: Mapping[str, set[str]]) -> set[str]:
+    return bus_family.get(bus_low, {bus_low})
+
+
+def _collect_non_empty_folders(
+    ptx: PtxSession,
+    excluded_lows: set[str] | None = None,
+    bus_family: Mapping[str, set[str]] | None = None,
+) -> tuple[set[str], dict[str, str]]:
     """Return ``(non_empty_folder_names_lower, parent_of_lower)`` via fixed-point propagation."""
+    excluded = excluded_lows or set()
+    fam = bus_family if bus_family is not None else _build_bus_family_map(ptx)
     folder_types = ("RoutingFolder", "BasicFolder")
     parent_of = {t.name.lower(): t.parent_folder_name.lower() for t in ptx.tracks if t.parent_folder_name}
     keep: set[str] = set()
     for trk in ptx.tracks:
+        if trk.name.lower() in excluded:
+            continue
         if trk.track_type not in (*folder_types, "Vca") and trk.parent_folder_name:
             _mark_ancestors(trk.parent_folder_name.lower(), parent_of, keep)
 
@@ -418,19 +456,21 @@ def _collect_non_empty_folders(ptx: PtxSession) -> tuple[set[str], dict[str, str
     while changed:
         changed = False
         for trk in ptx.tracks:
-            if trk.track_type == "Vca":
+            low = trk.name.lower()
+            if trk.track_type == "Vca" or low in excluded:
                 continue
-            if trk.track_type in folder_types and trk.name.lower() not in keep:
+            if trk.track_type in folder_types and low not in keep:
                 continue
             targets: list[str] = []
             if trk.main_output and trk.main_output.name:
                 targets.append(trk.main_output.name.lower())
             targets.extend(s.destination.name.lower() for s in trk.sends if s.destination and s.destination.name)
             for bus_low in targets:
-                for rf_low in rf_by_input.get(bus_low, ()):
-                    if rf_low not in keep:
-                        _mark_ancestors(rf_low, parent_of, keep)
-                        changed = True
+                for rel_bus in _expand_bus(bus_low, fam):
+                    for rf_low in rf_by_input.get(rel_bus, ()):
+                        if rf_low not in keep:
+                            _mark_ancestors(rf_low, parent_of, keep)
+                            changed = True
     return keep, parent_of
 
 
@@ -446,11 +486,13 @@ def _collect_unused_vcas(
     ptx: PtxSession,
     content_folders: set[str],
     candidate_empty_folders: list[PtxTrack],
+    extra_removed_lows: set[str] | None = None,
 ) -> tuple[list[PtxTrack], set[str]]:
     """Return ``(removed_vcas, removed_vca_names_lower)`` via fixed-point pruning.
 
     Dedicated VCA-organizer folders (holding surviving VCAs alongside unlinked VCAs)
-    never cause unrelated standalone VCAs inside them to be deleted.
+    never cause unrelated standalone VCAs inside them to be deleted, and VCAs tied to
+    surviving content folders are always protected.
     """
     vca_members: dict[str, set[str]] = {}
     for grp in ptx.groups:
@@ -473,7 +515,7 @@ def _collect_unused_vcas(
         if trk.track_type == "Vca" and trk.parent_folder_name:
             vcas_by_parent.setdefault(trk.parent_folder_name.lower(), []).append(trk.name.lower())
 
-    removed_lower = set(cand_folder_lows)
+    removed_lower = set(cand_folder_lows) | set(extra_removed_lows or ())
     removed_vcas: list[PtxTrack] = []
     removed_vca_lower: set[str] = set()
 
@@ -499,25 +541,84 @@ def _collect_unused_vcas(
     return removed_vcas, removed_vca_lower
 
 
-def plan_empty_folders_and_vcas(ptx: PtxSession) -> EmptyTrackCleanupPlan:
-    """Plan removal of empty folders (deepest-first) and unused/cascading VCA tracks."""
-    content_folders, parent_of = _collect_non_empty_folders(ptx)
+def _collect_orphaned_auxes(
+    ptx: PtxSession,
+    removed_lows: set[str],
+    bus_family: Mapping[str, set[str]] | None = None,
+) -> list[PtxTrack]:
+    """Iteratively find Aux busses causally orphaned by removing empty folders/busses.
+
+    An Aux bus is removed only when its input bus (``kind == "bus"``) was fed by
+    at least one removed track (main output or send) AND is no longer fed by any
+    surviving non-VCA track (accounting for Stereo/Mono bus subpaths). This protects
+    on-demand FX return Auxes and hardware-input Auxes while pruning dead chains.
+    """
+    fam = bus_family if bus_family is not None else _build_bus_family_map(ptx)
+    removed = set(removed_lows)
+    orphaned: list[PtxTrack] = []
+    changed = True
+    while changed:
+        changed = False
+        surviving_fed: set[str] = set()
+        removed_fed: set[str] = set()
+        for trk in ptx.tracks:
+            if trk.track_type == "Vca":
+                continue
+            target_set = removed_fed if trk.name.lower() in removed else surviving_fed
+            if trk.main_output and trk.main_output.name:
+                target_set.update(_expand_bus(trk.main_output.name.lower(), fam))
+            for send in trk.sends:
+                if send.destination and send.destination.name:
+                    target_set.update(_expand_bus(send.destination.name.lower(), fam))
+        for trk in ptx.tracks:
+            low = trk.name.lower()
+            if trk.track_type != "Aux" or low in removed:
+                continue
+            if trk.input_path is None or trk.input_path.kind != "bus" or not trk.input_path.name:
+                continue
+            in_low = trk.input_path.name.lower()
+            if in_low in removed_fed and in_low not in surviving_fed:
+                orphaned.append(trk)
+                removed.add(low)
+                changed = True
+    return orphaned
+
+
+def plan_empty_folders_and_vcas(
+    ptx: PtxSession,
+    *,
+    remove_unused_aux_tracks: bool = True,
+) -> EmptyTrackCleanupPlan:
+    """Plan removal of empty folders (deepest-first), unused VCAs, and optionally orphaned Auxes."""
     folder_types = ("RoutingFolder", "BasicFolder")
-    candidate_empty = [
-        trk for trk in ptx.tracks
-        if trk.track_type in folder_types and trk.name.lower() not in content_folders
-    ]
-    unused_vcas, removed_vca_lower = _collect_unused_vcas(ptx, content_folders, candidate_empty)
-
-    keep_folders = set(content_folders)
-    for trk in ptx.tracks:
-        if trk.track_type == "Vca" and trk.name.lower() not in removed_vca_lower and trk.parent_folder_name:
-            _mark_ancestors(trk.parent_folder_name.lower(), parent_of, keep_folders)
-
-    empty_folders = [trk for trk in candidate_empty if trk.name.lower() not in keep_folders]
+    bus_family = _build_bus_family_map(ptx)
+    orphaned_auxes: list[PtxTrack] = []
+    removed_aux_lows: set[str] = set()
+    while True:
+        content_folders, parent_of = _collect_non_empty_folders(ptx, removed_aux_lows, bus_family)
+        candidate_empty = [
+            trk for trk in ptx.tracks
+            if trk.track_type in folder_types and trk.name.lower() not in content_folders
+        ]
+        unused_vcas, removed_vca_lower = _collect_unused_vcas(
+            ptx, content_folders, candidate_empty, removed_aux_lows,
+        )
+        keep_folders = set(content_folders)
+        for trk in ptx.tracks:
+            if trk.track_type == "Vca" and trk.name.lower() not in removed_vca_lower and trk.parent_folder_name:
+                _mark_ancestors(trk.parent_folder_name.lower(), parent_of, keep_folders)
+        empty_folders = [trk for trk in candidate_empty if trk.name.lower() not in keep_folders]
+        if not remove_unused_aux_tracks:
+            break
+        removed_lows = {ef.name.lower() for ef in empty_folders} | removed_vca_lower | removed_aux_lows
+        newly_orphaned = _collect_orphaned_auxes(ptx, removed_lows, bus_family)
+        if not newly_orphaned:
+            break
+        orphaned_auxes.extend(newly_orphaned)
+        removed_aux_lows.update(a.name.lower() for a in newly_orphaned)
     depths = {ef.name: _folder_depth(ef.name.lower(), parent_of) for ef in empty_folders}
     empty_folders.sort(key=lambda t: (-depths[t.name], t.index))
-    return EmptyTrackCleanupPlan(tuple(empty_folders), tuple(unused_vcas), depths)
+    return EmptyTrackCleanupPlan(tuple(empty_folders), tuple(unused_vcas), depths, tuple(orphaned_auxes))
 
 
 def _delete_track_batch(
@@ -552,24 +653,47 @@ def _delete_track_batch(
     return succeeded, failed, err
 
 
+def _run_cleanup_batch(
+    engine,
+    pairs: list[tuple[str, str]],
+    op_name: str,
+    parent_of: dict[str, str],
+    blocked_folders: set[str],
+    errors: list[tuple[str, str, str]],
+    *,
+    block_self: bool,
+    batch_job_id: str | None,
+    progress: int,
+) -> list[str]:
+    if not pairs:
+        return []
+    ok, failed, err = _delete_track_batch(engine, pairs, batch_job_id=batch_job_id, progress=progress)
+    if err:
+        errors.append((op_name, ", ".join(failed), err))
+        for fname in failed:
+            start = fname.lower() if block_self else parent_of.get(fname.lower(), "")
+            _mark_ancestors(start, parent_of, blocked_folders)
+    return ok
+
+
 def execute_empty_folder_cleanup(
     engine,
     ptx: PtxSession,
     live_tracks: list[Any],
     *,
+    remove_unused_aux_tracks: bool = True,
     batch_job_id: str | None = None,
     progress: int = 94,
-) -> tuple[list[str], list[str], list[tuple[str, str, str]]]:
-    """Delete empty folders and unused VCAs via PTSL ``CId_DeleteTracks``.
+) -> tuple[list[str], list[str], list[str], list[tuple[str, str, str]]]:
+    """Delete unused VCAs, orphaned Aux busses, and empty folders via PTSL ``CId_DeleteTracks``.
 
-    Deletes VCAs first, then empty folders grouped deepest-first with
+    Deletes VCAs first, then orphaned Auxes, then empty folders grouped deepest-first with
     ``keep_folder_members=True`` so surviving tracks are never accidentally deleted.
-    Returns ``(deleted_folder_names, deleted_vca_names, errors)`` where each error is
-    ``(operation, target_label, message)``.
+    Returns ``(deleted_folder_names, deleted_vca_names, deleted_aux_names, errors)``.
     """
-    plan = plan_empty_folders_and_vcas(ptx)
-    if not plan.empty_folders and not plan.unused_vcas:
-        return [], [], []
+    plan = plan_empty_folders_and_vcas(ptx, remove_unused_aux_tracks=remove_unused_aux_tracks)
+    if not plan.empty_folders and not plan.unused_vcas and not plan.orphaned_auxes:
+        return [], [], [], []
 
     live_by_uuid = {_live_field(t, "id").lower(): _live_field(t, "id") for t in live_tracks if _live_field(t, "id")}
     live_by_name = {_live_field(t, "name").lower(): _live_field(t, "id") for t in live_tracks if _live_field(t, "id")}
@@ -580,21 +704,22 @@ def execute_empty_folder_cleanup(
             log.warning("Could not resolve live PTSL track ID for %r; skipping deletion.", trk.name)
         return tid
 
-    deleted_vcas: list[str] = []
-    deleted_folders: list[str] = []
     errors: list[tuple[str, str, str]] = []
     blocked_folders: set[str] = set()
     parent_of = {t.name.lower(): t.parent_folder_name.lower() for t in ptx.tracks if t.parent_folder_name}
 
     vca_pairs = [(v.name, tid) for v in plan.unused_vcas if (tid := _resolve_id(v))]
-    if vca_pairs:
-        ok, failed, err = _delete_track_batch(engine, vca_pairs, batch_job_id=batch_job_id, progress=progress)
-        deleted_vcas.extend(ok)
-        if err:
-            errors.append(("remove_unused_vca", ", ".join(failed), err))
-            for fname in failed:
-                _mark_ancestors(parent_of.get(fname.lower(), ""), parent_of, blocked_folders)
+    deleted_vcas = _run_cleanup_batch(
+        engine, vca_pairs, "remove_unused_vca", parent_of, blocked_folders, errors,
+        block_self=False, batch_job_id=batch_job_id, progress=progress,
+    )
+    aux_pairs = [(a.name, tid) for a in plan.orphaned_auxes if (tid := _resolve_id(a))]
+    deleted_auxes = _run_cleanup_batch(
+        engine, aux_pairs, "remove_unused_aux", parent_of, blocked_folders, errors,
+        block_self=False, batch_job_id=batch_job_id, progress=progress,
+    )
 
+    deleted_folders: list[str] = []
     by_depth: dict[int, list[tuple[str, str]]] = {}
     for ef in plan.empty_folders:
         tid = _resolve_id(ef)
@@ -604,16 +729,11 @@ def execute_empty_folder_cleanup(
         by_depth.setdefault(plan.folder_depths.get(ef.name, 0), []).append((ef.name, tid))
     for depth in sorted(by_depth, reverse=True):
         pairs = [(n, tid) for n, tid in by_depth[depth] if n.lower() not in blocked_folders]
-        if not pairs:
-            continue
-        ok, failed, err = _delete_track_batch(engine, pairs, batch_job_id=batch_job_id, progress=progress)
-        deleted_folders.extend(ok)
-        if err:
-            errors.append(("remove_empty_folder", ", ".join(failed), err))
-            for fname in failed:
-                _mark_ancestors(fname.lower(), parent_of, blocked_folders)
-
-    return deleted_folders, deleted_vcas, errors
+        deleted_folders.extend(_run_cleanup_batch(
+            engine, pairs, "remove_empty_folder", parent_of, blocked_folders, errors,
+            block_self=True, batch_job_id=batch_job_id, progress=progress,
+        ))
+    return deleted_folders, deleted_vcas, deleted_auxes, errors
 
 
 def apply_post_close_ptx_patches(

@@ -151,6 +151,7 @@ class SlotATrimInfo:
     max_db: float
     is_active: bool = True
     is_bypassed: bool = False
+    is_clean_donor: bool = False
 
 
 @dataclass

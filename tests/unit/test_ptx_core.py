@@ -128,8 +128,9 @@ def _mixer_audio_261c(
         + b"\xff\xff\xff\xff\x00\xff\x7f\x0a\x00"
         + _zchunk(0x4856, b"\x00" * 8)
     )
-    body = uid + pre_input + d0 + (b"\x00" * 40)
-    return _zchunk(0x261C, body, version=1)
+    inner_261b = _zchunk(0x261B, uid + pre_input + d0, version=15)
+    body = inner_261b + _zchunk(0x2038, b"\x00" * 16, version=1) + (b"\x00" * 24)
+    return _zchunk(0x261C, body, version=6)
 
 
 def _io_1021(name: str, kind: int, is_stereo: bool, uid: bytes) -> bytes:
@@ -511,3 +512,34 @@ def test_clip_gain_shared_curve_multipoint_zero_legacy_and_missing_2637():
     struct.pack_into("<H", buf_m, c37_m.offset + 7, 0x7FFD)  # rename tag away from 0x2637
     with pytest.raises(RuntimeError, match="Missing 0x2637"):
         patch_clip_gains(encrypt_ptx(bytes(buf_m), delta_m), {"Kick": 3.0})
+
+
+def test_patch_clear_track_inputs_shrinks_enclosing_261b_and_aligns_trailing_chunk():
+    from sessionpreplib.ptx import patch_clear_track_inputs, validate_index_0002
+
+    raw = _build_synthetic_ptx()
+    cleared, meta = patch_clear_track_inputs(raw, ["Kick", "Snare"])
+    assert meta["Kick"]["cleared"] is True and meta["Snare"]["cleared"] is True
+
+    dec, _ = decrypt_ptx(cleared)
+    assert validate_index_0002(dec)
+    sess = PtxSession(dec)
+    assert sess.track_by_name("Kick").input_path is None
+    assert sess.track_by_name("Snare").input_path is None
+
+    # Every cleared 0x261C block's enclosing 0x261B chunk MUST end directly on the trailing 0x2038 Z-chunk (0x5A)
+    c2624 = sess.chunk_map[0x2624].raw
+    pos = 13
+    checked_audio = 0
+    for _ in range(struct.unpack_from("<I", c2624, 9)[0]):
+        sz = struct.unpack_from("<I", c2624, pos + 3)[0]
+        tag = struct.unpack_from("<H", c2624, pos + 7)[0]
+        blk = c2624[pos : pos + 7 + sz]
+        if tag == 0x261C:
+            checked_audio += 1
+            assert blk[9] == 0x5A and struct.unpack_from("<H", blk, 16)[0] == 0x261B
+            b1b_end = 9 + 7 + struct.unpack_from("<I", blk, 12)[0]
+            assert b1b_end + 9 <= len(blk)
+            assert blk[b1b_end] == 0x5A and struct.unpack_from("<H", blk, b1b_end + 7)[0] == 0x2038
+        pos += 7 + sz
+    assert checked_audio == 2

@@ -105,7 +105,46 @@ _AVID_TRIM_TAPER: tuple[tuple[float, int], ...] = (
 
 _PROTILITY_ACTIVE_SLOT_RE = re.compile(r'activeSlot="([AB])"')
 _PROTILITY_GAIN_RE = re.compile(r'(<PARAM\s+id="GAIN"\s+value=")([^"]*)(")')
+_PROTILITY_PARAM_RE = re.compile(r'<PARAM\s+id="([^"]+)"\s+value="([^"]*)"')
 _PROTILITY_MODIFIED_RE = re.compile(r'PRESET_MODIFIED="0"')
+_MONO_ONLY_4CCS = frozenset({"RTMN", "jcbb"})
+_STEREO_ONLY_4CCS = frozenset({"RTST", "jccc"})
+_PROTILITY_CLEAN_DEFAULTS: dict[str, float] = {
+    "BASS_MONO_ENABLED": 0.0,
+    "BASS_MONO_FREQ": 10.0,
+    "DUAL_PAN_L": -100.0,
+    "DUAL_PAN_R": 100.0,
+    "GAIN_L": 0.0,
+    "GAIN_MODE": 0.0,
+    "GAIN_R": 0.0,
+    "HP_ENABLED": 0.0,
+    "HP_FREQ": 10.0,
+    "HP_SLOPE": 1.0,
+    "MID_GAIN": 100.0,
+    "MONO_MODE": 0.0,
+    "PAN": 0.0,
+    "PAN_MODE": 0.0,
+    "PHASE_INVERT_L": 0.0,
+    "PHASE_INVERT_LINK": 1.0,
+    "PHASE_INVERT_R": 0.0,
+    "PHASE_SHIFT": 10.0,
+    "PHASE_SHIFT_ENABLED": 0.0,
+    "SIDE_GAIN": 100.0,
+    "STEREO_MODE": 0.0,
+    "TIMING_ENABLED": 0.0,
+    "TIMING_LINK": 1.0,
+    "TIMING_MS_L": 0.0,
+    "TIMING_MS_R": 0.0,
+    "TIMING_SAMPLES_L": 0.0,
+    "TIMING_SAMPLES_R": 0.0,
+    "TIMING_TYPE": 0.0,
+    "TRIM": 100.0,
+    "WIDTH": 100.0,
+    "WIDTH_ENABLED": 1.0,
+    "WIDTH_MODE": 0.0,
+    "BALANCE_LAW": 0.0,
+    "PAN_LAW": 1.0,
+}
 
 
 def match_slot_a_trim_spec(pinfo: PtxPluginInfo) -> SlotATrimSpec | None:
@@ -189,7 +228,27 @@ def _find_protility_active_slot_span(xml_str: str) -> tuple[int, int] | None:
     return (m.start(), m.end()) if m else None
 
 
-def _read_trackcontrol_db(b1038: bytes, expected_tag: bytes) -> float | None:
+def _is_protility_slot_clean(xml_str: str, slot_xml: str) -> bool:
+    slot_match = _PROTILITY_ACTIVE_SLOT_RE.search(xml_str)
+    if slot_match and slot_match.group(1) != "A":
+        return False
+    found_any = False
+    for pid, val_s in _PROTILITY_PARAM_RE.findall(slot_xml):
+        found_any = True
+        if pid == "GAIN":
+            continue
+        expected = _PROTILITY_CLEAN_DEFAULTS.get(pid)
+        if expected is None:
+            return False
+        try:
+            if abs(float(val_s) - expected) > 1e-3:
+                return False
+        except ValueError:
+            return False
+    return found_any
+
+
+def _read_trackcontrol_state(b1038: bytes, expected_tag: bytes) -> tuple[float, bool] | None:
     if expected_tag not in b1038[:64]:
         return None
     dgct = b1038.find(b"DGCT")
@@ -213,12 +272,15 @@ def _read_trackcontrol_db(b1038: bytes, expected_tag: bytes) -> float | None:
         if isinstance(ab_list, list) and 0 <= cur_ab < len(ab_list) and isinstance(ab_list[cur_ab], dict):
             params = ab_list[cur_ab].get("parameters")
             if params == "default":
-                return 0.0
+                return 0.0, (cur_ab == 0)
             if isinstance(params, dict) and "kOpGain" in params:
                 val = float(params["kOpGain"])
-                return _norm_zero(round(val * 218.0 - 200.0, 2)) if math.isfinite(val) else None
+                if not math.isfinite(val):
+                    return None
+                clean = cur_ab == 0 and set(params.keys()) <= {"kOpGain"}
+                return _norm_zero(round(val * 218.0 - 200.0, 2)), clean
         elck_val = struct.unpack_from(">d", b1038, ep + 8)[0]
-        return _norm_zero(round(elck_val * 218.0 - 200.0, 2)) if math.isfinite(elck_val) else None
+        return (_norm_zero(round(elck_val * 218.0 - 200.0, 2)), False) if math.isfinite(elck_val) else None
     except (ValueError, TypeError, KeyError, zlib.error, UnicodeDecodeError):
         return None
 
@@ -234,7 +296,7 @@ def _read_avid_trim_db(b1038: bytes, expected_tag: bytes) -> float | None:
     return avid_trim_step_to_db(_avid_trim_i32_to_step(raw_gain))
 
 
-def _read_protility_db(b1038: bytes, expected_tag: bytes) -> float | None:
+def _read_protility_state(b1038: bytes, expected_tag: bytes) -> tuple[float, bool] | None:
     if expected_tag not in b1038[:64]:
         return None
     juce = b1038.find(b"juce")
@@ -260,14 +322,17 @@ def _read_protility_db(b1038: bytes, expected_tag: bytes) -> float | None:
     span = _find_protility_active_slot_span(xml_str)
     if span is None:
         return None
-    match = _PROTILITY_GAIN_RE.search(xml_str[span[0] : span[1]])
+    slot_xml = xml_str[span[0] : span[1]]
+    match = _PROTILITY_GAIN_RE.search(slot_xml)
     if not match:
         return None
     try:
         val = float(match.group(2))
     except ValueError:
         return None
-    return _norm_zero(round(val, 2)) if math.isfinite(val) else None
+    if not math.isfinite(val):
+        return None
+    return _norm_zero(round(val, 2)), _is_protility_slot_clean(xml_str, slot_xml)
 
 
 def inspect_slot_a_trim(
@@ -276,26 +341,43 @@ def inspect_slot_a_trim(
     *,
     is_active: bool,
     is_bypassed: bool,
+    track_format: str = "",
+    has_sidechain: bool = False,
 ) -> SlotATrimInfo | None:
     """Validate Slot A plugin identity and state blob, returning decoded gain info or ``None``."""
     spec = match_slot_a_trim_spec(pinfo)
     if spec is None:
         return None
+    if track_format == "Mono" and pinfo.type_4cc in _STEREO_ONLY_4CCS:
+        return None
+    if track_format == "Stereo" and pinfo.type_4cc in _MONO_ONLY_4CCS:
+        return None
     s1038 = find_subchunks(slot_blk, 0x1038)
-    if not s1038:
+    # Fail closed on missing or Multi-Mono (>1) 0x1038 plugin state blocks.
+    if len(s1038) != 1:
         return None
     b1038 = s1038[0]
     expected_tag = f"{pinfo.manufacturer_4cc}{pinfo.product_4cc}{pinfo.type_4cc}".encode("latin1")
+    is_clean = False
     if spec.plugin_id == "trackcontrol":
-        gain_db = _read_trackcontrol_db(b1038, expected_tag)
+        state = _read_trackcontrol_state(b1038, expected_tag)
+        if state is None:
+            return None
+        gain_db, is_clean = state
     elif spec.plugin_id == "trim":
-        gain_db = _read_avid_trim_db(b1038, expected_tag)
+        t_db = _read_avid_trim_db(b1038, expected_tag)
+        if t_db is None:
+            return None
+        gain_db, is_clean = t_db, True
     elif spec.plugin_id == "protility":
-        gain_db = _read_protility_db(b1038, expected_tag)
+        state = _read_protility_state(b1038, expected_tag)
+        if state is None:
+            return None
+        gain_db, is_clean = state
     else:
         return None
-    if gain_db is None:
-        return None
+    if has_sidechain or (track_format and track_format not in ("Mono", "Stereo")):
+        is_clean = False
     fourcc = f"{pinfo.manufacturer_4cc}/{pinfo.product_4cc}/{pinfo.type_4cc}"
     return SlotATrimInfo(
         plugin_id=spec.plugin_id,
@@ -307,6 +389,7 @@ def inspect_slot_a_trim(
         max_db=spec.max_db,
         is_active=is_active,
         is_bypassed=is_bypassed,
+        is_clean_donor=is_clean,
     )
 
 
@@ -438,33 +521,97 @@ def _find_child_zchunk_span(buf: bytes, parent_off: int, tag: int) -> tuple[int,
     return parent_off + rel, parent_off + rel + len(matches[0])
 
 
-def _extract_slot_a_from_block(
+@dataclass(frozen=True)
+class _SlotAEmptyLocation:
+    """Structurally verified offsets for an empty Insert Slot A (``0x2625``) inside ``0x2624``."""
+
+    ancestors: tuple[int, ...]  # c2624 -> track blk -> [0x261B] -> 0x2627
+    slot0_start: int
+    slot0_end: int
+
+
+_PLUGIN_TIE_ORDER = {"trackcontrol": 0, "trim": 1, "protility": 2}
+
+
+def select_preferred_slot_a_trim_donor(session: Any, track_format: str) -> Any | None:
+    """Return the cleanest verified donor track for the most-used Slot A Trim matching *track_format*."""
+    if track_format not in ("Mono", "Stereo"):
+        return None
+    clean_candidates = [
+        trk for trk in session.tracks
+        if trk.slot_a_trim is not None and trk.slot_a_trim.is_clean_donor and trk.format == track_format
+    ]
+    if not clean_candidates:
+        return None
+    # Count usage across all validated same-format Slot A trims, selecting the highest-used plugin that has a clean donor
+    total_counts: dict[str, int] = {}
+    for trk in session.tracks:
+        if trk.slot_a_trim is not None and trk.format == track_format:
+            pid = trk.slot_a_trim.plugin_id
+            total_counts[pid] = total_counts.get(pid, 0) + 1
+    avail_pids = {trk.slot_a_trim.plugin_id for trk in clean_candidates}
+    best_pid = min(avail_pids, key=lambda pid: (-total_counts.get(pid, 0), _PLUGIN_TIE_ORDER.get(pid, 99), pid))
+    matching = [trk for trk in clean_candidates if trk.slot_a_trim.plugin_id == best_pid]
+    matching.sort(
+        key=lambda t: (
+            t.slot_a_trim.is_bypassed,
+            abs(t.slot_a_trim.gain_db) >= 0.05,
+            t.index,
+        )
+    )
+    return matching[0]
+
+
+def _first_slot_in_2627(b2627: bytes, p2627: int) -> tuple[int, int, int] | None:
+    """Return ``(abs_start, abs_end, tag)`` for exact Slot A (slot index 0) inside ``0x2627``."""
+    rel = 11 if (len(b2627) > 11 and b2627[11] == 0x5A) else 9
+    if rel + 9 > len(b2627) or b2627[rel] != 0x5A:
+        return None
+    ver = struct.unpack_from("<H", b2627, rel + 1)[0]
+    csz = struct.unpack_from("<I", b2627, rel + 3)[0]
+    tag = struct.unpack_from("<H", b2627, rel + 7)[0]
+    end = rel + 7 + csz
+    if ver >= 0x1000 or csz < 2 or end > len(b2627):
+        return None
+    return p2627 + rel, p2627 + end, tag
+
+
+def _find_block_2627_ancestors(
     dec: bytearray,
     c2624_off: int,
     blk_start: int,
     blk_end: int,
-) -> _SlotALocation | None:
-    """Walk the exact Z-chunk hierarchy ``c2624 -> blk -> [261B] -> 2627 -> 2616 -> [2615] -> 2613 -> 1038``."""
+) -> tuple[list[int], int, int] | None:
     blk = bytes(dec[blk_start:blk_end])
-    ancestors: list[int] = [c2624_off, blk_start]
-
     r2627 = _find_child_zchunk_span(blk, blk_start, 0x2627)
     if r2627 is None:
         return None
     p2627, e2627 = r2627
-    # Optional enclosing 0x261B wrapper inside blk containing 0x2627
+    ancestors: list[int] = [c2624_off, blk_start]
     for sub_1b in find_subchunks(blk, 0x261B):
         rel_1b = blk.find(sub_1b, 9)
         if rel_1b != -1 and blk_start + rel_1b < p2627 and blk_start + rel_1b + len(sub_1b) >= e2627:
             ancestors.append(blk_start + rel_1b)
             break
     ancestors.append(p2627)
+    return ancestors, p2627, e2627
 
-    b2627 = bytes(dec[p2627:e2627])
-    r2616 = _find_child_zchunk_span(b2627, p2627, 0x2616)
-    if r2616 is None:
+
+def _extract_slot_a_from_block(
+    dec: bytearray,
+    c2624_off: int,
+    blk_start: int,
+    blk_end: int,
+) -> _SlotALocation | None:
+    """Walk the exact Z-chunk hierarchy ``c2624 -> blk -> [261B] -> 2627 -> slot0(2616) -> [2615] -> 2613 -> 1038``."""
+    found = _find_block_2627_ancestors(dec, c2624_off, blk_start, blk_end)
+    if found is None:
         return None
-    p2616, e2616 = r2616
+    ancestors, p2627, e2627 = found
+    slot0 = _first_slot_in_2627(bytes(dec[p2627:e2627]), p2627)
+    if slot0 is None or slot0[2] != 0x2616:
+        return None
+    p2616, e2616, _ = slot0
     ancestors.append(p2616)
 
     b2616 = bytes(dec[p2616:e2616])
@@ -472,7 +619,6 @@ def _extract_slot_a_from_block(
     if r2613 is None:
         return None
     p2613, e2613 = r2613
-    # Optional enclosing 0x2615 wrapper inside 0x2616 containing 0x2613
     for sub_15 in find_subchunks(b2616, 0x2615):
         rel_15 = b2616.find(sub_15, 9)
         if rel_15 != -1 and p2616 + rel_15 < p2613 and p2616 + rel_15 + len(sub_15) >= e2613:
@@ -488,13 +634,12 @@ def _extract_slot_a_from_block(
     return _SlotALocation(tuple(ancestors), e2616, p2613, p1038, e1038 - p1038)
 
 
-def _locate_slot_a_offsets(
-    dec: bytearray,
+def _locate_track_block_bounds(
+    dec: bytes | bytearray,
     c2624_off: int,
     track_index: int,
     track_uuid_hex: str = "",
-) -> _SlotALocation | None:
-    """Locate Slot A structurally inside ``0x2624`` (UUID-first; index fallback only when no UUID)."""
+) -> tuple[int, int] | None:
     if c2624_off + 13 > len(dec) or dec[c2624_off] != 0x5A:
         return None
     c2624_end = c2624_off + 7 + struct.unpack_from("<I", dec, c2624_off + 3)[0]
@@ -513,19 +658,55 @@ def _locate_slot_a_offsets(
             return None
         if uuid_bytes:
             if dec.find(uuid_bytes, pos, min(pos + 256, end)) != -1:
-                return _extract_slot_a_from_block(dec, c2624_off, pos, end)
+                return pos, end
         elif ti == track_index:
             fallback_bounds = (pos, end)
         pos = end
-    return _extract_slot_a_from_block(dec, c2624_off, *fallback_bounds) if fallback_bounds else None
+    return fallback_bounds
 
 
-def _validate_and_shift_ancestors(dec: bytearray, loc: _SlotALocation, delta: int) -> None:
-    """Verify strict Z-chunk nesting for *loc.ancestors* and adjust all ancestor lengths by *delta*."""
-    target_s, target_e = loc.p1038, loc.p1038 + loc.len1038
-    prev_start, prev_end = -1, len(dec) + 1
+def _locate_slot_a_offsets(
+    dec: bytearray,
+    c2624_off: int,
+    track_index: int,
+    track_uuid_hex: str = "",
+) -> _SlotALocation | None:
+    """Locate occupied Slot A (``0x2616``) structurally inside ``0x2624``."""
+    bounds = _locate_track_block_bounds(dec, c2624_off, track_index, track_uuid_hex)
+    return _extract_slot_a_from_block(dec, c2624_off, *bounds) if bounds else None
+
+
+def _locate_slot_a_empty_2625(
+    dec: bytearray,
+    c2624_off: int,
+    track_index: int,
+    track_uuid_hex: str = "",
+) -> _SlotAEmptyLocation | None:
+    """Locate an empty Insert Slot A (``0x2625``) structurally inside ``0x2624``."""
+    bounds = _locate_track_block_bounds(dec, c2624_off, track_index, track_uuid_hex)
+    if bounds is None:
+        return None
+    found = _find_block_2627_ancestors(dec, c2624_off, *bounds)
+    if found is None:
+        return None
+    ancestors, p2627, e2627 = found
+    slot0 = _first_slot_in_2627(bytes(dec[p2627:e2627]), p2627)
+    if slot0 is None or slot0[2] != 0x2625:
+        return None
+    return _SlotAEmptyLocation(tuple(ancestors), slot0[0], slot0[1])
+
+
+def _validate_and_shift_span_ancestors(
+    dec: bytearray,
+    ancestors: tuple[int, ...],
+    target_s: int,
+    target_e: int,
+    delta: int,
+) -> None:
+    """Verify strict Z-chunk nesting for *ancestors* around ``[target_s, target_e)`` and shift lengths."""
+    prev_start, prev_end = -1, len(dec)
     new_sizes: list[tuple[int, int]] = []
-    for anc in loc.ancestors:
+    for anc in ancestors:
         if anc + 9 > len(dec) or dec[anc] != 0x5A:
             raise ValueError(f"Corrupt ancestor Z-chunk header at 0x{anc:x}.")
         ver = struct.unpack_from("<H", dec, anc + 1)[0]
@@ -540,6 +721,71 @@ def _validate_and_shift_ancestors(dec: bytearray, loc: _SlotALocation, delta: in
         prev_start, prev_end = anc, end
     for anc, new_sz in new_sizes:
         struct.pack_into("<I", dec, anc + 3, new_sz)
+
+
+def _patch_1038_for_plugin(b1038: bytes, trim_info: SlotATrimInfo, clamped_db: float) -> bytes:
+    expected_tag = trim_info.fourcc.replace("/", "").encode("latin1")
+    if trim_info.plugin_id == "trackcontrol":
+        return _patch_trackcontrol_1038(b1038, clamped_db, expected_tag)
+    if trim_info.plugin_id == "trim":
+        return _patch_avid_trim_1038(b1038, clamped_db, expected_tag)
+    if trim_info.plugin_id == "protility":
+        return _patch_protility_1038(b1038, clamped_db, expected_tag)
+    raise ValueError(f"Unsupported Slot A Trim plugin ID: {trim_info.plugin_id!r}")
+
+
+def _extract_pristine_donor_2616(orig_dec: bytes, c2624_off: int, donor_trk: Any) -> bytes:
+    """Extract the raw ``0x2616`` Insert Slot A chunk from *donor_trk* before any mutations."""
+    bounds = _locate_track_block_bounds(orig_dec, c2624_off, donor_trk.index, donor_trk.uuid_hex)
+    if bounds is None:
+        raise ValueError(f"Could not locate donor track {donor_trk.name!r} in 0x2624.")
+    blk = orig_dec[bounds[0] : bounds[1]]
+    r2627 = _find_child_zchunk_span(blk, bounds[0], 0x2627)
+    if r2627 is None:
+        raise ValueError(f"Donor track {donor_trk.name!r} missing 0x2627 insert bank.")
+    slot0 = _first_slot_in_2627(orig_dec[r2627[0] : r2627[1]], r2627[0])
+    if slot0 is None or slot0[2] != 0x2616:
+        raise ValueError(f"Donor track {donor_trk.name!r} does not have an occupied 0x2616 Slot A.")
+    return orig_dec[slot0[0] : slot0[1]]
+
+
+def _build_cloned_slot_a_2616(
+    donor_2616: bytes,
+    trim_info: SlotATrimInfo,
+    clamped_db: float,
+    *,
+    activate_if_inactive: bool,
+) -> tuple[bytes, bool]:
+    """Patch a cloned ``0x2616`` Slot A chunk to *clamped_db*, activate if needed, and clear bypass."""
+    buf = bytearray(donor_2616)
+    r2613 = _find_child_zchunk_span(bytes(buf), 0, 0x2613)
+    if r2613 is None:
+        raise ValueError("Donor 0x2616 missing 0x2613 subchunk.")
+    p2613, e2613 = r2613
+    ancestors: list[int] = [0]
+    for sub_15 in find_subchunks(bytes(buf), 0x2615):
+        rel_15 = bytes(buf).find(sub_15, 9)
+        if rel_15 != -1 and rel_15 < p2613 and rel_15 + len(sub_15) >= e2613:
+            ancestors.append(rel_15)
+            break
+    ancestors.append(p2613)
+    r1038 = _find_child_zchunk_span(bytes(buf[p2613:e2613]), p2613, 0x1038)
+    if r1038 is None:
+        raise ValueError("Donor 0x2616 missing 0x1038 plugin state.")
+    p1038, e1038 = r1038
+    new_1038 = _patch_1038_for_plugin(bytes(buf[p1038:e1038]), trim_info, clamped_db)
+    delta = len(new_1038) - (e1038 - p1038)
+    if delta != 0:
+        _validate_and_shift_span_ancestors(buf, tuple(ancestors), p1038, e1038, delta)
+    buf[p1038:e1038] = new_1038
+    # Auto-inserted Slot A Trim with non-zero gain is always activated and unbypassed so it is never a silent no-op.
+    activated = False
+    if abs(clamped_db) >= 0.05 or activate_if_inactive:
+        activated = _activate_slot_a_in_place(buf, p2613, len(buf), p1038 + len(new_1038))
+    p13_end = p2613 + 7 + struct.unpack_from("<I", buf, p2613 + 3)[0]
+    if p13_end < len(buf) and buf[p13_end] == 1:
+        buf[p13_end] = 0
+    return bytes(buf), activated
 
 
 def _activate_slot_a_in_place(dec: bytearray, p2613: int, p2616_end: int, p1038_end: int) -> bool:
@@ -576,20 +822,12 @@ def _apply_one_slot_a_patch(
     loc = _locate_slot_a_offsets(dec, c2624_off, trk_idx, trk_uuid_hex)
     if loc is None:
         raise ValueError(f"Could not locate Slot A 0x1038 chunk on track {trk_name!r}.")
-    expected_tag = trim_info.fourcc.replace("/", "").encode("latin1")
     b1038 = bytes(dec[loc.p1038 : loc.p1038 + loc.len1038])
-    if trim_info.plugin_id == "trackcontrol":
-        new_1038 = _patch_trackcontrol_1038(b1038, clamped_db, expected_tag)
-    elif trim_info.plugin_id == "trim":
-        new_1038 = _patch_avid_trim_1038(b1038, clamped_db, expected_tag)
-    elif trim_info.plugin_id == "protility":
-        new_1038 = _patch_protility_1038(b1038, clamped_db, expected_tag)
-    else:
-        raise ValueError(f"Unsupported Slot A Trim plugin ID: {trim_info.plugin_id!r}")
+    new_1038 = _patch_1038_for_plugin(b1038, trim_info, clamped_db)
 
     delta = len(new_1038) - loc.len1038
     if delta != 0:
-        _validate_and_shift_ancestors(dec, loc, delta)
+        _validate_and_shift_span_ancestors(dec, loc.ancestors, loc.p1038, loc.p1038 + loc.len1038, delta)
         dec[loc.p1038 : loc.p1038 + loc.len1038] = new_1038
         shift_index_0002(dec, loc.p1038 + loc.len1038, delta)
     else:
@@ -611,25 +849,50 @@ def _apply_one_slot_a_patch(
         "target_db": clamped_db,
         "activated": activated,
         "unbypassed": unbypassed,
+        "auto_inserted": False,
     }
 
 
-def patch_slot_a_trim_gains_on_session(
-    raw_ptx: bytes,
+def _apply_one_slot_a_auto_insert(
+    dec: bytearray,
+    c2624_off: int,
+    trk_idx: int,
+    trk_uuid_hex: str,
+    trk_name: str,
+    donor_2616: bytes,
+    donor_trim: SlotATrimInfo,
+    clamped_db: float,
+    *,
+    activate_if_inactive: bool,
+) -> dict[str, Any]:
+    loc = _locate_slot_a_empty_2625(dec, c2624_off, trk_idx, trk_uuid_hex)
+    if loc is None:
+        raise ValueError(f"Track {trk_name!r} does not have an empty Insert Slot A (0x2625) for auto-insert.")
+    cloned_2616, activated = _build_cloned_slot_a_2616(
+        donor_2616, donor_trim, clamped_db, activate_if_inactive=activate_if_inactive,
+    )
+    delta = len(cloned_2616) - (loc.slot0_end - loc.slot0_start)
+    _validate_and_shift_span_ancestors(dec, loc.ancestors, loc.slot0_start, loc.slot0_end, delta)
+    dec[loc.slot0_start : loc.slot0_end] = cloned_2616
+    if delta != 0:
+        shift_index_0002(dec, loc.slot0_end, delta)
+    return {
+        "plugin": donor_trim.plugin_name,
+        "previous_db": 0.0,
+        "target_db": clamped_db,
+        "activated": activated,
+        "unbypassed": False,
+        "auto_inserted": True,
+    }
+
+
+def _resolve_slot_a_targets(
     session: Any,
     track_gains_db: dict[str, float],
     *,
-    activate_if_inactive: bool = True,
-    unbypass_if_bypassed: bool = False,
-) -> tuple[bytes, dict[str, Any]]:
-    """Patch validated Slot A Trim plugin gains using an already-parsed ``PtxSession``."""
-    if not track_gains_db:
-        return raw_ptx, {}
-    c2624 = session.chunk_map.get(0x2624)
-    if c2624 is None:
-        raise ValueError("Session missing 0x2624 mixer chunk.")
-
-    targets: list[tuple[int, str, str, SlotATrimInfo, float]] = []
+    allow_auto_insert: bool,
+) -> list[tuple[int, str, str, SlotATrimInfo, float, Any | None]]:
+    targets: list[tuple[int, str, str, SlotATrimInfo, float, Any | None]] = []
     seen_keys: set[str] = set()
     for name, raw_db in track_gains_db.items():
         if not math.isfinite(float(raw_db)):
@@ -641,22 +904,73 @@ def patch_slot_a_trim_gains_on_session(
         if key in seen_keys:
             raise ValueError(f"Duplicate Slot A trim target resolving to track {trk.name!r}.")
         seen_keys.add(key)
-        if trk.slot_a_trim is None:
-            raise ValueError(f"Track {name!r} does not have a validated Slot A Trim plugin.")
-        clamped = _norm_zero(round(max(trk.slot_a_trim.min_db, min(trk.slot_a_trim.max_db, float(raw_db))), 1))
-        targets.append((trk.index, trk.uuid_hex, trk.name, trk.slot_a_trim, clamped))
-
+        donor_trk = None
+        trim_info = trk.slot_a_trim
+        if trim_info is None:
+            slot_a_ins = next((ins for ins in trk.inserts if ins.slot_index == 0), None)
+            if slot_a_ins is not None:
+                plug = slot_a_ins.plugin_name or slot_a_ins.fourcc or "unknown plugin"
+                raise ValueError(
+                    f"Track {trk.name!r} does not have a validated Slot A Trim plugin "
+                    f"(Insert Slot A is occupied by {plug!r})."
+                )
+            if not allow_auto_insert:
+                raise ValueError(f"Track {trk.name!r} does not have a validated Slot A Trim plugin.")
+            donor_trk = select_preferred_slot_a_trim_donor(session, trk.format)
+            if donor_trk is None or donor_trk.slot_a_trim is None:
+                raise ValueError(
+                    f"Track {trk.name!r} ({trk.format}) has an empty Slot A, but no matching "
+                    f"{trk.format} Slot A Trim donor exists in the session."
+                )
+            trim_info = donor_trk.slot_a_trim
+        clamped = _norm_zero(round(max(trim_info.min_db, min(trim_info.max_db, float(raw_db))), 1))
+        targets.append((trk.index, trk.uuid_hex, trk.name, trim_info, clamped, donor_trk))
     targets.sort(key=lambda item: item[0], reverse=True)
+    return targets
+
+
+def patch_slot_a_trim_gains_on_session(
+    raw_ptx: bytes,
+    session: Any,
+    track_gains_db: dict[str, float],
+    *,
+    activate_if_inactive: bool = True,
+    unbypass_if_bypassed: bool = False,
+    allow_auto_insert: bool = True,
+) -> tuple[bytes, dict[str, Any]]:
+    """Patch (or auto-insert into empty Slot A) validated Slot A Trim gains on *session*."""
+    if not track_gains_db:
+        return raw_ptx, {}
+    c2624 = session.chunk_map.get(0x2624)
+    if c2624 is None:
+        raise ValueError("Session missing 0x2624 mixer chunk.")
+
+    targets = _resolve_slot_a_targets(session, track_gains_db, allow_auto_insert=allow_auto_insert)
     dec_bytes, xor_delta = decrypt_ptx(raw_ptx)
     k0 = raw_ptx[0x14] ^ 0x5A
+    donor_blobs: dict[str, bytes] = {}
+    for _, _, _, _, _, donor_trk in targets:
+        if donor_trk is not None:
+            dkey = donor_trk.uuid_hex or f"idx:{donor_trk.index}"
+            if dkey not in donor_blobs:
+                donor_blobs[dkey] = _extract_pristine_donor_2616(dec_bytes, c2624.offset, donor_trk)
+
     dec = bytearray(dec_bytes)
     meta: dict[str, Any] = {}
-    for trk_idx, trk_uuid_hex, trk_name, trim_info, clamped_db in targets:
-        meta[trk_name] = _apply_one_slot_a_patch(
-            dec, c2624.offset, trk_idx, trk_uuid_hex, trk_name, trim_info, clamped_db,
-            activate_if_inactive=activate_if_inactive,
-            unbypass_if_bypassed=unbypass_if_bypassed,
-        )
+    for trk_idx, trk_uuid_hex, trk_name, trim_info, clamped_db, donor_trk in targets:
+        if donor_trk is not None:
+            dkey = donor_trk.uuid_hex or f"idx:{donor_trk.index}"
+            meta[trk_name] = _apply_one_slot_a_auto_insert(
+                dec, c2624.offset, trk_idx, trk_uuid_hex, trk_name,
+                donor_blobs[dkey], trim_info, clamped_db,
+                activate_if_inactive=activate_if_inactive,
+            )
+        else:
+            meta[trk_name] = _apply_one_slot_a_patch(
+                dec, c2624.offset, trk_idx, trk_uuid_hex, trk_name, trim_info, clamped_db,
+                activate_if_inactive=activate_if_inactive,
+                unbypass_if_bypassed=unbypass_if_bypassed,
+            )
 
     validate_index_0002(bytes(dec))
     return encrypt_ptx(bytes(dec), xor_delta, k0=k0), meta

@@ -107,8 +107,12 @@ def _slot_2616(plug_idx: int, c1038: bytes, *, is_active: bool = True, is_bypass
     return _zchunk(0x2616, c2615 + byp_byte + b"\x00\x00")
 
 
+def _slot_2625_empty() -> bytes:
+    return _zchunk(0x2625, _zchunk(0x2626, b""))
+
+
 def _wrap_slots(slots: list[bytes]) -> bytes:
-    return _zchunk(0x261B, _zchunk(0x2627, b"".join(slots)), ver=15)
+    return _zchunk(0x261B, _zchunk(0x2627, struct.pack("<H", len(slots)) + b"".join(slots)), ver=15)
 
 
 def _plugin_entry_1017(name: str, mfr: str, prod: str, typ: str, bundle: str) -> bytes:
@@ -116,8 +120,10 @@ def _plugin_entry_1017(name: str, mfr: str, prod: str, typ: str, bundle: str) ->
     return _zchunk(0x1017, body)
 
 
-def _build_plugin_trim_ptx(*, k0: int = 0, slot_overrides: dict[int, bytes] | None = None, decoy_in_blk0: bytes = b"") -> bytes:
-    dec, xd = decrypt_ptx(_build_console_ptx())
+def _build_plugin_trim_ptx(
+    *, k0: int = 0, slot_overrides: dict[int, bytes] | None = None, decoy_in_blk0: bytes = b"", k1_mono: bool = False,
+) -> bytes:
+    dec, xd = decrypt_ptx(_build_console_ptx(k1_mono=k1_mono))
     plugins = [
         _plugin_entry_1017("TrackControl", "DMGA", "TrCt", "RTST", "com.dmgaudio.TrackControl.aax"),
         _plugin_entry_1017("TrackControl", "DMGA", "TrCt", "RTMN", "com.dmgaudio.TrackControl.aax"),
@@ -133,7 +139,7 @@ def _build_plugin_trim_ptx(*, k0: int = 0, slot_overrides: dict[int, bytes] | No
     tcount = struct.unpack_from("<I", c_body, 9)[0]
     default_wrappers = {
         0: _wrap_slots([_slot_2616(0, _build_1038_trackcontrol(b"RTST", 0.0, extra_param=True), is_active=False)]),
-        2: _wrap_slots([_slot_2616(1, _build_1038_trackcontrol(b"RTMN", -6.0), is_active=True, is_bypassed=True)]),
+        2: _wrap_slots([_slot_2616(0, _build_1038_trackcontrol(b"RTST", -6.0), is_active=True, is_bypassed=True)]),
         3: _wrap_slots([_slot_2616(2, _build_1038_trim(-6.0), is_active=True)]),
         4: _wrap_slots([_slot_2616(3, _build_1038_protility(b"jccc", 0.0), is_active=True)]),
         5: _wrap_slots([_slot_2616(5, _build_1038_non_trim(), is_active=True)]),
@@ -234,26 +240,26 @@ def test_slot_a_trim_preserves_k0_decoy_bytes_and_slot_b_isolation():
 
 def test_slot_a_trim_ab_slots_mono_presets_and_zero_unbypass_flags():
     wrappers = {
-        0: _wrap_slots([_slot_2616(0, _build_1038_trackcontrol(b"RTST", -3.0, extra_param=True, current_ab=1, multi_preset=True), is_active=False)]),
-        1: _wrap_slots([_slot_2616(4, _build_1038_protility(b"jcbb", -4.5, active_slot="B"), is_active=True, is_bypassed=True)]),
+        0: _wrap_slots([_slot_2616(4, _build_1038_protility(b"jcbb", -4.5, active_slot="B"), is_active=True, is_bypassed=True)]),
+        1: _wrap_slots([_slot_2616(0, _build_1038_trackcontrol(b"RTST", -3.0, extra_param=True, current_ab=1, multi_preset=True), is_active=False)]),
         2: _wrap_slots([_slot_2616(2, _build_1038_trim(0.0, flag3=0x7FFFFFFE), is_active=True)]),  # +12 dB mode / non-default
     }
-    raw = _build_plugin_trim_ptx(slot_overrides=wrappers)
+    raw = _build_plugin_trim_ptx(slot_overrides=wrappers, k1_mono=True)
     s = PtxSession.from_bytes(raw)
-    assert s.tracks[0].slot_a_trim.gain_db == pytest.approx(-3.0, abs=0.05)
-    assert s.tracks[1].slot_a_trim.gain_db == pytest.approx(-4.5, abs=0.05)
+    assert s.tracks[0].slot_a_trim.gain_db == pytest.approx(-4.5, abs=0.05)
+    assert s.tracks[1].slot_a_trim.gain_db == pytest.approx(-3.0, abs=0.05)
     assert s.tracks[2].slot_a_trim is None  # Avid Trim non-default switch fails closed
 
     patched, meta = patch_slot_a_trim_gains(
-        raw, {s.tracks[0].name: 0.0, s.tracks[1].name: 7.2}, activate_if_inactive=True, unbypass_if_bypassed=True,
+        raw, {s.tracks[1].name: 0.0, s.tracks[0].name: 7.2}, activate_if_inactive=True, unbypass_if_bypassed=True,
     )
-    assert meta[s.tracks[0].name]["activated"] is False  # target 0.0 leaves inactive untouched
-    assert meta[s.tracks[1].name]["unbypassed"] is True
+    assert meta[s.tracks[1].name]["activated"] is False  # target 0.0 leaves inactive untouched
+    assert meta[s.tracks[0].name]["unbypassed"] is True
     s2 = PtxSession.from_bytes(patched)
-    assert s2.tracks[0].slot_a_trim.gain_db == pytest.approx(0.0, abs=0.05)
-    assert s2.tracks[0].slot_a_trim.is_active is False
-    assert s2.tracks[1].slot_a_trim.gain_db == pytest.approx(7.2, abs=0.05)
-    assert s2.tracks[1].slot_a_trim.is_bypassed is False
+    assert s2.tracks[1].slot_a_trim.gain_db == pytest.approx(0.0, abs=0.05)
+    assert s2.tracks[1].slot_a_trim.is_active is False
+    assert s2.tracks[0].slot_a_trim.gain_db == pytest.approx(7.2, abs=0.05)
+    assert s2.tracks[0].slot_a_trim.is_bypassed is False
 
     # Verify TrackControl preserved kWidth and second saved preset without mutating it
     dec_p, _ = decrypt_ptx(patched)
@@ -286,3 +292,101 @@ def test_slot_a_trim_rejects_corrupt_dgct_xml_and_zlib_bomb():
 
     bad_pr = _slot_2616(3, _build_1038_protility(b"jccc", 0.0).replace(b"VC2!", b"NOPE"))
     assert inspect_slot_a_trim(bad_pr, pr_pinfo, is_active=True, is_bypassed=False) is None
+
+
+def test_slot_a_empty_2625_auto_insert_most_used_donor_and_slot_b_indexing():
+    # Track 0 & 1: Stereo TrackControl (count=2, wins), Track 2: Stereo Protility (count=1),
+    # Track 3: empty Slot A (0x2625) + TrackControl in Slot B, Track 4: empty Slot A (0x2625)
+    wrappers = {
+        0: _wrap_slots([_slot_2616(0, _build_1038_trackcontrol(b"RTST", 0.0), is_active=False)]),
+        1: _wrap_slots([_slot_2616(0, _build_1038_trackcontrol(b"RTST", -3.0), is_active=True)]),
+        2: _wrap_slots([_slot_2616(3, _build_1038_protility(b"jccc", 0.0), is_active=True)]),
+        3: _wrap_slots([_slot_2625_empty(), _slot_2616(0, _build_1038_trackcontrol(b"RTST", -5.0), is_active=True)]),
+        4: _wrap_slots([_slot_2625_empty(), _slot_2625_empty()]),
+    }
+    raw = _build_plugin_trim_ptx(k0=0x33, slot_overrides=wrappers)
+    s = PtxSession.from_bytes(raw)
+    # Track 3 has empty Slot A (0x2625) + TrackControl in Slot B -> slot_index MUST be 1 ('B'), slot_a_trim MUST be None!
+    assert s.tracks[3].slot_a_trim is None
+    assert len(s.tracks[3].inserts) == 1 and s.tracks[3].inserts[0].slot == "B" and s.tracks[3].inserts[0].slot_index == 1
+    assert s.tracks[4].slot_a_trim is None and s.tracks[4].inserts == []
+
+    # Auto-insert onto Track 4 picks most-used donor (TrackControl) and patches Track 1 in the same pass!
+    patched, meta = patch_slot_a_trim_gains(raw, {s.tracks[1].name: -4.0, s.tracks[4].name: -8.8})
+    assert (patched[0x14] ^ 0x5A) == 0x33
+    assert meta[s.tracks[4].name]["auto_inserted"] is True
+    assert meta[s.tracks[4].name]["plugin"] == "TrackControl"
+    assert meta[s.tracks[4].name]["activated"] is True
+
+    s2 = PtxSession.from_bytes(patched)
+    assert s2.tracks[4].slot_a_trim is not None
+    assert s2.tracks[4].slot_a_trim.plugin_id == "trackcontrol"
+    assert s2.tracks[4].slot_a_trim.is_active is True
+    assert s2.tracks[4].slot_a_trim.gain_db == pytest.approx(-8.8, abs=0.05)
+    assert s2.tracks[1].slot_a_trim.gain_db == pytest.approx(-4.0, abs=0.05)
+
+    # allow_auto_insert=False refuses empty Slot A
+    with pytest.raises(ValueError, match="validated Slot A Trim"):
+        patch_slot_a_trim_gains(raw, {s.tracks[4].name: -3.0}, allow_auto_insert=False)
+
+
+def test_slot_a_donor_rejects_dirty_sidechain_multimono_and_format_mismatch():
+    tc_st = PtxPluginInfo(0, "TrackControl", "DMGA", "TrCt", "RTST", "com.dmgaudio.TrackControl.aax")
+    tc_mo = PtxPluginInfo(1, "TrackControl", "DMGA", "TrCt", "RTMN", "com.dmgaudio.TrackControl.aax")
+    pr_st = PtxPluginInfo(3, "Protility", "PrAu", "PrTy", "jccc", "com.Process.Audio.Protility")
+    pr_mo = PtxPluginInfo(4, "Protility", "PrAu", "PrTy", "jcbb", "com.Process.Audio.Protility")
+
+    # Dirty TrackControl (extra kWidth / AB slot B) and dirty Protility (WIDTH != 100 / slot B) are not clean donors
+    dirty_tc_w = _slot_2616(0, _build_1038_trackcontrol(b"RTST", 0.0, extra_param=True))
+    dirty_tc_b = _slot_2616(0, _build_1038_trackcontrol(b"RTST", 0.0, current_ab=1))
+    assert inspect_slot_a_trim(dirty_tc_w, tc_st, is_active=True, is_bypassed=False, track_format="Stereo").is_clean_donor is False
+    assert inspect_slot_a_trim(dirty_tc_b, tc_st, is_active=True, is_bypassed=False, track_format="Stereo").is_clean_donor is False
+    dirty_pr_b = _slot_2616(3, _build_1038_protility(b"jccc", 0.0, active_slot="B"))
+    dirty_pr_w = _slot_2616(3, _build_1038_protility(b"jccc", 0.0).replace(b'value="100.0"', b'value="50.0"'))
+    assert inspect_slot_a_trim(dirty_pr_b, pr_st, is_active=True, is_bypassed=False, track_format="Stereo").is_clean_donor is False
+    assert inspect_slot_a_trim(dirty_pr_w, pr_st, is_active=True, is_bypassed=False, track_format="Stereo").is_clean_donor is False
+
+    # Sidechain marks donor non-clean; Multi-Mono (2 x 0x1038) and Mono/Stereo stem mismatches fail closed
+    clean_tc = _slot_2616(0, _build_1038_trackcontrol(b"RTST", 0.0))
+    assert inspect_slot_a_trim(clean_tc, tc_st, is_active=True, is_bypassed=False, track_format="Stereo", has_sidechain=True).is_clean_donor is False
+    mm_slot = _slot_2616(1, _build_1038_trackcontrol(b"RTMN", 0.0) + _build_1038_trackcontrol(b"RTMN", 0.0))
+    assert inspect_slot_a_trim(mm_slot, tc_mo, is_active=True, is_bypassed=False, track_format="Stereo") is None
+    assert inspect_slot_a_trim(clean_tc, tc_st, is_active=True, is_bypassed=False, track_format="Mono") is None
+    assert inspect_slot_a_trim(_slot_2616(1, _build_1038_trackcontrol(b"RTMN", 0.0)), tc_mo, is_active=True, is_bypassed=False, track_format="Stereo") is None
+    assert inspect_slot_a_trim(_slot_2616(3, _build_1038_protility(b"jccc", 0.0)), pr_st, is_active=True, is_bypassed=False, track_format="Mono") is None
+    assert inspect_slot_a_trim(_slot_2616(4, _build_1038_protility(b"jcbb", 0.0)), pr_mo, is_active=True, is_bypassed=False, track_format="Stereo") is None
+
+    # Auto-insert skips dirty TrackControl donors and selects clean Protility instead
+    wrappers = {
+        0: _wrap_slots([dirty_tc_w]),
+        1: _wrap_slots([dirty_tc_b]),
+        2: _wrap_slots([_slot_2616(3, _build_1038_protility(b"jccc", 0.0))]),
+        4: _wrap_slots([_slot_2625_empty()]),
+    }
+    raw = _build_plugin_trim_ptx(slot_overrides=wrappers)
+    s = PtxSession.from_bytes(raw)
+    patched, meta = patch_slot_a_trim_gains(raw, {s.tracks[4].name: -6.0})
+    assert meta[s.tracks[4].name]["plugin"] == "Protility"
+    assert PtxSession.from_bytes(patched).tracks[4].slot_a_trim.gain_db == pytest.approx(-6.0, abs=0.05)
+
+
+def test_slot_a_auto_insert_avid_trim_and_always_activates_non_zero():
+    # Track 0: inactive & bypassed clean Avid Trim donor; Track 4: empty Slot A
+    wrappers = {
+        0: _wrap_slots([_slot_2616(2, _build_1038_trim(0.0), is_active=False, is_bypassed=True)]),
+        1: _wrap_slots([_slot_2625_empty()]),
+        2: _wrap_slots([_slot_2625_empty()]),
+        3: _wrap_slots([_slot_2625_empty()]),
+        4: _wrap_slots([_slot_2625_empty()]),
+    }
+    raw = _build_plugin_trim_ptx(slot_overrides=wrappers)
+    s = PtxSession.from_bytes(raw)
+    # Even with activate_if_inactive=False, a freshly auto-inserted non-zero trim MUST be active & unbypassed
+    patched, meta = patch_slot_a_trim_gains(raw, {s.tracks[4].name: -7.0}, activate_if_inactive=False)
+    assert meta[s.tracks[4].name]["auto_inserted"] is True
+    assert meta[s.tracks[4].name]["plugin"] == "Trim"
+    assert meta[s.tracks[4].name]["activated"] is True
+    s2 = PtxSession.from_bytes(patched)
+    assert s2.tracks[4].slot_a_trim.is_active is True
+    assert s2.tracks[4].slot_a_trim.is_bypassed is False
+    assert s2.tracks[4].slot_a_trim.gain_db == pytest.approx(-7.0, abs=0.1)

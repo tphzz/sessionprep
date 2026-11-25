@@ -371,10 +371,10 @@ def test_empty_folder_and_cascading_vca_cleanup_plan_and_execution(monkeypatch):
         # Empty routing folders fed by surviving main_output / send -> protected!
         _trk(3, "SUB_DRM", "RoutingFolder", in_bus="SUB_DRM", out_bus="MIX"),
         _trk(4, "SEND_BUS", "RoutingFolder", in_bus="SEND_BUS", out_bus="MIX"),
-        # Empty folders (one with nested empty basic folder, one with single contained VCA)
-        _trk(5, "HIT", "RoutingFolder", in_bus="HIT", out_bus="MIX"),
+        # Empty folders (one feeding downstream cHIT -> ALLHIT, one with single contained VCA)
+        _trk(5, "HIT", "RoutingFolder", in_bus="HIT", out_bus="cHIT"),
         _trk(6, "HIT-Sub", "BasicFolder", parent="HIT"),
-        _trk(7, "RIS", "RoutingFolder", in_bus="RIS", out_bus="MIX"),
+        _trk(7, "RIS", "RoutingFolder", in_bus="RIS", out_bus="cHIT"),
         _trk(8, "RIS-VCA", "Vca", parent="RIS"),
         # Dedicated VCA-organizer folder holding surviving VCAs, standalone unlinked PRINT-VCA, and unused HIT-VCA
         _trk(9, "VCAs", "BasicFolder"),
@@ -392,8 +392,11 @@ def test_empty_folder_and_cascading_vca_cleanup_plan_and_execution(monkeypatch):
         # Folder containing a VCA controlling surviving Kick_In -> both VCA and folder stay!
         _trk(19, "ORPHAN", "BasicFolder"),
         _trk(20, "GLOBAL-VCA", "Vca", parent="ORPHAN"),
-        # Standalone Aux downstream bus -> stays!
-        _trk(21, "cHIT", "Aux", in_bus="cHIT", out_bus="MIX"),
+        # Downstream Aux chain orphaned by deleting HIT/RIS -> removed; standalone un-wired FX return -> protected!
+        _trk(21, "cHIT", "Aux", in_bus="cHIT", out_bus="ALLHIT", sends=["HIT-PA"]),
+        _trk(22, "HIT-PA", "Aux", in_bus="HIT-PA", out_bus="ALLHIT"),
+        _trk(23, "ALLHIT", "Aux", in_bus="ALLHIT", out_bus="MIX"),
+        _trk(24, "DLY-RET", "Aux", in_bus="FX-DLY1", out_bus="MIX"),
     ]
     groups = [
         PtxGroup(0, "<ALL>", "edit", "Mix/Edit", -1, "!", member_names=[t.name for t in tracks]),
@@ -405,12 +408,18 @@ def test_empty_folder_and_cascading_vca_cleanup_plan_and_execution(monkeypatch):
     ]
     ptx = SimpleNamespace(tracks=tracks, groups=groups)
 
-    plan = plan_empty_folders_and_vcas(ptx)
+    plan_keep = plan_empty_folders_and_vcas(ptx, remove_unused_aux_tracks=False)
+    assert plan_keep.orphaned_auxes == ()
+
+    plan = protools_ptx.plan_empty_folders_and_vcas(ptx, remove_unused_aux_tracks=True)
     folder_names = [t.name for t in plan.empty_folders]
     vca_names = [t.name for t in plan.unused_vcas]
+    aux_names = [t.name for t in plan.orphaned_auxes]
     assert set(folder_names) == {"KIK-EmptySub", "HIT-Sub", "HIT", "RIS"}
     assert folder_names.index("HIT-Sub") < folder_names.index("HIT")
     assert set(vca_names) == {"HIT-VCA", "RIS-VCA", "SFX-VCA", "ALL-SFX-VCA"}
+    assert set(aux_names) == {"cHIT", "HIT-PA", "ALLHIT"}  # Causally orphaned chain removed; RV-CLS & DLY-RET preserved!
+    assert "RV-CLS" not in aux_names and "DLY-RET" not in aux_names
     assert "VCAs" not in folder_names
     assert "ORPHAN" not in folder_names
     assert "PRINT-VCA" not in vca_names
@@ -419,7 +428,7 @@ def test_empty_folder_and_cascading_vca_cleanup_plan_and_execution(monkeypatch):
     assert "KIK-VCA" not in vca_names
     assert "RV-VCA" not in vca_names
 
-    # Verify PTSL execution: VCAs first, then folders deepest-first, keep_folder_members=True
+    # Verify PTSL execution: VCAs first, then orphaned Auxes, then folders deepest-first, keep_folder_members=True
     calls: list[tuple[list[str], bool]] = []
 
     def fake_delete_tracks(engine, *, track_ids=None, keep_folder_members=True, **_kw):
@@ -428,16 +437,18 @@ def test_empty_folder_and_cascading_vca_cleanup_plan_and_execution(monkeypatch):
 
     monkeypatch.setattr(ptslh, "delete_tracks", fake_delete_tracks)
     live = [{"id": t.uuid_braced, "name": t.name} for t in tracks]
-    del_folders, del_vcas, del_errors = execute_empty_folder_cleanup(object(), ptx, live)
+    del_folders, del_vcas, del_auxes, del_errors = execute_empty_folder_cleanup(object(), ptx, live)
     assert del_errors == []
     assert set(del_vcas) == {"HIT-VCA", "RIS-VCA", "SFX-VCA", "ALL-SFX-VCA"}
+    assert set(del_auxes) == {"cHIT", "HIT-PA", "ALLHIT"}
     assert set(del_folders) == {"KIK-EmptySub", "HIT-Sub", "HIT", "RIS"}
     assert all(keep for _, keep in calls)
     id_to_name = {t.uuid_braced: t.name for t in tracks}
     batches = [{id_to_name[i] for i in batch} for batch, _ in calls]
     assert batches[0] == {"HIT-VCA", "RIS-VCA", "SFX-VCA", "ALL-SFX-VCA"}
-    assert batches[1] == {"KIK-EmptySub", "HIT-Sub"}
-    assert batches[2] == {"HIT", "RIS"}
+    assert batches[1] == {"cHIT", "HIT-PA", "ALLHIT"}
+    assert batches[2] == {"KIK-EmptySub", "HIT-Sub"}
+    assert batches[3] == {"HIT", "RIS"}
 
     # Partial failure (success_count < len) reconciles against live track_list and skips parent of failed child
     hit_sub_id = next(t.uuid_braced for t in tracks if t.name == "HIT-Sub")
@@ -454,15 +465,15 @@ def test_empty_folder_and_cascading_vca_cleanup_plan_and_execution(monkeypatch):
 
     fake_engine = SimpleNamespace(track_list=lambda: [{"id": i, "name": id_to_name[i]} for i in remaining_ids])
     monkeypatch.setattr(ptslh, "delete_tracks", fake_partial_delete)
-    p_folders, p_vcas, p_errors = execute_empty_folder_cleanup(fake_engine, ptx, live)
-    assert "KIK-EmptySub" in p_folders and "RIS" in p_folders
+    p_folders, p_vcas, p_auxes, p_errors = execute_empty_folder_cleanup(fake_engine, ptx, live)
+    assert "KIK-EmptySub" in p_folders and "RIS" in p_folders and set(p_auxes) == {"cHIT", "HIT-PA", "ALLHIT"}
     assert "HIT-Sub" not in p_folders and "HIT" not in p_folders  # Parent HIT skipped after HIT-Sub failed
     assert any(op == "remove_empty_folder" and "HIT-Sub" in tgt for op, tgt, _ in p_errors)
 
     # Exception in delete_tracks is isolated into errors without raising
     monkeypatch.setattr(ptslh, "delete_tracks", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("PTSL boom")))
-    e_folders, e_vcas, e_errors = execute_empty_folder_cleanup(object(), ptx, live)
-    assert e_folders == [] and e_vcas == []
+    e_folders, e_vcas, e_auxes, e_errors = execute_empty_folder_cleanup(object(), ptx, live)
+    assert e_folders == [] and e_vcas == [] and e_auxes == []
     assert any("PTSL boom" in msg for _, _, msg in e_errors)
 
 
@@ -512,7 +523,7 @@ def test_protools_transfer_runs_empty_folder_cleanup_and_guards_session_switch(t
         monkeypatch.setattr(ptslh, "session_matches_path", lambda *a, **kw: not session_switched)
         monkeypatch.setattr(
             "sessionpreplib.daw_processors.protools.execute_empty_folder_cleanup",
-            lambda *a, **kw: (deleted_ops.append("called") or ["RIM"], ["RIM-VCA"], []),
+            lambda *a, **kw: (deleted_ops.append("called") or ["RIM"], ["RIM-VCA"], ["cRIM"], []),
         )
         monkeypatch.setattr(
             "sessionpreplib.daw_processors.protools.run_post_close_ptx_enhancement",
@@ -533,6 +544,7 @@ def test_protools_transfer_runs_empty_folder_cleanup_and_guards_session_switch(t
     assert deleted_ops == ["called"]
     assert any(r.command.command_type == "remove_empty_folder" and r.command.target == "RIM" and r.success for r in res_ok)
     assert any(r.command.command_type == "remove_unused_vca" and r.command.target == "RIM-VCA" and r.success for r in res_ok)
+    assert any(r.command.command_type == "remove_unused_aux" and r.command.target == "cRIM" and r.success for r in res_ok)
 
     deleted_ops.clear()
     res_sw = _run_transfer(session_switched=True)
@@ -636,3 +648,50 @@ def test_gain_mode_none_preserves_rough_mix_balance_in_preview_and_post_close(tm
     )
     # gain_mode="none" uses attenuate_only=True so quiet busses are NEVER boosted
     assert g_none.nodes["KIK"].recommended_fader_db <= 0.0
+
+
+def test_orphan_aux_cleanup_subpath_hw_input_cycle_vca_cascade_and_emptied_folders():
+    from sessionpreplib.ptx.models import PtxGroup, PtxSignalPath, PtxSignalPathRef, PtxTrack
+
+    def _trk(idx, name, ttype, parent="", in_bus="", in_kind="bus", out_bus=""):
+        return PtxTrack(
+            index=idx, name=name, uuid_hex=f"{idx:032x}", uuid_braced=f"{{{idx:032x}}}",
+            track_type=ttype, format="Stereo", is_folder=(ttype in ("RoutingFolder", "BasicFolder")),
+            parent_folder_name=parent,
+            input_path=PtxSignalPathRef(in_bus, in_kind, f"i{idx}") if in_bus else None,
+            main_output=PtxSignalPathRef(out_bus, "bus", f"o{idx}") if out_bus else None,
+        )
+
+    tracks = [
+        _trk(0, "KIK", "RoutingFolder", in_bus="KIK", out_bus="cSUB.L"),
+        _trk(1, "Kick", "Audio", parent="KIK", out_bus="KIK"),
+        _trk(2, "KIK-VCA", "Vca", parent="KIK"),
+        _trk(3, "DEAD", "RoutingFolder", in_bus="DEAD", out_bus="cDEAD"),
+        _trk(4, "DEAD_RF", "RoutingFolder", in_bus="DEAD_RF_BUS", out_bus="MIX"),
+        _trk(5, "DEAD_BOX", "BasicFolder"),
+        _trk(6, "cSUB", "Aux", in_bus="cSUB", out_bus="MIX"),  # Protected by surviving Mono subpath cSUB.L!
+        _trk(7, "HW_AUX", "Aux", in_bus="In 1-2", in_kind="io", out_bus="MIX"),  # Hardware input protected
+        _trk(8, "cDEAD", "Aux", parent="DEAD_BOX", in_bus="cDEAD", out_bus="DEAD_RF_BUS"),
+        _trk(9, "CYC1", "Aux", in_bus="CYC_A", out_bus="CYC_B"),
+        _trk(10, "CYC2", "Aux", in_bus="CYC_B", out_bus="CYC_A"),  # Feedback cycle terminates safely
+        _trk(11, "DEAD-AUX-VCA", "Vca"),
+    ]
+    groups = [
+        PtxGroup(0, "G_DEAD_AUX", "User", "Mix/Edit", 1, "a", vca_track_name="DEAD-AUX-VCA", member_names=["cDEAD"]),
+        PtxGroup(1, "G_KIK_OLD", "User", "Mix/Edit", 2, "b", vca_track_name="KIK-VCA", member_names=["cDEAD"]),
+    ]
+    sig_paths = [
+        PtxSignalPath(0, "cSUB", "bus", True, 2, "s0", "{s0}", "0x2603", subpaths=["cSUB.L", "cSUB.R"]),
+        PtxSignalPath(1, "cSUB.L", "bus", False, 1, "s1", "{s1}", "0x2603", is_subpath=True, parent_name="cSUB"),
+    ]
+    ptx = SimpleNamespace(tracks=tracks, groups=groups, signal_paths=sig_paths)
+
+    plan = protools_ptx.plan_empty_folders_and_vcas(ptx, remove_unused_aux_tracks=True)
+    aux_names = {a.name for a in plan.orphaned_auxes}
+    vca_names = {v.name for v in plan.unused_vcas}
+    folder_names = {f.name for f in plan.empty_folders}
+
+    assert aux_names == {"cDEAD"}
+    assert "cSUB" not in aux_names and "HW_AUX" not in aux_names
+    assert vca_names == {"DEAD-AUX-VCA"} and "KIK-VCA" not in vca_names
+    assert folder_names == {"DEAD", "DEAD_BOX", "DEAD_RF"}

@@ -47,6 +47,7 @@ from .plugin_trim import (
     SLOT_A_TRIM_SPECS,
     SlotATrimSpec,
     inspect_slot_a_trim,
+    select_preferred_slot_a_trim_donor,
 )
 from .signal_flow import (
     LeafAudioInput,
@@ -101,6 +102,7 @@ __all__ = [
     "patch_slot_a_trim_gains",
     "patch_track_volumes",
     "read_lp_str",
+    "select_preferred_slot_a_trim_donor",
     "shift_index_0002",
     "splice_top_chunk",
     "validate_index_0002",

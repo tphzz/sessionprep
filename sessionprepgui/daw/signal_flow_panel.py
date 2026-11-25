@@ -220,7 +220,8 @@ def _node_notes(node: dict[str, Any], *, staging_enabled: bool = True) -> str:
         trim_plug = node.get("slot_a_trim_plugin")
         if node.get("staged") and trim_plug and strat in ("trim_and_fader", "trim_only"):
             trim_db = float(node.get("recommended_trim_db", 0.0))
-            parts.append(f"Slot A {trim_plug}: {_format_db(trim_db, signed=True)}")
+            tag = " (auto-insert)" if node.get("slot_a_trim_auto_insert") else ""
+            parts.append(f"Slot A {trim_plug}{tag}: {_format_db(trim_db, signed=True)}")
         elif node.get("staged") and not node.get("is_overridden") and abs(float(node.get("recommended_fader_db", 0.0))) >= 0.05:
             parts.append("auto-staged")
     return " · ".join(parts)

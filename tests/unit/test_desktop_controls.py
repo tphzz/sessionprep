@@ -409,3 +409,18 @@ def test_selected_disabled_gain_preserves_foreground_and_numeric_state(qapp):
         assert len(changes) == 2
     finally:
         table.close()
+
+
+def test_about_dialog_shows_only_name_and_version(monkeypatch):
+    from sessionprepgui import mainwindow
+    from sessionpreplib import __version__ as ver
+
+    captured: list[tuple[object, str, str]] = []
+    monkeypatch.setattr(
+        mainwindow.QMessageBox,
+        "about",
+        staticmethod(lambda parent, title, text: captured.append((parent, title, text))),
+    )
+    dummy = object()
+    mainwindow.SessionPrepWindow._on_about(dummy)
+    assert captured == [(dummy, "About SessionPrep", f"<h2>SessionPrep</h2><p>Version {ver}</p>")]

@@ -323,16 +323,29 @@ def patch_clear_track_inputs(
     if c2624 is None or c2624.offset + 13 > len(buf):
         raise RuntimeError("Missing or truncated 0x2624 mixer chunk in .ptx")
     edits, changes = _locate_input_clear_edits(buf, c2624.offset, min(len(buf), c2624.offset + 7 + c2624.size), targets_by_uuid)
-    for blk_off, p_in, nlen in reversed(edits):
+    for blk_off, p_in, nlen, p261b_off in reversed(edits):
         edit_end = blk_off + p_in + 4 + nlen + 16
         buf[blk_off + p_in : edit_end] = b"\x00" * 20
         if nlen != 0:
-            old_blk_sz = struct.unpack_from("<I", buf, blk_off + 3)[0]
-            struct.pack_into("<I", buf, blk_off + 3, old_blk_sz - nlen)
-            old_c24_sz = struct.unpack_from("<I", buf, c2624.offset + 3)[0]
-            struct.pack_into("<I", buf, c2624.offset + 3, old_c24_sz - nlen)
+            for anc_off in (p261b_off, blk_off, c2624.offset):
+                if anc_off is None:
+                    continue
+                old_sz = struct.unpack_from("<I", buf, anc_off + 3)[0]
+                if old_sz < nlen + 2:
+                    raise RuntimeError(f"Enclosing Z-chunk at 0x{anc_off:x} too small to shrink by {nlen}")
+                struct.pack_into("<I", buf, anc_off + 3, old_sz - nlen)
             shift_index_0002(buf, edit_end, -nlen)
     return encrypt_ptx(bytes(buf), delta, k0=k0), changes
+
+
+def _find_enclosing_261b_in_block(blk: bytes, blk_off: int, p_in: int, nlen: int) -> int | None:
+    """Return absolute offset of an enclosing ``0x261B`` container inside ``0x261C``, if present."""
+    slot_end = p_in + 4 + nlen + 16
+    for sub in find_subchunks(blk, 0x261B):
+        rel = blk.find(sub, 9)
+        if rel != -1 and rel < p_in and rel + len(sub) >= slot_end:
+            return blk_off + rel
+    return None
 
 
 def _locate_input_clear_edits(
@@ -340,10 +353,10 @@ def _locate_input_clear_edits(
     c2624_off: int,
     chunk_end: int,
     targets_by_uuid: dict[bytes, str],
-) -> tuple[list[tuple[int, int, int]], dict[str, dict[str, Any]]]:
+) -> tuple[list[tuple[int, int, int, int | None]], dict[str, dict[str, Any]]]:
     tcount = struct.unpack_from("<I", buf, c2624_off + 9)[0]
     pos = c2624_off + 13
-    edits: list[tuple[int, int, int]] = []
+    edits: list[tuple[int, int, int, int | None]] = []
     changes: dict[str, dict[str, Any]] = {}
     for _ in range(tcount):
         if pos + 9 > chunk_end or buf[pos] != 0x5A:
@@ -362,7 +375,8 @@ def _locate_input_clear_edits(
                 changes[tname] = {"previous_input": None, "cleared": False}
             else:
                 p_in, nlen, prev_name = edit
-                edits.append((pos, p_in, nlen))
+                p261b_off = _find_enclosing_261b_in_block(blk, pos, p_in, nlen)
+                edits.append((pos, p_in, nlen, p261b_off))
                 changes[tname] = {"previous_input": prev_name, "cleared": True}
         pos = blk_end
     return edits, changes
@@ -771,8 +785,9 @@ def patch_slot_a_trim_gains(
     *,
     activate_if_inactive: bool = True,
     unbypass_if_bypassed: bool = False,
+    allow_auto_insert: bool = True,
 ) -> tuple[bytes, dict[str, Any]]:
-    """Patch validated Slot A Trim plugin gains across tracks and return ``(patched_bytes, meta)``."""
+    """Patch (or auto-insert into empty Slot A) validated Slot A Trim plugin gains across tracks."""
     if not track_gains_db:
         return raw_ptx, {}
     session = PtxSession.from_bytes(raw_ptx)
@@ -780,6 +795,7 @@ def patch_slot_a_trim_gains(
         raw_ptx, session, track_gains_db,
         activate_if_inactive=activate_if_inactive,
         unbypass_if_bypassed=unbypass_if_bypassed,
+        allow_auto_insert=allow_auto_insert,
     )
 
 

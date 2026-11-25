@@ -48,8 +48,10 @@ threshold controls in a familiar range.
 
 Practical limitation:
   - Insert chains have multiple stages, and each stage can have its own "best"
-    operating level. SessionPrep only standardizes the level at the top of the
-    channel; you still trim between inserts as needed.
+    operating level. SessionPrep standardizes the level entering the first
+    insert on each track — and, for Pro Tools templates, recursively at each
+    downstream insert-bearing bus stage (see §3.1) — while you still trim
+    between serial plugins inside a single insert chain as needed.
 
 1. **NON-LINEAR RESPONSE:**
    Analog gear (and its software clones like SSL channels, 1176s, Tape Machines)
@@ -109,11 +111,13 @@ The Script's Solution:
   - Dry-run (default): analyze the session and print a session health/level overview.
   - Execute (`-x`): optionally write processed tracks and export fader offsets.
 
-  In execute mode, it sets a consistent starting level into the first insert
-  (Physics) and calculates the inverse fader offsets to preserve the original
-  balance (Art).  The GUI's DAW Transfer action then applies fader offsets automatically
-  (Pro Tools via PTSL; DAWproject via file generation). A machine-readable
-  `sessionprep.json` is also exported for custom workflows.
+  In execute mode — or directly in Pro Tools via non-destructive `.ptx` Clip
+  Gain + inverse Track Fader staging — it sets a consistent starting level into
+  the first insert (Physics) and applies the inverse fader offset to preserve
+  the original balance (Art). On Pro Tools templates with bus routing, it
+  extends the same two-level principle recursively down the bus hierarchy (see
+  §3.1). DAWproject exports embed audio and fader offsets into self-contained
+  archives, and `sessionprep.json` remains available for custom workflows.
 
 ---
 
@@ -221,6 +225,63 @@ The signal path is not a single volume knob. It is a chain:
       |
 [MIX BUS]
 ```
+
+### 3.1 Recursive Multi-Stage Bus Gain Staging (Pro Tools)
+
+Normalizing leaf tracks solves gain structure at the top of individual audio
+channels, but summing multiple tracks into subgroups, stems, and a mix bus
+shifts the combined level again:
+
+- A quiet two-track bass subgroup can still arrive well below `-18 dBFS RMS`,
+  under-driving analog-modeled bus compressors and saturators.
+- A dense drum stem or full mix bus summing many channels can easily exceed
+  `-6 dBFS peak` or `0 dBFS` pre-fader, over-driving or clipping bus inserts.
+
+For Pro Tools templates, SessionPrep reconstructs the template's directed
+acyclic signal-flow graph (Audio → Routing Folders → Subgroup/Stem Auxes →
+Mix Bus → Master), sums the time-aligned, gain-adjusted audio in topological
+order (respecting Mono/Stereo pan geometry, sends, mutes, and VCAs), and
+applies the same bimodal classification and two-level gain-staging principle
+recursively at each bus stage:
+
+```
+[SUMMED BUS INPUT]
+        |
+[SLOT A TRIM (+g)]  <--- Pre-insert gain stage (TrackControl / Avid Trim / Protility)
+        |                Calibrates summed signal to bimodal target (-6 pk / -18 RMS)
+[BUS INSERTS]       <--- Bus compressors, EQs, tape/console models hit nominal drive
+        |
+[BUS FADER (-g)]    <--- Inverse post-insert offset cancels +g so downstream
+        |                balance stays identical across unequal bus depths
+[NEXT BUS / MIX BUS]
+        |
+[TERMINAL SLOT A TRIM (attenuate-only)]  <--- Single headroom trim; Mix Bus fader stays at 0.0 dB
+        |
+[POST-TERMINAL BUSSES / MASTER]
+```
+
+Key invariants:
+
+- **Balance preservation across unequal bus depths:** Because every
+  intermediate bus satisfies `slot_a_trim + bus_fader == template_fader` in
+  balance-preserving modes (`clip_gain_and_fader` / `fader_only` / `none`),
+  parallel branches of different depths (for example, a direct vocal bus
+  alongside a three-tier `KIK → cKIK → ALLDRM → ALLRYT` drum chain) arrive at
+  the terminal Mix Bus with their exact relative rough-mix levels intact. In
+  `clip_gain_unity` mode, Slot A trims are applied with unity faders.
+- **Pure summing folders vs. insert-bearing busses:** Zero-insert summing
+  Routing Folders feeding downstream Slot A trim busses remain at `0.0 dB`
+  unity; post-terminal serial Mix Busses (e.g. metering/mastering chains) and
+  `Master` remain untouched.
+- **Validated Slot A trim plugins & strict safety:** SessionPrep supports
+  **DMG Audio TrackControl**, **Avid Trim** (default `+6 dB` mode), and
+  **Process.Audio Protility** in Insert Slot A. If a required staged bus needs
+  non-zero staging and has an empty Slot A, SessionPrep automatically clones
+  the template's most-used clean matching-format (`Mono`/`Stereo`) Slot A trim
+  plugin into Slot A; if Slot A is occupied by a non-trim or unvalidated
+  plugin, transfer stops with an error rather than silently falling back to a
+  post-insert fader. Templates without Slot A trim plugins fall back to bus
+  fader staging on Routing Folders and multi-input subgroup Auxes.
 
 ---
 

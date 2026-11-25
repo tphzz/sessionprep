@@ -195,6 +195,7 @@ class ProToolsDawProcessor(DawProcessor):
         self._group_type: str = str(config.get("protools_group_type", "Mix/Edit"))
         self._stage_bus_faders: bool = bool(config.get("protools_stage_bus_faders", True))
         self._pan_law_db: float = float(config.get("protools_pan_law_db", -3.0))
+        self._remove_unused_aux_tracks: bool = bool(config.get("protools_remove_unused_aux_tracks", True))
         self._connection_settings = ProToolsConnectionSettings.from_config(config)
 
     def check_connectivity(self) -> tuple[bool, str]:
@@ -738,15 +739,19 @@ class ProToolsDawProcessor(DawProcessor):
             if not ptslh.session_matches_path(engine, created_session_path):
                 raise RuntimeError("Pro Tools switched sessions before SessionPrep could remove empty folders.")
             if progress_cb:
-                progress_cb(94, 100, "Removing empty folders and unused VCAs...")
+                progress_cb(94, 100, "Removing empty folders, unused VCAs, and orphaned Auxes...")
             ptslh.save_session(engine)
             ptx = PtxSession.from_file(created_session_path)
             live_tracks = engine.track_list()
-            del_folders, del_vcas, del_errors = execute_empty_folder_cleanup(engine, ptx, live_tracks)
+            del_folders, del_vcas, del_auxes, del_errors = execute_empty_folder_cleanup(
+                engine, ptx, live_tracks, remove_unused_aux_tracks=self._remove_unused_aux_tracks,
+            )
             for fname in del_folders:
                 record("remove_empty_folder", fname)
             for vname in del_vcas:
                 record("remove_unused_vca", vname)
+            for aname in del_auxes:
+                record("remove_unused_aux", aname)
             for op, target_label, err in del_errors:
                 record(op, target_label, error=err)
         except Exception as exc:
@@ -817,7 +822,8 @@ class ProToolsDawProcessor(DawProcessor):
         for tname, info in (meta.get("slot_a_trims") or {}).items():
             record(
                 "set_slot_a_trim", tname,
-                plugin=info.get("plugin"), trim_db=info.get("target_db"), activated=info.get("activated"),
+                plugin=info.get("plugin"), trim_db=info.get("target_db"),
+                activated=info.get("activated"), auto_inserted=info.get("auto_inserted", False),
             )
         for tname, info in meta["volumes"].items():
             record("set_fader_ptx", tname, fader_db=info["target_db"])

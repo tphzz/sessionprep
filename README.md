@@ -1,10 +1,11 @@
 # SessionPrep
 
-Batch audio analyzer and bimodal normalizer for mix session preparation.
+Batch audio analyzer, bimodal normalizer, and multi-stage DAW gain-staging tool for mix session preparation.
 
 SessionPrep audits and prepares raw audio tracks for mix sessions.
-It performs the mechanical, non-creative labor of checking files for problems and
-normalizing levels, so you can focus on mixing.
+It performs the mechanical, non-creative labor of checking files for problems,
+normalizing track levels, and staging DAW routing/bus gain structure so you can
+focus on mixing.
 
 This is a **preflight heuristic** and a **starting-point generator**, not a fully
 automatic mix prep tool. 
@@ -117,11 +118,16 @@ points up to open and down to close; keyboard focus remains visible.
 Table Gain fields share the neighboring selectors’ gray surface, with clear focus
 and muted disabled values.
 
-**4. Import** tracks into your DAW. **DAW Transfer** writes fader offsets into
-DAWproject files, and for Pro Tools automatically routes inserted tracks to
-their parent Routing Folders, applies bimodal Clip Gain and Track Fader staging,
-creates per-folder Groups linked to template VCAs, and stages downstream
-folder/bus faders with an interactive offline **Signal Flow** preview.
+**4. Import** tracks into your DAW. **DAW Transfer** builds self-contained
+DAWproject archives (with embedded audio, fader offsets, and empty-folder
+cleanup), and for Pro Tools automates session setup via PTSL and validated
+`.ptx` updates: routing inserted tracks to their parent Routing Folders,
+clearing newly created audio track inputs to `No Input`, removing empty
+template folders, unused VCAs, and causally orphaned downstream Aux busses
+(enabled by default), creating per-folder Groups linked to template VCAs,
+applying two-level Clip Gain + inverse Track Fader staging, and running
+**recursive multi-stage bimodal gain staging** across the template's bus
+hierarchy with an offline **Signal Flow** inspector.
 
 ---
 
@@ -169,7 +175,7 @@ SessionPrep operates in three phases:
 |-------|------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|--------------------------------|
 | **1** | Track Layout           | Define how source tracks map to output files: channel routing, reordering, splitting, merging. Automatically optimizes layouts based on Phase 1 diagnostics (e.g. dropping silent files, extracting active channels from dual-mono and one-sided silence). Drag-and-drop between input/output trees with visual insert-position indicator. Optional recursive subfolder scanning. Output written to `sp_01_tracklayout/`. Pre-computed peak cache files written to `sp_peaks/` for fast waveform rendering. | GUI Phase 1 (always available) |
 | **2** | Analysis & Preparation | Format checks, clipping, DC offset, stereo compatibility, silence, subsonic, peak/RMS measurement, classification, tail exceedance. Bimodal normalization (clip gain adjustment) via Prepare. Output written to `sp_02_prepared/`.                                                                                                                                                                                        | GUI Phase 2 / CLI              |
-| **3** | DAW Transfer           | Transfer tracks into DAW sessions with per-track naming and folder assignment. Duplicate entries for multi-track scenarios (same clip on different tracks). DAWproject files embed audio and fader offsets. Pro Tools transfers automatically route tracks to parent Routing Folders, apply two-level Clip Gain + Track Fader staging, create folder Groups with template VCA linking, and stage downstream bus faders with an offline Signal Flow inspector. Support for unattended batch processing of multiple songs. | GUI Phase 3 |
+| **3** | DAW Transfer           | Transfer tracks into DAW sessions with per-track naming and folder assignment. Duplicate entries for multi-track scenarios (same clip on different tracks). DAWproject exports self-contained archives with embedded audio, fader offsets, and empty-folder cleanup. Pro Tools transfers route tracks to parent Routing Folders, clear audio track inputs to `No Input`, clean up empty folders, unused VCAs, and orphaned downstream Aux busses, create VCA-linked folder Groups, apply two-level Clip Gain + Track Fader staging, and run recursive multi-stage bimodal bus gain staging via validated Slot A trim plugins (with an offline Signal Flow inspector and per-bus fader overrides). Supports unattended batch processing of multiple songs. | GUI Phase 3 |
 
 
 In Track Layout, **Unassigned** marks an input channel with no output routes. Collapse the input file to see how many of its channels are unassigned.
@@ -207,7 +213,37 @@ The three-metric approach resolves common misclassifications: compressed drums
 crest but slow decay → correctly Sustained), and sparse percussion like toms
 and crashes (caught by density even with ambiguous crest/decay values).
 
-For the engineering rationale, see [TECHNICAL.md](TECHNICAL.md).
+### Multi-stage bus gain staging (Pro Tools)
+
+Calibrating individual tracks does not keep summed subgroups, stems, or the mix
+bus at target level: a few quiet tracks summed onto a subgroup can under-drive
+bus inserts, while many tracks summed onto a drum bus or mix bus can overload
+them.
+
+When transferring to a Pro Tools template, SessionPrep reconstructs the
+template's signal-flow graph (Audio → Routing Folders → Subgroup/Stem Auxes →
+Mix Bus → Master), sums the time-aligned, gain-adjusted audio in topological
+order, and applies **recursive multi-stage bimodal gain staging**:
+
+- **Intermediate insert-bearing busses** use a validated Insert Slot A trim
+  plugin (**DMG Audio TrackControl**, **Avid Trim** in default `+6 dB` mode, or
+  **Process.Audio Protility**) set to `+g` pre-insert, paired with an inverse
+  `-g` post-insert Bus Fader offset (in balance-preserving modes) so downstream
+  bus inserts receive the bimodal target level while the rough-mix balance stays
+  intact across unequal bus depths.
+- **Terminal Mix Bus** applies a single attenuate-only pre-insert Slot A trim
+  with its fader at unity (`0.0 dB`) so downstream serial Mix Busses and Master
+  stay below target without overloading.
+- **Missing or blocked Slot A handling:** On templates using Slot A trim
+  plugins, if a required staged bus has an empty Slot A and needs non-zero
+  staging, SessionPrep clones the template's most-used clean matching-format
+  (`Mono`/`Stereo`) Slot A trim plugin into Slot A automatically; if Slot A is
+  occupied by a non-trim plugin, transfer stops with an error rather than
+  silently falling back to post-insert faders. Pure summing folders, quiet
+  `0.0 dB` busses, post-terminal Mix Busses, and Master are exempt.
+
+For the engineering rationale, see [TECHNICAL.md](TECHNICAL.md). For full Pro
+Tools transfer details, see [REFERENCE.md §9](REFERENCE.md#9-pro-tools-transfer-automation-ptx--ptsl).
 
 ---
 

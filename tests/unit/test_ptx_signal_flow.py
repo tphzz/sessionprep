@@ -356,8 +356,8 @@ def _make_trim_session_fixture():
     from types import SimpleNamespace
     from sessionpreplib.ptx.models import PtxSend, PtxSignalPathRef, PtxTrack, SlotATrimInfo
 
-    def _tc_trim(gain_db: float = 0.0, *, active: bool = False, bypassed: bool = False) -> SlotATrimInfo:
-        return SlotATrimInfo("trackcontrol", "TrackControl", "DMGA/TrCt/RTST", "com.dmgaudio.TrackControl.aax", gain_db, -200.0, 18.0, active, bypassed)
+    def _tc_trim(gain_db: float = 0.0, *, active: bool = False, bypassed: bool = False, clean: bool = True) -> SlotATrimInfo:
+        return SlotATrimInfo("trackcontrol", "TrackControl", "DMGA/TrCt/RTST", "com.dmgaudio.TrackControl.aax", gain_db, -200.0, 18.0, active, bypassed, clean)
 
     def _trk(
         idx: int, name: str, ttype: str, *, in_bus: str = "", out_bus: str = "",
@@ -414,7 +414,13 @@ def test_recursive_two_level_slot_a_trim_preserves_balance_and_drives_bus_insert
     assert g.nodes["cBAS"].pre_fader_rms_db == pytest.approx(-18.0, abs=0.2)
     assert g.nodes["cVOX"].staging_strategy == "none" and "cVOX" not in g.recommended_slot_a_trims()
     assert g.nodes["ALLMUS"].recommended_trim_db + g.nodes["ALLMUS"].recommended_fader_db == pytest.approx(0.0, abs=1e-6)
-    assert g.nodes["MIX1"].staging_strategy == "fader_only" and g.nodes["Master"].pre_fader_rms_db == pytest.approx(-18.0, abs=0.2)
+    # Terminal MIX1 has empty Slot A -> auto-inserts TrackControl (-trim_only, fader=0.0 dB), protecting MIX1 & Master!
+    assert g.nodes["MIX1"].staging_strategy == "trim_only"
+    assert g.nodes["MIX1"].slot_a_trim_auto_insert is True
+    assert g.nodes["MIX1"].recommended_trim_db < 0.0 and g.nodes["MIX1"].recommended_fader_db == 0.0
+    assert "MIX1" in g.recommended_slot_a_trims()
+    assert g.nodes["MIX1"].pre_fader_rms_db == pytest.approx(-18.0, abs=0.2)
+    assert g.nodes["Master"].pre_fader_rms_db == pytest.approx(-18.0, abs=0.2)
 
     g_raw = build_annotated_signal_flow(ptx, leaves, {"target_peak": -6.0, "target_rms": -18.0}, stage_bus_faders=False)
     assert g.nodes["ALLRYT"].post_fader_rms_db == pytest.approx(g_raw.nodes["ALLRYT"].post_fader_rms_db, abs=0.1)
@@ -486,3 +492,123 @@ def test_slot_a_trim_inactive_isolation_and_staging_off_template_trim():
     g_off = build_annotated_signal_flow(_wrap(tracks), leaves, {"target_peak": -6.0, "target_rms": -18.0}, stage_bus_faders=False)
     assert g_off.nodes["ACT_TRIM"].pre_fader_rms_db == pytest.approx(g_off.nodes["ACT_TRIM"].pre_insert_rms_db + 4.0, abs=0.1)
     assert g_off.nodes["INACT_TRIM"].pre_fader_rms_db == pytest.approx(g_off.nodes["INACT_TRIM"].pre_insert_rms_db, abs=0.1)
+
+
+def test_slot_a_trim_hard_error_on_occupied_non_trim_and_post_terminal_exemption():
+    from sessionpreplib.ptx.models import PtxInsert
+
+    _tc_trim, _trk, _wrap, _PtxSend, _PtxRef = _make_trim_session_fixture()
+    sr = 48000
+    non_trim_a = PtxInsert("A", 0, 1, "FabFilter Pro-Q 4", "com.fabfilter.Pro-Q.4", "FabF/FQ4p/FQ4S", True, False)
+    metra_a = PtxInsert("A", 0, 2, "PSP Metra", "com.pspaudioware.Metra", "PSPa/Metr/MtrS", False, False)
+    leaves = {
+        "K1": LeafAudioInput(_sustained_tone(sr, 0.5, 10.0 ** (-8.0 / 20.0), freq=80.0), sr),
+        "V1": LeafAudioInput(_sustained_tone(sr, 0.5, 10.0 ** (-10.0 / 20.0), freq=440.0), sr),
+    }
+
+    # 1. Post-terminal MIX2 (PSP Metra in Slot A) + Master are exempt while MIX1 auto-inserts TrackControl
+    tracks_ok = [
+        _trk(0, "K1", "Audio", out_bus="KIK"), _trk(1, "V1", "Audio", out_bus="VOX"),
+        _trk(2, "KIK", "RoutingFolder", in_bus="KIK", out_bus="cKIK"),
+        _trk(3, "VOX", "RoutingFolder", in_bus="VOX", out_bus="cVOX"),
+        _trk(4, "cKIK", "Aux", in_bus="cKIK", out_bus="MIX1", trim=_tc_trim()),
+        _trk(5, "cVOX", "Aux", in_bus="cVOX", out_bus="MIX1", trim=_tc_trim()),
+        _trk(6, "MIX1", "Aux", in_bus="MIX1", out_bus="MIX2"),
+        _trk(7, "MIX2", "Aux", in_bus="MIX2", out_bus="Out 1-2"),
+        _trk(8, "Master", "Master", out_bus="Out 1-2"),
+    ]
+    tracks_ok[7].inserts = [metra_a]
+    g_ok = build_annotated_signal_flow(_wrap(tracks_ok), leaves, {"target_peak": -6.0, "target_rms": -18.0}, stage_bus_faders=True, attenuate_only=True)
+    assert g_ok.nodes["MIX1"].slot_a_trim_auto_insert is True and g_ok.nodes["MIX1"].recommended_trim_db < 0.0
+    assert g_ok.nodes["MIX2"].staging_strategy == "none"
+
+    # 2. Terminal MIX1 with non-trim plugin in Slot A -> hard ValueError!
+    tracks_ok[6].inserts = [non_trim_a]
+    with pytest.raises(ValueError, match="Insert Slot A is occupied by non-trim plugin 'FabFilter Pro-Q 4'"):
+        build_annotated_signal_flow(_wrap(tracks_ok), leaves, {"target_peak": -6.0, "target_rms": -18.0}, stage_bus_faders=True, attenuate_only=True)
+
+    # 3. Mono bus with empty Slot A when only Stereo donors exist -> hard ValueError!
+    tracks_ok[6].inserts = []
+    tracks_ok[6].format = "Mono"
+    with pytest.raises(ValueError, match="no matching Mono Slot A Trim donor"):
+        build_annotated_signal_flow(_wrap(tracks_ok), leaves, {"target_peak": -6.0, "target_rms": -18.0}, stage_bus_faders=True, attenuate_only=True)
+
+
+def test_slot_a_trim_single_branch_fallback_and_effective_downstream_unity():
+    from sessionpreplib.ptx.models import PtxInsert
+
+    _tc_trim, _trk, _wrap, _PtxSend, _PtxRef = _make_trim_session_fixture()
+    sr = 48000
+    metra_a = PtxInsert("A", 0, 2, "PSP Metra", "com.pspaudioware.Metra", "PSPa/Metr/MtrS", True, False)
+
+    # Single-branch chain after orphan cleanup: MIX1 (empty) elected terminal; MIX2 (Metra) & MIX3 (TC) stay untouched
+    single = [
+        _trk(0, "Vox", "Audio", out_bus="VOX"),
+        _trk(1, "VOX", "RoutingFolder", in_bus="VOX", out_bus="cVOX"),
+        _trk(2, "cVOX", "Aux", in_bus="cVOX", out_bus="ALLMUS", trim=_tc_trim()),
+        _trk(3, "ALLMUS", "Aux", in_bus="ALLMUS", out_bus="MIX1", trim=_tc_trim()),
+        _trk(4, "MIX1", "Aux", in_bus="MIX1", out_bus="MIX2"),
+        _trk(5, "MIX2", "Aux", in_bus="MIX2", out_bus="MIX3"),
+        _trk(6, "MIX3", "Aux", in_bus="MIX3", out_bus="Out 1-2", trim=_tc_trim()),
+        _trk(7, "Master", "Master", out_bus="Out 1-2"),
+    ]
+    single[5].inserts = [metra_a]
+    g_s = build_annotated_signal_flow(
+        _wrap(single), {"Vox": LeafAudioInput(_sustained_tone(sr, 0.5, 10.0 ** (-8.0 / 20.0), freq=440.0), sr)},
+        {"target_peak": -6.0, "target_rms": -18.0}, stage_bus_faders=True, attenuate_only=True,
+    )
+    assert g_s.nodes["MIX1"].slot_a_trim_auto_insert is True and g_s.nodes["MIX1"].recommended_trim_db < 0.0
+    assert g_s.nodes["MIX2"].staging_strategy == "none"
+    assert g_s.nodes["MIX3"].staging_strategy == "none" and "MIX3" not in g_s.recommended_slot_a_trims()
+
+    # Insertless multi-input SubAux feeding auto-inserted MIX1 stays at 0.0 dB unity (rough-mix balance preserved)
+    multi = [
+        _trk(0, "K1", "Audio", out_bus="SUB"), _trk(1, "K2", "Audio", out_bus="SUB"),
+        _trk(2, "V1", "Audio", out_bus="VOX"),
+        _trk(3, "SUB", "Aux", in_bus="SUB", out_bus="MIX1"),
+        _trk(4, "VOX", "Aux", in_bus="VOX", out_bus="MIX1", trim=_tc_trim()),
+        _trk(5, "MIX1", "Aux", in_bus="MIX1", out_bus="Out 1-2"),
+        _trk(6, "Master", "Master", out_bus="Out 1-2"),
+    ]
+    leaves = {
+        "K1": LeafAudioInput(_sustained_tone(sr, 0.5, 10.0 ** (-8.0 / 20.0), freq=80.0), sr),
+        "K2": LeafAudioInput(_sustained_tone(sr, 0.5, 10.0 ** (-10.0 / 20.0), freq=120.0), sr),
+        "V1": LeafAudioInput(_sustained_tone(sr, 0.5, 10.0 ** (-12.0 / 20.0), freq=440.0), sr),
+    }
+    g_m = build_annotated_signal_flow(_wrap(multi), leaves, {"target_peak": -6.0, "target_rms": -18.0}, stage_bus_faders=True, attenuate_only=True)
+    assert g_m.nodes["SUB"].staging_strategy == "none" and g_m.nodes["SUB"].recommended_fader_db == 0.0
+    assert g_m.nodes["MIX1"].slot_a_trim_auto_insert is True and g_m.nodes["MIX1"].recommended_trim_db < 0.0
+
+
+def test_slot_a_trim_quiet_bus_skips_auto_insert_and_inactive_inserts_exempt():
+    from sessionpreplib.ptx.models import PtxInsert
+
+    _tc_trim, _trk, _wrap, _PtxSend, _PtxRef = _make_trim_session_fixture()
+    sr = 48000
+    inactive_b = PtxInsert("B", 1, 1, "FabFilter Pro-Q 4", "com.fabfilter.Pro-Q.4", "FabF/FQ4p/FQ4S", False, False)
+    active_b = PtxInsert("B", 1, 1, "FabFilter Pro-Q 4", "com.fabfilter.Pro-Q.4", "FabF/FQ4p/FQ4S", True, False)
+    bad_trim_a = PtxInsert("A", 0, 2, "Trim", "com.avid.aax.sdk.trim", "Digi/Trim/TR11", True, False)
+
+    # Quiet MIX1 needing 0.0 dB under attenuate_only=True does NOT auto-insert and does NOT false-error
+    tracks = [
+        _trk(0, "K1", "Audio", out_bus="cKIK"), _trk(1, "V1", "Audio", out_bus="cVOX"),
+        _trk(2, "cKIK", "Aux", in_bus="cKIK", out_bus="MIX1", trim=_tc_trim()),
+        _trk(3, "cVOX", "Aux", in_bus="cVOX", out_bus="MIX1"),
+        _trk(4, "MIX1", "Aux", in_bus="MIX1", out_bus="Out 1-2"),
+    ]
+    tracks[3].inserts = [inactive_b]  # Inactive insert on intermediate Aux must NOT force auto-insert
+    quiet_leaves = {
+        "K1": LeafAudioInput(_sustained_tone(sr, 0.5, 10.0 ** (-28.0 / 20.0), freq=80.0), sr),
+        "V1": LeafAudioInput(_sustained_tone(sr, 0.5, 10.0 ** (-28.0 / 20.0), freq=440.0), sr),
+    }
+    g_q = build_annotated_signal_flow(_wrap(tracks), quiet_leaves, {"target_peak": -6.0, "target_rms": -18.0}, stage_bus_faders=True, attenuate_only=True)
+    assert g_q.nodes["cVOX"].slot_a_trim_auto_insert is False and g_q.nodes["cVOX"].staging_strategy == "none"
+    assert g_q.nodes["MIX1"].slot_a_trim_auto_insert is False and g_q.nodes["MIX1"].staging_strategy == "none"
+
+    # Active Slot B insert on intermediate Aux DOES auto-insert Slot A Trim; invalid Avid Trim in Slot A gives clear error
+    tracks[3].inserts = [active_b]
+    g_act = build_annotated_signal_flow(_wrap(tracks), quiet_leaves, {"target_peak": -6.0, "target_rms": -18.0}, stage_bus_faders=True, attenuate_only=True)
+    assert g_act.nodes["cVOX"].slot_a_trim_auto_insert is True and g_act.nodes["cVOX"].recommended_trim_db > 0.0
+    tracks[3].inserts = [bad_trim_a]
+    with pytest.raises(ValueError, match="could not be validated"):
+        build_annotated_signal_flow(_wrap(tracks), quiet_leaves, {"target_peak": -6.0, "target_rms": -18.0}, stage_bus_faders=True, attenuate_only=True)

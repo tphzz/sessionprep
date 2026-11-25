@@ -686,23 +686,44 @@ class PtxSession:
         s2627 = find_subchunks(blk, 0x2627)
         if not s2627:
             return
-        for si, slot_blk in enumerate(find_subchunks(s2627[0], 0x2616)):
-            s2626 = find_subchunks(slot_blk, 0x2626)
-            if not s2626:
+        b27 = s2627[0]
+        # Real Pro Tools 0x2627 has a 2-byte slot count at +9 followed by sequential 0x2616/0x2625 slots at +11.
+        pos = 11 if (len(b27) > 11 and b27[11] == 0x5A) else 9
+        si = 0
+        while pos + 9 <= len(b27) and b27[pos] == 0x5A:
+            ver = struct.unpack_from("<H", b27, pos + 1)[0]
+            csz = struct.unpack_from("<I", b27, pos + 3)[0]
+            tag = struct.unpack_from("<H", b27, pos + 7)[0]
+            end = pos + 7 + csz
+            if ver >= 0x1000 or csz < 2 or end > len(b27):
+                break
+            if tag == 0x2625:
+                si += 1
+                pos = end
                 continue
-            plug_idx, plug_name, bundle_id, fourcc = self._resolve_insert_plugin(slot_blk, s2626[0])
-            sc_chunks = find_subchunks(slot_blk, 0x260E)
-            sc_ref = self._extract_260e_ref(sc_chunks[0]) if sc_chunks else None
-            is_active, is_bypassed = self._parse_insert_flags(slot_blk)
-            slot = SEND_SLOTS[si] if si < len(SEND_SLOTS) else str(si)
-            track.inserts.append(
-                PtxInsert(slot, si, plug_idx, plug_name, bundle_id, fourcc, is_active, is_bypassed, sc_ref)
-            )
-            if si == 0 and plug_idx is not None and plug_idx < len(self.plugins):
-                from .plugin_trim import inspect_slot_a_trim
-                track.slot_a_trim = inspect_slot_a_trim(
-                    slot_blk, self.plugins[plug_idx], is_active=is_active, is_bypassed=is_bypassed,
+            if tag == 0x2616:
+                slot_blk = b27[pos:end]
+                s2626 = find_subchunks(slot_blk, 0x2626)
+                if s2626:
+                    plug_idx, plug_name, bundle_id, fourcc = self._resolve_insert_plugin(slot_blk, s2626[0])
+                else:
+                    plug_idx, plug_name, bundle_id, fourcc = None, "(Hardware / Unknown Insert)", "", ""
+                sc_chunks = find_subchunks(slot_blk, 0x260E)
+                sc_ref = self._extract_260e_ref(sc_chunks[0]) if sc_chunks else None
+                is_active, is_bypassed = self._parse_insert_flags(slot_blk)
+                slot = SEND_SLOTS[si] if si < len(SEND_SLOTS) else str(si)
+                track.inserts.append(
+                    PtxInsert(slot, si, plug_idx, plug_name, bundle_id, fourcc, is_active, is_bypassed, sc_ref)
                 )
+                if si == 0 and plug_idx is not None and plug_idx < len(self.plugins):
+                    from .plugin_trim import inspect_slot_a_trim
+                    track.slot_a_trim = inspect_slot_a_trim(
+                        slot_blk, self.plugins[plug_idx],
+                        is_active=is_active, is_bypassed=is_bypassed,
+                        track_format=track.format, has_sidechain=(sc_ref is not None),
+                    )
+                si += 1
+            pos = end
 
     def _resolve_insert_plugin(self, slot_blk: bytes, s2626: bytes) -> tuple[int | None, str, str, str]:
         idx_pos = slot_blk.find(s2626) + len(s2626)
