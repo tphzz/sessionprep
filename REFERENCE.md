@@ -440,7 +440,11 @@ When several normalized sources share an output, they must share a DAW fader off
 ## 5. Fader Restoration (Stage D)
 
 The script calculates the inverse fader offsets for the gain applied in Stage C.
-Applying those offsets restores the producer's rough-mix balance exactly.
+Applying those offsets preserves the incoming file-level balance exactly (which
+matches the producer's rough-mix balance when multitracks were exported
+post-fader; when tracks were exported pre-fader at unity, inverse faders simply
+reproduce the raw unity import while track inserts still receive calibrated
+levels).
 
 Linked tracks use the lowest individual gain among the active members.
 Headroom can shift all eligible faders down together. A named anchor then
@@ -460,8 +464,9 @@ In execute mode (`-x/--execute`), the script generates a text report and a
 machine-readable JSON file (`sessionprep.json`) for applying fader offsets.
 In dry-run mode (no `-x`), it prints a session overview to the terminal.
 
-Applying the offsets preserves the producer's rough-mix balance while keeping
-the prepared levels ahead of your inserts.
+Applying the offsets preserves the incoming file-level balance (rough-mix
+balance when multitracks were printed post-fader) while keeping the prepared
+levels ahead of your inserts.
 
 - **Pro Tools** — **DAW Transfer** imports the audio and applies static Clip
   Gain, Track/Bus Faders, and validated Slot A Trim plugin adjustments in a
@@ -712,27 +717,33 @@ post-close pass with automatic rollback if Pro Tools fails to reopen the session
   insert-bearing busses receive pre-insert Slot A Trim gain (`+g`, activating an
   inactive Slot A Trim automatically while respecting bypassed inserts) paired
   with an inverse post-insert Bus Fader offset (`-g` relative to the template
-  fader) so downstream analog-emulated insert chains hit their target sweet spot
-  while rough-mix balance stays intact across unequal bus depths (or Slot A Trim
-  only with unity faders in `clip_gain_unity` mode), and the terminal
-  convergence Mix Bus applies a single headroom trim protecting Master while
-  keeping its fader at unity. If a required staged bus (such as the terminal Mix
-  Bus or an active-insert intermediate Aux needing non-zero staging) has an
-  empty Insert Slot A, SessionPrep automatically inserts the template's
-  most-used clean matching-format (`Mono`/`Stereo`) Slot A Trim plugin; if Slot
-  A is occupied by a non-trim or unvalidated plugin, SessionPrep stops with an
-  error rather than silently falling back to post-insert fader staging (post-terminal
-  serial Mix Busses, quiet `0.0 dB` busses, and `Master` are exempt). On
-  templates or branches without Slot A Trim plugins, SessionPrep stages Routing
-  Folders and multi-input Subgroup/Stem Auxes via bus faders while leaving
-  single-input insert Auxes, Master Faders, and `-∞ dB` parallel auxes
-  untouched. In the GUI Phase 3 right pane, **Routing & Folders** previews each
-  folder's input bus, planned group/VCA, and output routing chain directly from
-  the `.ptxt` template, while the **Signal Flow** tab provides both a
-  calculation **Table** and an auto-routed **Graph** DAG view with path-equation
-  tracing, a balance-validation banner (reporting path spread, global
-  leaf-fader convergence shifts, pre-fader send caveats, and unsimulated active
-  inserts), per-bus manual fader overrides (`Reset Overrides` or per-row reset),
-  and exports the annotated graph (including `recommended_slot_a_trims`,
+  fader) so downstream analog-emulated insert chains hit their initial linear
+  target sweet spot while the incoming file-level balance stays intact across
+  unequal bus depths (or Slot A Trim only with unity faders in
+  `clip_gain_unity` mode), and the terminal convergence Mix Bus applies a
+  single attenuate-only headroom trim protecting Master while keeping its fader
+  at unity (sparse arrangements below target are left untouched at `0.0 dB`
+  rather than boosted). Bus levels and Slot A trims are **initial linear
+  estimates** computed assuming unity gain for unsimulated non-trim inserts,
+  initial fader positions, and excluded post-fader sends; they serve as a
+  calibrated starting point before mix-time fader moves or insert gain changes.
+  If a required staged bus (such as the terminal Mix Bus or an active-insert
+  intermediate Aux needing non-zero staging) has an empty Insert Slot A,
+  SessionPrep automatically inserts the template's most-used clean
+  matching-format (`Mono`/`Stereo`) Slot A Trim plugin; if Slot A is occupied
+  by a non-trim or unvalidated plugin, SessionPrep stops with an error rather
+  than silently falling back to post-insert fader staging (post-terminal serial
+  Mix Busses, quiet `0.0 dB` busses, and `Master` are exempt). On templates or
+  branches without Slot A Trim plugins, SessionPrep stages Routing Folders and
+  multi-input Subgroup/Stem Auxes via bus faders while leaving single-input
+  insert Auxes, Master Faders, and `-∞ dB` parallel auxes untouched. In the GUI
+  Phase 3 right pane, **Routing & Folders** previews each folder's input bus,
+  planned group/VCA, and output routing chain directly from the `.ptxt`
+  template, while the **Signal Flow** tab provides both a calculation **Table**
+  and an auto-routed **Graph** DAG view with path-equation tracing, a
+  balance-validation banner (reporting path spread, global leaf-fader
+  convergence shifts, pre-fader send caveats, and unsimulated active inserts),
+  per-bus manual fader overrides (`Reset Overrides` or per-row reset), and
+  exports the annotated graph (including `recommended_slot_a_trims`,
   `balance_validation`, and `leaf_fader_shift_db`) under `daw_signal_flow` in
   JSON reports.

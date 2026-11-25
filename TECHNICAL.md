@@ -114,7 +114,10 @@ The Script's Solution:
   In execute mode — or directly in Pro Tools via non-destructive `.ptx` Clip
   Gain + inverse Track Fader staging — it sets a consistent starting level into
   the first insert (Physics) and applies the inverse fader offset to preserve
-  the original balance (Art). On Pro Tools templates with bus routing, it
+  the incoming file-level balance (Art — matching the producer's rough mix when
+  multitracks were exported post-fader; when tracks were printed pre-fader at
+  unity, inverse faders simply reproduce a raw unity import while track inserts
+  still receive calibrated levels). On Pro Tools templates with bus routing, it
   extends the same two-level principle recursively down the bus hierarchy (see
   §3.1). DAWproject exports embed audio and fader offsets into self-contained
   archives, and `sessionprep.json` remains available for custom workflows.
@@ -284,17 +287,23 @@ Key invariants:
   in balance-preserving modes (`clip_gain_and_fader` / `fader_only` / `none`),
   parallel branches of different depths (for example, a direct vocal bus
   alongside a deeper drum chain) arrive at the terminal Mix Bus with their
-  exact relative rough-mix levels intact. If an intermediate bus would exceed
-  the `+12.0 dB` inverse-fader ceiling, the solver applies a shared global
-  leaf-fader shift (`leaf_fader_shift_db`) equally across all leaf tracks so
-  both headroom and rough-mix balance converge. In `clip_gain_unity` mode,
-  Slot A trims are applied with unity faders.
-- **Known linear-model boundaries:** Active **pre-fader sends** tap after
-  Clip Gain or Slot A Trim and before the inverse fader (flagged explicitly in
-  the Signal Flow balance validator; post-fader sends remain invariant), and
-  active downstream non-trim bus plugins (compressors, saturators, EQs) are
-  not simulated offline — the solver computes linear static gain structure
-  assuming unity pass-through for downstream inserts.
+  exact relative incoming file-level balance intact (matching the rough mix when
+  multitracks were exported post-fader, or the unity tracking sum when exported
+  pre-fader). If an intermediate bus would exceed the `+12.0 dB` inverse-fader
+  ceiling, the solver applies a shared global leaf-fader shift
+  (`leaf_fader_shift_db`) equally across all leaf tracks so both headroom and
+  incoming balance converge. In `clip_gain_unity` mode, Slot A trims are applied
+  with unity faders.
+- **Initial linear estimate & model boundaries:** While algebraic balance
+  invariance (`Δ_bus = 0.0 dB`) is exact at session open, bus levels and Slot A
+  trims are **initial linear estimates** rather than permanent physical targets:
+  they assume unity pass-through for unsimulated active track/bus inserts
+  (compressors, saturators, EQs — indicated explicitly in the Signal Flow UI),
+  exclude post-fader FX sends, and reflect initial fader positions (moving track
+  faders or engaging non-unity plugins during mixing will shift downstream bus
+  levels by several dB). Active **pre-fader sends** tap after Clip Gain or
+  Slot A Trim and before the inverse fader and are flagged explicitly in the
+  Signal Flow balance validator (post-fader sends remain invariant).
 - **Pure summing folders vs. insert-bearing busses:** Zero-insert summing
   Routing Folders feeding downstream Slot A trim busses remain at `0.0 dB`
   unity; post-terminal serial Mix Busses (e.g. metering/mastering chains) and

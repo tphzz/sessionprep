@@ -949,7 +949,9 @@ class SignalFlowPanel(QWidget):
         )
         ins_cue = f" \u00b7 {len(unsim)} active insert{'s' if len(unsim) != 1 else ''} unsimulated \u24d8" if unsim else ""
         self._balance_lbl.setText(f"{glyph}  {summary or 'Balance summary unavailable'}{ins_cue}")
-        tips: list[str] = []
+        tips: list[str] = [
+            "Bus levels and Slot A trims are initial linear estimates (unity non-trim inserts, initial faders, post-fader sends excluded)."
+        ]
         blocked_map = val.get("blocked_busses") or {}
         if isinstance(blocked_map, dict) and blocked_map:
             tips.append("Blocked Slot A busses:\n" + "\n".join(f"{k}: {v}" for k, v in blocked_map.items()))
@@ -1206,6 +1208,6 @@ class SignalFlowPanel(QWidget):
         master_txt = f" \u00b7 Master Peak: {_format_db(master_pk)}" if master_pk is not None else ""
         scale_txt = "AES17 (+3.01 dB)" if conv == "aes17" else "Standard dBFS"
         self.footer_label.setText(
-            f"Staged on Create: {staged_txt}{master_txt} \u00b7 Scale: {scale_txt} \u00b7 Atomic post-close .ptx pass with rollback"
+            f"Staged on Create: {staged_txt}{master_txt} \u00b7 Initial linear estimates \u00b7 Scale: {scale_txt} \u00b7 Atomic post-close .ptx pass with rollback"
         )
         self.footer_label.show()

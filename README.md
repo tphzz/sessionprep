@@ -2,16 +2,16 @@
 
 Batch audio preflight, bimodal normalizer, and recursive multi-stage DAW gain-staging tool for mix session preparation.
 
-SessionPrep audits raw multitracks for technical problems, calibrates track levels for predictable insert drive without flattening the rough mix, and — for Pro Tools templates — extends that same compensation recursively across every subgroup, stem, and mix bus in your routing graph before you ever press Play.
+SessionPrep audits raw multitracks for technical problems, calibrates track levels for predictable insert drive while preserving the incoming file-level balance (the rough mix when multitracks were exported post-fader), and — for Pro Tools templates — extends that same static compensation recursively across every subgroup, stem, and mix bus in your routing graph as an initial linear starting point before you ever press Play.
 
-Conceptually, it works a bit like **Automatic Delay Compensation (ADC) for static gain structure**: each track and insert-bearing bus gets the pre-insert trim its plugins expect (e.g., to reach a target level per bus), paired with an inverse post-insert fader so every path from leaf track to Mix Bus accumulates the exact same net linear gain.
+Conceptually, it works a bit like **Automatic Delay Compensation (ADC) for static gain structure**: each track and insert-bearing bus gets the pre-insert trim its plugins expect (e.g., to reach an initial target level per bus), paired with an inverse post-insert fader so every path from leaf track to Mix Bus accumulates the exact same net linear gain.
 
-> This is a **deterministic preflight and starting-point generator** — not a dynamic real-time AGC, not an AI auto-mixer, and not a non-linear plugin simulator.
+> This is a **deterministic preflight and starting-point generator** — not a dynamic real-time AGC, not an AI auto-mixer, and not a non-linear plugin simulator. Bus trims are **initial linear estimates** computed from incoming file levels assuming unity pass-through for unsimulated active inserts and initial fader positions; once you move faders, add non-unity track plugins, or drive FX sends, downstream bus levels will naturally shift.
 
 ![Recursive Multi-Stage Bimodal Gain Staging](docs/images/multi-stage-gain-staging.svg)
 
-- Every insert chain (`Kick`, `Vocal`, `cKIK`, `cVOX`, `ALLDRM`, `MIX 1`) receives its bimodal target (`-6 dBFS peak / -18 dBFS RMS`), and `MIX 1` stays below pre-fader overload with its fader at `0.0 dB`.
-- Both tracks arrive at `Master` shifted by the exact same `-11.8 dB` (`-4.0 dB` shared leaf headroom shift + `-7.8 dB` `MIX 1` trim → `0.0 dB` relative rough-mix balance change), even though `Kick` passes through more bus tiers than `Vocal`.
+- Every insert chain (`Kick`, `Vocal`, `cKIK`, `cVOX`, `ALLDRM`, `MIX 1`) starts at its bimodal target (`-6 dBFS peak / -18 dBFS RMS`, initial linear estimate), and `MIX 1` stays below pre-fader overload with its fader at `0.0 dB`.
+- Both tracks arrive at `Master` shifted by the exact same `-11.8 dB` (`-4.0 dB` shared leaf headroom shift + `-7.8 dB` `MIX 1` trim → `0.0 dB` relative incoming-balance change), even though `Kick` passes through more bus tiers than `Vocal`.
 
 ## Screenshots
 
@@ -77,7 +77,7 @@ Most normalizers treat a kick drum and a synth pad the same. SessionPrep classif
 - **Transient** (high crest + fast decay, or sparse percussion): peak-normalized to `--target_peak` (`-6 dBFS`)
 - **Sustained** (low crest + slow decay): RMS-normalized to `--target_rms` (`-18 dBFS`), peak-limited by `--target_peak`
 
-The three-metric approach resolves common misclassifications: compressed drums (low crest, fast decay → Transient), plucked instruments (high crest, slow decay → Sustained), and sparse percussion like toms and crashes (caught by density). Each gain adjustment is paired with an inverse fader offset so the original rough-mix balance is preserved.
+The three-metric approach resolves common misclassifications: compressed drums (low crest, fast decay → Transient), plucked instruments (high crest, slow decay → Sustained), and sparse percussion like toms and crashes (caught by density). Each gain adjustment is paired with an inverse fader offset so the incoming file-level balance is preserved (matching the producer's rough mix when multitracks were exported post-fader, or matching a raw unity import when tracks were exported pre-fader at unity).
 
 ### Recursive multi-stage bus gain staging (Pro Tools)
 
@@ -89,7 +89,7 @@ When transferring to a Pro Tools template, SessionPrep reconstructs the template
 - **Intermediate insert-bearing busses** set a validated Insert Slot A trim plugin (**DMG Audio TrackControl**, **Avid Trim** in default `+6 dB` mode, or **Process.Audio Protility**) to `+g` pre-insert, paired with an inverse `-g` post-insert Bus Fader offset (or Slot A trim with unity faders in `clip_gain_unity` mode).
 - **Terminal Mix Bus** applies a single attenuate-only pre-insert Slot A trim with its fader at unity (`0.0 dB`), protecting post-terminal serial Mix Busses and `Master`.
 - **Missing or blocked Slot A handling:** If a required staged bus has an empty Slot A and needs non-zero staging, SessionPrep clones the template's most-used clean matching-format (`Mono`/`Stereo`) Slot A trim plugin into Slot A automatically; if Slot A is occupied by a non-trim plugin, transfer stops with an error rather than silently falling back to post-insert faders.
-- **Known linear-model boundaries:** Active **pre-fader sends** tap after Clip Gain / Slot A Trim and before the inverse fader (flagged explicitly in the Signal Flow balance validator), and active downstream non-trim bus plugins (compressors, saturators, EQs) are not simulated offline — the solver computes linear static gain staging assuming unity pass-through for downstream inserts.
+- **Initial linear estimate & model boundaries:** While algebraic balance invariance (`Δ_bus = 0.0 dB`) is exact at session open, bus input levels and Slot A trims are **initial linear estimates** — they reflect incoming file levels (which equal the rough mix only when multitracks were printed post-fader; unity exports calibrate busses to the unity tracking sum), assume unity pass-through for unsimulated active track/bus inserts (flagged in the Signal Flow inspector with `N active inserts unsimulated ⓘ`), exclude post-fader FX sends, and will naturally shift once you adjust faders or non-unity plugins during mixing. Active **pre-fader sends** tap after Clip Gain / Slot A Trim and before the inverse fader and are flagged explicitly in the Signal Flow balance validator.
 
 #### Why this runs offline instead of as a plugin
 
