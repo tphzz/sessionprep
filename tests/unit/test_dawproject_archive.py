@@ -370,3 +370,117 @@ def test_embedded_audio_io_failure_rolls_back_atomically(archive_session, tmp_pa
     results = adapter.transfer(session, str(target), progress_cb=remove_audio_before_save)
     assert results and all(not r.success for r in results)
     assert target.read_bytes() == prior
+
+
+def test_prunes_empty_folders_vcas_and_dangling_lanes_while_protecting_routed_buses(tmp_path):
+    xml = """<Project version="1.0">
+  <Application name="Cubase" version="14"/>
+  <Structure>
+    <Track id="f_kick" name="Kick" contentType="tracks" loaded="true">
+      <Channel id="ch_kick" role="master" audioChannels="2" name="Kick" destination="ch_drum_bus"/>
+    </Track>
+    <Track id="f_drum_bus" name="DrumBus" contentType="tracks" loaded="true">
+      <Channel id="ch_drum_bus" role="submix" audioChannels="2" name="DrumBus" destination="ch_master"/>
+    </Track>
+    <Track id="f_snare" name="Snare" contentType="tracks" loaded="true">
+      <Channel id="ch_snare" role="master" audioChannels="2" name="Snare" destination="ch_sub_snare">
+        <Volume id="p_snare_vol" value="1.0" unit="linear"/>
+      </Channel>
+      <Track id="t_snare_vca" name="Snare VCA" contentType="audio" loaded="true">
+        <Channel id="ch_snare_vca" role="vca" name="Snare VCA"/>
+      </Track>
+    </Track>
+    <Track id="f_chain_a" name="ChainA" contentType="tracks" loaded="true">
+      <Channel id="ch_chain_a" role="submix" audioChannels="2" name="ChainA" destination="ch_chain_b"/>
+    </Track>
+    <Track id="f_chain_b" name="ChainB" contentType="tracks" loaded="true">
+      <Channel id="ch_chain_b" role="submix" audioChannels="2" name="ChainB" destination="ch_master"/>
+    </Track>
+    <Track id="f_ref_protected" name="RefProtected" contentType="tracks" loaded="true"/>
+    <Track id="f_vcas" name="VCAs" contentType="tracks" loaded="true">
+      <Track id="t_vca_kick" name="Kick VCA" contentType="audio" loaded="true">
+        <Channel id="ch_vca_kick" role="vca" name="Kick VCA"/>
+      </Track>
+      <Track id="t_vca_other" name="Print VCA" contentType="audio" loaded="true">
+        <Channel id="ch_vca_other" role="vca" name="Print VCA"/>
+      </Track>
+    </Track>
+    <Track id="f_outer_empty" name="OuterEmpty" contentType="tracks" loaded="true">
+      <Track id="f_inner_empty" name="InnerEmpty" contentType="tracks" loaded="true"/>
+    </Track>
+    <Track name="BitwigUnused" contentType="tracks" loaded="true"/>
+    <Track id="f_fx" name="FX" contentType="tracks" loaded="true">
+      <Track id="t_reverb" name="Reverb" contentType="audio" loaded="true">
+        <Channel id="ch_reverb" role="effect" audioChannels="2" name="Reverb" destination="ch_master"/>
+      </Track>
+    </Track>
+    <Channel id="ch_sub_snare" role="submix" audioChannels="2" name="cSnare" destination="ch_master"/>
+    <Channel id="ch_master" role="master" audioChannels="2" name="Stereo Out"/>
+  </Structure>
+  <Arrangement>
+    <Lanes timeUnit="seconds">
+      <Lanes track="f_kick">
+        <Points><Target parameter="p_snare_vol"/></Points>
+        <Clips><Clip time="0" duration="1" reference="lane_ref_protected"/></Clips>
+      </Lanes>
+      <Lanes id="lane_ref_protected" track="f_ref_protected"/>
+      <Lanes track="f_snare"/>
+      <Lanes track="f_inner_empty"/>
+      <Lanes track="t_snare_vca"/>
+      <Lanes track="f_fx"/>
+    </Lanes>
+  </Arrangement>
+  <Scenes>
+    <Scene id="sc_empty"><ClipSlot track="f_snare"/></Scene>
+    <Scene id="sc_keep"><ClipSlot track="f_kick"/></Scene>
+  </Scenes>
+</Project>"""
+    template = tmp_path / "EmptyPrune.dawproject"
+    with ZipFile(template, "w") as archive:
+        archive.writestr("project.xml", xml)
+        archive.writestr("metadata.xml", "<MetaData/>")
+    template_bytes_before = template.read_bytes()
+
+    wav = tmp_path / "Kick.wav"
+    sf.write(wav, np.full(480, 0.25), 48000, subtype="PCM_16")
+    track = load_track(str(wav))
+    session = SessionContext(
+        [track], {"_use_processed": False}, output_tracks=[track],
+        prepare_state="ready", transfer_manifest=[TransferEntry("e1", track.filename, "Kick")],
+    )
+    adapter = DawProjectDawProcessor(template_path=str(template))
+    adapter.fetch(session)
+    session.daw_state[adapter.id]["assignments"] = {"e1": "f_kick"}
+
+    output = tmp_path / "Pruned.dawproject"
+    results = adapter.transfer(session, str(output))
+    assert all(r.success for r in results), [r.error for r in results]
+    assert template.read_bytes() == template_bytes_before
+    removed_targets = {r.command.target for r in results if r.command.command_type == "remove_empty_folder"}
+    assert removed_targets == {"Snare", "ChainA", "ChainB", "InnerEmpty", "OuterEmpty", "BitwigUnused"}
+
+    with ZipFile(output) as archive:
+        root = ET.fromstring(archive.read("project.xml"))
+        # Populated Kick, externally-fed DrumBus, externally-referenced RefProtected, VCAs organizer, FX, cSnare survive
+        assert root.find(".//Track[@id='f_kick']") is not None
+        assert root.find(".//Track[@id='f_drum_bus']") is not None
+        assert root.find(".//Track[@id='f_ref_protected']") is not None
+        assert root.find(".//Track[@id='f_vcas']") is not None
+        assert root.find(".//Track[@id='f_fx']") is not None
+        assert root.find(".//Channel[@id='ch_sub_snare']") is not None
+        # Empty Snare (VCA only), chained ChainA->ChainB, nested OuterEmpty/InnerEmpty, ID-less BitwigUnused removed
+        for gone_id in ("f_snare", "t_snare_vca", "f_chain_a", "f_chain_b", "f_outer_empty", "f_inner_empty"):
+            assert root.find(f".//Track[@id='{gone_id}']") is None
+        assert root.find(".//Track[@name='BitwigUnused']") is None
+        # Standalone automation Points targeting deleted p_snare_vol inside surviving f_kick lane was pruned
+        assert root.find(".//Target[@parameter='p_snare_vol']") is None
+        # Empty Scene sc_empty removed (no invalid empty <Scene/>); sc_keep preserved
+        assert root.find(".//Scene[@id='sc_empty']") is None
+        assert root.find(".//Scene[@id='sc_keep']") is not None
+        # Zero dangling IDREFs anywhere
+        all_ids = {el.get("id") for el in root.iter() if el.get("id")}
+        for attr in ("track", "destination", "reference", "parameter"):
+            for el in root.iter():
+                ref = el.get(attr)
+                if ref is not None:
+                    assert ref in all_ids, f"Dangling {attr}={ref!r} on <{el.tag}>"

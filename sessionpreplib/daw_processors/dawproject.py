@@ -103,10 +103,135 @@ def _copy_zip_member(source: zipfile.ZipFile, archive: zipfile.ZipFile, member: 
         shutil.copyfileobj(old, new)
 
 
+def _is_folder_xml_element(elem: Any) -> bool:
+    """Return True when an XML ``<Track>`` element is a folder track (``tracks`` contentType)."""
+    raw = (elem.get("contentType") or "").replace(" ", ",")
+    return any(tok.strip().lower() == "tracks" for tok in raw.split(","))
+
+
+def _collect_dependent_timeline_nodes(root: Any, subtree_ids: set[str]) -> list[Any]:
+    """Return Arrangement/Scene timeline nodes referencing any ID in *subtree_ids*."""
+    if not subtree_ids:
+        return []
+    nodes: list[Any] = []
+    seen: set[Any] = set()
+    for node in root.xpath("//*[@track]"):
+        if node.get("track") in subtree_ids and node not in seen:
+            nodes.append(node)
+            seen.add(node)
+    for target in root.xpath("//Target[@parameter]"):
+        if target.get("parameter") in subtree_ids:
+            owner = target.getparent()
+            if owner is not None and owner not in seen:
+                nodes.append(owner)
+                seen.add(owner)
+    return nodes
+
+
+def _has_external_routing_ref(
+    root: Any,
+    folder_elem: Any,
+    dep_nodes: list[Any],
+    all_removed_ids: set[str],
+) -> bool:
+    """Return True when any surviving element outside *folder_elem*/*dep_nodes* references *all_removed_ids*."""
+    if not all_removed_ids:
+        return False
+    excluded = set(folder_elem.iter())
+    for dep in dep_nodes:
+        excluded.update(dep.iter())
+    for attr in ("destination", "reference"):
+        for node in root.xpath(f"//*[@{attr}]"):
+            if node not in excluded and node.get(attr) in all_removed_ids:
+                return True
+    return False
+
+
+def _remove_dependent_nodes(dep_nodes: list[Any]) -> None:
+    """Remove dependent timeline nodes and prune any ``<Scene>`` left with zero children."""
+    scenes_to_check: list[Any] = []
+    for node in dep_nodes:
+        parent = node.getparent()
+        if parent is None:
+            continue
+        parent.remove(node)
+        if parent.tag == "Scene":
+            scenes_to_check.append(parent)
+    for scene in scenes_to_check:
+        if len(scene) == 0 and scene.getparent() is not None:
+            scene.getparent().remove(scene)
+
+
+def _is_vca_xml_element(elem: Any) -> bool:
+    """Return True when an XML ``<Track>`` element is a VCA-only track (``Channel/@role='vca'``)."""
+    if _is_folder_xml_element(elem):
+        return False
+    ch = elem.find("Channel")
+    return ch is not None and (ch.get("role") or "").strip().lower() == "vca"
+
+
+def _is_prunable_vca_only_folder(elem: Any, child_tracks: list[Any], other_folder_names: set[str]) -> bool:
+    """Return True when a folder holding only VCA tracks is an empty folder (not a VCA-organizer folder)."""
+    if not child_tracks:
+        return True
+    if elem.find("Channel") is None and len(child_tracks) > 1:
+        return False
+    folder_low = (elem.get("name") or "").strip().lower()
+    for vca in child_tracks:
+        vlow = (vca.get("name") or "").strip().lower()
+        for other in other_folder_names:
+            if other and other != folder_low and vlow in (f"{other}-vca", f"{other} vca", f"{other}_vca"):
+                return False
+    return True
+
+
+def _prune_empty_dawproject_folders(root: Any) -> list[str]:
+    """Remove empty folder ``<Track>`` subtrees (bottom-up) and their dangling XML references.
+
+    Preserves folders with non-VCA child tracks, dedicated VCA-organizer folders,
+    and folders (or dependent lanes) referenced externally via ``@destination`` / ``@reference``.
+    Returns removed folder names in removal order.
+    """
+    structure = root.find("Structure")
+    if structure is None:
+        return []
+    removed_names: list[str] = []
+    changed = True
+    while changed:
+        changed = False
+        all_folders = [el for el in structure.iter("Track") if el.getparent() is not None and _is_folder_xml_element(el)]
+        for elem in reversed(all_folders):
+            if elem.getparent() is None:
+                continue
+            child_tracks = elem.findall("Track")
+            if any(not _is_vca_xml_element(child) for child in child_tracks):
+                continue
+            other_names = {
+                (f.get("name") or "").strip().lower()
+                for f in all_folders
+                if f is not elem and f.getparent() is not None
+            }
+            if not _is_prunable_vca_only_folder(elem, child_tracks, other_names):
+                continue
+            subtree_ids = {nid for nid in elem.xpath(".//@id") if nid}
+            dep_nodes = _collect_dependent_timeline_nodes(root, subtree_ids)
+            all_removed_ids = set(subtree_ids)
+            for dep in dep_nodes:
+                all_removed_ids.update(nid for nid in dep.xpath(".//@id") if nid)
+            if _has_external_routing_ref(root, elem, dep_nodes, all_removed_ids):
+                continue
+            name = elem.get("name") or elem.get("id") or "(unnamed)"
+            elem.getparent().remove(elem)
+            _remove_dependent_nodes(dep_nodes)
+            removed_names.append(name)
+            changed = True
+    return removed_names
+
+
 def _save_template(
     source, root, output_path, project, additions, embedded_files, replace_existing,
-):
-    """Append new tracks and embed audio into a self-contained DAWproject archive."""
+) -> list[str]:
+    """Append new tracks, prune empty folders, and embed audio into a DAWproject archive."""
     from lxml import etree
 
     template = Path(source.filename)
@@ -134,6 +259,8 @@ def _save_template(
             element.append(track.to_xml())
             lanes.append(lane.to_xml())
 
+        removed_folders = _prune_empty_dawproject_folders(root)
+
         with zipfile.ZipFile(stream, "w", allowZip64=True, strict_timestamps=False) as archive:
             archive.comment = source.comment
             archive.writestr(
@@ -149,6 +276,7 @@ def _save_template(
                 _copy_zip_member(source, archive, member)
             for src_filepath, arcname in embedded_files:
                 archive.write(src_filepath, arcname=arcname, compress_type=zipfile.ZIP_STORED)
+    return removed_folders
 
 
 def _allocate_archive_audio_path(
@@ -499,10 +627,12 @@ class DawProjectDawProcessor(DawProcessor):
             if path.resolve() == Path(template.filename).resolve():
                 raise ValueError("Choose a different output path to preserve the DAWproject template.")
             path.parent.mkdir(parents=True, exist_ok=True)
-            _save_template(
+            removed_folders = _save_template(
                 template, root, path, project, additions, embedded_files,
                 replace_existing=not session.config.get("_batch_transfer", False),
             )
+            for fname in removed_folders:
+                results.append(DawCommandResult(DawCommand("remove_empty_folder", fname, {}), True))
             results.append(DawCommandResult(DawCommand("save_project", output_path, {}), True))
             log.info("DAWproject saved to %s", output_path)
         except Exception as exc:

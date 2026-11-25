@@ -524,6 +524,7 @@ class SessionPersistenceController(QObject):
         self._daw_ctrl.page.use_processed_cb.setChecked(use_processed)
         self._daw_ctrl.update_use_processed_action()
         self._daw_ctrl.update_lifecycle_buttons()
+        self._daw_ctrl.sync_protools_ui_mode()
         if has_manifest and self._state.active_daw_processor:
             dp_state = session.daw_state.get(self._state.active_daw_processor.id, {})
             if dp_state.get("folders"):

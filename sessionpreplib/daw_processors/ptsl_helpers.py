@@ -863,3 +863,115 @@ def get_track_main_output_assignments(
         {"track_ids": track_ids},
         batch_job_id=batch_job_id, progress=progress)
     return list((resp or {}).get("signalpath_ids", []))
+
+
+def open_session(engine, session_path: str) -> None:
+    """Open an existing Pro Tools ``.ptx`` session via ``CId_OpenSession``."""
+    run_command(engine, "CId_OpenSession", {"session_path": os.path.abspath(session_path)})
+
+
+def delete_tracks(
+    engine,
+    *,
+    track_ids: list[str] | None = None,
+    track_names: list[str] | None = None,
+    keep_folder_members: bool = True,
+    keep_alternate_playlists: bool = False,
+    coalesce_automation: bool = False,
+    batch_job_id: str | None = None,
+    progress: int = 0,
+) -> int:
+    """Delete tracks via ``CId_DeleteTracks`` (PTSL 2025.10+) and return ``success_count``."""
+    body: dict[str, Any] = {
+        "delete_track_behavior_options": {
+            "keep_folder_members": keep_folder_members,
+            "keep_alternate_playlists": keep_alternate_playlists,
+            "coalesce_automation": coalesce_automation,
+        },
+    }
+    if track_ids:
+        body["track_ids"] = list(track_ids)
+    if track_names:
+        body["track_names"] = list(track_names)
+    if not body.get("track_ids") and not body.get("track_names"):
+        return 0
+    resp = run_command(
+        engine, "CId_DeleteTracks", body,
+        batch_job_id=batch_job_id, progress=progress,
+    )
+    return int((resp or {}).get("success_count", 0))
+
+
+_NON_OUTPUT_TRACK_TYPES = frozenset({
+    "TType_Vca", "Vca", "TT_Vca",
+    "TType_BasicFolder", "BasicFolder", "TT_BasicFolder",
+    "TType_Master", "Master", "TT_Master",
+    "TType_Tempo", "TType_Markers", "TType_Meter",
+    "TType_KeySignature", "TType_ChordSymbols",
+    "TType_Midi", "Midi", "TT_Midi",
+    "TType_Video", "Video", "TT_Video",
+})
+
+
+def _live_track_attr(track: Any, field: str, default: str = "") -> str:
+    if isinstance(track, dict):
+        return str(track.get(field, default) or default)
+    return str(getattr(track, field, default) or default)
+
+
+def calibrate_signalpath_base(
+    engine,
+    ptx: Any,
+    live_tracks: list[Any],
+) -> tuple[int, int, list[str]]:
+    """Calibrate ``live_signalpath_id == hex(base + ptx_0x2603_index)`` via consensus voting.
+
+    Returns ``(base_int, verified_track_count, warnings)``.
+    Raises ``RuntimeError`` if no routed tracks can be matched between PTSL and ``ptx``.
+    """
+    ptx_by_uuid = {t.uuid_braced.lower(): t for t in ptx.tracks if t.uuid_braced}
+    votes: dict[int, list[str]] = {}
+    for lt in live_tracks:
+        track_id = _live_track_attr(lt, "id")
+        track_name = _live_track_attr(lt, "name")
+        ptx_track = ptx_by_uuid.get(track_id.lower())
+        if (
+            ptx_track is None
+            or ptx_track.track_type in _NON_OUTPUT_TRACK_TYPES
+            or ptx_track.main_output is None
+            or ptx_track.main_output.ptsl_index is None
+        ):
+            continue
+        try:
+            sp_ids = get_track_main_output_assignments(engine, [track_id])
+        except Exception:
+            continue
+        if len(sp_ids) != 1 or not isinstance(sp_ids[0], str):
+            continue
+        try:
+            live_int = int(sp_ids[0], 16)
+        except (ValueError, TypeError):
+            continue
+        cand_base = live_int - ptx_track.main_output.ptsl_index
+        if cand_base < 0:
+            continue
+        votes.setdefault(cand_base, []).append(track_name)
+
+    if not votes:
+        raise RuntimeError(
+            "Could not calibrate PTSL signalpath base: no routed tracks matched between live PTSL and .ptx."
+        )
+    max_votes = max(len(tracks) for tracks in votes.values())
+    top_bases = [base for base, tracks in votes.items() if len(tracks) == max_votes]
+    if len(top_bases) > 1:
+        raise RuntimeError(
+            f"Ambiguous PTSL signalpath base calibration: tied consensus across {[hex(b) for b in top_bases]}."
+        )
+    best_base = top_bases[0]
+    agreed = votes[best_base]
+    warnings = [
+        f"{len(tracks)} track(s) ({tracks[:4]}) disagree with consensus base {hex(best_base)} (got {hex(base)})."
+        for base, tracks in votes.items()
+        if base != best_base
+    ]
+    return best_base, len(agreed), warnings

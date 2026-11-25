@@ -261,13 +261,18 @@ class TrackTableController(QObject):
             gcm_rank = group_utils.group_rank_map(self._state)
             glm = group_utils.gain_linked_map(self._state)
 
+            from sessionpreplib.daw_processors.protools import ProToolsDawProcessor
+
             assignments: dict[str, str] = {}
             if session.daw_state and self._state.active_daw_processor:
                 dp_state = session.daw_state.get(self._state.active_daw_processor.id, {})
                 assignments = dp_state.get("assignments", {})
+            pt_gain_mode = "clip_gain_and_fader"
+            if isinstance(self._state.active_daw_processor, ProToolsDawProcessor):
+                pt_gain_mode = str(self._state.flat_config().get("protools_gain_mode", "clip_gain_and_fader"))
 
             for row, entry in enumerate(manifest):
-                self._populate_setup_row(row, entry, out_map, assignments, gcm, gcm_rank, glm)
+                self._populate_setup_row(row, entry, out_map, assignments, gcm, gcm_rank, glm, pt_gain_mode)
         finally:
             table.setSortingEnabled(True)
             self.setup_table_populating_changed.emit(False)
@@ -290,6 +295,7 @@ class TrackTableController(QObject):
         gcm: dict[str, str],
         gcm_rank: dict[str, int],
         glm: dict[str, bool],
+        pt_gain_mode: str = "clip_gain_and_fader",
     ) -> None:
         table = self._setup_table
         assert table is not None
@@ -321,14 +327,13 @@ class TrackTableController(QObject):
         ch_item.setForeground(QColor(COLORS["metadata"]))
         table.setItem(row, 3, ch_item)
 
-        clip_gain = pr.gain_db if pr else 0.0
-        cg_item = _SortableItem(f"{clip_gain:+.1f} dB", clip_gain)
+        clip_text, clip_val, fader_text, fader_val = self._setup_gain_display(track, pr, pt_gain_mode)
+        cg_item = _SortableItem(clip_text, clip_val)
         cg_item.setFlags(cg_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-        cg_item.setForeground(QColor(COLORS["text"]))
+        cg_item.setForeground(QColor(COLORS["metadata"] if "(baked)" in clip_text else COLORS["text"]))
         table.setItem(row, 4, cg_item)
 
-        fader_gain = pr.data.get("fader_offset", 0.0) if pr else 0.0
-        fg_item = _SortableItem(f"{fader_gain:+.1f} dB", fader_gain)
+        fg_item = _SortableItem(fader_text, fader_val)
         fg_item.setFlags(fg_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
         fg_item.setForeground(QColor(COLORS["text"]))
         table.setItem(row, 5, fg_item)
@@ -342,6 +347,42 @@ class TrackTableController(QObject):
         table.setItem(row, 6, grp_item)
 
         group_utils.apply_row_group_color(table, self._state, row, grp, gcm)
+
+    @staticmethod
+    def _fmt_signed_db(val: float) -> str:
+        return "0.0 dB" if abs(val) < 0.05 else f"{val:+.1f} dB"
+
+    def _setup_gain_display(self, track: Any, pr: Any, pt_gain_mode: str) -> tuple[str, float, str, float]:
+        from sessionpreplib.daw_processors.protools import ProToolsDawProcessor
+        from sessionpreplib.daw_processors.protools_ptx import (
+            GAIN_MODE_CLIP_UNITY,
+            GAIN_MODE_FADER_ONLY,
+            GAIN_MODE_NONE,
+            resolve_protools_track_staging,
+        )
+
+        dp = self._state.active_daw_processor
+        session = self._state.session
+        clip_gain = pr.gain_db if pr else 0.0
+        fader_gain = pr.data.get("fader_offset", 0.0) if pr else 0.0
+        if isinstance(dp, ProToolsDawProcessor) and track is not None and session is not None:
+            try:
+                staging = resolve_protools_track_staging(session, track, gain_mode=pt_gain_mode)
+            except ValueError:
+                staging = None
+            if staging is not None:
+                if abs(staging.baked_gain_db) >= 0.05 and abs(staging.clip_gain_db) < 0.05:
+                    clip_text = "0.0 dB (baked)"
+                else:
+                    clip_text = self._fmt_signed_db(staging.clip_gain_db)
+                return clip_text, staging.clip_gain_db, self._fmt_signed_db(staging.fader_db), staging.fader_db
+            if pt_gain_mode == GAIN_MODE_NONE:
+                clip_gain, fader_gain = 0.0, 0.0
+            elif pt_gain_mode == GAIN_MODE_CLIP_UNITY:
+                fader_gain = 0.0
+            elif pt_gain_mode == GAIN_MODE_FADER_ONLY:
+                clip_gain, fader_gain = 0.0, 0.0
+        return self._fmt_signed_db(clip_gain), clip_gain, self._fmt_signed_db(fader_gain), fader_gain
 
     # ── Classification & gain overrides ──────────────────────────────────
 

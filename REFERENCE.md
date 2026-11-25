@@ -657,3 +657,65 @@ gain calculation.
 Pro Tools Utils uses a narrower initial width on ultrawide displays (a full-screen
 aspect ratio of at least 2:1). Standard displays retain the existing initial width.
 The window remains centered and resizable; its height continues to fit the active tool.
+
+---
+
+## 9. Pro Tools Transfer Automation (`.ptx` / PTSL)
+
+When creating a Pro Tools session from a template, SessionPrep combines PTSL
+commands with validated, atomic `.ptx` session-file updates (applied in a single
+post-close pass with automatic rollback if Pro Tools fails to reopen the session):
+
+- **Automatic Folder Output Routing (`protools_auto_route_folders`, default `true`), Empty Folder/VCA Cleanup & Audio Track `No Input` Clearing:**
+  Routes each newly created audio track's Main Output to its parent Routing
+  Folder's input bus (walking up through nested Basic Folders when necessary),
+  removes empty template folders and unused pre-created VCAs (including
+  cascading super-VCAs that no longer control any surviving tracks, while
+  keeping FX folders, active bus folders, and downstream Aux busses intact),
+  and clears each newly created audio track's auto-assigned hardware input to
+  `No Input` during the atomic post-close `.ptx` pass. DAWproject export
+  likewise prunes empty template folder tracks (and their dangling lanes) while
+  preserving folders with pre-existing tracks, externally routed busses, and
+  standalone submix/master channels.
+- **Two-Level Gain Staging (`protools_gain_mode`, default `clip_gain_and_fader`):**
+  - `clip_gain_and_fader`: On un-normalized source audio, writes bimodal
+    normalization gain (`+gain_db`) to Pro Tools Clip Gain (pre-insert, mono and
+    stereo `.L`/`.R` clips) and the inverse offset (`fader_offset`) to the Track
+    Fader (post-insert), preserving rough-mix balance without requiring
+    gain-baked WAV files. On already-prepared WAVs, Clip Gain stays `0.0 dB` so
+    gain is never double-applied (displayed as `0.0 dB (baked)` in Phase 3).
+  - `clip_gain_unity`: Writes `+gain_db` to Clip Gain on un-normalized audio and
+    leaves Track Faders at `0.0 dB`.
+  - `fader_only`: Leaves Clip Gain at `0.0 dB` and applies `fader_offset` only
+    when transferring gain-baked prepared WAVs.
+  - `none`: Leaves both Clip Gain and Track Faders untouched.
+- **Automatic Per-Folder Groups & Template VCA Linking (`protools_auto_group_folders`, `protools_link_template_vcas`, defaults `true`; `protools_group_type`, default `Mix/Edit`):**
+  Creates or updates a Mix/Edit group per populated folder and links each group
+  to its matching template VCA master (supporting up to 104 groups across all
+  four Pro Tools banks).
+- **Signal-Flow Bus Gain Staging, Slot A Trim Plugins & Phase 3 Inspector (`protools_stage_bus_faders`, default `true`; `protools_pan_law_db`, default `-3.0`):**
+  Reconstructs the template's audio routing graph, sums the time-aligned,
+  gain-adjusted audio tracks in topological order to measure summed Peak dBFS,
+  active RMS dBFS, and Transient/Sustained classification at every folder/bus
+  node. When template busses carry a validated Insert Slot A gain-trim plugin
+  (**DMG Audio TrackControl**, **Avid Trim** in default `+6 dB` mode, or
+  **Process.Audio Protility**), SessionPrep applies recursive two-level bus
+  staging: pure summing folders stay at `0.0 dB` unity, intermediate
+  insert-bearing busses receive pre-insert Slot A Trim gain (`+g`, activating an
+  inactive Slot A Trim automatically while respecting bypassed inserts) paired
+  with an inverse post-insert Bus Fader offset (`-g` relative to the template
+  fader) so downstream analog-emulated insert chains hit their target sweet spot
+  while rough-mix balance stays intact across unequal bus depths (or Slot A Trim
+  only with unity faders in `clip_gain_unity` mode), and the terminal
+  convergence Mix Bus applies a single headroom trim protecting Master. On
+  templates or branches without Slot A Trim plugins, SessionPrep stages Routing
+  Folders and multi-input Subgroup/Stem Auxes via bus faders while leaving
+  single-input insert Auxes, Master Faders, and `-∞ dB` parallel auxes
+  untouched. In the GUI Phase 3 right pane, **Routing & Folders** previews each
+  folder's input bus, planned group/VCA, and output routing chain directly from
+  the `.ptxt` template, while the **Signal Flow** tab computes offline previews,
+  displays planned Slot A Trim and fader adjustments, highlights unsimulated
+  active-insert/cycle/unreadable-audio caveats, allows per-bus manual fader
+  overrides (`Reset Overrides` or per-row reset), and exports the annotated
+  graph (including `recommended_slot_a_trims`) under `daw_signal_flow` in JSON
+  reports.

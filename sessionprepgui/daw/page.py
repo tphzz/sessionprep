@@ -5,6 +5,7 @@ from __future__ import annotations
 from PySide6.QtCore import QSize, Qt, QTimer
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QCheckBox,
     QComboBox,
     QHBoxLayout,
@@ -12,9 +13,11 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMenu,
+    QPushButton,
     QSizePolicy,
     QStackedWidget,
     QTableWidget,
+    QTabWidget,
     QToolBar,
     QToolButton,
     QTreeWidget,
@@ -22,6 +25,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ..change_marker import install_tab_marker, use_marker_tab_bar
 from ..controls import FormActionButton, bind_primary_action, content_splitter
 from ..theme import COLORS, CONTENT_INSET, tune_toolbar_checkbox
 from ..tracks.table_widgets import (
@@ -29,6 +33,7 @@ from ..tracks.table_widgets import (
     _FolderDropTree,
     _SetupDragTable,
 )
+from .signal_flow_panel import SignalFlowPanel
 
 _SETUP_TABLE_EXTRA_WIDTH = 30
 _SETUP_RIGHT_MIN_WIDTH = 360
@@ -228,18 +233,128 @@ class DawSetupPage(QWidget):
         proj_layout.addWidget(self.open_project_btn)
         t_layout.addWidget(proj_row)
 
-        self.folder_tree = _FolderDropTree()
-        self.folder_tree.setHeaderLabels(["Folder / Track"])
-        self.folder_tree.setSelectionMode(QTreeWidget.SelectionMode.ExtendedSelection)
-        self.folder_tree.setAlternatingRowColors(True)
-        self.folder_tree.setStyleSheet(
-            "QTreeWidget::item:selected { background-color: rgba(42, 109, 181, 128); }"
-        )
-        t_layout.addWidget(self.folder_tree, 1)
+        self.rollback_banner = self._build_rollback_banner()
+        t_layout.addWidget(self.rollback_banner)
+
+        self.right_tabs = QTabWidget()
+        self.right_tabs.setStyleSheet("QTabWidget::pane { border: none; margin: 0; padding: 0; }")
+        use_marker_tab_bar(self.right_tabs)
+        self.right_tabs.setDocumentMode(True)
+
+        routing_tab = self._build_routing_tab()
+        self.signal_flow_panel = SignalFlowPanel()
+        self.right_tabs.addTab(routing_tab, "Routing && Folders")
+        self.right_tabs.addTab(self.signal_flow_panel, "Signal Flow")
+        install_tab_marker(self.right_tabs, 1)
+        self.right_tabs.setTabEnabled(1, False)
+        self.right_tabs.tabBar().hide()
+        t_layout.addWidget(self.right_tabs, 1)
 
         stack.addWidget(tree_page)
         stack.setCurrentIndex(_SETUP_RIGHT_PLACEHOLDER)
         return stack
+
+    def _build_rollback_banner(self) -> QWidget:
+        banner = QWidget()
+        banner.setObjectName("rollbackBanner")
+        banner.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        banner.setStyleSheet(
+            f"QWidget#rollbackBanner {{ background-color: #2e1a1a; border: 1px solid #6e3030; "
+            f"border-left: 3px solid {COLORS['problems']}; border-radius: 2px; }}"
+        )
+        r_lay = QHBoxLayout(banner)
+        r_lay.setContentsMargins(8, 6, 8, 6)
+        r_lay.setSpacing(8)
+        self.rollback_label = QLabel("")
+        self.rollback_label.setWordWrap(True)
+        self.rollback_label.setStyleSheet(f"border: none; background: transparent; color: {COLORS['text']};")
+        r_lay.addWidget(self.rollback_label, 1)
+        self.open_log_btn = FormActionButton("Open Log Viewer")
+        self.open_log_btn.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.open_log_btn.setStyleSheet(
+            f"QPushButton:focus {{ border: 2px solid {COLORS['information']}; }}"
+        )
+        r_lay.addWidget(self.open_log_btn)
+        banner.hide()
+        return banner
+
+    def _build_routing_tab(self) -> QWidget:
+        tab = QWidget()
+        self._routing_tab_layout = QVBoxLayout(tab)
+        self._routing_tab_layout.setContentsMargins(0, 0, 0, 0)
+        self._routing_tab_layout.setSpacing(6)
+
+        self.ptx_summary_bar = QWidget()
+        self.ptx_summary_bar.setObjectName("ptxSummaryBar")
+        self.ptx_summary_bar.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.ptx_summary_bar.setStyleSheet(
+            f"QWidget#ptxSummaryBar {{ background-color: {COLORS['surface']}; "
+            f"border: 1px solid {COLORS['accent']}; border-radius: 2px; }}"
+        )
+        s_lay = QHBoxLayout(self.ptx_summary_bar)
+        s_lay.setContentsMargins(8, 4, 8, 4)
+        s_lay.setSpacing(8)
+        self.ptx_summary_label = QLabel("")
+        self.ptx_summary_label.setStyleSheet(f"border: none; background: transparent; color: {COLORS['metadata']};")
+        self.ptx_summary_label.setWordWrap(True)
+        s_lay.addWidget(self.ptx_summary_label, 1)
+        self.edit_config_btn = QPushButton("Edit in Session Config")
+        self.edit_config_btn.setFlat(True)
+        self.edit_config_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.edit_config_btn.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.edit_config_btn.setStyleSheet(
+            f"QPushButton {{ border: 2px solid transparent; background: transparent; "
+            f"color: {COLORS['information']}; font-weight: bold; padding: 0px 2px; border-radius: 2px; }}"
+            f"QPushButton:hover {{ text-decoration: underline; }}"
+            f"QPushButton:focus {{ border: 2px solid {COLORS['information']}; }}"
+            f"QPushButton:disabled {{ color: {COLORS['dim']}; }}"
+        )
+        s_lay.addWidget(self.edit_config_btn)
+        self.ptx_summary_bar.hide()
+        self._routing_tab_layout.addWidget(self.ptx_summary_bar)
+
+        self.folder_tree = _FolderDropTree()
+        self.folder_tree.setHeaderLabels(["Folder / Track"])
+        self.folder_tree.setSelectionMode(QTreeWidget.SelectionMode.ExtendedSelection)
+        self.folder_tree.setAlternatingRowColors(True)
+        self.folder_tree.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.folder_tree.setStyleSheet(
+            "QTreeWidget::item:selected { background-color: rgba(42, 109, 181, 128); }"
+        )
+        self._routing_tab_layout.addWidget(self.folder_tree, 1)
+        return tab
+
+    def set_protools_mode(self, enabled: bool) -> None:
+        """Toggle Pro Tools right-pane tabs, summary bar, and 4-column enriched folder tree."""
+        self.right_tabs.setTabEnabled(1, enabled)
+        self.right_tabs.tabBar().setVisible(enabled)
+        self.ptx_summary_bar.setVisible(enabled)
+        pane_border = f"1px solid {COLORS['border']}" if enabled else "none"
+        self.right_tabs.setStyleSheet(
+            f"QTabWidget::pane {{ border: none; border-top: {pane_border}; margin: 0; padding: 0; }}"
+        )
+        self._routing_tab_layout.setContentsMargins(0, 6 if enabled else 0, 0, 0)
+        if not enabled:
+            self.right_tabs.setCurrentIndex(0)
+            self.rollback_banner.hide()
+            self.folder_tree.setColumnCount(1)
+            self.folder_tree.setHeaderLabels(["Folder / Track"])
+            self.folder_tree.header().setStretchLastSection(True)
+            return
+        self.folder_tree.setColumnCount(4)
+        self.folder_tree.setHeaderLabels(["Folder / Track", "Input Bus", "Planned Group & VCA", "Output Routing"])
+        hdr = self.folder_tree.header()
+        for col, width in enumerate((220, 115, 195, 210)):
+            hdr.setSectionResizeMode(col, QHeaderView.ResizeMode.Interactive)
+            self.folder_tree.setColumnWidth(col, width)
+        hdr.setStretchLastSection(True)
+
+    def show_rollback_notice(self, detail: str) -> None:
+        self.rollback_label.setText(f"\u2715  {detail}")
+        self.rollback_banner.show()
+
+    def clear_rollback_notice(self) -> None:
+        self.rollback_banner.hide()
 
     def apply_table_column_modes(self) -> None:
         """Restore the intended setup-table resize behavior after auto-fit."""

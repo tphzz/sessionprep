@@ -603,6 +603,18 @@ def _validate_daw_state(states: dict) -> None:
                 not isinstance(tracks, list) or any(not isinstance(name, str) for name in tracks)
                 for tracks in order.values()):
             raise ValueError(f"Invalid track order for '{processor_id}'.")
+        if "bus_fader_overrides" in state:
+            overrides = state["bus_fader_overrides"]
+            if not isinstance(overrides, dict) or any(
+                not isinstance(k, str)
+                or isinstance(v, bool)
+                or not isinstance(v, (int, float))
+                or not math.isfinite(float(v))
+                for k, v in overrides.items()
+            ):
+                raise ValueError(f"Invalid bus fader overrides for '{processor_id}'.")
+        if "signal_flow" in state and state["signal_flow"] is not None and not isinstance(state["signal_flow"], dict):
+            raise ValueError(f"Invalid signal flow cache for '{processor_id}'.")
 
 
 def _validate_editable_fields(raw: dict) -> None:

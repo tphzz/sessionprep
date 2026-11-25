@@ -28,6 +28,7 @@ from ..theme import COLORS, PT_DEFAULT_COLORS
 from ..tracks.group_utils import group_color_map, normalize_session_groups, tint_group_color
 from ..tracks.table_widgets import _PHASE_SETUP, _SETUP_RIGHT_PLACEHOLDER, _SETUP_RIGHT_TREE
 from .page import DawSetupPage
+from .signal_flow_controller import SignalFlowController
 
 log = logging.getLogger(__name__)
 
@@ -38,6 +39,8 @@ class DawTransferController(QObject):
     transfer_finished = Signal(bool, str)
     setup_table_refresh_requested = Signal()
     clear_workspace_requested = Signal()
+    edit_protools_config_requested = Signal()
+    open_log_viewer_requested = Signal()
 
     def __init__(
         self,
@@ -63,6 +66,13 @@ class DawTransferController(QObject):
         self.setup_table_populating: bool = False
 
         self.page = DawSetupPage()
+        self.signal_flow_ctrl = SignalFlowController(
+            self._state,
+            self.page.signal_flow_panel,
+            self.page.right_tabs,
+            get_pt_options=self._protools_ptx_options,
+            parent=self,
+        )
         self._shell.register_phase_progress_layout(_PHASE_SETUP, self.page.main_layout)
         self._connect_page_signals()
         self.configure_daw_processors()
@@ -85,6 +95,9 @@ class DawTransferController(QObject):
         p.open_project_btn.clicked.connect(self._on_open_active_project_folder)
         p.folder_tree.tracks_dropped.connect(self.assign_tracks_to_folder)
         p.folder_tree.tracks_unassigned.connect(self.unassign_tracks)
+        p.edit_config_btn.clicked.connect(self.edit_protools_config_requested.emit)
+        p.signal_flow_panel.edit_config_requested.connect(self.edit_protools_config_requested.emit)
+        p.open_log_btn.clicked.connect(self.open_log_viewer_requested.emit)
 
     # ── Lifecycle & workspace clearing ───────────────────────────────────
 
@@ -98,6 +111,9 @@ class DawTransferController(QObject):
         self.update_use_processed_action()
         self.page.setup_table.setRowCount(0)
         self.page.folder_tree.clear()
+        self.page.clear_rollback_notice()
+        self.page.edit_config_btn.setEnabled(False)
+        self.signal_flow_ctrl.clear_workspace()
         self.page.right_stack.setCurrentIndex(_SETUP_RIGHT_PLACEHOLDER)
         self.page.project_name_edit.clear()
 
@@ -109,12 +125,48 @@ class DawTransferController(QObject):
 
     def dispose(self) -> None:
         self.pending_after_check = None
+        self.signal_flow_ctrl.dispose()
         for attr in ("check_worker", "fetch_worker", "transfer_worker"):
             worker = getattr(self, attr, None)
             if isinstance(worker, QThread) and isValid(worker) and worker.isRunning():
                 worker.requestInterruption()
                 worker.wait()
             setattr(self, attr, None)
+
+    def mark_signal_flow_stale(self) -> None:
+        """Invalidate any cached Signal Flow preview after Phase 2 or config edits."""
+        self.signal_flow_ctrl.mark_stale()
+
+    def _protools_ptx_options(self) -> dict[str, Any]:
+        flat = self._state.flat_config()
+        return {
+            "auto_route": bool(flat.get("protools_auto_route_folders", True)),
+            "gain_mode": str(flat.get("protools_gain_mode", "clip_gain_and_fader")),
+            "auto_group_folders": bool(flat.get("protools_auto_group_folders", True)),
+            "link_template_vcas": bool(flat.get("protools_link_template_vcas", True)),
+            "group_type": str(flat.get("protools_group_type", "Mix/Edit")),
+            "stage_bus_faders": bool(flat.get("protools_stage_bus_faders", True)),
+            "pan_law_db": float(flat.get("protools_pan_law_db", -3.0)),
+        }
+
+    def sync_protools_ui_mode(self) -> None:
+        is_pt = self.signal_flow_ctrl.active_protools_processor() is not None
+        self.page.set_protools_mode(is_pt)
+        self.page.edit_config_btn.setEnabled(self._state.session is not None)
+        if not is_pt:
+            return
+        opts = self._protools_ptx_options()
+        route_s = "On" if opts["auto_route"] else "Off"
+        grp_s = f"On ({opts['group_type']})" if opts["auto_group_folders"] else "Off"
+        vca_s = " + VCAs" if (opts["auto_group_folders"] and opts["link_template_vcas"]) else ""
+        bus_s = f"On ({opts['pan_law_db']:.1f} dB pan law)" if opts["stage_bus_faders"] else "Off"
+        summary = (
+            f"Pro Tools .ptx: Mode: {opts['gain_mode']}  ·  Auto-route: {route_s}  ·  "
+            f"Groups: {grp_s}{vca_s}  ·  Bus staging: {bus_s}"
+        )
+        self.page.ptx_summary_label.setText(summary)
+        self.page.ptx_summary_label.setToolTip(summary)
+        self.signal_flow_ctrl.sync_from_session()
 
     # ── DAW processor configuration & template bindings ──────────────────
 
@@ -195,10 +247,9 @@ class DawTransferController(QObject):
         previous = self._state.daw_template_bindings
         self.configure_daw_processors()
         self.populate_daw_combo(self.matching_daw_id(active_id, previous))
-        if self._state.session and (
-            previous != self._state.daw_template_bindings
-            or active_id != getattr(self._state.active_daw_processor, "id", None)
-        ):
+        self.sync_protools_ui_mode()
+        self.signal_flow_ctrl.mark_stale()
+        if self._state.session:
             self.populate_folder_tree()
             self.setup_table_refresh_requested.emit()
         self.page.daw_check_label.setText("")
@@ -254,6 +305,10 @@ class DawTransferController(QObject):
             proc_idx = self.page.daw_combo.itemData(index)
             self._state.active_daw_processor = self._state.daw_processors[proc_idx]
         self.page.daw_check_label.setText("")
+        self.signal_flow_ctrl.on_daw_processor_changed()
+        self.sync_protools_ui_mode()
+        self.populate_folder_tree()
+        self.setup_table_refresh_requested.emit()
         self.update_lifecycle_buttons()
 
     # ── Connectivity check & Fetch ───────────────────────────────────────
@@ -369,6 +424,7 @@ class DawTransferController(QObject):
             assert self._state.session is not None
             if processor.id in session.daw_state:
                 self._state.session.daw_state[processor.id] = session.daw_state[processor.id]
+            self.sync_protools_ui_mode()
             self.populate_folder_tree()
             self.page.right_stack.setCurrentIndex(_SETUP_RIGHT_TREE)
             self.setup_table_refresh_requested.emit()
@@ -401,6 +457,8 @@ class DawTransferController(QObject):
         if self._state.session:
             self._state.session.config["_use_processed"] = checked
         self.update_use_processed_action()
+        self.setup_table_refresh_requested.emit()
+        self.signal_flow_ctrl.mark_stale()
 
     def update_use_processed_action(self) -> None:
         cb = self.page.use_processed_cb
@@ -460,6 +518,8 @@ class DawTransferController(QObject):
         ):
             return
         log.info("DAW transfer: %s (%d tracks)", processor.name, len(source.transfer_manifest))
+        self.signal_flow_ctrl.cancel_preview(wait=False)
+        self.page.clear_rollback_notice()
         project_name = self.page.project_name_edit.text().strip()
         if not self._validate_transfer_target(processor, project_name):
             return
@@ -537,6 +597,7 @@ class DawTransferController(QObject):
         worker = DawTransferWorker(
             processor, snapshot, output_path, parent=self, close_session=False
         )
+        worker._origin_session = source  # type: ignore[attr-defined]
         self.transfer_worker = worker
         worker.progress.connect(self._on_transfer_progress)
         worker.progress_value.connect(self._on_transfer_progress_value)
@@ -555,13 +616,15 @@ class DawTransferController(QObject):
         self._shell.progress_value(current, total)
 
     @Slot(bool, str, object)
-    def _on_daw_transfer_result(self, ok: bool, message: str, _results: Any) -> None:
-        if self.transfer_worker is None:
+    def _on_daw_transfer_result(self, ok: bool, message: str, results: Any) -> None:
+        worker = self.transfer_worker
+        if worker is None:
             return
         set_action_busy(self.page.transfer_action, False)
         self.transfer_worker = None
         if self._shell.is_closing_after_daw():
             return
+        self._sync_transfer_signal_flow_and_rollback(worker, results)
         self.update_lifecycle_buttons()
         if ok:
             log.info("DAW transfer complete")
@@ -571,6 +634,30 @@ class DawTransferController(QObject):
             self._shell.progress_fail(message)
         self._shell.show_status(message)
         self.transfer_finished.emit(ok, message)
+
+    def _sync_transfer_signal_flow_and_rollback(self, worker: Any, results: Any) -> None:
+        session = self._state.session
+        origin = getattr(worker, "_origin_session", session)
+        if session is None or session is not origin:
+            return
+        dp = getattr(worker, "_processor", None)
+        snap = getattr(worker, "_session", None)
+        is_active_dp = dp is not None and self._state.active_daw_processor is dp
+        if dp is not None and snap is not None:
+            sf = (snap.daw_state or {}).get(dp.id, {}).get("signal_flow")
+            if isinstance(sf, dict):
+                session.daw_state.setdefault(dp.id, {})["signal_flow"] = sf
+                if is_active_dp:
+                    self.signal_flow_ctrl.apply_authoritative_graph(sf)
+        if is_active_dp and isinstance(results, list):
+            rollback_errs = [
+                r.error for r in results
+                if not r.success and r.command.command_type in ("patch_ptx", "reopen_session") and r.error
+            ]
+            if rollback_errs:
+                self.page.show_rollback_notice(
+                    f"Transfer partially completed — .ptx post-close patch rolled back safely: {rollback_errs[0]}"
+                )
 
     # ── Folder tree & assignments ────────────────────────────────────────
 
@@ -619,8 +706,10 @@ class DawTransferController(QObject):
         item.setFlags(
             (item.flags() | Qt.ItemFlag.ItemIsDropEnabled) & ~Qt.ItemFlag.ItemIsDragEnabled
         )
-        for fname in folder_tracks.get(folder["id"], []):
-            self._add_folder_track_node(item, fname, track_map, entry_map, gcm)
+        folder_member_fnames = folder_tracks.get(folder["id"], [])
+        self._decorate_folder_columns(item, folder, len(folder_member_fnames))
+        for fname in folder_member_fnames:
+            self._add_folder_track_node(item, folder, fname, track_map, entry_map, gcm)
         for child in children_map.get(folder["id"], []):
             self._add_folder_node(
                 item, child, children_map, folder_tracks, track_map, entry_map,
@@ -628,9 +717,38 @@ class DawTransferController(QObject):
             )
         item.setExpanded(True)
 
+    def _decorate_folder_columns(self, item: QTreeWidgetItem, folder: dict[str, Any], member_count: int) -> None:
+        if self.page.folder_tree.columnCount() < 4:
+            return
+        topo = self.signal_flow_ctrl.current_topology
+        meta = topo.lookup(str(folder.get("id", "")), str(folder.get("name", ""))) if topo else None
+        opts = self._protools_ptx_options()
+        is_routing = folder.get("folder_type") == "routing"
+        in_bus = f"Bus: {meta.input_bus}" if (meta and meta.input_bus) else ("None (Basic)" if not is_routing else "\u2014")
+        item.setText(1, in_bus)
+        item.setForeground(1, QColor(COLORS["text"] if (meta and meta.input_bus) else COLORS["metadata"]))
+
+        vca = meta.vca_track if (meta and opts["link_template_vcas"] and opts["group_type"].lower() != "edit") else None
+        if not opts["auto_group_folders"]:
+            grp_txt, grp_col = "Auto-grouping off", COLORS["dim"]
+        elif member_count > 0:
+            grp_txt = f"Group: {folder['name']} \u2192 {vca}" if vca else f"Group: {folder['name']} (no VCA)"
+            grp_col = COLORS["clean"] if vca else COLORS["metadata"]
+        elif vca:
+            grp_txt, grp_col = f"VCA: {vca} (0 tracks)", COLORS["dim"]
+        else:
+            grp_txt, grp_col = "No tracks (no group)", COLORS["dim"]
+        item.setText(2, grp_txt)
+        item.setForeground(2, QColor(grp_col))
+
+        route_txt = meta.output_chain if meta else ""
+        item.setText(3, route_txt)
+        item.setForeground(3, QColor(COLORS["metadata"] if member_count > 0 else COLORS["dim"]))
+
     def _add_folder_track_node(
         self,
         parent_item: QTreeWidgetItem,
+        folder: dict[str, Any],
         fname: str,
         track_map: dict[str, Any],
         entry_map: dict[str, TransferEntry],
@@ -653,12 +771,32 @@ class DawTransferController(QObject):
         track_item.setFlags(
             (track_item.flags() | Qt.ItemFlag.ItemIsDragEnabled) & ~Qt.ItemFlag.ItemIsDropEnabled
         )
+        if self.page.folder_tree.columnCount() >= 4:
+            topo = self.signal_flow_ctrl.current_topology
+            meta = topo.lookup(str(folder.get("id", "")), str(folder.get("name", ""))) if topo else None
+            opts = self._protools_ptx_options()
+            track_item.setText(1, "\u2014")
+            track_item.setForeground(1, QColor(COLORS["metadata"]))
+            grp_lbl = f"member of {folder['name']}" if opts["auto_group_folders"] else "\u2014"
+            track_item.setText(2, grp_lbl)
+            track_item.setForeground(2, QColor(COLORS["metadata"] if opts["auto_group_folders"] else COLORS["dim"]))
+            rbus = meta.resolved_routing_bus if meta else None
+            if opts["auto_route"] and rbus:
+                track_item.setText(3, f"Auto-route \u2192 Bus: {rbus}")
+                track_item.setForeground(3, QColor(COLORS["text"]))
+            elif not opts["auto_route"]:
+                track_item.setText(3, "Auto-route off")
+                track_item.setForeground(3, QColor(COLORS["dim"]))
+            else:
+                track_item.setText(3, "\u2014")
+                track_item.setForeground(3, QColor(COLORS["metadata"]))
         out_fn = te.output_filename if te else fname
         tc = track_map.get(out_fn)
         if tc and tc.group:
             tint = tint_group_color(self._state, tc.group, gcm)
             if tint:
-                track_item.setBackground(0, tint)
+                for col in range(self.page.folder_tree.columnCount()):
+                    track_item.setBackground(col, tint)
 
     @Slot(list, str, int)
     def assign_tracks_to_folder(
@@ -694,6 +832,7 @@ class DawTransferController(QObject):
 
         self.populate_folder_tree()
         self.setup_table_refresh_requested.emit()
+        self.signal_flow_ctrl.mark_stale()
         self.update_lifecycle_buttons()
 
     @Slot(list)
@@ -715,6 +854,7 @@ class DawTransferController(QObject):
                     pass
         self.populate_folder_tree()
         self.setup_table_refresh_requested.emit()
+        self.signal_flow_ctrl.mark_stale()
         self.update_lifecycle_buttons()
 
     @Slot()
@@ -746,6 +886,7 @@ class DawTransferController(QObject):
         track_order.clear()
         self.populate_folder_tree()
         self.setup_table_refresh_requested.emit()
+        self.signal_flow_ctrl.mark_stale()
         self.update_lifecycle_buttons()
         self._shell.show_status("All DAW folder assignments cleared.")
 
@@ -879,6 +1020,7 @@ class DawTransferController(QObject):
         if entry.daw_track_name != new_name:
             entry.daw_track_name = new_name
             self.populate_folder_tree()
+            self.signal_flow_ctrl.mark_stale()
 
     def reset_manifest(self) -> None:
         session = self._state.session
@@ -897,6 +1039,7 @@ class DawTransferController(QObject):
         self.prune_assignments_to_manifest()
         self.setup_table_refresh_requested.emit()
         self.populate_folder_tree()
+        self.signal_flow_ctrl.mark_stale()
         self.update_lifecycle_buttons()
         self._shell.show_status("DAW track list reset.")
 
@@ -928,7 +1071,11 @@ class DawTransferController(QObject):
             if entry.entry_id == entry_id:
                 if entry.entry_id != entry.output_filename:
                     del manifest[i]
+                    self.prune_assignments_to_manifest()
                     self.setup_table_refresh_requested.emit()
+                    self.populate_folder_tree()
+                    self.signal_flow_ctrl.mark_stale()
+                    self.update_lifecycle_buttons()
                     self._shell.show_status(f"Removed duplicate '{entry.daw_track_name}'")
                 break
 

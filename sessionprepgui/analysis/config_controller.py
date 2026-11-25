@@ -183,6 +183,19 @@ class SessionConfigController(QObject):
 
     # ── Preset combo & widget loading ────────────────────────────────────
 
+    def select_daw_processor_page(self, label: str = "Pro Tools") -> bool:
+        """Select the named DAW processor entry in the Phase 2 Config tree."""
+        for i in range(self.session_tree.topLevelItemCount()):
+            top = self.session_tree.topLevelItem(i)
+            if top is None:
+                continue
+            for j in range(top.childCount()):
+                child = top.child(j)
+                if child is not None and child.text(0).strip().lower() == label.strip().lower():
+                    self.session_tree.setCurrentItem(child)
+                    return True
+        return False
+
     def populate_config_preset_combo(self) -> None:
         combo = self.config_preset_combo
         presets = self._state.config.get(

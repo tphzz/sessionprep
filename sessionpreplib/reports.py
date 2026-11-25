@@ -269,8 +269,27 @@ def save_json(
         })
         sort_index += 1
 
+    signal_flows = {
+        dp_id: _sanitize_json_value(dp_state["signal_flow"])
+        for dp_id, dp_state in (session.daw_state or {}).items()
+        if isinstance(dp_state, dict) and isinstance(dp_state.get("signal_flow"), dict)
+    }
+    if signal_flows:
+        data["daw_signal_flow"] = signal_flows
+
     with atomic_writer(output_path) as f:
-        json.dump(data, f, indent=4, ensure_ascii=False)
+        json.dump(data, f, indent=4, ensure_ascii=False, allow_nan=False)
+
+
+def _sanitize_json_value(value: Any) -> Any:
+    """Recursively replace non-finite floats with ``None`` for RFC 8259 JSON compliance."""
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {k: _sanitize_json_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_json_value(v) for v in value]
+    return value
 
 
 def build_warnings(

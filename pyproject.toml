@@ -72,6 +72,14 @@ files = [
     "sessionpreplib/events.py",
     "sessionpreplib/utils.py",
     "sessionpreplib/reports.py",
+    "sessionpreplib/ptx/__init__.py",
+    "sessionpreplib/ptx/models.py",
+    "sessionpreplib/ptx/codec.py",
+    "sessionpreplib/ptx/parser.py",
+    "sessionpreplib/ptx/patcher.py",
+    "sessionpreplib/ptx/signal_flow.py",
+    "sessionpreplib/daw_processors/protools_ptx.py",
+    "sessionpreplib/daw_processors/protools_ptx_preview.py",
     "sessionprepgui/state.py",
     "sessionprepgui/shell.py",
     "sessionprepgui/progress.py",
@@ -82,6 +90,8 @@ files = [
     "sessionprepgui/topology/controller.py",
     "sessionprepgui/daw/page.py",
     "sessionprepgui/daw/controller.py",
+    "sessionprepgui/daw/signal_flow_panel.py",
+    "sessionprepgui/daw/signal_flow_controller.py",
     "sessionprepgui/detail/controller.py",
     "sessionprepgui/detail/repair_preview.py",
     "sessionprepgui/tracks/group_utils.py",
@@ -94,6 +104,7 @@ files = [
     "sessionprepgui/analysis/analysis_controller.py",
     "sessionprepgui/analysis/persistence_controller.py",
     "sessionprepgui/analysis/worker.py",
+    "sessionpreplib/ptx/plugin_trim.py",
 ]
 
 [project.optional-dependencies]

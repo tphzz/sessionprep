@@ -4,7 +4,7 @@ from urllib.parse import quote
 import pytest
 
 pytest.importorskip("PySide6")
-from PySide6.QtCore import QPoint, QSignalBlocker, Qt, QUrl
+from PySide6.QtCore import QPoint, QSignalBlocker, QUrl
 from PySide6.QtWidgets import QApplication, QLabel, QPushButton, QSplitter, QTableWidgetItem, QToolBar
 
 from qt_helpers import dispose_window
@@ -433,8 +433,9 @@ def test_transfer_table_is_flush_and_the_right_pane_keeps_insets(qapp, window, r
     assert right.layout().contentsRect() == right.rect().adjusted(6, 6, -6, -6)
     if routing_visible:
         tree = owner.daw_controller.page.folder_tree
-        assert tree.x() == CONTENT_INSET
-        assert tree.x() + tree.width() == right.width() - CONTENT_INSET
+        tree_x = tree.mapTo(right, QPoint()).x()
+        assert tree_x == CONTENT_INSET
+        assert tree_x + tree.width() == right.width() - CONTENT_INSET
         project_row = owner.daw_controller.page.project_name_edit.parentWidget()
         assert project_row.pos() == QPoint(CONTENT_INSET, CONTENT_INSET)
 

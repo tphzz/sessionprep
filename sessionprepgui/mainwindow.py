@@ -52,6 +52,7 @@ from .tracks import (
     _PHASE_ANALYSIS,
     _PHASE_SETUP,
     _PHASE_TOPOLOGY,
+    _TAB_SESSION,
 )
 from .window_geometry import (
     FALLBACK_STARTUP_SIZE,
@@ -639,6 +640,7 @@ class SessionPrepWindow(QMainWindow):
         self._table_ctrl.setup_splitter_fit_requested.connect(self._daw_ctrl.page.schedule_splitter_fit)
         self._table_ctrl.setup_table_populating_changed.connect(self._daw_ctrl.set_setup_table_populating)
         self._table_ctrl.prepare_stale_requested.connect(self._analysis_ctrl.mark_prepare_stale)
+        self._table_ctrl.prepare_stale_requested.connect(self._daw_ctrl.mark_signal_flow_stale)
         self._table_ctrl.repair_plan_requested.connect(
             lambda tracks, anchors: self._analysis_ctrl.queue_repair_plan(tracks, refresh_anchors=anchors)
         )
@@ -647,12 +649,15 @@ class SessionPrepWindow(QMainWindow):
         self._groups_ctrl.setup_table_refresh_requested.connect(self._table_ctrl.populate_setup_table)
         self._groups_ctrl.file_tab_refresh_requested.connect(self._table_ctrl.refresh_file_tab)
         self._groups_ctrl.prepare_stale_requested.connect(self._analysis_ctrl.mark_prepare_stale)
+        self._groups_ctrl.prepare_stale_requested.connect(self._daw_ctrl.mark_signal_flow_stale)
         self._groups_ctrl.detail_tab_dirty_changed.connect(self._config_ctrl.set_detail_tab_dirty)
         self._groups_ctrl.auto_fit_requested.connect(self._table_ctrl.auto_fit_track_table)
 
     def _wire_config_and_detail_signals(self) -> None:
         self._config_ctrl.daw_refresh_requested.connect(self._refresh_daw_processors_from_config)
         self._config_ctrl.prepare_stale_requested.connect(self._analysis_ctrl.mark_prepare_stale)
+        self._config_ctrl.prepare_stale_requested.connect(self._daw_ctrl.mark_signal_flow_stale)
+        self._config_ctrl.config_impact_applied.connect(lambda _imp: self._daw_ctrl.mark_signal_flow_stale())
         self._config_ctrl.repair_plan_requested.connect(self._analysis_ctrl.queue_repair_plan)
         self._config_ctrl.reanalyze_phase1_requested.connect(self._persistence_ctrl.reanalyze_topology)
         self._config_ctrl.reanalyze_phase2_requested.connect(self._analysis_ctrl.analyze)
@@ -676,6 +681,8 @@ class SessionPrepWindow(QMainWindow):
     def _wire_lifecycle_and_daw_signals(self) -> None:
         self._daw_ctrl.setup_table_refresh_requested.connect(self._table_ctrl.populate_setup_table)
         self._daw_ctrl.clear_workspace_requested.connect(self._persistence_ctrl.clear_workspace)
+        self._daw_ctrl.edit_protools_config_requested.connect(self._open_protools_session_config)
+        self._daw_ctrl.open_log_viewer_requested.connect(self._on_open_log_viewer)
         self._batch_ctrl.batch_mode_changed.connect(lambda _c: self._daw_ctrl.update_lifecycle_buttons())
         self._batch_ctrl.batch_mode_changed.connect(
             lambda _c: self._topology_ctrl.dismiss_overwrite_prompt()
@@ -704,7 +711,15 @@ class SessionPrepWindow(QMainWindow):
         self._analysis_ctrl.peak_build_requested.connect(self._persistence_ctrl.on_peak_build_requested)
         self._analysis_ctrl.prepare_state_changed.connect(self._daw_ctrl.update_lifecycle_buttons)
         self._analysis_ctrl.prepare_state_changed.connect(self._daw_ctrl.update_use_processed_action)
+        self._analysis_ctrl.phase1_completed.connect(lambda _s: self._daw_ctrl.sync_protools_ui_mode())
+        self._analysis_ctrl.analysis_completed.connect(self._on_analysis_completed_for_daw)
         self._analysis_ctrl.prepare_completed.connect(lambda _s: self._table_ctrl.populate_setup_table())
+        self._analysis_ctrl.prepare_completed.connect(lambda _s: self._daw_ctrl.mark_signal_flow_stale())
+
+    @Slot(object, object)
+    def _on_analysis_completed_for_daw(self, _session: Any, _summary: Any) -> None:
+        self._daw_ctrl.sync_protools_ui_mode()
+        self._daw_ctrl.mark_signal_flow_stale()
 
     def _is_track_repair_pending(self, filename: str) -> bool:
         plan = self._analysis_ctrl.repair_plan_worker
@@ -832,6 +847,15 @@ class SessionPrepWindow(QMainWindow):
         """Rebuild DAW processors and related Phase 3 UI from current config."""
         self._daw_ctrl.refresh_from_config()
         self._update_tools_menu()
+
+    @Slot()
+    def _open_protools_session_config(self) -> None:
+        """Jump from Phase 3's read-only summary bar to Phase 2 › Config › Pro Tools."""
+        if self._state.session is None:
+            return
+        self._phase_tabs.setCurrentIndex(_PHASE_ANALYSIS)
+        self._phase2_page.detail_tabs.setCurrentIndex(_TAB_SESSION)
+        self._config_ctrl.select_daw_processor_page("Pro Tools")
 
     @Slot()
     def _on_preferences(self) -> None:
