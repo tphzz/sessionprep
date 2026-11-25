@@ -612,3 +612,360 @@ def test_slot_a_trim_quiet_bus_skips_auto_insert_and_inactive_inserts_exempt():
     tracks[3].inserts = [bad_trim_a]
     with pytest.raises(ValueError, match="could not be validated"):
         build_annotated_signal_flow(_wrap(tracks), quiet_leaves, {"target_peak": -6.0, "target_rms": -18.0}, stage_bus_faders=True, attenuate_only=True)
+
+
+def test_signal_flow_avid_trim_quantization_carry_and_nonzero_template_trim():
+    from sessionpreplib.ptx.models import SlotATrimInfo
+
+    _tc_trim, _trk, _wrap, _PtxSend, _PtxRef = _make_trim_session_fixture()
+    sr = 48000
+
+    def _avid_trim(gain_db: float = 0.0, *, active: bool = True) -> SlotATrimInfo:
+        return SlotATrimInfo("trim", "Trim", "Digi/Trim/TR11", "com.avid.aax.trim", gain_db, -144.0, 6.0, active, False, True)
+
+    tracks = [
+        _trk(0, "K1", "Audio", out_bus="KIK"),
+        _trk(1, "V1", "Audio", out_bus="VOX"),
+        _trk(2, "KIK", "RoutingFolder", in_bus="KIK", out_bus="cKIK"),
+        _trk(3, "VOX", "RoutingFolder", in_bus="VOX", out_bus="cVOX"),
+        _trk(4, "cKIK", "Aux", in_bus="cKIK", out_bus="ALLDRM", trim=_avid_trim(-3.0, active=True)),
+        _trk(5, "cVOX", "Aux", in_bus="cVOX", out_bus="MIX1", trim=_avid_trim(0.0, active=True)),
+        _trk(6, "ALLDRM", "Aux", in_bus="ALLDRM", out_bus="ALLRYT", trim=_avid_trim(0.0, active=True)),
+        _trk(7, "ALLRYT", "Aux", in_bus="ALLRYT", out_bus="MIX1", trim=_avid_trim(0.0, active=True)),
+        _trk(8, "MIX1", "Aux", in_bus="MIX1", out_bus="Out 1-2", trim=_avid_trim(0.0, active=True)),
+        _trk(9, "Master", "Master", out_bus="Out 1-2"),
+    ]
+    leaves = {
+        "K1": LeafAudioInput(_sustained_tone(sr, 0.5, 10.0 ** (-10.0 / 20.0), freq=80.0), sr, clip_gain_db=-4.0, fader_db=0.0),
+        "V1": LeafAudioInput(_sustained_tone(sr, 0.5, 10.0 ** (-12.0 / 20.0), freq=440.0), sr, clip_gain_db=-2.0, fader_db=-2.0),
+    }
+    g = build_annotated_signal_flow(
+        _wrap(tracks), leaves, {"target_peak": -6.0, "target_rms": -18.0},
+        stage_bus_faders=True, attenuate_only=True, allow_leaf_convergence=True,
+    )
+    val = g.balance_validation
+    assert val["status"] == "verified"
+    assert val["converged"] is True
+    assert val["max_balance_spread_db"] <= 0.15
+    # Non-zero active template trim (-3.0 dB) on cKIK is coupled into inverse fader so net_gain_delta_db stays ~0
+    ckik = g.nodes["cKIK"]
+    assert abs(ckik.net_gain_delta_db) <= 0.1
+    assert abs((ckik.recommended_trim_db - (-3.0)) + (ckik.recommended_fader_db - ckik.template_fader_db)) <= 0.1
+
+
+def test_signal_flow_iterative_leaf_convergence_and_floor_limit():
+    _tc_trim, _trk, _wrap, _PtxSend, _PtxRef = _make_trim_session_fixture()
+    sr = 48000
+    tracks = [
+        _trk(0, "K1", "Audio", out_bus="KIK"),
+        _trk(1, "K2", "Audio", out_bus="KIK"),
+        _trk(2, "V1", "Audio", out_bus="VOX"),
+        _trk(3, "KIK", "RoutingFolder", in_bus="KIK", out_bus="cKIK"),
+        _trk(4, "VOX", "RoutingFolder", in_bus="VOX", out_bus="cVOX"),
+        _trk(5, "cKIK", "Aux", in_bus="cKIK", out_bus="MIX1", trim=_tc_trim()),
+        _trk(6, "cVOX", "Aux", in_bus="cVOX", out_bus="MIX1", trim=_tc_trim()),
+        _trk(7, "MIX1", "Aux", in_bus="MIX1", out_bus="Out 1-2", trim=_tc_trim()),
+        _trk(8, "Master", "Master", out_bus="Out 1-2"),
+    ]
+    # Sum of K1 + K2 arrives ~+15 dB above -18 dBFS RMS -> Pass 1 saturates +12 dB fader with excess ~3 dB
+    hot_sig = _sustained_tone(sr, 0.4, 10.0 ** (-6.0 / 20.0), freq=100.0)
+    vox_sig = _sustained_tone(sr, 0.4, 10.0 ** (-16.0 / 20.0), freq=440.0)
+    leaves = {
+        "K1": LeafAudioInput(hot_sig, sr, clip_gain_db=0.0, fader_db=0.0),
+        "K2": LeafAudioInput(hot_sig, sr, clip_gain_db=0.0, fader_db=0.0),
+        "V1": LeafAudioInput(vox_sig, sr, clip_gain_db=-2.0, fader_db=2.0),
+    }
+    g_conv = build_annotated_signal_flow(
+        _wrap(tracks), leaves, {"target_peak": -6.0, "target_rms": -18.0},
+        stage_bus_faders=True, attenuate_only=True, allow_leaf_convergence=True,
+    )
+    val = g_conv.balance_validation
+    assert val["status"] == "converged_shifted"
+    assert val["converged"] is True
+    assert val["passes"] >= 2
+    assert g_conv.leaf_fader_shift_db < -0.5
+    assert val["max_balance_spread_db"] <= 0.15
+    assert g_conv.nodes["cKIK"].trim_clamped_excess_db == 0.0
+    # Leaf clip gains remain untouched while all leaf faders shift equally
+    assert g_conv.nodes["V1"].clip_gain_db == -2.0
+    assert g_conv.nodes["V1"].recommended_fader_db == pytest.approx(2.0 + g_conv.leaf_fader_shift_db, abs=0.1)
+    assert g_conv.nodes["K1"].recommended_fader_db == pytest.approx(g_conv.leaf_fader_shift_db, abs=0.1)
+
+    # Floor-clamp non-convergence: audible active leaf right at level floor (-119 dBFS) prevents global shift -> unconverged cleanly
+    floor_leaves = {
+        "K1": LeafAudioInput(hot_sig, sr, clip_gain_db=0.0, fader_db=0.0),
+        "K2": LeafAudioInput(hot_sig, sr, clip_gain_db=0.0, fader_db=0.0),
+        "V1": LeafAudioInput(vox_sig, sr, clip_gain_db=0.0, fader_db=-103.0),
+    }
+    g_unc = build_annotated_signal_flow(
+        _wrap(tracks), floor_leaves, {"target_peak": -6.0, "target_rms": -18.0},
+        stage_bus_faders=True, attenuate_only=True, allow_leaf_convergence=True,
+    )
+    assert g_unc.balance_validation["status"] == "unconverged"
+    assert g_unc.balance_validation["converged"] is False
+    assert "cKIK" in g_unc.balance_validation["clamped_busses"]
+
+
+def test_signal_flow_validation_states_blocked_override_caveat_layout_and_path():
+    from sessionpreplib.ptx import compute_signal_flow_graph_layout, trace_signal_flow_path
+    from sessionpreplib.ptx.models import PtxInsert
+
+    _tc_trim, _trk, _wrap, PtxSend, PtxSignalPathRef = _make_trim_session_fixture()
+    sr = 48000
+    eq_a = PtxInsert("A", 0, 1, "FabFilter Pro-Q 4", "com.fabfilter.Pro-Q.4", "FabF/FQ4p/FQ4S", True, False)
+
+    tracks = [
+        _trk(0, "K1", "Audio", out_bus="KIK"),
+        _trk(1, "V1", "Audio", out_bus="VOX"),
+        _trk(2, "KIK", "RoutingFolder", in_bus="KIK", out_bus="cKIK"),
+        _trk(3, "VOX", "RoutingFolder", in_bus="VOX", out_bus="cVOX"),
+        _trk(4, "cKIK", "Aux", in_bus="cKIK", out_bus="MIX1", trim=_tc_trim()),
+        _trk(5, "cVOX", "Aux", in_bus="cVOX", out_bus="MIX1", trim=_tc_trim()),
+        _trk(6, "MIX1", "Aux", in_bus="MIX1", out_bus="MIX2"),
+        _trk(7, "MIX2", "Aux", in_bus="MIX2", out_bus="Out 1-2"),
+        _trk(8, "Master", "Master", out_bus="Out 1-2"),
+    ]
+    leaves = {
+        "K1": LeafAudioInput(_sustained_tone(sr, 0.4, 10.0 ** (-8.0 / 20.0), freq=80.0), sr, clip_gain_db=-6.0, fader_db=0.0),
+        "V1": LeafAudioInput(_sustained_tone(sr, 0.4, 10.0 ** (-10.0 / 20.0), freq=440.0), sr, clip_gain_db=-4.0, fader_db=-2.0),
+    }
+
+    # 1. Override drift
+    g_ovr = build_annotated_signal_flow(
+        _wrap(tracks), leaves, {"target_peak": -6.0, "target_rms": -18.0},
+        stage_bus_faders=True, attenuate_only=True, bus_fader_overrides={"cKIK": 6.0},
+    )
+    assert g_ovr.balance_validation["status"] == "override_drift"
+    assert "cKIK" in g_ovr.balance_validation["overridden_busses"]
+
+    # 2. Pre-fader send caveat detected even with include_sends=False
+    tracks[4].sends = [PtxSend("A", 0, PtxSignalPathRef("Verb", "bus", "s_verb"), volume_db=-6.0, is_pre_fader=True)]
+    g_cav = build_annotated_signal_flow(
+        _wrap(tracks), leaves, {"target_peak": -6.0, "target_rms": -18.0},
+        stage_bus_faders=True, attenuate_only=True, include_sends=False,
+    )
+    assert g_cav.balance_validation["status"] == "caveat"
+    assert len(g_cav.balance_validation["pre_fader_send_caveats"]) == 1
+    tracks[4].sends = []
+
+    # 3. Layout & Path trace include MIX1 -> MIX2 (intra-column serial edge) and MIX2 (0)
+    layout = compute_signal_flow_graph_layout(g_cav.to_dict(), active_only=True)
+    assert layout.nodes["K1"].column == 0
+    assert layout.nodes["KIK"].column == 1
+    assert layout.nodes["cKIK"].column == 2
+    assert layout.nodes["MIX1"].column == 4 and layout.nodes["MIX2"].column == 4
+    assert layout.nodes["Master"].column == 5
+    assert any(e.source == "MIX1" and e.target == "MIX2" and e.is_intra_column for e in layout.edges)
+    trace = trace_signal_flow_path(g_cav.to_dict(), "cKIK")
+    assert "MIX2 (0)" in trace.equation_text
+    assert trace.total_delta_db == pytest.approx(g_cav.balance_validation["global_path_delta_db"], abs=0.1)
+
+    # 4. strict_slot_a=False records blocked bus without raising; strict_slot_a=True raises
+    tracks[6].inserts = [eq_a]
+    g_blk = build_annotated_signal_flow(
+        _wrap(tracks), leaves, {"target_peak": -6.0, "target_rms": -18.0},
+        stage_bus_faders=True, attenuate_only=True, strict_slot_a=False,
+    )
+    assert "MIX1" in g_blk.blocked_nodes
+    assert g_blk.balance_validation["status"] == "blocked"
+    assert g_blk.nodes["MIX1"].slot_a_blocked_error is not None
+    with pytest.raises(ValueError, match="non-trim plugin"):
+        build_annotated_signal_flow(
+            _wrap(tracks), leaves, {"target_peak": -6.0, "target_rms": -18.0},
+            stage_bus_faders=True, attenuate_only=True, strict_slot_a=True,
+        )
+
+
+def test_signal_flow_dsp_review_regressions():
+    from sessionpreplib.ptx import patch_slot_a_trim_gains, trace_signal_flow_path
+    from sessionpreplib.ptx.models import SlotATrimInfo
+    from sessionpreplib.ptx.plugin_trim import avid_trim_db_to_step, avid_trim_step_to_db
+    from tests.unit.test_ptx_plugin_trim import _build_plugin_trim_ptx
+
+    _tc_trim, _trk, _wrap, _PtxSend, _PtxRef = _make_trim_session_fixture()
+    sr = 48000
+
+    # 1. Prepared (gain-baked) WAVs with distinct baked_gain_db validate with 0.0 dB spread
+    prep_tracks = [
+        _trk(0, "K1", "Audio", out_bus="KIK"),
+        _trk(1, "V1", "Audio", out_bus="VOX"),
+        _trk(2, "KIK", "RoutingFolder", in_bus="KIK", out_bus="MIX1"),
+        _trk(3, "VOX", "RoutingFolder", in_bus="VOX", out_bus="MIX1"),
+        _trk(4, "MIX1", "Aux", in_bus="MIX1", out_bus="Out 1-2", trim=_tc_trim()),
+        _trk(5, "Master", "Master", out_bus="Out 1-2"),
+    ]
+    prep_leaves = {
+        "K1": LeafAudioInput(_sustained_tone(sr, 0.3, 10.0 ** (-18.0 / 20.0), freq=80.0), sr, clip_gain_db=0.0, fader_db=-10.0, baked_gain_db=10.0),
+        "V1": LeafAudioInput(_sustained_tone(sr, 0.3, 10.0 ** (-18.0 / 20.0), freq=440.0), sr, clip_gain_db=0.0, fader_db=4.0, baked_gain_db=-4.0),
+    }
+    g_prep = build_annotated_signal_flow(
+        _wrap(prep_tracks), prep_leaves, {"target_peak": -6.0, "target_rms": -18.0},
+        stage_bus_faders=True, attenuate_only=True,
+    )
+    assert g_prep.balance_validation["status"] == "verified"
+    assert g_prep.balance_validation["max_balance_spread_db"] <= 0.1
+    tr_prep = trace_signal_flow_path(g_prep.to_dict(), "K1")
+    assert "baked" in tr_prep.equation_text
+
+    # 2. Avid Trim 2-decimal precision survives patch_slot_a_trim_gains without step jump (step 251 = -23.95 dB, step 874 = +2.44 dB)
+    raw_ptx = _build_plugin_trim_ptx()
+    ptx_t = PtxSession.from_bytes(raw_ptx)
+    avid_trk = next(t for t in ptx_t.tracks if t.slot_a_trim and t.slot_a_trim.plugin_id == "trim")
+    for step in (251, 874):
+        target_db = avid_trim_step_to_db(step)
+        patched, _ = patch_slot_a_trim_gains(raw_ptx, {avid_trk.name: target_db})
+        re_ptx = PtxSession.from_bytes(patched)
+        got = re_ptx.track_by_name(avid_trk.name).slot_a_trim.gain_db
+        assert avid_trim_db_to_step(got) == step
+
+    # 3. Parallel-parked Aux (-144 dB) ahead of active bus on same bus is skipped by path delta & path trace
+    pa_tracks = [
+        _trk(0, "K1", "Audio", out_bus="KIK"),
+        _trk(1, "V1", "Audio", out_bus="VOX"),
+        _trk(2, "KIK", "RoutingFolder", in_bus="KIK", out_bus="cKIK"),
+        _trk(3, "VOX", "RoutingFolder", in_bus="VOX", out_bus="cVOX"),
+        _trk(4, "PA_KIK", "Aux", in_bus="cKIK", out_bus="Out 1-2", vol=-144.0),
+        _trk(5, "cKIK", "Aux", in_bus="cKIK", out_bus="MIX1", trim=_tc_trim()),
+        _trk(6, "cVOX", "Aux", in_bus="cVOX", out_bus="MIX1", trim=_tc_trim()),
+        _trk(7, "MIX1", "Aux", in_bus="MIX1", out_bus="Out 1-2", trim=_tc_trim()),
+        _trk(8, "Master", "Master", out_bus="Out 1-2"),
+    ]
+    pa_leaves = {
+        "K1": LeafAudioInput(_sustained_tone(sr, 0.3, 10.0 ** (-8.0 / 20.0), freq=80.0), sr, clip_gain_db=0.0, fader_db=0.0),
+        "V1": LeafAudioInput(_sustained_tone(sr, 0.3, 10.0 ** (-8.0 / 20.0), freq=440.0), sr, clip_gain_db=0.0, fader_db=0.0),
+    }
+    g_pa = build_annotated_signal_flow(
+        _wrap(pa_tracks), pa_leaves, {"target_peak": -6.0, "target_rms": -18.0},
+        stage_bus_faders=True, attenuate_only=True,
+    )
+    assert g_pa.balance_validation["status"] == "verified"
+    assert g_pa.balance_validation["max_balance_spread_db"] <= 0.1
+    assert "MIX1" in trace_signal_flow_path(g_pa.to_dict(), "K1").path_nodes
+
+    # 4. Parked leaf (-144 dB) does NOT block convergence; leaf into muted folder excluded from spread; VCA near floor safe
+    conv_tracks = [
+        _trk(0, "K1", "Audio", out_bus="KIK"),
+        _trk(1, "K2", "Audio", out_bus="KIK"),
+        _trk(2, "PARK", "Audio", out_bus="VOX"),
+        _trk(3, "DEAD_L", "Audio", out_bus="MUTE_F"),
+        _trk(4, "KIK", "RoutingFolder", in_bus="KIK", out_bus="cKIK"),
+        _trk(5, "VOX", "RoutingFolder", in_bus="VOX", out_bus="MIX1"),
+        _trk(6, "MUTE_F", "RoutingFolder", in_bus="MUTE_F", out_bus="MIX1"),
+        _trk(7, "cKIK", "Aux", in_bus="cKIK", out_bus="MIX1", trim=_tc_trim()),
+        _trk(8, "MIX1", "Aux", in_bus="MIX1", out_bus="Out 1-2", trim=_tc_trim()),
+    ]
+    conv_tracks[6].is_muted = True
+    hot = _sustained_tone(sr, 0.3, 10.0 ** (-6.0 / 20.0), freq=100.0)
+    conv_leaves = {
+        "K1": LeafAudioInput(hot, sr, 0.0, 0.0),
+        "K2": LeafAudioInput(hot, sr, 0.0, 0.0),
+        "PARK": LeafAudioInput(hot, sr, 0.0, -144.0),
+        "DEAD_L": LeafAudioInput(hot, sr, 0.0, 0.0),
+    }
+    g_c = build_annotated_signal_flow(
+        _wrap(conv_tracks), conv_leaves, {"target_peak": -6.0, "target_rms": -18.0},
+        stage_bus_faders=True, attenuate_only=True, allow_leaf_convergence=True,
+    )
+    assert g_c.balance_validation["status"] == "converged_shifted"
+    assert "DEAD_L" not in g_c.balance_validation["track_path_deltas"]
+    assert "PARK" not in g_c.balance_validation["track_path_deltas"]
+
+    # 5. Lower-floor clamp keeps active bus above -140 dB (never silences to -144 dB -inf mute) and preserves net_gain_delta_db=0
+    low_tracks = [
+        _trk(0, "K1", "Audio", out_bus="cLOW"),
+        _trk(1, "V1", "Audio", out_bus="MIX1"),
+        _trk(2, "cLOW", "Aux", in_bus="cLOW", out_bus="MIX1", vol=-135.0, trim=_tc_trim()),
+        _trk(3, "MIX1", "Aux", in_bus="MIX1", out_bus="Out 1-2", trim=_tc_trim()),
+    ]
+    low_leaves = {
+        "K1": LeafAudioInput(_sustained_tone(sr, 0.3, 10.0 ** (-32.0 / 20.0), freq=100.0), sr, 0.0, 0.0),
+        "V1": LeafAudioInput(_sustained_tone(sr, 0.3, 10.0 ** (-20.0 / 20.0), freq=440.0), sr, 0.0, 0.0),
+    }
+    g_low = build_annotated_signal_flow(
+        _wrap(low_tracks), low_leaves, {"target_peak": -6.0, "target_rms": -18.0},
+        stage_bus_faders=True, attenuate_only=True,
+    )
+    assert g_low.nodes["cLOW"].recommended_fader_db == pytest.approx(-136.0, abs=0.05)
+    assert g_low.nodes["cLOW"].recommended_trim_db == pytest.approx(1.0, abs=0.05)
+    assert abs(g_low.nodes["cLOW"].net_gain_delta_db) <= 0.05
+
+    # 5b. Active leaf with negative VCA offset near floor is never pushed into silence by convergence
+    from sessionpreplib.ptx.models import PtxGroup
+    vca_tracks = [
+        _trk(0, "K1", "Audio", out_bus="KIK"),
+        _trk(1, "K2", "Audio", out_bus="KIK"),
+        _trk(2, "V1", "Audio", out_bus="VOX"),
+        _trk(3, "KIK", "RoutingFolder", in_bus="KIK", out_bus="cKIK"),
+        _trk(4, "VOX", "RoutingFolder", in_bus="VOX", out_bus="MIX1"),
+        _trk(5, "cKIK", "Aux", in_bus="cKIK", out_bus="MIX1", trim=_tc_trim()),
+        _trk(6, "MIX1", "Aux", in_bus="MIX1", out_bus="Out 1-2", trim=_tc_trim()),
+        _trk(7, "VOX-VCA", "Vca", vol=-20.0),
+    ]
+    vca_tracks[2].groups = ["VOX"]
+    vca_sess = _wrap(vca_tracks)
+    vca_grp = PtxGroup(0, "VOX", "mix", "Mix/Edit", 1, "a", True, vca_track_name="VOX-VCA", member_names=["V1"])
+    vca_sess.groups = [vca_grp]
+    vca_sess.group_by_name = lambda name: vca_grp if name.lower() == "vox" else None
+    vca_leaves = {
+        "K1": LeafAudioInput(hot, sr, 0.0, 0.0),
+        "K2": LeafAudioInput(hot, sr, 0.0, 0.0),
+        "V1": LeafAudioInput(_sustained_tone(sr, 0.3, 10.0 ** (-12.0 / 20.0), freq=440.0), sr, 0.0, -86.5),
+    }
+    g_vca = build_annotated_signal_flow(
+        vca_sess, vca_leaves, {"target_peak": -6.0, "target_rms": -18.0},
+        stage_bus_faders=True, attenuate_only=True, allow_leaf_convergence=True,
+    )
+    assert g_vca.nodes["V1"].vca_offset_db == pytest.approx(-20.0, abs=0.05)
+    assert g_vca.nodes["V1"].post_fader_peak_db is not None
+    assert g_vca.nodes["V1"].recommended_fader_db + g_vca.nodes["V1"].vca_offset_db > -140.0
+
+    # 6. Terminal bus with active template Trim -4.0 dB never boosts to 0.0 dB under attenuate_only=True
+    term_tracks = [
+        _trk(0, "K1", "Audio", out_bus="MIX1"),
+        _trk(1, "V1", "Audio", out_bus="MIX1"),
+        _trk(2, "MIX1", "Aux", in_bus="MIX1", out_bus="Out 1-2", trim=SlotATrimInfo("trackcontrol", "TrackControl", "DMGA/TrCt/RTST", "com.dmgaudio.TrackControl.aax", -4.0, -200.0, 18.0, True, False, True)),
+    ]
+    quiet_l = {
+        "K1": LeafAudioInput(_sustained_tone(sr, 0.3, 10.0 ** (-28.0 / 20.0), freq=100.0), sr, 0.0, 0.0),
+        "V1": LeafAudioInput(_sustained_tone(sr, 0.3, 10.0 ** (-28.0 / 20.0), freq=440.0), sr, 0.0, 0.0),
+    }
+    g_term = build_annotated_signal_flow(
+        _wrap(term_tracks), quiet_l, {"target_peak": -6.0, "target_rms": -18.0},
+        stage_bus_faders=True, attenuate_only=True,
+    )
+    assert g_term.nodes["MIX1"].recommended_trim_db <= -4.0
+    assert g_term.nodes["MIX1"].net_gain_delta_db <= 0.0
+
+    # 7. Override on Bus A does NOT mask genuinely clamped Bus B (converged must stay False)
+    mask_tracks = [
+        _trk(0, "K1", "Audio", out_bus="cKIK"),
+        _trk(1, "K2", "Audio", out_bus="cKIK"),
+        _trk(2, "V1", "Audio", out_bus="cVOX"),
+        _trk(3, "cKIK", "Aux", in_bus="cKIK", out_bus="MIX1", trim=_tc_trim()),
+        _trk(4, "cVOX", "Aux", in_bus="cVOX", out_bus="MIX1", trim=_tc_trim()),
+        _trk(5, "MIX1", "Aux", in_bus="MIX1", out_bus="Out 1-2", trim=_tc_trim()),
+    ]
+    mask_leaves = {
+        "K1": LeafAudioInput(hot, sr, 0.0, 0.0),
+        "K2": LeafAudioInput(hot, sr, 0.0, 0.0),
+        "V1": LeafAudioInput(_sustained_tone(sr, 0.3, 10.0 ** (-18.0 / 20.0), freq=440.0), sr, 0.0, 0.0),
+    }
+    g_mask = build_annotated_signal_flow(
+        _wrap(mask_tracks), mask_leaves, {"target_peak": -6.0, "target_rms": -18.0},
+        stage_bus_faders=True, attenuate_only=True, allow_leaf_convergence=False,
+        bus_fader_overrides={"cVOX": 5.0},
+    )
+    assert g_mask.balance_validation["converged"] is False
+    assert "cKIK" in g_mask.balance_validation["clamped_busses"]
+
+    # 8. Path equation formats +0.0 explicitly when chained after trim (never "-2.50.0")
+    eq_graph = {
+        "nodes": {
+            "K1": {"track_type": "Audio", "clip_gain_db": -6.0, "recommended_fader_db": 0.0, "pre_fader_peak_db": -6.0, "post_fader_peak_db": -6.0},
+            "cKIK": {"track_type": "Aux", "staging_strategy": "trim_and_fader", "recommended_trim_db": -2.5, "template_trim_db": 0.0, "recommended_fader_db": 0.0, "template_fader_db": 0.0, "net_gain_delta_db": -2.5, "pre_fader_peak_db": -6.0},
+        },
+        "edges": [{"source": "K1", "target": "cKIK", "kind": "main"}],
+    }
+    tr_eq = trace_signal_flow_path(eq_graph, "cKIK")
+    assert "(-2.5+0.0)" in tr_eq.equation_text
+    assert "-2.50.0" not in tr_eq.equation_text

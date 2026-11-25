@@ -820,6 +820,7 @@ def _load_leaf_audio_input(track: TrackContext, staging: ProToolsTrackStaging) -
             samplerate=track.samplerate,
             clip_gain_db=staging.clip_gain_db,
             fader_db=staging.fader_db,
+            baked_gain_db=staging.baked_gain_db,
         )
     try:
         samples, sr = sf.read(staging.filepath, dtype="float64", always_2d=False)
@@ -831,6 +832,7 @@ def _load_leaf_audio_input(track: TrackContext, staging: ProToolsTrackStaging) -
         samplerate=int(sr),
         clip_gain_db=staging.clip_gain_db,
         fader_db=staging.fader_db,
+        baked_gain_db=staging.baked_gain_db,
     )
 
 
@@ -849,6 +851,24 @@ def _apply_group_actions_in_memory(raw_ptx: bytes, group_actions: list[FolderGro
                 kwargs["vca_track"] = act.vca_track
             cur, _ = patch_modify_group(cur, act.group_name, **kwargs)
     return PtxSession.from_bytes(cur)
+
+
+def _merge_graph_volumes(
+    graph: SignalFlowGraph,
+    created_names: list[str],
+    track_volumes_db: dict[str, float],
+) -> dict[str, float]:
+    if abs(graph.leaf_fader_shift_db) >= 0.05:
+        nodes_lc = {k.lower(): v for k, v in graph.nodes.items()}
+        for created_name in created_names:
+            leaf_node = nodes_lc.get(created_name.lower())
+            if leaf_node is None:
+                continue
+            track_volumes_db[created_name] = round(leaf_node.recommended_fader_db, 1)
+    for bus_name, bus_db in graph.recommended_bus_faders().items():
+        if bus_name not in track_volumes_db:
+            track_volumes_db[bus_name] = bus_db
+    return graph.recommended_slot_a_trims()
 
 
 def run_post_close_ptx_enhancement(
@@ -873,7 +893,7 @@ def run_post_close_ptx_enhancement(
     clip_gains_db: dict[str, float] = {}
     track_volumes_db: dict[str, float] = {}
     leaf_entries: dict[str, tuple[TrackContext, ProToolsTrackStaging]] = {}
-    leaf_gains: dict[str, tuple[float, float]] = {}
+    leaf_gains: dict[str, tuple[float, float, float]] = {}
     created_names: list[str] = []
 
     for created_name, _tid, staging, track in created_tracks:
@@ -883,7 +903,7 @@ def run_post_close_ptx_enhancement(
         if abs(staging.fader_db) >= 0.05:
             track_volumes_db[created_name] = staging.fader_db
         leaf_entries[created_name.lower()] = (track, staging)
-        leaf_gains[created_name] = (staging.clip_gain_db, staging.fader_db)
+        leaf_gains[created_name] = (staging.clip_gain_db, staging.fader_db, staging.baked_gain_db)
 
     group_actions = (
         plan_folder_groups_and_vcas(ptx, created_names, link_vcas=link_template_vcas, group_type=group_type)
@@ -891,9 +911,7 @@ def run_post_close_ptx_enhancement(
         else []
     )
     dag_ptx = _apply_group_actions_in_memory(raw_bytes, group_actions) if group_actions else ptx
-
-    sf_cfg = dict(session.config)
-    sf_cfg["protools_pan_law_db"] = pan_law_db
+    sf_cfg = {**session.config, "protools_pan_law_db": pan_law_db}
     attenuate_only = gain_mode != GAIN_MODE_CLIP_UNITY
 
     def _lazy_leaf(track_name: str) -> LeafAudioInput | None:
@@ -907,14 +925,13 @@ def run_post_close_ptx_enhancement(
             dag_ptx, None, sf_cfg,
             stage_bus_faders=stage_bus_faders,
             attenuate_only=attenuate_only,
+            strict_slot_a=True,
+            allow_leaf_convergence=(gain_mode == GAIN_MODE_CLIP_AND_FADER and stage_bus_faders),
             leaf_loader=_lazy_leaf,
             leaf_gains=leaf_gains,
             bus_fader_overrides=bus_fader_overrides,
         )
-        slot_a_trims_db = graph.recommended_slot_a_trims()
-        for bus_name, bus_db in graph.recommended_bus_faders().items():
-            if bus_name not in track_volumes_db:
-                track_volumes_db[bus_name] = bus_db
+        slot_a_trims_db = _merge_graph_volumes(graph, created_names, track_volumes_db)
 
     if not (created_names or clip_gains_db or slot_a_trims_db or track_volumes_db or group_actions):
         return None, {"cleared_inputs": {}, "clip_gains": {}, "slot_a_trims": {}, "volumes": {}, "groups": []}, graph

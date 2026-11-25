@@ -923,7 +923,8 @@ def _resolve_slot_a_targets(
                     f"{trk.format} Slot A Trim donor exists in the session."
                 )
             trim_info = donor_trk.slot_a_trim
-        clamped = _norm_zero(round(max(trim_info.min_db, min(trim_info.max_db, float(raw_db))), 1))
+        prec = 2 if trim_info.plugin_id == "trim" else 1
+        clamped = _norm_zero(round(max(trim_info.min_db, min(trim_info.max_db, float(raw_db))), prec))
         targets.append((trk.index, trk.uuid_hex, trk.name, trim_info, clamped, donor_trk))
     targets.sort(key=lambda item: item[0], reverse=True)
     return targets

@@ -133,6 +133,7 @@ class SignalFlowWorker(QThread):
                 group_type=str(self._options.get("group_type", "Mix/Edit")),
                 stage_bus_faders=bool(self._options.get("stage_bus_faders", True)),
                 pan_law_db=float(self._options.get("pan_law_db", -3.0)),
+                remove_unused_aux_tracks=bool(self._options.get("remove_unused_aux_tracks", True)),
                 bus_fader_overrides=self._bus_overrides or None,
                 progress_cb=lambda cur, tot, nm: self.progress.emit(
                     cur, tot, f"Summing signal flow — evaluating {tot} nodes ({cur} / {tot}) · {nm}…"
@@ -153,6 +154,7 @@ class SignalFlowController(QObject):
     """Owns offline template topology inspection, SignalFlowWorker, and bus fader overrides."""
 
     topology_updated = Signal(object)
+    signal_flow_updated = Signal(object)
 
     def __init__(
         self,
@@ -214,6 +216,7 @@ class SignalFlowController(QObject):
         self._current_topology = None
         self._update_tab_chrome(None, {})
         self._panel.show_empty(assigned_count=0, folder_count=0)
+        self.signal_flow_updated.emit(None)
 
     def on_daw_processor_changed(self) -> None:
         self._override_timer.stop()
@@ -273,6 +276,7 @@ class SignalFlowController(QObject):
             self._stale_ids.discard(dp.id)
             self._panel.show_empty(assigned_count=0, folder_count=0)
             self._update_tab_chrome(None, {})
+            self.signal_flow_updated.emit(None)
             return
         self._stale_ids.add(dp.id)
         if dp_state.get("signal_flow"):
@@ -307,6 +311,7 @@ class SignalFlowController(QObject):
             overrides if staging_on else {},
             staging_enabled=staging_on,
         )
+        self.signal_flow_updated.emit(graph_dict if isinstance(graph_dict, dict) else None)
 
     def apply_authoritative_graph(self, graph_dict: dict[str, Any] | None) -> None:
         dp = self.active_protools_processor()
@@ -322,6 +327,7 @@ class SignalFlowController(QObject):
             self._panel.show_graph(graph_dict, staging_enabled=staging_on)
             self._panel.set_stale(False)
         self._update_tab_chrome(graph_dict, overrides if staging_on else {}, staging_enabled=staging_on)
+        self.signal_flow_updated.emit(graph_dict if isinstance(graph_dict, dict) else None)
 
     @Slot(int)
     def _on_right_tab_changed(self, index: int) -> None:
@@ -434,6 +440,7 @@ class SignalFlowController(QObject):
         self._panel.show_graph(graph_dict, staging_enabled=staging_on, focus_bus=focus_bus)
         self._panel.set_stale(False)
         self._update_tab_chrome(graph_dict, pruned if staging_on else {}, staging_enabled=staging_on)
+        self.signal_flow_updated.emit(graph_dict)
 
     @Slot(str, str)
     def _on_worker_failed(self, title: str, detail: str) -> None:
@@ -452,9 +459,15 @@ class SignalFlowController(QObject):
 
     @Slot(str, float)
     def set_bus_override(self, bus_name: str, value_db: float) -> None:
+        try:
+            fval = float(value_db)
+        except (TypeError, ValueError):
+            return
+        if not math.isfinite(fval):
+            return
         dp_state = self._dp_state()
         overrides = dp_state.setdefault("bus_fader_overrides", {})
-        val = round(float(value_db), 1)
+        val = round(fval, 1)
         graph = dp_state.get("signal_flow")
         node = ((graph or {}).get("nodes") or {}).get(bus_name) if isinstance(graph, dict) else None
         if isinstance(node, dict) and abs(val - float(node.get("auto_fader_db", 0.0))) < 0.05:

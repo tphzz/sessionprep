@@ -463,9 +463,10 @@ In dry-run mode (no `-x`), it prints a session overview to the terminal.
 Applying the offsets preserves the producer's rough-mix balance while keeping
 the prepared levels ahead of your inserts.
 
-- **Pro Tools** — **DAW Transfer** imports the audio and saves the session.
-  Automatic volume automation is temporarily disabled. The **Fader Gain**
-  column lists the calculated offsets for manual application.
+- **Pro Tools** — **DAW Transfer** imports the audio and applies static Clip
+  Gain, Track/Bus Faders, and validated Slot A Trim plugin adjustments in a
+  single atomic post-close `.ptx` pass (see [§9](#9-pro-tools-transfer-automation-ptx--ptsl));
+  only legacy PTSL volume-automation breakpoint writes remain disabled.
 - **DAWproject** — fader volumes are written directly into the generated
   `.dawproject` file.
 
@@ -727,9 +728,11 @@ post-close pass with automatic rollback if Pro Tools fails to reopen the session
   single-input insert Auxes, Master Faders, and `-∞ dB` parallel auxes
   untouched. In the GUI Phase 3 right pane, **Routing & Folders** previews each
   folder's input bus, planned group/VCA, and output routing chain directly from
-  the `.ptxt` template, while the **Signal Flow** tab computes offline previews,
-  displays planned Slot A Trim and fader adjustments, highlights unsimulated
-  active-insert/cycle/unreadable-audio caveats, allows per-bus manual fader
-  overrides (`Reset Overrides` or per-row reset), and exports the annotated
-  graph (including `recommended_slot_a_trims`) under `daw_signal_flow` in JSON
-  reports.
+  the `.ptxt` template, while the **Signal Flow** tab provides both a
+  calculation **Table** and an auto-routed **Graph** DAG view with path-equation
+  tracing, a balance-validation banner (reporting path spread, global
+  leaf-fader convergence shifts, pre-fader send caveats, and unsimulated active
+  inserts), per-bus manual fader overrides (`Reset Overrides` or per-row reset),
+  and exports the annotated graph (including `recommended_slot_a_trims`,
+  `balance_validation`, and `leaf_fader_shift_db`) under `daw_signal_flow` in
+  JSON reports.

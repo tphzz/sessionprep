@@ -494,6 +494,8 @@ sessionpreplib/
         protools.py              # ProToolsDawProcessor — Pro Tools integration via py-ptsl + .ptx orchestration
         protools_ptx.py          # Pro Tools .ptx routing, cleanup (folders/VCAs/orphaned Auxes), & post-close patching
         protools_ptx_preview.py  # Offline .ptxt template topology inspection & Signal Flow preview engine
+        ptsl_connection.py       # PTSL engine connection & host-readiness helpers
+        ptsl_helpers.py          # PTSL command wrappers, signalpath calibration & track/batch utilities
         dawproject.py            # DawProjectDawProcessor — self-contained .dawproject archive generation
     ptx/
         __init__.py              # Public .ptx parser, patcher, Slot A trim & signal-flow exports
@@ -503,6 +505,7 @@ sessionpreplib/
         plugin_trim.py           # Validated Slot A trim reader, clean-donor selector & 0x2625->0x2616 auto-insert/patcher
         patcher.py               # Atomic .ptx patchers (No Input, 0x2637 Clip Gain, faders, groups/VCAs, Slot A trims)
         signal_flow.py           # Signal-flow DAG reconstruction, float64 summing & recursive multi-stage bus staging
+        signal_flow_analysis.py  # Balance validation, pre-fader send caveats, path tracing & semantic-tier DAG layout
 
 sessionprepgui/                  # GUI package (PySide6)
     __init__.py                  # Exports main()
@@ -528,7 +531,8 @@ sessionprepgui/                  # GUI package (PySide6)
     daw/
         page.py                  # DawSetupPage — Phase 3 DAW Transfer widgets (incl. Pro Tools Routing & Signal Flow tabs)
         controller.py            # DawTransferController — DAW selection, fetch, transfer, folder tree, assignments
-        signal_flow_panel.py     # SignalFlowPanel & BusFaderSpinBox — Phase 3 Signal Flow table & override controls
+        signal_flow_panel.py     # SignalFlowPanel & BusFaderSpinBox — [Table | Graph] toggle, balance banner & overrides
+        signal_flow_graph_view.py # SignalFlowGraphView — auto-routed QGraphicsView DAG renderer with path tracing
         signal_flow_controller.py # SignalFlowController & SignalFlowWorker — async offline preview & debounced overrides
     detail/
         controller.py            # TrackDetailController — file detail view, waveform display, overlays, playback

@@ -26,6 +26,7 @@ from .protools_ptx import (
     GAIN_MODE_CLIP_UNITY,
     ProToolsTrackStaging,
     _find_folder_vca,
+    plan_empty_folders_and_vcas,
     plan_folder_groups_and_vcas,
     resolve_protools_track_staging,
 )
@@ -183,13 +184,13 @@ def _inject_virtual_leaves(
     link_template_vcas: bool,
     group_type: str,
     excluded: dict[str, str],
-) -> tuple[dict[str, tuple[TrackContext, ProToolsTrackStaging]], dict[str, tuple[float, float]]]:
+) -> tuple[dict[str, tuple[TrackContext, ProToolsTrackStaging]], dict[str, tuple[float, float, float]]]:
     if session.config.get("_use_processed") is True and session.prepare_state != "ready":
         raise ValueError("Prepared audio is out of date. Run Prepare again (or uncheck Use Processed).")
     out_map = {t.filename: t for t in session.output_tracks}
     folder_lookup = {str(f.get("id", "")): f for f in folders}
     leaf_entries: dict[str, tuple[TrackContext, ProToolsTrackStaging]] = {}
-    leaf_gains: dict[str, tuple[float, float]] = {}
+    leaf_gains: dict[str, tuple[float, float, float]] = {}
     virtual_names: list[str] = []
     used_names = {t.name.lower() for t in ptx.tracks}
 
@@ -218,7 +219,7 @@ def _inject_virtual_leaves(
             )
         )
         leaf_entries[vname.lower()] = (track, staging)
-        leaf_gains[vname] = (staging.clip_gain_db, staging.fader_db)
+        leaf_gains[vname] = (staging.clip_gain_db, staging.fader_db, staging.baked_gain_db)
         virtual_names.append(vname)
 
     if auto_group_folders and virtual_names:
@@ -256,17 +257,28 @@ def _load_preview_leaf(
         if not np.all(np.isfinite(arr)):
             excluded[track.filename] = "Non-finite samples (NaN/Inf)"
             return None
-        return LeafAudioInput(arr, track.samplerate, staging.clip_gain_db, staging.fader_db)
+        return LeafAudioInput(arr, track.samplerate, staging.clip_gain_db, staging.fader_db, staging.baked_gain_db)
     try:
         samples, sr = sf.read(staging.filepath, dtype="float64", always_2d=False)
         arr = np.asarray(samples, dtype=np.float64)
         if not np.all(np.isfinite(arr)):
             excluded[track.filename] = "Non-finite samples (NaN/Inf)"
             return None
-        return LeafAudioInput(arr, int(sr), staging.clip_gain_db, staging.fader_db)
+        return LeafAudioInput(arr, int(sr), staging.clip_gain_db, staging.fader_db, staging.baked_gain_db)
     except Exception as exc:
         excluded[track.filename] = str(exc)
         return None
+
+
+def _prune_preview_empty_branches(ptx: PtxSession, *, remove_unused_aux_tracks: bool) -> None:
+    """Mirror Create's empty-folder/VCA/orphaned-Aux cleanup on the in-memory preview session."""
+    plan = plan_empty_folders_and_vcas(ptx, remove_unused_aux_tracks=remove_unused_aux_tracks)
+    removed = {
+        t.name.lower()
+        for t in (*plan.empty_folders, *plan.unused_vcas, *plan.orphaned_auxes)
+    }
+    if removed:
+        ptx.tracks = [t for t in ptx.tracks if t.name.lower() not in removed]
 
 
 def preview_protools_signal_flow(
@@ -282,6 +294,7 @@ def preview_protools_signal_flow(
     group_type: str = "Mix/Edit",
     stage_bus_faders: bool = True,
     pan_law_db: float = -3.0,
+    remove_unused_aux_tracks: bool = True,
     bus_fader_overrides: Mapping[str, float] | None = None,
     progress_cb: Callable[[int, int, str], None] | None = None,
     cancel_cb: Callable[[], bool] | None = None,
@@ -295,13 +308,17 @@ def preview_protools_signal_flow(
         auto_group_folders=auto_group_folders, link_template_vcas=link_template_vcas,
         group_type=group_type, excluded=excluded,
     )
+    _prune_preview_empty_branches(ptx, remove_unused_aux_tracks=remove_unused_aux_tracks)
     sf_cfg = dict(session.config)
     sf_cfg["protools_pan_law_db"] = pan_law_db
     attenuate_only = gain_mode != GAIN_MODE_CLIP_UNITY
+    allow_convergence = gain_mode == GAIN_MODE_CLIP_AND_FADER and stage_bus_faders
     graph = build_annotated_signal_flow(
         ptx, None, sf_cfg,
         stage_bus_faders=stage_bus_faders,
         attenuate_only=attenuate_only,
+        strict_slot_a=False,
+        allow_leaf_convergence=allow_convergence,
         leaf_loader=lambda name: _load_preview_leaf(name, leaf_entries, excluded),
         leaf_gains=leaf_gains,
         bus_fader_overrides=bus_fader_overrides,

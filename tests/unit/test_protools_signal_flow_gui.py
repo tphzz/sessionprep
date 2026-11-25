@@ -212,13 +212,14 @@ def test_signal_flow_panel_states_spinbox_focus_wheel_narrow_and_formatting(qapp
     panel.show()
 
     # Controls bar splits actions across two narrow-safe rows (never sums buttons + checkbox + target on one line)
-    row1_min_w = panel.refresh_btn.minimumSizeHint().width() + panel.reset_all_btn.minimumSizeHint().width() + 24
-    assert panel.controls_bar.minimumSizeHint().width() <= row1_min_w
-    assert panel.controls_bar.minimumSizeHint().width() < (
-        panel.refresh_btn.minimumSizeHint().width()
+    row1_min_w = (
+        panel.view_toggle.minimumSizeHint().width()
+        + panel.refresh_btn.minimumSizeHint().width()
         + panel.reset_all_btn.minimumSizeHint().width()
-        + panel.active_only_cb.minimumSizeHint().width()
+        + 36
     )
+    assert panel.controls_bar.minimumSizeHint().width() <= row1_min_w
+    assert panel.controls_bar.minimumSizeHint().width() < row1_min_w + panel.active_only_cb.minimumSizeHint().width()
 
     # Empty state with 0 assigned tracks vs assigned tracks ready to compute
     panel.show_empty(assigned_count=0, folder_count=0)
@@ -240,34 +241,54 @@ def test_signal_flow_panel_states_spinbox_focus_wheel_narrow_and_formatting(qapp
     panel.show_error("Template missing", "Cannot find Mix.ptxt")
     assert "Template missing" in panel.error_title.text()
 
-    # Graph with 0.0 dBFS Master peak, non-zero fixed Aux fader, Slot A Trim aux, parked aux, and banners
+    # Graph with 0.0 dBFS Master peak, Slot A Trim aux, parked aux, validation strip, path bar, and graph view
     graph = {
         "target_peak_db": -6.0, "target_rms_db": -18.0, "pan_law_db": -3.0, "dbfs_convention": "standard",
-        "topological_order": ["KIK", "cKIK", "cBAS", "MIX 1", "Master", "RYT-PA"],
+        "topological_order": ["Kick", "KIK", "cKIK", "cBAS", "MIX 1", "Master", "RYT-PA"],
+        "edges": [
+            {"source": "Kick", "target": "KIK", "bus_name": "KIK", "kind": "main"},
+            {"source": "KIK", "target": "cKIK", "bus_name": "cKIK", "kind": "main"},
+            {"source": "cKIK", "target": "MIX 1", "bus_name": "MIX 1", "kind": "main"},
+            {"source": "cBAS", "target": "MIX 1", "bus_name": "MIX 1", "kind": "main"},
+            {"source": "MIX 1", "target": "Master", "bus_name": "Out 1-2", "kind": "main"},
+        ],
         "cycles": [["FX-A", "FX-B", "FX-A"]],
         "excluded_tracks": {"Bad.wav": "corrupt"},
         "recommended_bus_faders": {"cBAS": -4.5, "MIX 1": -1.9},
         "recommended_slot_a_trims": {"cBAS": 4.5},
+        "balance_validation": {
+            "status": "verified",
+            "converged": True,
+            "passes": 1,
+            "leaf_fader_shift_db": 0.0,
+            "global_path_delta_db": -7.9,
+            "max_balance_spread_db": 0.0,
+            "active_leaf_count": 1,
+            "staged_bus_count": 2,
+            "summary": "Balance invariant verified (±0.0 dB across 1 tracks) · Global path Δ: -7.9 dB · 2 staged busses",
+        },
         "nodes": {
-            "KIK": {"track_name": "KIK", "track_type": "RoutingFolder", "classification": "Transient", "staged": True, "is_overridden": False, "auto_fader_db": 0.0, "recommended_fader_db": 0.0, "pre_fader_peak_db": -8.0, "pre_fader_rms_db": -22.0, "post_fader_peak_db": -8.0, "post_fader_rms_db": -22.0, "upstream_tracks": ["Kick"], "active_inserts": []},
-            "cKIK": {"track_name": "cKIK", "track_type": "Aux", "classification": "Transient", "staged": False, "is_overridden": False, "template_fader_db": -3.5, "recommended_fader_db": -3.5, "pre_fader_peak_db": -8.0, "pre_fader_rms_db": -22.0, "post_fader_peak_db": -11.5, "post_fader_rms_db": -25.5, "upstream_tracks": ["KIK"], "active_inserts": ["SSL 4K E"]},
-            "cBAS": {"track_name": "cBAS", "track_type": "Aux", "classification": "Sustained", "staged": True, "is_overridden": False, "auto_fader_db": -4.5, "recommended_fader_db": -4.5, "slot_a_trim_plugin": "TrackControl", "recommended_trim_db": 4.5, "staging_strategy": "trim_and_fader", "pre_fader_peak_db": -10.0, "pre_fader_rms_db": -18.0, "post_fader_peak_db": -14.5, "post_fader_rms_db": -22.5, "upstream_tracks": ["EB"], "active_inserts": ["TrackControl", "SSL 4K E"]},
-            "MIX 1": {"track_name": "MIX 1", "track_type": "Aux", "classification": "Transient", "staged": True, "is_overridden": False, "auto_fader_db": -1.9, "recommended_fader_db": -1.9, "pre_fader_peak_db": -4.1, "pre_fader_rms_db": -19.5, "post_fader_peak_db": -6.0, "post_fader_rms_db": -21.4, "upstream_tracks": ["cKIK", "ALLMUS"], "active_inserts": ["SSL G-Master"]},
-            "Master": {"track_name": "Master", "track_type": "Master", "classification": "Transient", "staged": False, "is_overridden": False, "template_fader_db": 0.0, "recommended_fader_db": 0.0, "pre_fader_peak_db": -4.0, "pre_fader_rms_db": -21.4, "post_fader_peak_db": 0.0, "post_fader_rms_db": -17.4, "upstream_tracks": ["MIX 1"], "active_inserts": []},
+            "Kick": {"track_name": "Kick", "track_type": "Audio", "classification": "Transient", "clip_gain_db": -8.0, "recommended_fader_db": 2.0, "pre_fader_peak_db": -6.0, "post_fader_peak_db": -4.0, "net_gain_delta_db": -6.0},
+            "KIK": {"track_name": "KIK", "track_type": "RoutingFolder", "classification": "Transient", "staged": True, "is_overridden": False, "auto_fader_db": 0.0, "recommended_fader_db": 0.0, "pre_insert_peak_db": -8.0, "pre_insert_rms_db": -22.0, "pre_fader_peak_db": -8.0, "pre_fader_rms_db": -22.0, "post_fader_peak_db": -8.0, "post_fader_rms_db": -22.0, "net_gain_delta_db": 0.0, "upstream_tracks": ["Kick"], "active_inserts": []},
+            "cKIK": {"track_name": "cKIK", "track_type": "Aux", "classification": "Transient", "staged": False, "is_overridden": False, "template_fader_db": -3.5, "recommended_fader_db": -3.5, "pre_insert_peak_db": -8.0, "pre_insert_rms_db": -22.0, "pre_fader_peak_db": -8.0, "pre_fader_rms_db": -22.0, "post_fader_peak_db": -11.5, "post_fader_rms_db": -25.5, "net_gain_delta_db": 0.0, "upstream_tracks": ["KIK"], "active_inserts": ["SSL 4K E"]},
+            "cBAS": {"track_name": "cBAS", "track_type": "Aux", "classification": "Sustained", "staged": True, "is_overridden": False, "auto_fader_db": -4.5, "recommended_fader_db": -4.5, "slot_a_trim_plugin": "TrackControl", "recommended_trim_db": 4.5, "staging_strategy": "trim_and_fader", "pre_insert_peak_db": -14.5, "pre_insert_rms_db": -22.5, "pre_fader_peak_db": -10.0, "pre_fader_rms_db": -18.0, "post_fader_peak_db": -14.5, "post_fader_rms_db": -22.5, "net_gain_delta_db": 0.0, "upstream_tracks": ["EB"], "active_inserts": ["TrackControl", "SSL 4K E"]},
+            "MIX 1": {"track_name": "MIX 1", "track_type": "Aux", "classification": "Transient", "is_terminal": True, "staged": True, "is_overridden": False, "auto_fader_db": -1.9, "recommended_fader_db": -1.9, "pre_insert_peak_db": -4.1, "pre_insert_rms_db": -19.5, "pre_fader_peak_db": -4.1, "pre_fader_rms_db": -19.5, "post_fader_peak_db": -6.0, "post_fader_rms_db": -21.4, "net_gain_delta_db": -1.9, "staging_strategy": "fader_only", "upstream_tracks": ["cKIK", "cBAS"], "active_inserts": ["SSL G-Master"]},
+            "Master": {"track_name": "Master", "track_type": "Master", "classification": "Transient", "staged": False, "is_overridden": False, "template_fader_db": 0.0, "recommended_fader_db": 0.0, "pre_insert_peak_db": -4.0, "pre_insert_rms_db": -21.4, "pre_fader_peak_db": -4.0, "pre_fader_rms_db": -21.4, "post_fader_peak_db": 0.0, "post_fader_rms_db": -17.4, "net_gain_delta_db": 0.0, "upstream_tracks": ["MIX 1"], "active_inserts": []},
             "RYT-PA": {"track_name": "RYT-PA", "track_type": "Aux", "classification": "Silent", "staged": False, "is_overridden": False, "is_parallel_parked": True, "upstream_tracks": [], "active_inserts": []},
         },
     }
     panel.show_graph(graph, staging_enabled=True)
     assert not panel.reset_all_btn.isEnabled()
-    assert panel.inserts_banner.isVisible() and panel.cycle_banner.isVisible() and panel.excluded_banner.isVisible()
+    assert panel.balance_banner.isVisible() and panel.cycle_banner.isVisible() and panel.excluded_banner.isVisible()
+    assert "active inserts unsimulated" in panel._balance_lbl.text()
+    assert "cBAS (SSL 4K E)" in panel.balance_banner.toolTip()
+    assert "TrackControl" not in panel.balance_banner.toolTip()
     # 0.0 dBFS Master post-fader peak must not fall back to pre-fader -4.0 dB
     assert "Master Peak: 0.0 dB" in panel.footer_label.text()
     assert "cBAS (Trim +4.5 dB, Fader -4.5 dB)" in panel.footer_label.text()
-    # Unsimulated inserts banner skips simulated Slot A TrackControl and reports SSL 4K E
-    assert "cBAS (SSL 4K E)" in panel._inserts_lbl.text()
-    assert "TrackControl" not in panel._inserts_lbl.text()
+    assert panel.path_bar.isVisible() and "Path:" in panel.path_bar.text()
 
-    # Tier header rows are non-selectable; fixed non-zero aux shows its real fader dB and Slot A Trim note
+    # Tier header rows are non-selectable; 9 calculation columns show Slot A Trim, Bus Fader, Net Δ, and Notes
     assert not (panel.table.item(0, 0).flags() & Qt.ItemFlag.ItemIsSelectable)
     row_by_name = {
         panel.table.item(r, 0).text(): r
@@ -275,8 +296,45 @@ def test_signal_flow_panel_states_spinbox_focus_wheel_narrow_and_formatting(qapp
         if panel.table.item(r, 0) is not None
     }
     assert panel.table.item(row_by_name["cKIK"], 5).text() == "-3.5 dB (fixed)"
+    assert "+4.5 dB (TC)" in panel.table.item(row_by_name["cBAS"], 3).text()
+    assert panel.table.item(row_by_name["cBAS"], 7).text() == "0.0 dB \u2713"
     assert "Slot A TrackControl: +4.5 dB" in panel.table.item(row_by_name["cBAS"], 8).text()
     assert "RYT-PA" not in row_by_name
+
+    # _SelectedWhiteTextDelegate forces #ffffff text across all cells when row is selected
+    from PySide6.QtWidgets import QStyle, QStyleOptionViewItem
+    opt = QStyleOptionViewItem()
+    opt.state |= QStyle.StateFlag.State_Selected
+    panel.table.itemDelegate().initStyleOption(opt, panel.table.model().index(row_by_name["cBAS"], 3))
+    assert opt.palette.color(opt.palette.ColorRole.Text).name().lower() == "#ffffff"
+    assert opt.palette.color(opt.palette.ColorRole.HighlightedText).name().lower() == "#ffffff"
+
+    # [Table | Graph] toggle switches views cleanly, claims Space ShortcutOverride, and renders DAG cards
+    space_ovr = QKeyEvent(QEvent.Type.ShortcutOverride, Qt.Key.Key_Space, Qt.KeyboardModifier.NoModifier)
+    assert panel.view_toggle.table_btn.event(space_ovr) is True and space_ovr.isAccepted()
+    panel.view_toggle.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Right, Qt.KeyboardModifier.NoModifier))
+    assert panel.view_stack.currentIndex() == 1
+    assert "cBAS" in panel.graph_view._card_items
+    # _NodeCardItem boundingRect encompasses focus ring (-2.5..+2.5)
+    cbas_card = panel.graph_view._card_items["cBAS"]
+    assert cbas_card.boundingRect().left() <= -3.5 and cbas_card.boundingRect().top() <= -3.5
+    # Graph view claims Space/Escape ShortcutOverride and Escape clears selection + hides path_bar
+    g_space = QKeyEvent(QEvent.Type.ShortcutOverride, Qt.Key.Key_Space, Qt.KeyboardModifier.NoModifier)
+    assert panel.graph_view.view.event(g_space) is True and g_space.isAccepted()
+    panel.graph_view.select_node("MIX 1", emit=True)
+    assert "MIX 1" in panel.path_bar.text()
+    panel.graph_view.view.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Escape, Qt.KeyboardModifier.NoModifier))
+    assert panel._selected_node is None and not panel.path_bar.isVisible()
+    panel.graph_view.zoom_in()
+    assert panel.graph_view.view.zoom_percent() > 100
+    panel.graph_view.zoom_reset()
+    assert panel.graph_view.view.zoom_percent() == 100
+    # Narrow 360 px pane stays valid without clipping
+    panel.resize(360, 640)
+    qapp.processEvents()
+    assert panel.width() == 360
+    panel.view_toggle.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Left, Qt.KeyboardModifier.NoModifier))
+    assert panel.view_stack.currentIndex() == 0
 
     # Unchecking Active path only reveals parked parallel aux
     panel.active_only_cb.setChecked(False)
@@ -299,18 +357,33 @@ def test_signal_flow_panel_states_spinbox_focus_wheel_narrow_and_formatting(qapp
     # Manual override uses scoped #overrideCell tint, enables Reset Overrides, and sets accessible names
     graph["nodes"]["MIX 1"]["is_overridden"] = True
     graph["nodes"]["MIX 1"]["recommended_fader_db"] = -1.0
+    graph["balance_validation"]["status"] = "override_drift"
+    graph["balance_validation"]["summary"] = "Balance shifted by override (MIX 1 +0.9 dB · spread 0.9 dB)"
     panel.show_graph(graph, staging_enabled=True)
     assert panel.reset_all_btn.isEnabled()
+    assert panel._balance_btn is not None and panel._balance_btn.isVisible()
     mix_row = next(r for r in range(panel.table.rowCount()) if panel.table.item(r, 0) and panel.table.item(r, 0).text() == "MIX 1")
     override_cell = panel.table.cellWidget(mix_row, 5)
     assert override_cell is not None and override_cell.objectName() == "overrideCell"
     assert panel._spin_by_bus["MIX 1"].accessibleName() == "MIX 1 target fader (dB)"
+
+    # Blocked Slot A shows red SLOT A BLOCKED row & red balance strip even while Table & Graph remain visible
+    graph["nodes"]["MIX 1"]["slot_a_blocked_error"] = "Insert Slot A is occupied by non-trim plugin 'SSL G-Master'."
+    graph["balance_validation"]["status"] = "blocked"
+    graph["balance_validation"]["summary"] = "Slot A blocked on MIX 1 (1 bus)"
+    panel.show_graph(graph, staging_enabled=True)
+    blk_row = next(r for r in range(panel.table.rowCount()) if panel.table.item(r, 0) and panel.table.item(r, 0).text() == "MIX 1")
+    assert panel.table.item(blk_row, 3).text() == "SLOT A BLOCKED"
+    assert panel.table.item(blk_row, 7).text() == "BLOCKED"
+    graph["nodes"]["MIX 1"].pop("slot_a_blocked_error")
+    graph["balance_validation"]["status"] = "verified"
 
     # Staging disabled -> read-only banner shown, Master stays "(fixed)", eligible bus shows "(staging off)", footer/notes hide staged text
     panel.show_graph(graph, staging_enabled=False)
     assert panel.disabled_banner.isVisible()
     assert not panel.reset_all_btn.isEnabled()
     assert "Staged on Create: none" in panel.footer_label.text()
+    assert "SLOT A TRIM" not in panel.table.item(0, 0).text()
     row_by_name_off = {
         panel.table.item(r, 0).text(): r
         for r in range(panel.table.rowCount())
@@ -404,6 +477,25 @@ def test_daw_controller_protools_tabs_enriched_tree_marker_and_rollback(qapp, tm
     )
     assert bar.is_marked(1) is True
     assert "2 busses staged" in ctrl.page.right_tabs.tabText(1)
+    # Left leaf-balance footer respects gain_mode and stage_bus_faders
+    sf_sample = {
+        "leaf_fader_shift_db": -3.5,
+        "nodes": {
+            "Kick": {"track_type": "Audio", "baked_gain_db": 0.0, "clip_gain_db": -8.0, "recommended_fader_db": 4.5, "post_fader_peak_db": -3.5},
+        },
+    }
+    pt_cfg["protools_gain_mode"] = "clip_gain_and_fader"
+    pt_cfg["protools_stage_bus_faders"] = True
+    ctrl._update_leaf_balance_footer(sf_sample)
+    assert "headroom shift" in ctrl.page.setup_footer_label.text()
+    pt_cfg["protools_stage_bus_faders"] = False
+    ctrl._update_leaf_balance_footer(sf_sample)
+    assert "headroom shift" not in ctrl.page.setup_footer_label.text()
+    pt_cfg["protools_gain_mode"] = "clip_gain_unity"
+    ctrl._update_leaf_balance_footer(sf_sample)
+    assert "Unity-fader mode" in ctrl.page.setup_footer_label.text()
+    pt_cfg["protools_gain_mode"] = "clip_gain_and_fader"
+    pt_cfg["protools_stage_bus_faders"] = True
     # Staging disabled hides staged count & marker dot in tab chrome
     ctrl.signal_flow_ctrl._update_tab_chrome(
         {"recommended_bus_faders": {"KIK": -1.1}, "recommended_slot_a_trims": {"cKIK": 4.5}},
@@ -490,6 +582,17 @@ def test_setup_table_clip_gain_baked_display_and_gain_modes(qapp, tmp_path):
     tbl_ctrl.populate_setup_table()
     assert page.setup_table.item(0, 4).text() == "+6.0 dB"
     assert page.setup_table.item(0, 5).text() == "0.0 dB"
+
+    # Converged leaf_fader_shift_db updates assigned leaf Fader Gain cell + tooltip in clip_gain_and_fader mode
+    pt_cfg["protools_gain_mode"] = "clip_gain_and_fader"
+    state.session.daw_state[state.active_daw_processor.id] = {
+        "assignments": {"Kick.wav": "f1"},
+        "signal_flow": {"leaf_fader_shift_db": -3.5},
+    }
+    tbl_ctrl.populate_setup_table()
+    assert page.setup_table.item(0, 4).text() == "+6.0 dB"
+    assert page.setup_table.item(0, 5).text() == "-9.5 dB"
+    assert "headroom shift" in page.setup_table.item(0, 5).toolTip()
 
 
 def test_signal_flow_controller_async_compute_cancel_overrides_and_stale(qapp, tmp_path, monkeypatch):

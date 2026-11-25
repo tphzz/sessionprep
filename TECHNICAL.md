@@ -220,8 +220,9 @@ The signal path is not a single volume knob. It is a chain:
       |             We counteract the gain change using the Fader.
       |             This restores the Producer's intended balance.
       |             The GUI's DAW Transfer applies these fader offsets
-      |             automatically (Pro Tools via PTSL, DAWproject via file
-      |             generation). sessionprep.json remains for custom workflows.
+      |             automatically (Pro Tools via PTSL + .ptx patching,
+      |             DAWproject via file generation). sessionprep.json remains
+      |             for custom workflows.
       |
 [MIX BUS]
 ```
@@ -237,10 +238,25 @@ shifts the combined level again:
 - A dense drum stem or full mix bus summing many channels can easily exceed
   `-6 dBFS peak` or `0 dBFS` pre-fader, over-driving or clipping bus inserts.
 
+Conceptually, this works a bit like **Automatic Delay Compensation (ADC) for
+static gain structure**: each track and insert-bearing bus gets the pre-insert
+trim its plugins expect (e.g., to reach a target level per bus), paired with an
+inverse post-insert fader so every path from leaf track to Mix Bus accumulates
+the exact same net linear gain. Two key differences from ADC make offline
+host-level execution necessary:
+
+1. **Signed local cancellation:** Unlike latency (which is always positive and
+   must be padded on parallel branches), gain in dB can be inverted locally
+   (`+g` pre-insert, `-g` at the bus fader = `0.0 dB` net per intermediate bus).
+2. **Waveform-dependent summing:** Combined Peak and RMS at a bus depend on
+   actual time-domain waveform overlap and phase, not static per-track metadata,
+   and standard plugins (even ARA2) have neither visibility into the bus DAG nor
+   write access to native Clip Gain and Track/Bus Faders.
+
 For Pro Tools templates, SessionPrep reconstructs the template's directed
 acyclic signal-flow graph (Audio → Routing Folders → Subgroup/Stem Auxes →
-Mix Bus → Master), sums the time-aligned, gain-adjusted audio in topological
-order (respecting Mono/Stereo pan geometry, sends, mutes, and VCAs), and
+Mix Bus → Master), sums the time-aligned, gain-adjusted Main Output audio in
+topological order (respecting Mono/Stereo pan geometry, mutes, and VCAs), and
 applies the same bimodal classification and two-level gain-staging principle
 recursively at each bus stage:
 
@@ -262,13 +278,23 @@ recursively at each bus stage:
 
 Key invariants:
 
-- **Balance preservation across unequal bus depths:** Because every
-  intermediate bus satisfies `slot_a_trim + bus_fader == template_fader` in
-  balance-preserving modes (`clip_gain_and_fader` / `fader_only` / `none`),
+- **Balance preservation across unequal bus depths & headroom convergence:**
+  Because every intermediate bus satisfies
+  `(slot_a_trim - active_template_trim) + (bus_fader - template_fader) == 0`
+  in balance-preserving modes (`clip_gain_and_fader` / `fader_only` / `none`),
   parallel branches of different depths (for example, a direct vocal bus
-  alongside a three-tier `KIK → cKIK → ALLDRM → ALLRYT` drum chain) arrive at
-  the terminal Mix Bus with their exact relative rough-mix levels intact. In
-  `clip_gain_unity` mode, Slot A trims are applied with unity faders.
+  alongside a deeper drum chain) arrive at the terminal Mix Bus with their
+  exact relative rough-mix levels intact. If an intermediate bus would exceed
+  the `+12.0 dB` inverse-fader ceiling, the solver applies a shared global
+  leaf-fader shift (`leaf_fader_shift_db`) equally across all leaf tracks so
+  both headroom and rough-mix balance converge. In `clip_gain_unity` mode,
+  Slot A trims are applied with unity faders.
+- **Known linear-model boundaries:** Active **pre-fader sends** tap after
+  Clip Gain or Slot A Trim and before the inverse fader (flagged explicitly in
+  the Signal Flow balance validator; post-fader sends remain invariant), and
+  active downstream non-trim bus plugins (compressors, saturators, EQs) are
+  not simulated offline — the solver computes linear static gain structure
+  assuming unity pass-through for downstream inserts.
 - **Pure summing folders vs. insert-bearing busses:** Zero-insert summing
   Routing Folders feeding downstream Slot A trim busses remain at `0.0 dB`
   unity; post-terminal serial Mix Busses (e.g. metering/mastering chains) and
@@ -463,7 +489,8 @@ The default mode is analysis-first: it prints a session overview so you can fix
 format issues, clipping, DC offset, correlation concerns, and other problems
 before creating a DAW session. Execute mode (`-x`) is optional: it writes processed
 tracks and exports `sessionprep.json`. In the GUI, fader offsets are applied
-automatically via DAW Transfer (Pro Tools via PTSL, DAWproject via file generation).
+automatically via DAW Transfer (Pro Tools via PTSL + `.ptx` patching,
+DAWproject via file generation).
 
 ### Heuristic limitation
 

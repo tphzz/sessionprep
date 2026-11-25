@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+import math
 from typing import TYPE_CHECKING, Any
 
 from PySide6.QtCore import QObject, QSignalBlocker, Qt, Signal, Slot
@@ -264,15 +265,30 @@ class TrackTableController(QObject):
             from sessionpreplib.daw_processors.protools import ProToolsDawProcessor
 
             assignments: dict[str, str] = {}
+            leaf_shift_db = 0.0
             if session.daw_state and self._state.active_daw_processor:
                 dp_state = session.daw_state.get(self._state.active_daw_processor.id, {})
                 assignments = dp_state.get("assignments", {})
+            else:
+                dp_state = {}
             pt_gain_mode = "clip_gain_and_fader"
             if isinstance(self._state.active_daw_processor, ProToolsDawProcessor):
-                pt_gain_mode = str(self._state.flat_config().get("protools_gain_mode", "clip_gain_and_fader"))
+                flat = self._state.flat_config()
+                pt_gain_mode = str(flat.get("protools_gain_mode", "clip_gain_and_fader"))
+                if pt_gain_mode == "clip_gain_and_fader" and bool(flat.get("protools_stage_bus_faders", True)):
+                    sf = dp_state.get("signal_flow")
+                    if isinstance(sf, dict):
+                        raw_sh = sf.get("leaf_fader_shift_db", 0.0)
+                        try:
+                            sh_f = float(raw_sh) if raw_sh is not None and not isinstance(raw_sh, bool) else 0.0
+                        except (TypeError, ValueError):
+                            sh_f = 0.0
+                        leaf_shift_db = sh_f if math.isfinite(sh_f) else 0.0
 
             for row, entry in enumerate(manifest):
-                self._populate_setup_row(row, entry, out_map, assignments, gcm, gcm_rank, glm, pt_gain_mode)
+                self._populate_setup_row(
+                    row, entry, out_map, assignments, gcm, gcm_rank, glm, pt_gain_mode, leaf_shift_db,
+                )
         finally:
             table.setSortingEnabled(True)
             self.setup_table_populating_changed.emit(False)
@@ -296,6 +312,7 @@ class TrackTableController(QObject):
         gcm_rank: dict[str, int],
         glm: dict[str, bool],
         pt_gain_mode: str = "clip_gain_and_fader",
+        leaf_shift_db: float = 0.0,
     ) -> None:
         table = self._setup_table
         assert table is not None
@@ -328,6 +345,10 @@ class TrackTableController(QObject):
         table.setItem(row, 3, ch_item)
 
         clip_text, clip_val, fader_text, fader_val = self._setup_gain_display(track, pr, pt_gain_mode)
+        shifted_row = assigned and abs(leaf_shift_db) >= 0.05
+        if shifted_row:
+            fader_val = round(max(-144.0, min(12.0, fader_val + leaf_shift_db)), 1)
+            fader_text = self._fmt_signed_db(fader_val)
         cg_item = _SortableItem(clip_text, clip_val)
         cg_item.setFlags(cg_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
         cg_item.setForeground(QColor(COLORS["metadata"] if "(baked)" in clip_text else COLORS["text"]))
@@ -335,7 +356,11 @@ class TrackTableController(QObject):
 
         fg_item = _SortableItem(fader_text, fader_val)
         fg_item.setFlags(fg_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-        fg_item.setForeground(QColor(COLORS["text"]))
+        fg_item.setForeground(QColor(COLORS["information"] if shifted_row else COLORS["text"]))
+        if shifted_row:
+            fg_item.setToolTip(
+                f"Includes {leaf_shift_db:+.1f} dB global leaf headroom shift so downstream busses converge."
+            )
         table.setItem(row, 5, fg_item)
 
         grp = entry.group

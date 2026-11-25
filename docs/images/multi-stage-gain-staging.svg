@@ -1,0 +1,180 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 404" width="1200" height="404" role="img" aria-labelledby="title desc">
+  <title id="title">Recursive Multi-Stage Bimodal Gain Staging</title>
+  <desc id="desc">Signal-flow diagram showing a 4-stage Kick path and a 3-stage Vocal path converging into MIX 1 and Master, with explicit dashed stubs for other summed drum busses and stems. Every box-to-box level is mathematically consistent, every intermediate insert-bearing bus nets 0.0 dB, and both paths accumulate an identical -11.8 dB total gain (0.0 dB relative balance shift).</desc>
+
+  <defs>
+    <marker id="arrBlue" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#4499ff"/>
+    </marker>
+    <marker id="arrTeal" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#44cccc"/>
+    </marker>
+    <marker id="arrGreen" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#44cc44"/>
+    </marker>
+    <marker id="arrMuted" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="5.5" markerHeight="5.5" orient="auto">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#6f7a8a"/>
+    </marker>
+  </defs>
+
+  <!-- Outer Dark Card (looks crisp on both GitHub Light and Dark themes) -->
+  <rect x="1" y="1" width="1198" height="402" rx="10" fill="#1b1d22" stroke="#3a3f4a" stroke-width="1.5"/>
+
+  <!-- Top Header -->
+  <text x="24" y="30" fill="#ffffff" font-family="Segoe UI, Arial, Helvetica, sans-serif" font-size="16" font-weight="700">Recursive Multi-Stage Bimodal Gain Staging</text>
+  <text x="1176" y="30" text-anchor="end" fill="#9aa4b2" font-family="Segoe UI, Arial, Helvetica, sans-serif" font-size="12.5">Unequal bus depths · calibrated inserts at every stage · identical total path gain</text>
+
+  <!-- Column Headers -->
+  <g font-family="Segoe UI, Arial, Helvetica, sans-serif" font-size="10" font-weight="700" fill="#8b95a5" letter-spacing="0.5">
+    <text x="24"   y="58">AUDIO TRACK</text>
+    <text x="200"  y="58">ROUTING FOLDER</text>
+    <text x="364"  y="58">SUBGROUP AUX</text>
+    <text x="580"  y="58">STEM AUX</text>
+    <text x="796"  y="58">TERMINAL MIX BUS</text>
+    <text x="1024" y="58">MASTER</text>
+  </g>
+  <line x1="24" y1="65" x2="1176" y2="65" stroke="#2d323b" stroke-width="1"/>
+
+  <!-- Routing Connectors -->
+  <!-- Kick Path (Blue) -->
+  <path d="M 174 122 L 198 122" fill="none" stroke="#4499ff" stroke-width="2" marker-end="url(#arrBlue)"/>
+  <path d="M 336 122 L 362 122" fill="none" stroke="#4499ff" stroke-width="2" marker-end="url(#arrBlue)"/>
+  <path d="M 552 122 L 578 122" fill="none" stroke="#4499ff" stroke-width="2" marker-end="url(#arrBlue)"/>
+  <path d="M 768 122 C 782 122, 782 158, 795 158" fill="none" stroke="#4499ff" stroke-width="2" marker-end="url(#arrBlue)"/>
+
+  <!-- Explicit dashed stub: + other drums feeding ALLDRM -->
+  <path d="M 556 184 C 566 184, 566 152, 578 152" fill="none" stroke="#6f7a8a" stroke-width="1.4" stroke-dasharray="4 3" marker-end="url(#arrMuted)"/>
+  <text x="556" y="198" fill="#8b95a5" font-family="Segoe UI, Arial, Helvetica, sans-serif" font-size="10" font-style="italic">+ other drums (cSNR, cOH)</text>
+
+  <!-- Vocal Path (Teal) - skips Stem Aux tier -->
+  <path d="M 174 250 L 198 250" fill="none" stroke="#44cccc" stroke-width="2" marker-end="url(#arrTeal)"/>
+  <path d="M 336 250 L 362 250" fill="none" stroke="#44cccc" stroke-width="2" marker-end="url(#arrTeal)"/>
+  <path d="M 552 250 C 668 250, 722 196, 795 196" fill="none" stroke="#44cccc" stroke-width="2" marker-end="url(#arrTeal)"/>
+  <text x="674" y="266" text-anchor="middle" fill="#8b95a5" font-family="Segoe UI, Arial, Helvetica, sans-serif" font-size="10.5" font-style="italic">Direct to Mix Bus (shorter branch)</text>
+
+  <!-- Explicit dashed stub: + other stems feeding MIX 1 -->
+  <path d="M 760 264 C 776 264, 776 218, 795 218" fill="none" stroke="#6f7a8a" stroke-width="1.4" stroke-dasharray="4 3" marker-end="url(#arrMuted)"/>
+  <text x="796" y="268" fill="#8b95a5" font-family="Segoe UI, Arial, Helvetica, sans-serif" font-size="10" font-style="italic">+ other stems (Bass, Synths, FX)</text>
+
+  <!-- MIX 1 -> Master (Green) -->
+  <path d="M 996 184 L 1022 184" fill="none" stroke="#44cc44" stroke-width="2" marker-end="url(#arrGreen)"/>
+
+  <!-- ==================== ROW 1: KICK BRANCH ==================== -->
+  <!-- Kick Leaf -->
+  <g transform="translate(24, 78)">
+    <rect width="150" height="88" rx="6" fill="#22262e" stroke="#4499ff" stroke-width="1.5"/>
+    <text x="10" y="20" fill="#ffffff" font-family="Segoe UI, Arial, Helvetica, sans-serif" font-size="12.5" font-weight="700">Kick</text>
+    <text x="140" y="20" text-anchor="end" fill="#44cc44" font-family="Consolas, Menlo, monospace" font-size="10.5" font-weight="700">Σ -4.0</text>
+    <text x="10" y="38" fill="#d0d7e2" font-family="Consolas, Menlo, monospace" font-size="10.5">Clip Gain: -5.5</text>
+    <text x="10" y="53" fill="#44cc44" font-family="Consolas, Menlo, monospace" font-size="10.5">Ins: -6.0 pk ✓</text>
+    <text x="10" y="68" fill="#d0d7e2" font-family="Consolas, Menlo, monospace" font-size="10.5">Fader:     +1.5</text>
+    <text x="10" y="81" fill="#9aa4b2" font-family="Consolas, Menlo, monospace" font-size="10">Out: -4.5 pk</text>
+  </g>
+
+  <!-- KIK Folder -->
+  <g transform="translate(200, 86)">
+    <rect width="136" height="72" rx="6" fill="#22262e" stroke="#495160" stroke-width="1.3"/>
+    <text x="10" y="20" fill="#ffffff" font-family="Segoe UI, Arial, Helvetica, sans-serif" font-size="12.5" font-weight="700">KIK</text>
+    <text x="126" y="20" text-anchor="end" fill="#44cc44" font-family="Consolas, Menlo, monospace" font-size="10.5" font-weight="700">0.0 ✓</text>
+    <text x="10" y="38" fill="#9aa4b2" font-family="Consolas, Menlo, monospace" font-size="10">Summing (0 ins)</text>
+    <text x="10" y="52" fill="#d0d7e2" font-family="Consolas, Menlo, monospace" font-size="10">In/Out: -4.5 pk</text>
+    <text x="10" y="65" fill="#9aa4b2" font-family="Consolas, Menlo, monospace" font-size="9.5">Fader: 0.0 dB</text>
+  </g>
+
+  <!-- cKIK Subgroup Aux -->
+  <g transform="translate(364, 76)">
+    <rect width="188" height="92" rx="6" fill="#1e2736" stroke="#4499ff" stroke-width="1.5"/>
+    <text x="10" y="20" fill="#ffffff" font-family="Segoe UI, Arial, Helvetica, sans-serif" font-size="12.5" font-weight="700">cKIK</text>
+    <text x="178" y="20" text-anchor="end" fill="#44cc44" font-family="Consolas, Menlo, monospace" font-size="10.5" font-weight="700">Net 0.0 ✓</text>
+    <text x="10" y="38" fill="#ffaa00" font-family="Consolas, Menlo, monospace" font-size="10.5">In:     -4.5 pk</text>
+    <text x="10" y="53" fill="#4499ff" font-family="Consolas, Menlo, monospace" font-size="10.5" font-weight="700">Slot A: -1.5 dB</text>
+    <text x="10" y="68" fill="#44cc44" font-family="Consolas, Menlo, monospace" font-size="10.5">Ins:    -6.0 pk ✓</text>
+    <text x="10" y="83" fill="#d0d7e2" font-family="Consolas, Menlo, monospace" font-size="10.5">Fdr +1.5 → Out -4.5</text>
+  </g>
+
+  <!-- ALLDRM Stem Aux -->
+  <g transform="translate(580, 76)">
+    <rect width="188" height="92" rx="6" fill="#1e2736" stroke="#4499ff" stroke-width="1.5"/>
+    <text x="10" y="20" fill="#ffffff" font-family="Segoe UI, Arial, Helvetica, sans-serif" font-size="12.5" font-weight="700">ALLDRM</text>
+    <text x="178" y="20" text-anchor="end" fill="#44cc44" font-family="Consolas, Menlo, monospace" font-size="10.5" font-weight="700">Net 0.0 ✓</text>
+    <text x="10" y="38" fill="#ffaa00" font-family="Consolas, Menlo, monospace" font-size="10.5">In:     -1.8 pk</text>
+    <text x="10" y="53" fill="#4499ff" font-family="Consolas, Menlo, monospace" font-size="10.5" font-weight="700">Slot A: -4.2 dB</text>
+    <text x="10" y="68" fill="#44cc44" font-family="Consolas, Menlo, monospace" font-size="10.5">Ins:    -6.0 pk ✓</text>
+    <text x="10" y="83" fill="#d0d7e2" font-family="Consolas, Menlo, monospace" font-size="10.5">Fdr +4.2 → Out -1.8</text>
+  </g>
+
+  <!-- ==================== ROW 2: VOCAL BRANCH ==================== -->
+  <!-- Vocal Leaf -->
+  <g transform="translate(24, 206)">
+    <rect width="150" height="88" rx="6" fill="#22262e" stroke="#44cccc" stroke-width="1.5"/>
+    <text x="10" y="20" fill="#ffffff" font-family="Segoe UI, Arial, Helvetica, sans-serif" font-size="12.5" font-weight="700">Vocal</text>
+    <text x="140" y="20" text-anchor="end" fill="#44cc44" font-family="Consolas, Menlo, monospace" font-size="10.5" font-weight="700">Σ -4.0</text>
+    <text x="10" y="38" fill="#d0d7e2" font-family="Consolas, Menlo, monospace" font-size="10.5">Clip Gain: -7.0</text>
+    <text x="10" y="53" fill="#44cc44" font-family="Consolas, Menlo, monospace" font-size="10.5">Ins: -18.0 RMS ✓</text>
+    <text x="10" y="68" fill="#d0d7e2" font-family="Consolas, Menlo, monospace" font-size="10.5">Fader:     +3.0</text>
+    <text x="10" y="81" fill="#9aa4b2" font-family="Consolas, Menlo, monospace" font-size="10">Out: -15.0 RMS</text>
+  </g>
+
+  <!-- VOX Folder -->
+  <g transform="translate(200, 214)">
+    <rect width="136" height="72" rx="6" fill="#22262e" stroke="#495160" stroke-width="1.3"/>
+    <text x="10" y="20" fill="#ffffff" font-family="Segoe UI, Arial, Helvetica, sans-serif" font-size="12.5" font-weight="700">VOX</text>
+    <text x="126" y="20" text-anchor="end" fill="#44cc44" font-family="Consolas, Menlo, monospace" font-size="10.5" font-weight="700">0.0 ✓</text>
+    <text x="10" y="38" fill="#9aa4b2" font-family="Consolas, Menlo, monospace" font-size="10">Summing (0 ins)</text>
+    <text x="10" y="52" fill="#d0d7e2" font-family="Consolas, Menlo, monospace" font-size="10">In/Out: -15.0 RMS</text>
+    <text x="10" y="65" fill="#9aa4b2" font-family="Consolas, Menlo, monospace" font-size="9.5">Fader: 0.0 dB</text>
+  </g>
+
+  <!-- cVOX Subgroup Aux -->
+  <g transform="translate(364, 204)">
+    <rect width="188" height="92" rx="6" fill="#1c2b2e" stroke="#44cccc" stroke-width="1.5"/>
+    <text x="10" y="20" fill="#ffffff" font-family="Segoe UI, Arial, Helvetica, sans-serif" font-size="12.5" font-weight="700">cVOX</text>
+    <text x="178" y="20" text-anchor="end" fill="#44cc44" font-family="Consolas, Menlo, monospace" font-size="10.5" font-weight="700">Net 0.0 ✓</text>
+    <text x="10" y="38" fill="#ffaa00" font-family="Consolas, Menlo, monospace" font-size="10.5">In:     -15.0 RMS</text>
+    <text x="10" y="53" fill="#44cccc" font-family="Consolas, Menlo, monospace" font-size="10.5" font-weight="700">Slot A: -3.0 dB</text>
+    <text x="10" y="68" fill="#44cc44" font-family="Consolas, Menlo, monospace" font-size="10.5">Ins:    -18.0 RMS ✓</text>
+    <text x="10" y="83" fill="#d0d7e2" font-family="Consolas, Menlo, monospace" font-size="10.5">Fdr +3.0 → Out -15.0</text>
+  </g>
+
+  <!-- ==================== CONVERGENCE: MIX 1 & MASTER ==================== -->
+  <!-- MIX 1 -->
+  <g transform="translate(796, 134)">
+    <rect width="200" height="100" rx="6" fill="#1d2c3a" stroke="#4499ff" stroke-width="1.8"/>
+    <text x="10" y="21" fill="#ffffff" font-family="Segoe UI, Arial, Helvetica, sans-serif" font-size="13" font-weight="700">MIX 1</text>
+    <text x="190" y="21" text-anchor="end" fill="#4499ff" font-family="Consolas, Menlo, monospace" font-size="10.5" font-weight="700">TERMINAL</text>
+    <text x="10" y="40" fill="#ff6666" font-family="Consolas, Menlo, monospace" font-size="10.5" font-weight="700">In:     +1.8 pk (hot)</text>
+    <text x="10" y="56" fill="#4499ff" font-family="Consolas, Menlo, monospace" font-size="10.5" font-weight="700">Slot A: -7.8 dB (auto)</text>
+    <text x="10" y="72" fill="#44cc44" font-family="Consolas, Menlo, monospace" font-size="10.5">Ins:    -6.0 / -18.0 ✓</text>
+    <text x="10" y="88" fill="#d0d7e2" font-family="Consolas, Menlo, monospace" font-size="10.5">Fader:  0.0 dB (unity)</text>
+  </g>
+
+  <!-- Master -->
+  <g transform="translate(1024, 142)">
+    <rect width="152" height="84" rx="6" fill="#1b2b20" stroke="#44cc44" stroke-width="1.6"/>
+    <text x="10" y="21" fill="#ffffff" font-family="Segoe UI, Arial, Helvetica, sans-serif" font-size="13" font-weight="700">Master</text>
+    <text x="142" y="21" text-anchor="end" fill="#44cc44" font-family="Consolas, Menlo, monospace" font-size="10.5" font-weight="700">OK ✓</text>
+    <text x="10" y="43" fill="#44cc44" font-family="Consolas, Menlo, monospace" font-size="10.5" font-weight="700">Peak: -6.0 dBFS</text>
+    <text x="10" y="59" fill="#d0d7e2" font-family="Consolas, Menlo, monospace" font-size="10.5">RMS:  -18.0 dBFS</text>
+    <text x="10" y="74" fill="#9aa4b2" font-family="Consolas, Menlo, monospace" font-size="10">Fader: 0.0 dB</text>
+  </g>
+
+  <!-- Bottom Mathematical Proof Bar -->
+  <g transform="translate(24, 318)">
+    <rect width="1152" height="66" rx="6" fill="#14171c" stroke="#2f3744" stroke-width="1.2"/>
+    <rect x="0" y="0" width="4" height="66" rx="2" fill="#44cc44"/>
+
+    <text x="16" y="25" fill="#4499ff" font-family="Consolas, Menlo, monospace" font-size="11.5" font-weight="700">Kick  (4 stages):</text>
+    <text x="150" y="25" fill="#d8dee9" font-family="Consolas, Menlo, monospace" font-size="11.5">(-5.5 + 1.5) + 0.0 [KIK] + (-1.5 + 1.5) [cKIK] + (-4.2 + 4.2) [ALLDRM]</text>
+    <text x="698" y="25" fill="#d8dee9" font-family="Consolas, Menlo, monospace" font-size="11.5">+ (-7.8) [MIX 1]  =</text>
+    <text x="862" y="25" fill="#44cc44" font-family="Consolas, Menlo, monospace" font-size="12" font-weight="700">-11.8 dB</text>
+
+    <text x="16" y="49" fill="#44cccc" font-family="Consolas, Menlo, monospace" font-size="11.5" font-weight="700">Vocal (3 stages):</text>
+    <text x="150" y="49" fill="#d8dee9" font-family="Consolas, Menlo, monospace" font-size="11.5">(-7.0 + 3.0) + 0.0 [VOX] + (-3.0 + 3.0) [cVOX]</text>
+    <text x="698" y="49" fill="#d8dee9" font-family="Consolas, Menlo, monospace" font-size="11.5">+ (-7.8) [MIX 1]  =</text>
+    <text x="862" y="49" fill="#44cc44" font-family="Consolas, Menlo, monospace" font-size="12" font-weight="700">-11.8 dB</text>
+
+    <rect x="970" y="13" width="166" height="40" rx="4" fill="#1b2b20" stroke="#44cc44" stroke-width="1"/>
+    <text x="1053" y="30" text-anchor="middle" fill="#44cc44" font-family="Segoe UI, Arial, Helvetica, sans-serif" font-size="10.5" font-weight="700">BALANCE INVARIANT</text>
+    <text x="1053" y="46" text-anchor="middle" fill="#ffffff" font-family="Consolas, Menlo, monospace" font-size="11.5" font-weight="700">0.0 dB shift ✓</text>
+  </g>
+</svg>

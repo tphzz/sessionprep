@@ -98,6 +98,8 @@ class DawTransferController(QObject):
         p.edit_config_btn.clicked.connect(self.edit_protools_config_requested.emit)
         p.signal_flow_panel.edit_config_requested.connect(self.edit_protools_config_requested.emit)
         p.open_log_btn.clicked.connect(self.open_log_viewer_requested.emit)
+        self.signal_flow_ctrl.signal_flow_updated.connect(self._on_signal_flow_updated)
+        self._last_leaf_shift_db: float = 0.0
 
     # ── Lifecycle & workspace clearing ───────────────────────────────────
 
@@ -112,6 +114,8 @@ class DawTransferController(QObject):
         self.page.setup_table.setRowCount(0)
         self.page.folder_tree.clear()
         self.page.clear_rollback_notice()
+        self.page.set_leaf_balance_summary("")
+        self._last_leaf_shift_db = 0.0
         self.page.edit_config_btn.setEnabled(False)
         self.signal_flow_ctrl.clear_workspace()
         self.page.right_stack.setCurrentIndex(_SETUP_RIGHT_PLACEHOLDER)
@@ -147,13 +151,61 @@ class DawTransferController(QObject):
             "group_type": str(flat.get("protools_group_type", "Mix/Edit")),
             "stage_bus_faders": bool(flat.get("protools_stage_bus_faders", True)),
             "pan_law_db": float(flat.get("protools_pan_law_db", -3.0)),
+            "remove_unused_aux_tracks": bool(flat.get("protools_remove_unused_aux_tracks", True)),
         }
+
+    @Slot(object)
+    def _on_signal_flow_updated(self, graph_dict: dict[str, Any] | None) -> None:
+        opts = self._protools_ptx_options()
+        can_shift = opts["gain_mode"] == "clip_gain_and_fader" and opts["stage_bus_faders"]
+        raw_shift = (graph_dict or {}).get("leaf_fader_shift_db", 0.0) if (can_shift and isinstance(graph_dict, dict)) else 0.0
+        shift = float(raw_shift) if isinstance(raw_shift, (int, float)) and not isinstance(raw_shift, bool) else 0.0
+        if abs(shift - self._last_leaf_shift_db) >= 0.05:
+            self._last_leaf_shift_db = shift
+            self.setup_table_refresh_requested.emit()
+        self._update_leaf_balance_footer(graph_dict)
+
+    def _update_leaf_balance_footer(self, graph_dict: dict[str, Any] | None) -> None:
+        if self.signal_flow_ctrl.active_protools_processor() is None or not isinstance(graph_dict, dict):
+            self.page.set_leaf_balance_summary("")
+            return
+        opts = self._protools_ptx_options()
+        nodes = graph_dict.get("nodes") or {}
+        leaf_sums: list[float] = []
+        for n in nodes.values():
+            if not isinstance(n, dict) or n.get("track_type") not in ("Audio", "Instrument"):
+                continue
+            if n.get("post_fader_peak_db") is None or n.get("is_muted") or n.get("is_inactive") or n.get("is_parallel_parked"):
+                continue
+            bk = float(n.get("baked_gain_db") or 0.0)
+            cg = float(n.get("clip_gain_db") or 0.0)
+            fd = float(n.get("recommended_fader_db") or 0.0)
+            leaf_sums.append(round(bk + cg + fd, 1))
+        if not leaf_sums:
+            self.page.set_leaf_balance_summary("")
+            return
+        spread = round(max(leaf_sums) - min(leaf_sums), 1)
+        const_sum = sorted(leaf_sums)[len(leaf_sums) // 2]
+        can_shift = opts["gain_mode"] == "clip_gain_and_fader" and opts["stage_bus_faders"]
+        shift = float(graph_dict.get("leaf_fader_shift_db") or 0.0) if can_shift else 0.0
+        sum_txt = "0.0 dB" if abs(const_sum) < 0.05 else f"{const_sum:+.1f} dB"
+        if opts["gain_mode"] == "clip_gain_unity":
+            self.page.set_leaf_balance_summary(f"Unity-fader mode: {len(leaf_sums)} active tracks (per-track Clip Gain, 0.0 dB faders)", shifted=False)
+        elif spread > 0.2:
+            self.page.set_leaf_balance_summary(f"Leaf balance spread: \u00b1{spread:.1f} dB across {len(leaf_sums)} active tracks", shifted=False)
+        elif abs(shift) >= 0.05:
+            self.page.set_leaf_balance_summary(
+                f"Leaf balance: all {len(leaf_sums)} tracks sum to {sum_txt} (includes {shift:+.1f} dB headroom shift)", shifted=True,
+            )
+        else:
+            self.page.set_leaf_balance_summary(f"Leaf balance: all {len(leaf_sums)} tracks sum to {sum_txt} (\u00b1{spread:.1f} dB)", shifted=False)
 
     def sync_protools_ui_mode(self) -> None:
         is_pt = self.signal_flow_ctrl.active_protools_processor() is not None
         self.page.set_protools_mode(is_pt)
         self.page.edit_config_btn.setEnabled(self._state.session is not None)
         if not is_pt:
+            self.page.set_leaf_balance_summary("")
             return
         opts = self._protools_ptx_options()
         route_s = "On" if opts["auto_route"] else "Off"

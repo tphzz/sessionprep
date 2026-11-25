@@ -695,3 +695,40 @@ def test_orphan_aux_cleanup_subpath_hw_input_cycle_vca_cascade_and_emptied_folde
     assert "cSUB" not in aux_names and "HW_AUX" not in aux_names
     assert vca_names == {"DEAD-AUX-VCA"} and "KIK-VCA" not in vca_names
     assert folder_names == {"DEAD", "DEAD_BOX", "DEAD_RF"}
+
+
+def test_run_post_close_ptx_enhancement_applies_converged_leaf_fader_shift(tmp_path, monkeypatch):
+    from sessionpreplib.ptx import SignalFlowGraph, SignalFlowNode
+
+    raw = _build_nested_folder_ptx(folder_has_input=True)
+    ptx = PtxSession.from_bytes(raw)
+    audio_trk = next(t for t in ptx.tracks if t.track_type == "Audio")
+    ptx_path = tmp_path / "Converged.ptx"
+    ptx_path.write_bytes(raw)
+
+    wav = tmp_path / "Audio1.wav"
+    sf.write(wav, np.zeros(1024, dtype=np.float32), 48000, subtype="PCM_24")
+    tc = TrackContext("Audio1.wav", str(wav), None, 48000, 1, 1024, "24", "PCM_24", 1024 / 48000)
+    staging = protools_ptx.ProToolsTrackStaging(str(wav), clip_gain_db=-6.0, fader_db=2.0, baked_gain_db=0.0)
+    sess = SessionContext(tracks=[tc], output_tracks=[tc], config={}, project_name="Converged")
+
+    fake_graph = SignalFlowGraph(
+        samplerate=48000, target_peak_db=-6.0, target_rms_db=-18.0, pan_law_db=-3.0,
+        nodes={
+            audio_trk.name: SignalFlowNode(
+                track_name=audio_trk.name, track_type="Audio", format="Mono",
+                clip_gain_db=-6.0, recommended_fader_db=-3.5,
+            ),
+        },
+        leaf_fader_shift_db=-5.5,
+    )
+    monkeypatch.setattr(protools_ptx, "build_annotated_signal_flow", lambda *_a, **_kw: fake_graph)
+
+    _orig, meta, graph = protools_ptx.run_post_close_ptx_enhancement(
+        ptx_path, sess, [(audio_trk.name, audio_trk.uuid_braced, staging, tc)],
+        gain_mode=protools_ptx.GAIN_MODE_CLIP_AND_FADER, auto_group_folders=False, stage_bus_faders=True,
+    )
+    assert graph is fake_graph
+    assert meta["volumes"][audio_trk.name]["target_db"] == pytest.approx(-3.5, abs=0.1)
+    re_ptx = PtxSession.from_file(ptx_path)
+    assert re_ptx.track_by_name(audio_trk.name).volume_db == pytest.approx(-3.5, abs=0.1)

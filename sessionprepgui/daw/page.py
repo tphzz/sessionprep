@@ -82,8 +82,9 @@ class DawSetupPage(QWidget):
 
         self.splitter = content_splitter()
         self.setup_table = self._build_setup_table()
+        self.left_pane = self._build_left_pane()
         self.right_stack = self._build_right_stack()
-        self.splitter.addWidget(self.setup_table)
+        self.splitter.addWidget(self.left_pane)
         self.splitter.addWidget(self.right_stack)
         self.splitter.setStretchFactor(0, 1)
         self.splitter.setStretchFactor(1, 1)
@@ -201,6 +202,36 @@ class DawSetupPage(QWidget):
         sh.resizeSection(5, 90)
         sh.resizeSection(6, 110)
         return table
+
+    def _build_left_pane(self) -> QWidget:
+        pane = QWidget()
+        lay = QVBoxLayout(pane)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+        lay.addWidget(self.setup_table, 1)
+        self.setup_footer_label = QLabel("")
+        self.setup_footer_label.setObjectName("setupLeafBalanceFooter")
+        self.setup_footer_label.setStyleSheet(
+            f"QLabel#setupLeafBalanceFooter {{ background-color: {COLORS['surface']}; "
+            f"border-top: 1px solid {COLORS['accent']}; color: {COLORS['metadata']}; padding: 4px 8px; }}"
+        )
+        self.setup_footer_label.setWordWrap(True)
+        self.setup_footer_label.hide()
+        lay.addWidget(self.setup_footer_label)
+        return pane
+
+    def set_leaf_balance_summary(self, text: str, *, shifted: bool = False) -> None:
+        if not text:
+            self.setup_footer_label.hide()
+            self.setup_footer_label.setText("")
+            return
+        col = COLORS["information"] if shifted else COLORS["metadata"]
+        self.setup_footer_label.setStyleSheet(
+            f"QLabel#setupLeafBalanceFooter {{ background-color: {COLORS['surface']}; "
+            f"border-top: 1px solid {COLORS['accent']}; color: {col}; padding: 4px 8px; }}"
+        )
+        self.setup_footer_label.setText(text)
+        self.setup_footer_label.show()
 
     def _build_right_stack(self) -> QStackedWidget:
         stack = QStackedWidget()
