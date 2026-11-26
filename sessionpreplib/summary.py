@@ -243,7 +243,12 @@ def _collect_track_basic_findings(
         dc_r = t.detector_results.get("dc_offset")
         if dc_r and dc_r.data.get("dc_warn"):
             dc_db = dc_r.data.get("dc_db", float(-np.inf))
-            detail = f"DC offset {dc_db + offset:.1f} dBFS" if np.isfinite(dc_db) else "DC offset issue"
+            # AES17 offset applies to RMS only; DC offset stays unshifted dBFS.
+            detail = (
+                f"DC offset {float(dc_db):.1f} dBFS"
+                if isinstance(dc_db, (int, float)) and np.isfinite(dc_db)
+                else "DC offset issue"
+            )
             acc.add_item(lists["dc_offset"], t.filename, detail)
             issue_names.add(t.filename)
     if not acc.is_skipped("stereo_compat"):
@@ -367,10 +372,12 @@ def _build_overview(
         if not (t.detector_results.get("silence") or DetectorResult("", Severity.CLEAN, "", {})).data.get("is_silent", False)
     ]
 
-    def _metric(track: TrackContext, key: str) -> float:
-        cr = track.detector_results.get("audio_classifier")
-        val = cr.data.get(key, float(-np.inf)) if cr else float(-np.inf)
-        return val + offset if np.isfinite(val) else val
+    def _metric(track: TrackContext, key: str, apply_offset: bool) -> float:
+        pr = track.processor_results.get("bimodal_normalize")
+        val = pr.data.get(key) if pr else None
+        if not isinstance(val, (int, float)) or isinstance(val, bool) or not np.isfinite(val):
+            return float(-np.inf)
+        return float(val) + offset if apply_offset else float(val)
 
     overview: dict[str, Any] = {
         "total_ok": len(ok_tracks),
@@ -379,8 +386,11 @@ def _build_overview(
         "most_common_len": most_common_len,
         "most_common_len_fmt": most_common_len_fmt,
     }
-    for key, prefix in (("peak_db", "peak"), ("rms_anchor_db", "rms")):
-        scored = [(t, _metric(t, key)) for t in non_silent]
+    for key, prefix, apply_off in (
+        ("detected_peak_db", "peak", False),
+        ("detected_rms_db", "rms", True),
+    ):
+        scored = [(t, _metric(t, key, apply_off)) for t in non_silent]
         scored = [(t, v) for t, v in scored if np.isfinite(v)]
         if scored:
             vals = [v for _, v in scored]

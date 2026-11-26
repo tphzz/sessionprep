@@ -102,9 +102,10 @@ def test_verified_tail_ending_on_the_final_sample_survives_reopening(tmp_path):
     assert restored.corrected_analysis is not None
     assert restored.corrected_analysis.key == track.corrected_analysis.key
     for source_track in (track, restored):
-        for results in (source_track.detector_results, source_track.corrected_analysis.results):
-            spans = [(issue.sample_start, issue.sample_end) for issue in results["tail_exceedance"].issues]
-            assert spans == [(155280, len(samples) - 1)]
+        orig_spans = [(i.sample_start, i.sample_end) for i in source_track.detector_results["tail_exceedance"].issues]
+        corr_spans = [(i.sample_start, i.sample_end) for i in source_track.corrected_analysis.results["tail_exceedance"].issues]
+        assert orig_spans == [(155246, len(samples) - 1)]
+        assert corr_spans == [(155243, len(samples) - 1)]
 
 
 @pytest.mark.parametrize("detector_id", ["clipping", "dual_mono"])

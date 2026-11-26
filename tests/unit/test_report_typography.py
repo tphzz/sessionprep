@@ -298,8 +298,8 @@ def test_track_detail_and_report_fragments_use_relative_typography():
         verbose=True,
     )
     _assert_no_fixed_report_typography(proc_html)
-    # Chosen state is named in text; normalization uses no status colours.
-    assert "Chosen" in proc_html
+    # Governing state is named in text; normalization uses no status colours.
+    assert "Governs" in proc_html
     assert "#44cc44" not in proc_html and "#cc8844" not in proc_html
 
 

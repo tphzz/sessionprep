@@ -430,7 +430,7 @@ class SessionPersistenceController(QObject):
         )
         since_saved = infer_session_overrides(effective, data.get("session_config"))
         impact = classify_structured_config_change(resolve_session_config(effective, since_saved), effective)
-        analysis_changed = impact.requires_phase1 or impact.requires_phase2
+        analysis_changed = impact.requires_phase1 or impact.requires_phase2 or bool(data.get("migrated_from_v7"))
         if prepare_state == "ready" and (analysis_changed or repair_defaults_changed):
             prepare_state = "stale"
 
@@ -485,7 +485,12 @@ class SessionPersistenceController(QObject):
         self._table_ctrl.auto_fit_track_table()
 
         ok_count = sum(1 for t in session.tracks if t.status == "OK")
-        hint = "" if session.transfer_manifest else " — run Prepare to enable Session Setup"
+        if data.get("migrated_from_v7"):
+            hint = " — migrated to Peak-Capped RMS (Reanalyze recommended)"
+        elif not session.transfer_manifest:
+            hint = " — run Prepare to enable Session Setup"
+        else:
+            hint = ""
         self._shell.show_status(f"Session loaded: {ok_count}/{len(session.tracks)} tracks OK{hint}")
         self._shell.set_window_title("SessionPrep")
         self.start_peak_build(source_tracks, source_dir, (session.tracks, self._state.topology_dir))

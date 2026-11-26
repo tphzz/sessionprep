@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import time as _time
 
-from PySide6.QtCore import Qt, QItemSelectionModel, QTimer, Signal, QPoint
+from PySide6.QtCore import Qt, QItemSelectionModel, QLocale, QTimer, Signal, QPoint
 from PySide6.QtGui import QBrush, QColor, QPainter, QPalette, QTextDocument
 from PySide6.QtWidgets import (
     QApplication,
@@ -411,6 +411,7 @@ class TableCellDoubleSpinBox(QDoubleSpinBox):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setLocale(QLocale.c())
         self.setFocusPolicy(Qt.ClickFocus)
         self.setProperty("tableNumericEditor", True)
 

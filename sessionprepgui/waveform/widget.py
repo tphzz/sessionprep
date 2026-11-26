@@ -48,6 +48,8 @@ class WaveformWidget(QWidget):
         self._show_rms_avg: bool = False
         self._enabled_overlays: set[str] = set()
         self._show_markers: bool = False
+        self._governing_peak_sample: int = -1
+        self._governing_peak_db: float | None = None
         # Loading / display state
         self._loading: bool = False
         self._display_mode: str = "waveform"
@@ -106,6 +108,8 @@ class WaveformWidget(QWidget):
         self._view_end = self._total_samples
         self._vscale = 1.0
         self._issues = []
+        self._governing_peak_sample = -1
+        self._governing_peak_db = None
         self._rms_window_samples = 0
         self._wf_renderer.set_track_data(
             self._channels,
@@ -171,6 +175,8 @@ class WaveformWidget(QWidget):
         self._loading = False
         self._channels = []
         self._num_channels = self._total_samples = 0
+        self._governing_peak_sample = -1
+        self._governing_peak_db = None
         self._wf_renderer.reset()
         self._spec_renderer.set_spec_data(None)
         self._invalidate_bg()
@@ -263,6 +269,26 @@ class WaveformWidget(QWidget):
     def set_issues(self, issues: list):
         """Set the list of IssueLocation objects to overlay on the waveform."""
         self._issues = list(issues)
+
+    def set_governing_peak(self, sample_index: int | None, peak_db: float | None = None) -> None:
+        """Set or clear the Peak-Capped RMS governing-peak vertical marker."""
+        self._governing_peak_sample = int(sample_index) if sample_index is not None and sample_index >= 0 else -1
+        self._governing_peak_db = peak_db
+        self.update()
+
+    def center_on_sample(self, sample_index: int) -> None:
+        """Scroll the viewport if needed so *sample_index* is visible."""
+        if self._total_samples <= 0:
+            return
+        pos = max(0, min(int(sample_index), self._total_samples - 1))
+        view_len = self._view_end - self._view_start
+        if view_len < self._total_samples and not (self._view_start <= pos < self._view_end):
+            new_start = max(0, min(pos - view_len // 2, self._total_samples - view_len))
+            self._view_start = new_start
+            self._view_end = min(self._total_samples, new_start + view_len)
+            self._wf_renderer.invalidate()
+            self._invalidate_bg()
+
     def _invalidate_bg(self):
         """Invalidate the static background render cache."""
         self._bg_pixmap = None
@@ -404,10 +430,29 @@ class WaveformWidget(QWidget):
         painter.setRenderHint(QPainter.Antialiasing, True)
         x0, draw_w = self._draw_area()
         draw_h = h - self._MARGIN_BOTTOM
+        self._paint_governing_peak(painter, x0, draw_w, draw_h)
         self._paint_playback_cursor(painter, x0, draw_w, draw_h)
         if self._mouse_y >= 0:
             self._paint_mouse_crosshair(painter, w, x0, draw_w, draw_h)
         painter.end()
+
+    def _paint_governing_peak(self, painter: QPainter, x0: int, draw_w: int, draw_h: float) -> None:
+        if self._total_samples <= 0 or self._governing_peak_sample < 0:
+            return
+        if not (self._view_start <= self._governing_peak_sample <= self._view_end):
+            return
+        px = x0 + self._sample_to_x(self._governing_peak_sample, draw_w)
+        if not (x0 <= px <= x0 + draw_w):
+            return
+        color = QColor("#cc77ff")
+        painter.setPen(QPen(color, 1, Qt.DashLine))
+        painter.drawLine(px, 0, px, int(draw_h))
+        painter.setFont(QFont("Consolas", 7, QFont.Bold))
+        painter.setPen(color)
+        label = "Peak"
+        lw = painter.fontMetrics().horizontalAdvance(label)
+        lx = px + 3 if px + 3 + lw <= x0 + draw_w else px - 3 - lw
+        painter.drawText(int(lx), 12, label)
 
     def _paint_playback_cursor(self, painter: QPainter, x0: int, draw_w: int, draw_h: float) -> None:
         if self._total_samples <= 0:
@@ -556,8 +601,13 @@ class WaveformWidget(QWidget):
         view_len = self._view_end - self._view_start
         tolerance = int(view_len / max(draw_w, 1) * 5)
         tips: list[str] = []
+        _MARKER_PX_TOL = 6
+        if self._governing_peak_sample >= 0:
+            gp_px = x0 + self._sample_to_x(self._governing_peak_sample, draw_w)
+            if abs(mx - gp_px) <= _MARKER_PX_TOL:
+                pk_s = f"{self._governing_peak_db:.1f} dBFS" if self._governing_peak_db is not None else ""
+                tips.append(f"Governing peak: {pk_s}".strip())
         if self._display_mode == "waveform":
-            _MARKER_PX_TOL = 6
             if self._show_markers and self._wf_renderer.peak_sample >= 0:
                 peak_px = x0 + self._sample_to_x(self._wf_renderer.peak_sample, draw_w)
                 if abs(mx - peak_px) <= _MARKER_PX_TOL:

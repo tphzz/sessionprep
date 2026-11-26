@@ -1,4 +1,4 @@
-"""Analytic envelope, PCM and fader oracles for the normalization plan."""
+"""Analytic envelope, PCM and fader oracles for the Peak-Capped RMS normalization plan."""
 
 import html
 import json
@@ -9,22 +9,24 @@ import numpy as np
 import pytest
 import soundfile as sf
 
-from sessionpreplib.audio import load_track
+from sessionpreplib.audio import load_track, resolve_rms_anchor
 from sessionpreplib.daw_processor import resolve_transfer_audio
-from sessionpreplib.detectors import AudioClassifierDetector, SilenceDetector
+from sessionpreplib.detectors import SilenceDetector
 from sessionpreplib.models import SessionContext, TrackContext
 from sessionpreplib.pipeline import Pipeline
 from sessionpreplib.processors.bimodal_normalize import BimodalNormalizeProcessor
 from sessionpreplib.reports import save_json
 
 
-def classify(samples, rate, **settings):
-    track = TrackContext("Bass_01.wav", "", audio_data=samples, samplerate=rate,
-                         channels=1, total_samples=len(samples), duration_sec=len(samples) / rate,
-                         bitdepth="64-bit float", subtype="DOUBLE")
-    detector = AudioClassifierDetector()
-    detector.configure(settings)
-    return detector.analyze(track).data
+def _evaluate(samples, rate, filename="Bass_01.wav", **settings):
+    track = TrackContext(
+        filename, "", audio_data=samples, samplerate=rate,
+        channels=1, total_samples=len(samples), duration_sec=len(samples) / rate,
+        bitdepth="64-bit float", subtype="DOUBLE",
+    )
+    proc = BimodalNormalizeProcessor()
+    proc.configure(settings)
+    return proc.process(track)
 
 
 @pytest.mark.parametrize("trim_db", [-6, -7])
@@ -40,127 +42,79 @@ def test_held_pcm_note_keeps_rms_normalization_across_input_trims(tmp_path, trim
     rms = np.sqrt(np.mean(source[480:960]**2))
     gain = 10**(-18 / 20) / rms
     track = load_track(str(path))
-    pipeline = Pipeline([SilenceDetector(), AudioClassifierDetector()], [BimodalNormalizeProcessor()])
+    pipeline = Pipeline([SilenceDetector()], [BimodalNormalizeProcessor()])
     session = SessionContext([track], {})
     pipeline.analyze_phase1(session)
     pipeline.analyze_phase2(session)
     pipeline.plan(session)
-    metrics = track.detector_results["audio_classifier"].data
-    assert metrics["classification"] == "Sustained"
-    assert abs(metrics["decay_db"]) < 0.001
+    result = track.processor_results["bimodal_normalize"]
+    assert result.classification == "Auto (RMS)"
+    assert result.data["governing"] == "RMS"
     pipeline.execute(session, str(tmp_path / "printed"))
     printed, _ = sf.read(tmp_path / "printed" / path.name)
     np.testing.assert_allclose(printed, source * gain, atol=2**-23, rtol=0)
     assert 20 * np.log10(max(abs(printed))) == pytest.approx(-18 + 10 * np.log10(2), abs=.0001)
 
 
-def test_decay_of_a_louder_late_burst_into_silence_has_a_measurement_limit():
-    samples = np.zeros(3000)
-    samples[:1000] = 0.25
-    samples[1600:1700] = 0.26
-    samples[::2] *= -1
-    metrics = classify(samples, 2000)
-    assert metrics["decay_at_floor"]
-    assert metrics["decay_db"] == 120
+def test_post_repair_signal_determines_peak_capped_rms_gain_and_report(tmp_path):
+    from sessionpreplib.repairs import render_corrected
 
-
-@pytest.mark.parametrize("classifier_enabled", [True, False])
-def test_verbose_decay_uses_the_signal_that_determined_gain(tmp_path, classifier_enabled):
     rate = 48000
     samples = np.zeros(rate)
-    samples[2400:8160] = 0.25
+    samples[2400:8160] = 0.25  # unipolar pulse with significant DC mean
     path = tmp_path / "Pulse.wav"
     sf.write(path, samples, rate, subtype="PCM_24")
     track = load_track(str(path))
     track.repair_overrides["dc_remove"] = True
-    config = {"audio_classifier_enabled": classifier_enabled}
     proc = BimodalNormalizeProcessor()
-    pipeline = Pipeline([SilenceDetector(), AudioClassifierDetector()], [proc], config)
-    session = SessionContext([track], config)
+    pipeline = Pipeline([SilenceDetector()], [proc], {})
+    session = SessionContext([track], {})
     pipeline.analyze_phase1(session)
     pipeline.analyze_phase2(session)
     pipeline.plan(session)
     result = track.processor_results[proc.id]
-    assert result.classification == "Sustained"
-    assert track.detector_results["audio_classifier"].data["decay_at_floor"]
-    assert "Decay 8.2 dB" in proc.render_html(result, track, verbose=True)
+    corrected = render_corrected(track.audio_data, rate, track.repair_recipe)
+    expected_peak_db = 20 * math.log10(float(np.max(np.abs(corrected))))
+    raw_rms_db = 20 * math.log10(0.25)
+    assert result.data["detected_peak_db"] == pytest.approx(expected_peak_db, abs=0.01)
+    # DC removal alters the pulse body RMS substantially relative to the unipolar raw pulse
+    assert result.data["detected_rms_db"] < raw_rms_db - 1.0
+    rendered = html.unescape(re.sub("<[^>]*>", " ", proc.render_html(result, track, verbose=True))).replace("−", "-")
+    assert f"{result.data['detected_rms_db']:.1f} dBFS" in rendered
 
 
-@pytest.mark.parametrize("shape,padding,expected", [
-    ("attack", 0, "Sustained"), ("attack", 4, "Transient"),
-    ("flat", 4, "Sustained"), ("burst", 0, "Transient"),
+@pytest.mark.parametrize("force_peak,filename,expected_mode", [
+    ("kick|snare", "Kick_01.wav", "Peak"),
+    ("kick|snare", "SNARE_TOP.wav", "Peak"),
+    ("kick|snare", "Bass_01.wav", "Auto"),
+    ("", "Kick_01.wav", "Auto"),
 ])
-def test_classifier_votes_on_measured_envelopes(shape, padding, expected):
-    rate = 2000
-    signal = np.full(rate, 1 / 16)
-    if shape == "attack":
-        signal[rate // 4] = 0.5
-    elif shape == "burst":
-        signal[:rate // 10] = 0.5
-    signal[::2] *= -1
-    signal = np.pad(signal, padding * rate)
-    result = classify(signal, rate)
-
-    # Direct window sums use exact binary samples; no detector/cache helpers.
-    power = signal ** 2
-    momentary = np.convolve(power, np.ones(800), mode="valid") / 800
-    env = np.convolve(power, np.ones(20), mode="valid") / 20
-    peak_frame = int(env.argmax())
-    tail = env[peak_frame + 301:peak_frame + 401]
-    expected_decay = 10 * math.log10(env.max() / np.median(tail))
-    expected_crest = 10 * math.log10(power.max() / momentary.max())
-    density = np.mean(momentary >= momentary.max() * 1e-4)
-    assert result["crest"] == pytest.approx(expected_crest, abs=1e-10)
-    assert result["decay_db"] == pytest.approx(expected_decay, abs=1e-10)
-    assert result["density"] == pytest.approx(density, abs=1e-10)
-    assert result["classification"] == expected
-    if shape == "attack" and padding:
-        # Density must be strictly below its configured threshold.
-        assert classify(signal, rate, sparse_density_threshold=density)["classification"] == "Sustained"
-
-
-@pytest.mark.parametrize("force_transient,force_sustained,expected", [
-    (["bass"], ["Bass_01.wav$"], "Transient (Forced)"),
-    ([], ["BASS_??.wav"], "Sustained (Forced)"),
-    (["bass_01$"], [], "Transient (Forced)"),
-    (["bass_0$"], ["snare"], "Sustained"),
-])
-def test_classifier_filename_override_precedence(force_transient, force_sustained, expected):
+def test_force_peak_regex_override(force_peak, filename, expected_mode):
     samples = np.tile([0.125, -0.125], 1000)
-    result = classify(samples, 2000, force_transient=force_transient, force_sustained=force_sustained)
-    assert result["classification"] == expected
+    result = _evaluate(samples, 2000, filename=filename, force_peak=force_peak)
+    assert result.data["mode"] == expected_mode
+    if expected_mode == "Peak":
+        assert result.data["governing"] == "Peak"
+        assert result.classification == "Peak"
+        assert result.gain_db == pytest.approx(-6.0 - 20 * math.log10(0.125), abs=0.01)
+    else:
+        assert result.data["governing"] == "RMS"
+        assert result.classification == "Auto (RMS)"
 
 
 def test_rms_window_at_the_relative_gate_is_included():
     samples = np.tile([0.5, -0.25, 0.125], 100)
     width_db = 10 * np.log10(0.5**2) - 10 * np.log10(0.25**2)
-    equal = classify(samples, 1000, window=1, gate_relative_db=width_db, rms_percentile=25)
-    above = classify(samples, 1000, window=1, gate_relative_db=width_db - 1e-8, rms_percentile=25)
-    assert equal["density"] == pytest.approx(2 / 3)
-    assert above["density"] == pytest.approx(1 / 3)
-    assert equal["rms_anchor_db"] == pytest.approx(20 * np.log10(0.25))
-    assert above["rms_anchor_db"] == pytest.approx(20 * np.log10(0.5))
-
-
-@pytest.mark.parametrize("metric", ["crest", "decay"])
-def test_dynamic_vote_requires_strictly_exceeding_the_threshold(metric):
-    rate = 2000
-    signal = np.full(rate, 1 / 16)
-    if metric == "crest":
-        signal[rate // 4] = 0.5
-        signal = np.pad(signal, 4 * rate)
-        window_power = (0.5**2 + 799 * (1 / 16)**2) / 800
-        threshold = 20 * np.log10(0.5) - 20 * np.log10(math.sqrt(window_power))
-        key = "crest_threshold"
-    else:
-        signal[:rate // 10] = 0.5
-        threshold = 10 * np.log10(0.5**2) - 10 * np.log10((1 / 16)**2)
-        key = "decay_db_threshold"
-    signal[::2] *= -1
-    equal = classify(signal, rate, **{key: threshold})
-    below = classify(signal, rate, **{key: np.nextafter(threshold, -math.inf)})
-    assert equal["classification"] == "Sustained"
-    assert below["classification"] == "Transient"
+    t_eq = TrackContext("eq.wav", "", audio_data=samples, samplerate=1000, channels=1,
+                        total_samples=len(samples), bitdepth="64-bit float", subtype="DOUBLE",
+                        duration_sec=len(samples) / 1000)
+    t_ab = TrackContext("ab.wav", "", audio_data=samples, samplerate=1000, channels=1,
+                        total_samples=len(samples), bitdepth="64-bit float", subtype="DOUBLE",
+                        duration_sec=len(samples) / 1000)
+    eq = resolve_rms_anchor(t_eq, window_ms=1, stereo_mode="avg", gate_relative_db=width_db, rms_anchor_mode="percentile", rms_percentile=25.0)
+    ab = resolve_rms_anchor(t_ab, window_ms=1, stereo_mode="avg", gate_relative_db=width_db - 1e-8, rms_anchor_mode="percentile", rms_percentile=25.0)
+    assert eq["rms_anchor_db"] == pytest.approx(20 * np.log10(0.25))
+    assert ab["rms_anchor_db"] == pytest.approx(20 * np.log10(0.5))
 
 
 @pytest.mark.parametrize("rate", [16000, 44100, 48000])
@@ -177,18 +131,18 @@ def test_percussion_backbeat_and_sustained_bass_phrase(rate):
     hit = np.exp(-beat / 0.029) * (noise + 0.25 * np.sin(2 * np.pi * 185 * beat))
     for tick, accent in ((1, 0.8), (3, 1.0)):
         snare[tick * len(beat):(tick + 1) * len(beat)] = hit * accent
-    assert classify(snare, rate)["classification"] == "Transient"
-    assert classify(bass, rate)["classification"] == "Sustained"
+    assert _evaluate(snare, rate).data["governing"] == "Peak"
+    assert _evaluate(bass, rate).data["governing"] == "RMS"
 
 
-@pytest.mark.parametrize("stereo_mode,anchor,classification,high,convention", [
-    ("avg", "percentile", "Sustained", 0.25, "standard"),
-    ("sum", "percentile", "Sustained", 0.25, "aes17"),
-    ("avg", "max", "Sustained", 0.25, "aes17"),
-    ("sum", "max", "Transient", 0.25, "standard"),
-    ("avg", "percentile", "Sustained", 0.875, "aes17"),
+@pytest.mark.parametrize("stereo_mode,anchor,override,high,convention", [
+    ("avg", "percentile", None, 0.25, "standard"),
+    ("sum", "percentile", None, 0.25, "aes17"),
+    ("avg", "max", None, 0.25, "aes17"),
+    ("sum", "max", "Peak", 0.25, "standard"),
+    ("avg", "percentile", None, 0.875, "aes17"),
 ])
-def test_reported_target_gain_and_decoded_stereo_pcm(tmp_path, stereo_mode, anchor, classification,
+def test_reported_target_gain_and_decoded_stereo_pcm(tmp_path, stereo_mode, anchor, override,
                                                     high, convention):
     envelope = np.repeat([0.125, high], [900, 100])
     envelope[::2] *= -1
@@ -196,11 +150,11 @@ def test_reported_target_gain_and_decoded_stereo_pcm(tmp_path, stereo_mode, anch
     source = tmp_path / "Keys.wav"
     sf.write(source, original, 1000, subtype="PCM_24")
     track = load_track(str(source))
-    track.classification_override = classification
+    track.classification_override = override
     config = dict(window=1, rms_anchor=anchor, rms_percentile=75, stereo_mode=stereo_mode,
                   dbfs_convention=convention, target_rms=-18.0, target_peak=-6.0, fader_headroom_db=0)
     processor = BimodalNormalizeProcessor()
-    pipeline = Pipeline([SilenceDetector(), AudioClassifierDetector()], [processor], config, max_workers=1)
+    pipeline = Pipeline([SilenceDetector()], [processor], config, max_workers=1)
     session = SessionContext([track], config)
     pipeline.analyze_phase1(session)
     pipeline.analyze_phase2(session)
@@ -210,7 +164,7 @@ def test_reported_target_gain_and_decoded_stereo_pcm(tmp_path, stereo_mode, anch
     rms = 20 * math.log10(amplitude) + (10 * math.log10(2) if stereo_mode == "sum" else 0)
     peak_gain = -6.0 - 20 * math.log10(high)
     rms_gain = -18.0 - rms
-    use_peak = classification == "Transient" or peak_gain < rms_gain
+    use_peak = override == "Peak" or (override is None and peak_gain < rms_gain)
     gain = peak_gain if use_peak else rms_gain
     assert result.data["detected_rms_db"] == pytest.approx(rms)
     assert result.gain_db == pytest.approx(gain)
@@ -224,10 +178,13 @@ def test_reported_target_gain_and_decoded_stereo_pcm(tmp_path, stereo_mode, anch
     assert receipt["gain_applied_db"] == pytest.approx(gain, abs=0.005)
     assert receipt["fader_db"] == pytest.approx(-gain, abs=0.005)
 
-    display_offset = 10 * math.log10(2) if convention == "aes17" else 0.0
-    expected_target = (-6 if use_peak else -18) + display_offset
+    # Under AES17, ONLY RMS shifts by +3.01 dB; sample peak stays unshifted.
+    rms_offset = 10 * math.log10(2) if convention == "aes17" else 0.0
     summary = html.unescape(re.sub("<[^>]*>", " ", processor.render_html(result))).replace("−", "-")
-    assert f"→ {expected_target:.1f} dBFS" in summary
+    expected_peak = 20 * math.log10(high) + gain
+    expected_rms = rms + gain + rms_offset
+    assert f"peak {expected_peak:.1f} dBFS" in summary
+    assert f"RMS {expected_rms:.1f} dBFS" in summary
 
 
 def test_linked_and_bypassed_tracks_reach_receipts_and_manifest_with_one_headroom_shift(tmp_path):
@@ -245,7 +202,7 @@ def test_linked_and_bypassed_tracks_reach_receipts_and_manifest_with_one_headroo
         track.manual_gain_db = manual
         tracks.append(track)
     tracks[3].processor_skip.add("bimodal_normalize")
-    pipeline = Pipeline([SilenceDetector(), AudioClassifierDetector()], [BimodalNormalizeProcessor()],
+    pipeline = Pipeline([SilenceDetector()], [BimodalNormalizeProcessor()],
                         config, max_workers=1)
     session = SessionContext(tracks, config)
     pipeline.analyze_phase1(session)
@@ -277,7 +234,7 @@ def test_linked_and_bypassed_tracks_reach_receipts_and_manifest_with_one_headroo
 
     # Raising the -4 dB Room anchor to unity raises Snare from +3 to +7,
     # above the DAW's +6 dB maximum. The planner preserves relative balance.
-    anchor_pipeline = Pipeline([SilenceDetector(), AudioClassifierDetector()], [BimodalNormalizeProcessor()],
+    anchor_pipeline = Pipeline([SilenceDetector()], [BimodalNormalizeProcessor()],
                                dict(config, anchor="room l"), max_workers=1)
     anchor_pipeline.plan(session, preserve_selections={track.filename for track in tracks})
     faders = [t.processor_results["bimodal_normalize"].data["fader_offset"] for t in tracks]

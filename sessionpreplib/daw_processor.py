@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from .audio import INACTIVE_NORMALIZATION_CLASSIFICATIONS
 from dataclasses import dataclass
 import math
 import os
@@ -77,7 +78,7 @@ def _legacy_fader_db(session: SessionContext, track: TrackContext) -> float:
             or proc_id in track.processor_skip or proc_id in source.processor_skip):
         return 0.0
     result = track.processor_results.get(proc_id) or source.processor_results.get(proc_id)
-    if result is None or result.error or result.classification in ("Skip", "Silent"):
+    if result is None or result.error or result.classification in INACTIVE_NORMALIZATION_CLASSIFICATIONS:
         return 0.0
     return result.data.get("fader_offset", 0.0)
 

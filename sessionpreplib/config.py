@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
 
+from .audio import legacy_patterns_to_regex, migrate_legacy_override as migrate_legacy_override
 from .models import ConfigError as ConfigError, ParamSpec
 from .paths import (
     DEFAULT_STEREO_WINDOW_MS as DEFAULT_STEREO_WINDOW_MS,
@@ -95,8 +97,6 @@ def default_config() -> dict[str, Any]:
         for spec in component.config_params():
             cfg[spec.key] = deepcopy(spec.default)
     cfg.update({
-        "force_transient": [],
-        "force_sustained": [],
         "group": [],
         "anchor": None,
         "execute": False,
@@ -110,12 +110,11 @@ def default_config() -> dict[str, Any]:
 
 
 def merge_configs(*configs: dict[str, Any]) -> dict[str, Any]:
+    """Merge multiple config dicts left-to-right (later overrides earlier).
+
+    List values (``group``) are concatenated.
     """
-    Merge multiple config dicts left-to-right.
-    Later values override earlier ones.
-    List values (force_transient, force_sustained, group) are concatenated.
-    """
-    _LIST_KEYS = {"force_transient", "force_sustained", "group"}
+    _LIST_KEYS = {"group"}
     result: dict[str, Any] = {}
     for cfg in configs:
         for k, v in cfg.items():
@@ -131,9 +130,61 @@ def merge_configs(*configs: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+_RETIRED_FLAT_KEYS = frozenset({
+    "audio_classifier_enabled",
+    "crest_threshold",
+    "decay_lookahead_ms",
+    "decay_db_threshold",
+    "sparse_density_threshold",
+    "force_sustained",
+})
+
+
+def migrate_legacy_config(raw: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    """Migrate retired 3-metric classifier keys in flat or structured config dicts."""
+    cfg = deepcopy(raw)
+    notices: list[str] = []
+
+    if isinstance(cfg.get("detectors"), dict) and "audio_classifier" in cfg["detectors"]:
+        cfg["detectors"].pop("audio_classifier", None)
+        notices.append("Removed retired 'detectors.audio_classifier' configuration.")
+
+    procs = cfg.get("processors")
+    if isinstance(procs, dict) and isinstance(procs.get("bimodal_normalize"), dict):
+        bn = procs["bimodal_normalize"]
+        if "force_transient" in bn:
+            pattern = legacy_patterns_to_regex(bn.pop("force_transient"))
+            if pattern and not bn.get("force_peak"):
+                bn["force_peak"] = pattern
+            notices.append(f"Migrated legacy 'processors.bimodal_normalize.force_transient' to 'force_peak' = {pattern!r}.")
+        for retired in ("force_sustained", "crest_threshold"):
+            if retired in bn:
+                bn.pop(retired, None)
+                notices.append(f"Removed retired key 'processors.bimodal_normalize.{retired}'.")
+
+    if "force_transient" in cfg:
+        ft = cfg.pop("force_transient")
+        pattern = legacy_patterns_to_regex(ft)
+        if pattern:
+            if isinstance(procs, dict):
+                bn = procs.setdefault("bimodal_normalize", {})
+                if isinstance(bn, dict) and not bn.get("force_peak"):
+                    bn["force_peak"] = pattern
+            elif not cfg.get("force_peak"):
+                cfg["force_peak"] = pattern
+            notices.append(f"Migrated legacy 'force_transient' to 'force_peak' = {pattern!r}.")
+
+    for key in sorted(_RETIRED_FLAT_KEYS):
+        if key in cfg:
+            cfg.pop(key, None)
+            notices.append(f"Removed retired key '{key}'.")
+
+    return cfg, notices
+
+
 def load_preset(path: str) -> dict[str, Any]:
     """
-    Load a JSON preset file. Returns a partial config dict.
+    Load a JSON preset file. Returns a partial config dict (migrated if legacy).
     Raises ConfigError if the file cannot be read or parsed.
     """
     if not os.path.isfile(path):
@@ -155,7 +206,8 @@ def load_preset(path: str) -> dict[str, Any]:
     preset = {
         k: v for k, v in data.items() if k not in ("schema_version", "_description")
     }
-    return preset
+    migrated, _ = migrate_legacy_config(preset)
+    return migrated
 
 
 def save_preset(
@@ -196,7 +248,7 @@ ANALYSIS_PARAMS: list[ParamSpec] = [
         default=400,
         min=1,
         label="RMS window size (ms)",
-        description="Momentary-loudness window used for RMS analysis.",
+        description="Unweighted RMS analysis window length in milliseconds.",
     ),
     ParamSpec(
         key="stereo_mode",
@@ -260,10 +312,11 @@ ANALYSIS_PARAMS: list[ParamSpec] = [
         type=str,
         default="standard",
         choices=["standard", "aes17"],
+        presentation_only=True,
         label="dBFS convention",
         description=(
             "Standard: 0 dBFS = full-scale digital. "
-            "AES17: 0 dBFS = RMS of a full-scale sine (+3.01 dB offset)."
+            "AES17: +3.01 dB offset applied to RMS readouts/targets only (sample peaks stay unshifted)."
         ),
     ),
     # -- Global processing defaults ------------------------------------------
@@ -430,13 +483,52 @@ def _all_param_specs() -> list[ParamSpec]:
     return specs
 
 
+def _validate_normalization_invariants(
+    values: dict[str, Any],
+    *,
+    prefix: str = "",
+) -> list[ConfigFieldError]:
+    """Check cross-field Peak-Capped RMS invariants (target_rms <= target_peak, valid regex)."""
+    errors: list[ConfigFieldError] = []
+    t_rms = values.get("target_rms")
+    t_peak = values.get("target_peak")
+    if (
+        isinstance(t_rms, (int, float)) and not isinstance(t_rms, bool)
+        and isinstance(t_peak, (int, float)) and not isinstance(t_peak, bool)
+        and math.isfinite(float(t_rms)) and math.isfinite(float(t_peak))
+        and float(t_rms) > float(t_peak)
+    ):
+        errors.append(
+            ConfigFieldError(
+                f"{prefix}target_rms",
+                t_rms,
+                f"Target RMS ({t_rms} dBFS) must not exceed Peak ceiling ({t_peak} dBFS).",
+            )
+        )
+    pattern = values.get("force_peak")
+    if isinstance(pattern, str) and pattern.strip():
+        try:
+            re.compile(pattern)
+        except re.error as exc:
+            errors.append(
+                ConfigFieldError(
+                    f"{prefix}force_peak",
+                    pattern,
+                    f"Force peak pattern is not a valid regular expression: {exc}.",
+                )
+            )
+    return errors
+
+
 def validate_config_fields(config: dict[str, Any]) -> list[ConfigFieldError]:
     """Validate a **flat** config dict against all known :class:`ParamSpec`
     definitions (analysis + every detector + every processor).
 
     Returns structured errors.  Never raises.
     """
-    return validate_param_values(_all_param_specs(), config)
+    errors = validate_param_values(_all_param_specs(), config)
+    errors.extend(_validate_normalization_invariants(config))
+    return errors
 
 
 def validate_config(config: dict[str, Any]) -> None:
@@ -536,6 +628,13 @@ def strip_presentation_keys(structured: dict[str, Any]) -> dict[str, Any]:
             pres_keys[("processors", proc.id)] = keys
 
     stripped = copy.deepcopy(structured)
+    for spec in ANALYSIS_PARAMS:
+        if spec.presentation_only and isinstance(stripped.get("analysis"), dict):
+            stripped["analysis"].pop(spec.key, None)
+    if isinstance(stripped.get("presentation"), dict):
+        for spec in PRESENTATION_PARAMS:
+            if spec.presentation_only:
+                stripped["presentation"].pop(spec.key, None)
     for (section_type, comp_id), keys in pres_keys.items():
         section = stripped.get(section_type, {}).get(comp_id)
         if isinstance(section, dict):
@@ -707,84 +806,46 @@ def _validate_daw_templates(dp_id: str, section: dict[str, Any]) -> list[ConfigF
     return errors
 
 
+def _prefix_errors(prefix: str, errs: list[ConfigFieldError]) -> list[ConfigFieldError]:
+    return [ConfigFieldError(f"{prefix}.{e.key}", e.value, e.message) for e in errs]
+
+
 def validate_structured_config(
     structured: dict[str, Any],
 ) -> list[ConfigFieldError]:
-    """Validate a structured config dict section by section.
-
-    Returns a flat list of :class:`ConfigFieldError` (with the ``key``
-    prefixed by the section for disambiguation, e.g. ``"detectors.clipping.clip_consecutive"``).
-    """
+    """Validate a structured config dict section by section."""
     from .detectors import default_detectors
     from .processors import default_processors
     from .daw_processors import default_daw_processors
 
-    errors: list[ConfigFieldError] = []
-
-    # Analysis section
-    errors.extend(
-        validate_param_values(
-            ANALYSIS_PARAMS,
-            structured.get("analysis", {}),
-        )
+    errors: list[ConfigFieldError] = validate_param_values(
+        ANALYSIS_PARAMS, structured.get("analysis", {}),
     )
-
-    # Detector sections
     det_map = {d.id: d for d in default_detectors()}
-    det_sections = structured.get("detectors", {})
-    for det_id, section in det_sections.items():
+    for det_id, section in structured.get("detectors", {}).items():
         det = det_map.get(det_id)
-        if det is None or not isinstance(section, dict):
-            continue
-        for err in validate_param_values(det.config_params(), section):
-            errors.append(
-                ConfigFieldError(
-                    f"detectors.{det_id}.{err.key}",
-                    err.value,
-                    err.message,
-                )
-            )
+        if det is not None and isinstance(section, dict):
+            errors.extend(_prefix_errors(f"detectors.{det_id}", validate_param_values(det.config_params(), section)))
 
-    # Processor sections
     proc_map = {p.id: p for p in default_processors()}
-    proc_sections = structured.get("processors", {})
-    for proc_id, section in proc_sections.items():
-        proc = proc_map.get(proc_id)
-        if proc_id == "corrective":
-            if not isinstance(section, dict):
-                continue
-            specs = REPAIR_PARAMS
-        else:
-            if proc is None or not isinstance(section, dict):
-                continue
-            specs = proc.config_params()
-        for err in validate_param_values(specs, section):
-            errors.append(
-                ConfigFieldError(
-                    f"processors.{proc_id}.{err.key}",
-                    err.value,
-                    err.message,
-                )
-            )
+    for proc_id, section in structured.get("processors", {}).items():
+        if not isinstance(section, dict):
+            continue
+        specs = REPAIR_PARAMS if proc_id == "corrective" else (proc_map[proc_id].config_params() if proc_id in proc_map else None)
+        if specs is None:
+            continue
+        errors.extend(_prefix_errors(f"processors.{proc_id}", validate_param_values(specs, section)))
+        if proc_id == "bimodal_normalize":
+            errors.extend(_validate_normalization_invariants(section, prefix="processors.bimodal_normalize."))
 
-    # DAW Processor sections
     dp_map = {dp.id: dp for dp in default_daw_processors()}
-    dp_sections = structured.get("daw_processors", {})
-    for dp_id, section in dp_sections.items():
+    for dp_id, section in structured.get("daw_processors", {}).items():
         dp = dp_map.get(dp_id)
         if dp is None or not isinstance(section, dict):
             continue
         if dp_id in ("protools", "dawproject"):
             errors.extend(_validate_daw_templates(dp_id, section))
-        for err in validate_param_values(dp.config_params(), section):
-            errors.append(
-                ConfigFieldError(
-                    f"daw_processors.{dp_id}.{err.key}",
-                    err.value,
-                    err.message,
-                )
-            )
-
+        errors.extend(_prefix_errors(f"daw_processors.{dp_id}", validate_param_values(dp.config_params(), section)))
     return errors
 
 

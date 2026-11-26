@@ -5,7 +5,7 @@ import numpy as np
 from ..models import ParamSpec
 from ..detector import TrackDetector
 from ..models import DetectorResult, IssueLocation, Severity, TrackContext
-from ..audio import dbfs_offset, linear_to_db, is_silent
+from ..audio import linear_to_db, is_silent
 
 
 class DCOffsetDetector(TrackDetector):
@@ -44,7 +44,6 @@ class DCOffsetDetector(TrackDetector):
     def configure(self, config):
         super().configure(config)
         self.warn_db = config.get("dc_offset_warn_db", -40.0)
-        self._db_offset = dbfs_offset(config)
 
     def analyze(self, track: TrackContext) -> DetectorResult:
         if is_silent(track):
@@ -61,14 +60,13 @@ class DCOffsetDetector(TrackDetector):
         dc_linear = float(np.max(np.abs(means), initial=0))
         dc_db = linear_to_db(dc_linear)
         dc_warn = bool(np.isfinite(dc_db) and dc_db > self.warn_db)
-        dc_db_display = dc_db + self._db_offset
         evidence = {"dc_db": dc_db, "dc_warn": dc_warn, "signed_dc": means.tolist()}
 
         if dc_warn:
             return DetectorResult(
                 detector_id=self.id,
                 severity=Severity.ATTENTION,
-                summary=f"DC offset {dc_db_display:.1f} dBFS",
+                summary=f"DC offset {dc_db:.1f} dBFS",
                 data=evidence,
                 hint="consider DC removal",
                 issues=[IssueLocation(
@@ -77,7 +75,7 @@ class DCOffsetDetector(TrackDetector):
                     channel=None,
                     severity=Severity.ATTENTION,
                     label="dc_offset",
-                    description=f"DC offset {dc_db_display:.1f} dBFS",
+                    description=f"DC offset {dc_db:.1f} dBFS",
                 )],
             )
 

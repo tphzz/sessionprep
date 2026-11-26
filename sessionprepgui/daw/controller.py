@@ -195,10 +195,14 @@ class DawTransferController(QObject):
             self.page.set_leaf_balance_summary(f"Leaf balance spread: \u00b1{spread:.1f} dB across {len(leaf_sums)} active tracks", shifted=False)
         elif abs(shift) >= 0.05:
             self.page.set_leaf_balance_summary(
-                f"Leaf balance: all {len(leaf_sums)} tracks sum to {sum_txt} (includes {shift:+.1f} dB headroom shift)", shifted=True,
+                f"Leaf balance: each of {len(leaf_sums)} tracks nets {sum_txt} (clip gain + fader; includes {shift:+.1f} dB headroom shift)",
+                shifted=True,
             )
         else:
-            self.page.set_leaf_balance_summary(f"Leaf balance: all {len(leaf_sums)} tracks sum to {sum_txt} (\u00b1{spread:.1f} dB)", shifted=False)
+            self.page.set_leaf_balance_summary(
+                f"Leaf balance: each of {len(leaf_sums)} tracks nets {sum_txt} (clip gain + fader; \u00b1{spread:.1f} dB)",
+                shifted=False,
+            )
 
     def sync_protools_ui_mode(self) -> None:
         is_pt = self.signal_flow_ctrl.active_protools_processor() is not None

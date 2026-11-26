@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import fnmatch
 import math
 import os
+import re
 import sys
 from bisect import bisect_right
 from hashlib import file_digest, sha256
@@ -10,7 +12,7 @@ from typing import Any
 import numpy as np
 import soundfile as sf
 from scipy import fft
-from scipy.signal import ZoomFFT, stft as scipy_stft
+from scipy.signal import ZoomFFT, resample_poly, stft as scipy_stft
 
 from .models import TrackContext
 from .paths import DEFAULT_STEREO_WINDOW_MS
@@ -25,7 +27,103 @@ AUDIO_EXTENSIONS = ('.wav', '.aif', '.aiff')
 # Conversion helpers
 # ---------------------------------------------------------------------------
 
-AES17_OFFSET = 3.0103  # dB offset: 20 * log10(sqrt(2))
+AES17_OFFSET = 10.0 * math.log10(2.0)  # dB offset: 20 * log10(sqrt(2)) ≈ 3.010299956639812
+NOISE_FLOOR_PEAK_DB = -70.0
+TIE_BREAK_EPS_DB = 1e-9
+INACTIVE_NORMALIZATION_CLASSIFICATIONS = frozenset(
+    {"Skip", "Silent", "Noise Floor", "Error", "Unknown"}
+)
+
+
+def migrate_legacy_override(value: str | None) -> str | None:
+    """Map legacy v7 classification_override values to Peak-Capped RMS modes.
+
+    ``"Transient"`` -> ``"Peak"``, ``"Sustained"`` -> ``None`` (Auto),
+    ``"Skip"`` -> ``"Skip"``; current modes ``"Peak"``, ``"RMS"``, ``None`` pass through.
+    """
+    if value is None or value == "" or value == "Auto":
+        return None
+    if value == "Transient":
+        return "Peak"
+    if value == "Sustained":
+        return None
+    if value in ("Peak", "RMS", "Skip"):
+        return value
+    return None
+
+
+def legacy_patterns_to_regex(raw: str | list[str] | None) -> str:
+    """Translate legacy substring/glob/suffix tokens into a single regex string."""
+    if not raw:
+        return ""
+    if isinstance(raw, str):
+        return raw.strip()
+    parts: list[str] = []
+    for item in raw:
+        tok = str(item).strip()
+        if not tok:
+            continue
+        if "*" in tok or "?" in tok:
+            translated = fnmatch.translate(tok)
+            parts.append(rf"\A{translated}" if not translated.startswith(r"\A") else translated)
+        elif tok.endswith("$") and len(tok) > 1:
+            parts.append(rf"\A{re.escape(tok[:-1])}(?:\.(?:wav|aiff?))?\Z")
+        else:
+            parts.append(re.escape(tok))
+    return "|".join(parts)
+
+
+def parse_rms_anchor_override(
+    override: str | None,
+    default_mode: str = "percentile",
+    default_percentile: float = 95.0,
+) -> tuple[str, float]:
+    """Safely resolve a per-track ``rms_anchor_override`` string to ``(mode, percentile)``."""
+    if not isinstance(override, str) or not override.strip():
+        return default_mode, float(default_percentile)
+    token = override.strip().lower()
+    if token == "max":
+        return "max", float(default_percentile)
+    if token.startswith("p") and len(token) > 1:
+        try:
+            pct = float(token[1:])
+        except ValueError:
+            return default_mode, float(default_percentile)
+        if math.isfinite(pct) and 0.0 < pct <= 100.0:
+            return "percentile", pct
+    return default_mode, float(default_percentile)
+
+
+def compute_peak_capped_gain(
+    peak_db: float,
+    rms_db: float,
+    target_peak_db: float,
+    target_rms_db: float,
+    *,
+    max_gain_db: float = 24.0,
+    mode: str = "Auto",
+) -> tuple[str, float, bool]:
+    """Pure Peak-Capped RMS gain decision shared by track and bus staging.
+
+    Returns ``(governing, clamped_gain_db, boost_clamped)`` where *governing* is
+    ``"Peak"``, ``"RMS"``, ``"NoiseFloor"``, or ``"Silent"``.
+    """
+    if not math.isfinite(peak_db):
+        return "Silent", 0.0, False
+    if peak_db <= NOISE_FLOOR_PEAK_DB or (mode != "Peak" and not math.isfinite(rms_db)):
+        return "NoiseFloor", 0.0, False
+    g_pk = target_peak_db - peak_db
+    g_rms = target_rms_db - rms_db if math.isfinite(rms_db) else g_pk
+    if mode == "Peak":
+        governing, raw = "Peak", g_pk
+    elif mode == "RMS":
+        governing, raw = "RMS", g_rms
+    elif g_pk <= g_rms + TIE_BREAK_EPS_DB:
+        governing, raw = "Peak", g_pk
+    else:
+        governing, raw = "RMS", g_rms
+    cap = float(max_gain_db)
+    return governing, min(raw, cap), raw > cap
 
 
 def db_to_linear(db: float) -> float:
@@ -270,39 +368,54 @@ def max_momentary_rms(prefixes: list[np.ndarray], window: int) -> tuple[int, flo
     return start + window // 2, 20 * np.log10(rms) if rms else float("-inf"), rms
 
 
+def block_window_sums(power: np.ndarray, window_samples: int) -> np.ndarray:
+    """Sliding window sums via block-wise suffix+prefix accumulation (no cumsum cancellation)."""
+    if window_samples < 1:
+        raise ValueError(f"window_samples must be >= 1, got {window_samples}")
+    if len(power) <= window_samples:
+        return np.array([float(np.sum(power, dtype=np.float64))], dtype=np.float64)
+    count = len(power) - window_samples + 1
+    out = np.empty(count, dtype=np.float64)
+    batch = window_samples * max(1, 65536 // window_samples)
+    for start in range(0, count, batch):
+        chunk = power[start:start + batch + window_samples]
+        padding = -len(chunk) % window_samples
+        blocks = (np.pad(chunk, (0, padding)) if padding else chunk).reshape(-1, window_samples)
+        sums = np.cumsum(blocks[:, ::-1], axis=1, dtype=np.float64)[:, ::-1]
+        sums[:-1, 1:] += np.cumsum(blocks[1:, :-1], axis=1, dtype=np.float64)
+        end = min(start + batch, count)
+        out[start:end] = sums.ravel()[:end - start]
+    return out
+
+
 def get_rms_window_means(
     track: TrackContext,
     window_ms: int,
     stereo_mode: str,
 ) -> np.ndarray:
-    """
-    Momentary RMS window means via sliding-window cumsum.
-    Cached on track._cache.
-    """
+    """Momentary unweighted RMS window means via cancellation-free block sums. Cached."""
     key = f"rms_window_means_{window_ms}_{stereo_mode}"
     if key not in track._cache:
         data = track.audio_data
         assert data is not None
         samplerate = track.samplerate
 
-        if data.ndim > 1 and data.shape[1] > 1:
+        f64 = np.asarray(data, dtype=np.float64)
+        if f64.ndim > 1 and f64.shape[1] > 1:
             if stereo_mode == "sum":
-                squared = np.sum(data.astype(np.float64) ** 2, axis=1)
+                squared = np.einsum("ij,ij->i", f64, f64)
             else:  # avg
-                squared = np.mean(data.astype(np.float64) ** 2, axis=1)
+                squared = np.einsum("ij,ij->i", f64, f64) / f64.shape[1]
         else:
-            flat = data.flatten() if data.ndim > 1 else data
-            squared = flat.astype(np.float64) ** 2
+            flat = f64.reshape(-1)
+            squared = np.square(flat)
 
-        window_samples = max(1, int((window_ms / 1000) * samplerate))
+        window_samples = max(1, round(window_ms * samplerate / 1000))
 
         if len(squared) <= window_samples:
-            window_means = np.array([np.mean(squared)], dtype=np.float64)
+            window_means = np.array([float(np.mean(squared))], dtype=np.float64) if squared.size else np.zeros(0, dtype=np.float64)
         else:
-            cumsum = np.cumsum(squared, dtype=np.float64)
-            cumsum = np.concatenate(([0.0], cumsum))
-            window_sums = cumsum[window_samples:] - cumsum[:-window_samples]
-            window_means = window_sums / window_samples
+            window_means = block_window_sums(squared, window_samples) / window_samples
 
         track._cache[key] = window_means
         track._cache[f"window_samples_{window_ms}"] = window_samples
@@ -313,7 +426,7 @@ def get_window_samples(track: TrackContext, window_ms: int) -> int:
     """Number of samples per RMS window. Cached as side-effect of get_rms_window_means."""
     key = f"window_samples_{window_ms}"
     if key not in track._cache:
-        track._cache[key] = max(1, int((window_ms / 1000) * track.samplerate))
+        track._cache[key] = max(1, round(window_ms * track.samplerate / 1000))
     return track._cache[key]
 
 
@@ -323,23 +436,33 @@ def get_gated_rms_data(
     stereo_mode: str,
     gate_relative_db: float,
 ) -> dict[str, Any]:
-    """
-    Gated RMS analysis data. Returns dict with:
-        active_means, active_mask, max_window_db, window_means
-    Cached on track._cache.
-    """
+    """Gated RMS analysis data. Returns active_means, active_mask, max_window_db, window_means."""
     key = f"gated_rms_{window_ms}_{stereo_mode}_{gate_relative_db}"
     if key not in track._cache:
         window_means = get_rms_window_means(track, window_ms, stereo_mode)
+        if window_means.size and not np.all(np.isfinite(window_means)):
+            raise ValueError("Source contains non-finite samples")
+        max_mean = float(np.max(window_means)) if window_means.size else 0.0
+        if max_mean <= 0.0:
+            track._cache[key] = {
+                "active_means": np.zeros(0, dtype=np.float64),
+                "active_mask": np.zeros(window_means.shape, dtype=bool),
+                "max_window_db": float("-inf"),
+                "window_means": window_means,
+            }
+            return track._cache[key]
         floor = np.finfo(np.float64).tiny
-        window_rms_db = 10.0 * np.log10(np.maximum(window_means, floor))
-        max_window_db = float(np.max(window_rms_db)) if window_rms_db.size else float(-np.inf)
+        positive = window_means > 0.0
+        window_rms_db = np.where(
+            positive, 10.0 * np.log10(np.maximum(window_means, floor)), float("-inf"),
+        )
+        max_window_db = float(10.0 * math.log10(max_mean))
         gate_threshold_db = max_window_db - float(gate_relative_db)
         active_mask = window_rms_db >= gate_threshold_db
         active_means = window_means[active_mask] if active_mask.size else window_means
         if active_means.size == 0:
-            active_means = window_means
-            active_mask = np.ones(window_means.shape, dtype=bool)
+            active_means = window_means[positive]
+            active_mask = positive
 
         track._cache[key] = {
             "active_means": active_means,
@@ -348,6 +471,161 @@ def get_gated_rms_data(
             "window_means": window_means,
         }
     return track._cache[key]
+
+
+def resolve_rms_anchor(
+    track: TrackContext,
+    window_ms: int,
+    stereo_mode: str,
+    gate_relative_db: float,
+    rms_anchor_mode: str,
+    rms_percentile: float,
+) -> dict[str, Any]:
+    """Compute gated unweighted RMS anchor metrics for a track (cached per config)."""
+    anchor_mode, percentile = parse_rms_anchor_override(
+        getattr(track, "rms_anchor_override", None), rms_anchor_mode, rms_percentile,
+    )
+
+    key = f"rms_anchor_{window_ms}_{stereo_mode}_{gate_relative_db}_{anchor_mode}_{percentile:g}"
+    if key not in track._cache:
+        gated = get_gated_rms_data(track, window_ms, stereo_mode, gate_relative_db)
+        active_means = gated["active_means"]
+        max_mean = float(np.max(active_means)) if active_means.size else 0.0
+        rms_max_db = float(linear_to_db(math.sqrt(max_mean))) if max_mean > 0.0 else float("-inf")
+        if max_mean <= 0.0:
+            anchor_mean = 0.0
+            rms_anchor_db = float("-inf")
+        else:
+            anchor_mean = (
+                max_mean if anchor_mode == "max"
+                else float(np.percentile(active_means, percentile))
+            )
+            rms_anchor_db = float(linear_to_db(math.sqrt(anchor_mean))) if anchor_mean > 0.0 else float("-inf")
+        anchor_label = "max" if anchor_mode == "max" else f"p{percentile:g}"
+        n_samples = len(track.audio_data) if track.audio_data is not None else track.total_samples
+        eff_win_ms = (
+            min(float(window_ms), n_samples * 1000.0 / track.samplerate)
+            if track.samplerate > 0 else float(window_ms)
+        )
+        track._cache[key] = {
+            "rms_max_db": rms_max_db,
+            "rms_anchor_mean": float(anchor_mean),
+            "rms_anchor_db": rms_anchor_db,
+            "rms_anchor_label": anchor_label,
+            "rms_anchor_mode": anchor_mode,
+            "effective_window_ms": eff_win_ms,
+        }
+    return track._cache[key]
+
+
+def _scan_peak_range(data: np.ndarray, start: int, stop: int, block: int = 65536) -> tuple[float, int | None]:
+    """Find max stereo-linked absolute sample and earliest index in ``[start, stop)``."""
+    best_lin = 0.0
+    best_idx: int | None = None
+    for pos in range(start, stop, block):
+        chunk = data[pos:min(pos + block, stop)]
+        mag = np.max(np.abs(chunk), axis=1) if chunk.ndim > 1 else np.abs(chunk)
+        if not np.all(np.isfinite(mag)):
+            return float("nan"), None
+        rel = int(np.argmax(mag))
+        val = float(mag[rel])
+        if val > best_lin:
+            best_lin = val
+            best_idx = pos + rel
+    return best_lin, best_idx
+
+
+def find_governing_and_next_peak(
+    data: np.ndarray,
+    samplerate: int,
+    exclusion_ms: float = 100.0,
+) -> dict[str, Any]:
+    """Find global sample peak and next-highest distinct peak outside a ±exclusion_ms window.
+
+    Returns ``next_peak_db = None`` when no non-zero sample lies outside
+    ``±exclusion_ms`` of the governing peak (guaranteed for clips ``<= exclusion_ms``
+    or centered peaks in ``<= 2 * exclusion_ms`` clips).
+    """
+    empty = {
+        "peak_linear": 0.0, "peak_db": float("-inf"),
+        "peak_sample": None, "peak_time_s": None,
+        "next_peak_db": None, "next_peak_sample": None, "next_peak_time_s": None,
+        "exclusion_ms": float(exclusion_ms),
+    }
+    if data.size == 0 or samplerate <= 0:
+        return empty
+    n_samples = len(data)
+    peak_lin, peak_idx = _scan_peak_range(data, 0, n_samples)
+    peak_db = linear_to_db(peak_lin) if math.isfinite(peak_lin) else float("nan")
+    if peak_idx is None or peak_lin <= 0.0 or not math.isfinite(peak_lin):
+        return {**empty, "peak_linear": peak_lin, "peak_db": peak_db}
+
+    radius = max(1, round(exclusion_ms * samplerate / 1000.0))
+    lo = max(0, peak_idx - radius)
+    hi = min(n_samples, peak_idx + radius + 1)
+    best_lin, best_idx = _scan_peak_range(data, 0, lo) if lo > 0 else (0.0, None)
+    if hi < n_samples:
+        r_lin, r_idx = _scan_peak_range(data, hi, n_samples)
+        if not math.isfinite(r_lin):
+            return {**empty, "peak_linear": float("nan"), "peak_db": float("nan")}
+        if r_lin > best_lin:
+            best_lin, best_idx = r_lin, r_idx
+
+    next_db = linear_to_db(best_lin) if (best_idx is not None and best_lin > 0.0) else None
+    next_time = (best_idx / float(samplerate)) if (next_db is not None and best_idx is not None) else None
+    return {
+        "peak_linear": peak_lin,
+        "peak_db": peak_db,
+        "peak_sample": peak_idx,
+        "peak_time_s": peak_idx / float(samplerate),
+        "next_peak_db": next_db,
+        "next_peak_sample": best_idx if next_db is not None else None,
+        "next_peak_time_s": next_time,
+        "exclusion_ms": float(exclusion_ms),
+    }
+
+
+def _chunked_channel_true_peak(ch: np.ndarray, factor: int, chunk_size: int = 65536, pad: int = 64) -> float:
+    """Compute oversampled peak of one 1-D channel in bounded-memory overlap-save blocks."""
+    n = len(ch)
+    if n <= chunk_size + 2 * pad:
+        return float(np.max(np.abs(resample_poly(ch, factor, 1))))
+    max_tp = 0.0
+    for start in range(0, n, chunk_size):
+        stop = min(start + chunk_size, n)
+        ext_lo = max(0, start - pad)
+        ext_hi = min(n, stop + pad)
+        up = resample_poly(ch[ext_lo:ext_hi], factor, 1)
+        trim_lo = (start - ext_lo) * factor
+        trim_hi = len(up) - (ext_hi - stop) * factor
+        blk_peak = float(np.max(np.abs(up[trim_lo:trim_hi])))
+        if blk_peak > max_tp:
+            max_tp = blk_peak
+    return max_tp
+
+
+def measure_true_peak_db(data: np.ndarray, samplerate: int) -> float:
+    """Oversampled true peak (4x <=48k, 2x <192k, 1x >=192k) in dBTP.
+
+    Uses bounded-memory overlap-save ``scipy.signal.resample_poly`` (Kaiser
+    beta=5.0 polyphase FIR, 81 taps at 4x / 41 taps at 2x; oversampled rate
+    always >= 192 kHz matching ITU-R BS.1770-4 Annex 2 rate floor).
+    """
+    if data.size == 0 or samplerate <= 0:
+        return float("-inf")
+    if not np.all(np.isfinite(data)):
+        return float("nan")
+    factor = 4 if samplerate <= 48000 else (2 if samplerate < 192000 else 1)
+    if factor == 1 or len(data) < 2:
+        return linear_to_db(float(np.max(np.abs(data))))
+    channels = data.reshape(len(data), -1)
+    max_tp = 0.0
+    for ch_idx in range(channels.shape[1]):
+        ch = np.asarray(channels[:, ch_idx], dtype=np.float64)
+        ch_peak = _chunked_channel_true_peak(ch, factor)
+        if ch_peak > max_tp:
+            max_tp = ch_peak
+    return linear_to_db(max_tp)
 
 
 # ---------------------------------------------------------------------------

@@ -42,7 +42,7 @@ class PreFaderSendCaveat:
 class BalanceValidationReport:
     """Formal mathematical verification of rough-mix balance and solver convergence."""
 
-    status: str = "verified"  # verified | converged_shifted | override_drift | caveat | unconverged | blocked
+    status: str = "verified"  # verified | converged_shifted | override_drift | caveat | unconverged | blocked | error
     converged: bool = True
     passes: int = 1
     leaf_fader_shift_db: float = 0.0
@@ -51,11 +51,13 @@ class BalanceValidationReport:
     active_leaf_count: int = 0
     staged_bus_count: int = 0
     unsimulated_insert_busses: list[str] = field(default_factory=list)
+    unsimulated_insert_count: int = 0
     track_path_deltas: dict[str, float] = field(default_factory=dict)
     bus_net_deltas: dict[str, float] = field(default_factory=dict)
     overridden_busses: dict[str, float] = field(default_factory=dict)
     clamped_busses: dict[str, float] = field(default_factory=dict)
     blocked_busses: dict[str, str] = field(default_factory=dict)
+    non_finite_nodes: dict[str, str] = field(default_factory=dict)
     pre_fader_send_caveats: list[PreFaderSendCaveat] = field(default_factory=list)
     summary: str = ""
 
@@ -224,6 +226,10 @@ def _trace_leaf_path_delta(
 
 
 def _format_validation_summary(rep: BalanceValidationReport, *, attenuate_only: bool) -> str:
+    if rep.status == "error" and rep.non_finite_nodes:
+        first, err = next(iter(rep.non_finite_nodes.items()))
+        extra = f" (+{len(rep.non_finite_nodes) - 1} more)" if len(rep.non_finite_nodes) > 1 else ""
+        return f"Non-finite audio quarantined on {first}{extra}: {err}"
     if rep.status == "blocked":
         first, err = next(iter(rep.blocked_busses.items()))
         short_err = err.split(":", 1)[-1].strip() if ":" in err else err
@@ -249,7 +255,7 @@ def _format_validation_summary(rep: BalanceValidationReport, *, attenuate_only: 
         return f"Unity-fader staging active ({rep.staged_bus_count} busses staged)"
     delta_txt = f"Global path \u0394: {_fmt_signed(rep.global_path_delta_db)} dB" if rep.global_path_delta_db is not None else "No active leaves"
     return (
-        f"Balance invariant verified (\u00b1{rep.max_balance_spread_db:.1f} dB across {rep.active_leaf_count} tracks) "
+        f"File-level balance verified (\u00b1{rep.max_balance_spread_db:.1f} dB across {rep.active_leaf_count} tracks) "
         f"\u00b7 {delta_txt} \u00b7 {rep.staged_bus_count} staged busses"
     )
 
@@ -263,7 +269,9 @@ def _collect_validation_metrics(
     dict[str, float],
     dict[str, float],
     dict[str, str],
+    dict[str, str],
     list[str],
+    int,
     int,
 ]:
     track_deltas: dict[str, float] = {}
@@ -271,10 +279,14 @@ def _collect_validation_metrics(
     overridden: dict[str, float] = {}
     clamped: dict[str, float] = {}
     blocked: dict[str, str] = {}
+    non_finite: dict[str, str] = {}
     unsim_ins: list[str] = []
+    unsim_count = 0
     staged_count = 0
     for name, node in nodes.items():
         ttype = str(_get(node, "track_type", ""))
+        if _get(node, "non_finite_error"):
+            non_finite[name] = str(_get(node, "non_finite_error"))
         if _get(node, "slot_a_blocked_error"):
             blocked[name] = str(_get(node, "slot_a_blocked_error"))
         if ttype in ("Audio", "Instrument"):
@@ -293,10 +305,12 @@ def _collect_validation_metrics(
         if exc > _BALANCE_TOL_DB and not _get(node, "is_overridden"):
             clamped[name] = round(exc, 2)
         trim_plug = _get(node, "slot_a_trim_plugin")
-        non_trim_ins = [p for p in (_get(node, "active_inserts") or ()) if p != trim_plug]
+        raw_ins = list(_get(node, "active_inserts") or ())
+        non_trim_ins = raw_ins[1:] if (trim_plug and raw_ins and raw_ins[0] == trim_plug) else raw_ins
         if non_trim_ins and _get(node, "pre_fader_peak_db") is not None and _is_active_node(node):
             unsim_ins.append(name)
-    return track_deltas, bus_deltas, overridden, clamped, blocked, unsim_ins, staged_count
+            unsim_count += len(non_trim_ins)
+    return track_deltas, bus_deltas, overridden, clamped, blocked, non_finite, unsim_ins, unsim_count, staged_count
 
 
 def validate_signal_flow_balance(
@@ -309,15 +323,17 @@ def validate_signal_flow_balance(
     leaf_fader_shift_db: float = 0.0,
 ) -> BalanceValidationReport:
     """Compute formal balance-preservation and convergence diagnostics for a SignalFlowGraph."""
-    track_deltas, bus_deltas, overridden, clamped, blocked, unsim_ins, staged_count = _collect_validation_metrics(
-        nodes, _main_outgoing_map(edges),
+    track_deltas, bus_deltas, overridden, clamped, blocked, non_finite, unsim_ins, unsim_count, staged_count = (
+        _collect_validation_metrics(nodes, _main_outgoing_map(edges))
     )
     vals = [v for v in track_deltas.values() if math.isfinite(v)]
     spread = round(max(vals) - min(vals), 2) if len(vals) >= 2 else 0.0
     global_delta = round(sorted(vals)[len(vals) // 2], 2) if vals else None
     caveats = _scan_pre_fader_send_caveats(ptx, nodes)
 
-    if blocked:
+    if non_finite:
+        status, converged = "error", False
+    elif blocked:
         status, converged = "blocked", False
     elif clamped:
         status, converged = "unconverged", False
@@ -342,11 +358,13 @@ def validate_signal_flow_balance(
         active_leaf_count=len(vals),
         staged_bus_count=staged_count,
         unsimulated_insert_busses=unsim_ins,
+        unsimulated_insert_count=unsim_count,
         track_path_deltas=track_deltas,
         bus_net_deltas=bus_deltas,
         overridden_busses=overridden,
         clamped_busses=clamped,
         blocked_busses=blocked,
+        non_finite_nodes=non_finite,
         pre_fader_send_caveats=caveats,
     )
     rep.summary = _format_validation_summary(rep, attenuate_only=attenuate_only)
@@ -394,7 +412,7 @@ def _card_height_for_role(role: str) -> float:
 def _is_node_visible_in_graph(node: Any, *, active_only: bool) -> bool:
     if not active_only:
         return True
-    if _get(node, "slot_a_blocked_error"):
+    if _get(node, "slot_a_blocked_error") or _get(node, "non_finite_error"):
         return True
     if _get(node, "is_inactive") or _get(node, "is_parallel_parked"):
         return False

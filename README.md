@@ -1,6 +1,6 @@
 # SessionPrep
 
-Batch audio preflight, bimodal normalizer, and recursive multi-stage DAW gain-staging tool for mix session preparation.
+Batch audio preflight, peak-capped RMS normalizer, and recursive multi-stage DAW gain-staging tool for mix session preparation.
 
 SessionPrep audits raw multitracks for technical problems, calibrates track levels for predictable insert drive while preserving the incoming file-level balance (the rough mix when multitracks were exported post-fader), and — for Pro Tools templates — extends that same static compensation recursively across every subgroup, stem, and mix bus in your routing graph as an initial linear starting point before you ever press Play.
 
@@ -8,10 +8,10 @@ Conceptually, it works a bit like **Automatic Delay Compensation (ADC) for stati
 
 > This is a **deterministic preflight and starting-point generator** — not a dynamic real-time AGC, not an AI auto-mixer, and not a non-linear plugin simulator. Bus trims are **initial linear estimates** computed from incoming file levels assuming unity pass-through for unsimulated active inserts and initial fader positions; once you move faders, add non-unity track plugins, or drive FX sends, downstream bus levels will naturally shift.
 
-![Recursive Multi-Stage Bimodal Gain Staging](docs/images/multi-stage-gain-staging.svg)
+![Recursive Multi-Stage Peak-Capped RMS Gain Staging](docs/images/multi-stage-gain-staging.svg)
 
-- Every insert chain (`Kick`, `Vocal`, `cKIK`, `cVOX`, `ALLDRM`, `MIX 1`) starts at its bimodal target (`-6 dBFS peak / -18 dBFS RMS`, initial linear estimate), and `MIX 1` stays below pre-fader overload with its fader at `0.0 dB`.
-- Both tracks arrive at `Master` shifted by the exact same `-11.8 dB` (`-4.0 dB` shared leaf headroom shift + `-7.8 dB` `MIX 1` trim → `0.0 dB` relative incoming-balance change), even though `Kick` passes through more bus tiers than `Vocal`.
+- Every insert chain (`Kick`, `Vocal`, `cKIK`, `cVOX`, `ALLDRM`, `MIX 1`) starts at its Peak-Capped RMS target (`-18 dBFS RMS` capped at `-6 dBFS peak`, initial linear estimate), and `MIX 1` stays below pre-fader overload with its fader at `0.0 dB`.
+- Each track arrives at `Master` shifted by the exact same `-11.8 dB` (`-4.0 dB` shared leaf headroom shift + `-7.8 dB` `MIX 1` trim → `0.0 dB` relative incoming-balance change), even though `Kick` passes through more bus tiers than `Vocal`.
 
 ## Screenshots
 
@@ -61,8 +61,8 @@ SessionPrep operates in three phases:
 | Phase | Name                   | What happens                                                                                                                                                                                                                                                                                                                                                                                                              | When                           |
 |-------|------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|--------------------------------|
 | **1** | Track Layout           | Define how source tracks map to output files: channel routing, reordering, splitting, merging. Recommends layout cleanups from Phase 1 diagnostics (dropping silent files, extracting active channels from dual-mono and one-sided silence). Drag-and-drop between input/output trees with optional recursive subfolder scanning. Writes outputs to `sp_01_tracklayout/` and peak caches to `sp_peaks/`. | GUI Phase 1 (always available) |
-| **2** | Analysis & Preparation | Format checks, digital clipping, DC offset, stereo compatibility, silence, subsonic/ultrasonic content, peak/RMS measurement, bimodal classification, tail exceedance, and optional corrective repairs (DC, subsonic, ultrasonic). Computes track-level bimodal normalization and inverse fader offsets; optionally writes prepared WAVs to `sp_02_prepared/`. | GUI Phase 2 / CLI              |
-| **3** | DAW Transfer           | Transfer tracks into DAW sessions with per-track naming, folder assignment, and unattended batch queuing. DAWproject exports self-contained archives with embedded audio, fader offsets, and empty-folder cleanup. Pro Tools transfers automate folder output routing, `No Input` clearing, empty folder/VCA/orphaned Aux cleanup, VCA-linked folder Groups, two-level Clip Gain + Track Fader staging, and recursive multi-stage bimodal bus gain staging with an offline Signal Flow inspector. | GUI Phase 3 |
+| **2** | Analysis & Preparation | Format checks, digital clipping, DC offset, stereo compatibility, silence, subsonic/ultrasonic content, unweighted RMS anchor & governing/next-highest peak measurement, tail exceedance, and optional corrective repairs (DC, subsonic, ultrasonic). Computes track-level Peak-Capped RMS normalization and inverse fader offsets; optionally writes prepared WAVs to `sp_02_prepared/`. | GUI Phase 2 / CLI              |
+| **3** | DAW Transfer           | Transfer tracks into DAW sessions with per-track naming, folder assignment, and unattended batch queuing. DAWproject exports self-contained archives with embedded audio, fader offsets, and empty-folder cleanup. Pro Tools transfers automate folder output routing, `No Input` clearing, empty folder/VCA/orphaned Aux cleanup, VCA-linked folder Groups, two-level Clip Gain + Track Fader staging, and recursive multi-stage Peak-Capped RMS bus gain staging with an offline Signal Flow inspector. | GUI Phase 3 |
 
 ### Diagnostics & corrective repairs
 
@@ -70,20 +70,26 @@ Findings are organized into four categories: **PROBLEMS** (clipping, format/leng
 
 In Phase 2, **Track repairs…** lets you enable whole-track DC, subsonic, or ultrasonic filters per track or via presets, audition **Original** vs. **Corrected** in the waveform/spectrogram preview, and verify that the rechecked finding clears (`✓ Correction applied`). For every detector and GUI control detail, see [REFERENCE.md](REFERENCE.md).
 
-### Track-level bimodal normalization
+### Track-level Peak-Capped RMS normalization
 
-Most normalizers treat a kick drum and a synth pad the same. SessionPrep classifies tracks using three metrics — **crest factor**, **envelope decay rate**, and **content density** — then normalizes them differently:
+Rather than guessing track classes with brittle heuristic thresholds, SessionPrep applies one continuous, deterministic **Peak-Capped RMS** rule to every track:
 
-- **Transient** (high crest + fast decay, or sparse percussion): peak-normalized to `--target_peak` (`-6 dBFS`)
-- **Sustained** (low crest + slow decay): RMS-normalized to `--target_rms` (`-18 dBFS`), peak-limited by `--target_peak`
+```text
+gain = min(target_rms - rms_anchor, target_peak - sample_peak, max_gain_db)
+```
 
-The three-metric approach resolves common misclassifications: compressed drums (low crest, fast decay → Transient), plucked instruments (high crest, slow decay → Sustained), and sparse percussion like toms and crashes (caught by density). Each gain adjustment is paired with an inverse fader offset so the incoming file-level balance is preserved (matching the producer's rough mix when multitracks were exported post-fader, or matching a raw unity import when tracks were exported pre-fader at unity).
+- **Target RMS (`--target_rms`, default `-18 dBFS`):** Anchored to loud chorus sections (default P95 of gated 400 ms unweighted RMS windows), driving sustained vocals, guitars, basses, 808s, and compressed drum loops into a consistent operating range for level-sensitive inserts.
+- **Peak ceiling (`--target_peak`, default `-6 dBFS`):** Automatically caps high-crest transients (acoustic kicks, snares, percussion) whenever effective crest exceeds `target_peak − target_rms` (`12 dB` at default targets), preserving clean transient headroom without clipping.
+- **Safety guards:** Tracks at or below `-70.0 dBFS` peak hold at `0.0 dB` (**Noise Floor Hold**), and automatic boost is bounded by `--max_gain_db` (default `+24.0 dB`, max `+36.0 dB`) so room tone or dither never winds up.
+- **Explicit per-track & pattern overrides:** Force **Peak** mode (via Phase 2 Mode dropdown or `--force_peak <regex>`, e.g. `kick|snare|tom`) when a drum chain expects fixed peak levels, force **RMS** mode (bypassing the peak ceiling with lazy oversampled `dBTP` headroom warnings) when one isolated plosive caps a vocal, or choose **Skip**.
+
+Each gain adjustment is paired with an inverse fader offset so the incoming file-level balance is preserved (matching the producer's rough mix when multitracks were exported post-fader, or matching a raw unity import when tracks were exported pre-fader at unity).
 
 ### Recursive multi-stage bus gain staging (Pro Tools)
 
 Calibrating individual tracks does not keep summed subgroups, stems, or the mix bus at target level: a few quiet tracks summed onto a subgroup can under-drive bus inserts, while many tracks summed onto a drum bus or mix bus can overload them.
 
-When transferring to a Pro Tools template, SessionPrep reconstructs the template's routing DAG (`Audio → Routing Folders → Subgroup/Stem Auxes → Mix Bus → Master`), sums the time-aligned, gain-adjusted Main Output audio in `float64` topological order (accounting for pan law, mono/stereo adaptation, mutes, and VCAs), re-classifies each summing node, and applies compensation across every bus tier:
+When transferring to a Pro Tools template, SessionPrep reconstructs the template's routing DAG (`Audio → Routing Folders → Subgroup/Stem Auxes → Mix Bus → Master`), sums the time-aligned, gain-adjusted Main Output audio in `float64` topological order (accounting for pan law, mono/stereo adaptation, mutes, and VCAs), evaluates the same Peak-Capped RMS rule at each summing node, and applies compensation across every bus tier:
 
 - **Pure summing folders** (zero inserts) stay at `0.0 dB` unity.
 - **Intermediate insert-bearing busses** set a validated Insert Slot A trim plugin (**DMG Audio TrackControl**, **Avid Trim** in default `+6 dB` mode, or **Process.Audio Protility**) to `+g` pre-insert, paired with an inverse `-g` post-insert Bus Fader offset (or Slot A trim with unity faders in `clip_gain_unity` mode).
@@ -159,9 +165,9 @@ sessionprep /path/to/tracks --fix dc --fix subsonic --low-cut-hz 10 --execute
 
 Omit `--execute` to review selections first. Add `--fix ultrasonic` for eligible high-rate files.
 
-### Force classification overrides
+### Force peak targeting by track name & cap maximum boost
 ```bash
-sessionprep /path/to/tracks -x --force_transient 808 snare --force_sustained pad
+sessionprep /path/to/tracks -x --force_peak "kick|snare|tom" --max_gain_db 18
 ```
 
 ### Hotter calibration (modern plugins)
@@ -204,7 +210,7 @@ Groups use `Name:pattern1,pattern2` syntax. Patterns support substring, glob (`*
 |----------------------------------|------------------------------------------------------------------|
 | [README.md](README.md)           | Overview, mental model, installation, quick start, CLI usage     |
 | [REFERENCE.md](REFERENCE.md)     | Detector reference, analysis metrics, GUI controls, Pro Tools `.ptx` automation |
-| [TECHNICAL.md](TECHNICAL.md)     | Audio engineering background, bimodal & multi-stage gain-staging theory |
+| [TECHNICAL.md](TECHNICAL.md)     | Audio engineering background, Peak-Capped RMS & multi-stage gain-staging theory |
 | [DEVELOPMENT.md](DEVELOPMENT.md) | Development setup, building, library & `.ptx` architecture       |
 | [KANBAN.md](KANBAN.md)           | Backlog and planned features                                     |
 

@@ -7,12 +7,11 @@ from hashlib import sha256
 import json
 import os
 
-from .audio import sample_digest
+from .audio import compute_peak_capped_gain, get_peak_db, migrate_legacy_override, resolve_rms_anchor, sample_digest
 from .config import ANALYSIS_PARAMS
 from .detector import TrackDetector
-from .detectors.audio_classifier import AudioClassifierDetector
 from .detectors.silence import SilenceDetector
-from .models import CorrectedAnalysis, DetectorResult, IssueLocation, LifecyclePhase, Severity
+from .models import CorrectedAnalysis, DetectorResult, IssueLocation, LifecyclePhase, ProcessorResult, Severity
 
 
 class CheckOutcome(Enum):
@@ -161,18 +160,33 @@ def separate_rumble_finding(track, config):
 
 
 def original_report_track(track, session):
-    """Restore the original normalization context for detector relevance using stored analysis."""
+    """Restore lightweight original normalization relevance without synchronous true-peak DSP."""
     if not track.repair_recipe.active or session is None or "tail_exceedance" not in track.detector_results:
         return track
     norm = next((p for p in session.processors if p.id == "bimodal_normalize"), None)
-    classifier = track.detector_results.get("audio_classifier")
-    if norm is None or classifier is None or classifier.error:
+    if norm is None or track.audio_data is None:
         return track
-    # Bimodal gain is calculated from the stored classifier scalars. No audio is read.
     try:
-        original = norm.process(track)
-    except (KeyError, TypeError, ValueError):
-        # Legacy reports can lack classifier scalars until background verification completes.
+        override = migrate_legacy_override(track.classification_override)
+        if override == "Skip":
+            rms_active = False
+        else:
+            mode = "Peak" if override == "Peak" else ("RMS" if override == "RMS" else "Auto")
+            peak_db = get_peak_db(track)
+            anchor = resolve_rms_anchor(
+                track, norm.window_ms, norm.stereo_mode,
+                norm.gate_relative_db, norm.rms_anchor_mode, norm.rms_percentile,
+            )
+            gov, _, _ = compute_peak_capped_gain(
+                peak_db, float(anchor["rms_anchor_db"]),
+                norm.target_peak, norm.target_rms, max_gain_db=norm.max_gain_db, mode=mode,
+            )
+            rms_active = gov == "RMS"
+        original = ProcessorResult(
+            norm.id, 0.0, "Auto (RMS)" if rms_active else "Auto (Peak)",
+            "RMS" if rms_active else "Peak", data={"rms_anchor_active": rms_active},
+        )
+    except (AttributeError, KeyError, TypeError, ValueError):
         return track
     return replace(track, processor_results={**track.processor_results, norm.id: original})
 
@@ -222,10 +236,9 @@ class RepairVerification:
     def __init__(self, detectors, config):
         self.detectors = [d for d in detectors if config.get(f"{d.id}_enabled", True)]
         self.ids = {d.id for d in self.detectors}
-        # These two measurements are also inputs to gain planning. Some library
-        # callers configure a processor without registering its diagnostic rows.
+        # Silence is also an input to gain planning and tail exceedance.
         self.support = []
-        for kind in (SilenceDetector, AudioClassifierDetector):
+        for kind in (SilenceDetector,):
             if kind.id not in self.ids:
                 d = kind()
                 d.configure(config)
@@ -237,25 +250,22 @@ class RepairVerification:
         self.ordered = [silence, *(d for d in registered if d is not silence)]
         settings = {s.key: config[s.key] for s in ANALYSIS_PARAMS
                     if s.key in config and not s.presentation_only and s.key != "fader_headroom_db"}
-        settings.update({key: config.get(key, []) for key in ("force_transient", "force_sustained")})
         for detector in (*self.support, *self.detectors):
             for spec in detector.config_params():
                 if not spec.presentation_only and spec.key in config:
-                    # A detector's legacy configure({}) fallback can differ
-                    # from the value its ParamSpec inserts in a new preset.
                     settings[spec.key] = config[spec.key]
         implementations = [(d.id, type(d).__module__, type(d).__qualname__, d.depends_on)
                            for d in self.detectors]
-        # Bump the evidence version when detector or render semantics change.
-        self.settings_key = _digest([6, implementations, settings])
+        # Bump the evidence version when detector or normalization semantics change.
+        self.settings_key = _digest([7, implementations, settings])
         # Source layout evidence survives Apply. Bind it only to settings that
-        # affect these measurements, independently of repairs and normalization.
+        # affect these measurements, independently of presentation, repairs and normalization.
         layout = [d for d in detectors if d.phase == LifecyclePhase.PHASE1 and d.id in self.required_ids]
         self.layout_ids = {d.id for d in layout}
         layout_params = [(d.id, type(d).__module__, type(d).__qualname__,
                           {s.key: config.get(s.key, s.default)
                            for s in d.config_params() if not s.presentation_only}) for d in layout]
-        self.layout_settings_key = _digest([1, config.get("dbfs_convention", "standard"), layout_params])
+        self.layout_settings_key = _digest([2, layout_params])
 
     def original_key(self, track):
         samples = track.detector_sample_digest

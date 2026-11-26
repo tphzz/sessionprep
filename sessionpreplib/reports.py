@@ -9,7 +9,7 @@ from typing import Any
 
 import numpy as np
 
-from .audio import dbfs_offset, format_duration
+from .audio import INACTIVE_NORMALIZATION_CLASSIFICATIONS, format_duration
 from .file_io import atomic_writer
 from .models import SessionContext
 from .utils import protools_sort_key
@@ -37,7 +37,7 @@ def _processing_outcomes(session: SessionContext) -> dict[str, dict[str, Any]]:
         result = track.processor_results.get("bimodal_normalize")
         normalizing = (session.config.get("bimodal_normalize_enabled", True)
                        and result is not None and "bimodal_normalize" not in track.processor_skip
-                       and result.classification not in ("Skip", "Silent"))
+                       and result.classification not in INACTIVE_NORMALIZATION_CLASSIFICATIONS)
         error = failures.get(track.filename) or track._cache.get("repair_error")
         if track.status != "OK":
             error = error or track.status
@@ -45,11 +45,19 @@ def _processing_outcomes(session: SessionContext) -> dict[str, dict[str, Any]]:
             error = error or result.error
         receipt = None if error else receipts.get(track.filename)
         evidence = receipt if receipt is not None else track.repair_measurements
-        planned_gain = result.gain_db if normalizing and result is not None else (track.manual_gain_db or 0.0)
+        if result is not None:
+            planned_gain = result.gain_db if normalizing else 0.0
+        else:
+            planned_gain = track.manual_gain_db or 0.0
         outcomes[track.filename] = {
             "status": "failed" if error else "written" if receipt is not None else "planned",
             "error": error,
             "classification": result.classification if result else "Unknown",
+            "mode": result.data.get("mode", "Auto") if result else "Unknown",
+            "governing": result.data.get("governing") if result else None,
+            "post_peak_db": _report_db(result.data.get("post_peak_db")) if result else None,
+            "post_true_peak_db": _report_db(result.data.get("post_true_peak_db")) if result else None,
+            "peak_warning_level": result.data.get("peak_warning_level", "none") if result else "none",
             "planned_repairs": track.repair_recipe.applied_ids(),
             "boundary_settling": evidence.get("boundary_settling", []),
             "applied_repairs": [p for p in receipt["applied_processors"]
@@ -127,8 +135,12 @@ def _report_tail_lines(session: SessionContext, config: dict[str, Any]) -> list[
         if not regions:
             continue
         summary = tail_r.data.get("tail_summary") or {}
-        classifier = t.detector_results.get("audio_classifier")
-        anchor_label = classifier.data.get("rms_anchor_label") if classifier else None
+        norm = t.processor_results.get("bimodal_normalize")
+        anchor_label = (
+            tail_r.data.get("rms_anchor_label")
+            or summary.get("anchor_label")
+            or (norm.data.get("rms_anchor_label") if norm else None)
+        )
         anchor_note = f" ({anchor_label})" if anchor_label else ""
         lines.extend([
             f"{t.filename}",
@@ -186,7 +198,9 @@ def generate_report(
         f"Generated: {timestamp}",
         f"Source Directory: {os.path.abspath(config.get('_source_dir', ''))}",
         f"Output Directory: {os.path.dirname(output_path)}",
-        f"Target RMS: {config.get('target_rms', -18.0)} dBFS | Target Peak: {config.get('target_peak', -6.0)} dBFS",
+        f"Target RMS: {config.get('target_rms', -18.0)} dBFS (unweighted) | "
+        f"Peak Ceiling: {config.get('target_peak', -6.0)} dBFS | "
+        f"Max Boost: +{config.get('max_gain_db', 24.0)} dB",
         f"Clipping Detection Threshold: {config.get('clip_consecutive', 3)} consecutive near-full-scale samples",
         "",
     ]
@@ -221,7 +235,7 @@ def save_json(
 
     tracks_data: list[dict[str, Any]] = []
     data: dict[str, Any] = {
-        "schema_version": "2.0",
+        "schema_version": "3.0",
         "session": {
             "timestamp": datetime.now().isoformat(),
             "source_directory": os.path.abspath(source_dir),
@@ -229,6 +243,9 @@ def save_json(
             "config": {
                 "target_rms": config.get("target_rms", -18.0),
                 "target_peak": config.get("target_peak", -6.0),
+                "max_gain_db": config.get("max_gain_db", 24.0),
+                "force_peak": config.get("force_peak", ""),
+                "dbfs_convention": config.get("dbfs_convention", "standard"),
                 "stereo_mode": config.get("stereo_mode", "avg"),
                 "window_ms": config.get("window", 400),
                 "rms_anchor": config.get("rms_anchor", "percentile"),
@@ -335,13 +352,12 @@ def build_warnings(
                           type('', (), {"data": {}})()).data.get("dc_warn")]
     if dc_warn_tracks:
         dc_thresh = config.get("dc_offset_warn_db", -40.0)
-        _off = dbfs_offset(config)
         warnings.append(f"DC offset detected (>{dc_thresh} dBFS):")
         for t in dc_warn_tracks:
             dc_r = t.detector_results.get("dc_offset")
             dc_db = dc_r.data.get("dc_db", float('-inf')) if dc_r else float('-inf')
             if np.isfinite(dc_db):
-                warnings.append(f"  - {t.filename} is {dc_db + _off:.1f} dBFS")
+                warnings.append(f"  - {t.filename} is {dc_db:.1f} dBFS")
             else:
                 warnings.append(f"  - {t.filename}")
 

@@ -12,7 +12,7 @@ from typing import Any
 import numpy as np
 from scipy.signal import resample_poly
 
-from ..detectors.audio_classifier import AudioClassifierDetector
+from ..audio import NOISE_FLOOR_PEAK_DB, compute_peak_capped_gain, get_peak_db, resolve_rms_anchor
 from ..detectors.silence import SilenceDetector
 from ..models import TrackContext
 from .models import PtxInsert, PtxTrack, SlotATrimInfo
@@ -104,7 +104,9 @@ class SignalFlowNode:
     pre_fader_peak_db: float | None = None
     pre_fader_rms_db: float | None = None
     classification: str = "Silent"
+    governing: str | None = None
     is_transient: bool = False
+    non_finite_error: str | None = None
     staged: bool = False
     auto_fader_db: float = 0.0
     is_overridden: bool = False
@@ -379,13 +381,18 @@ def _measure_buffer(
     buf: np.ndarray,
     samplerate: int,
     silence_det: SilenceDetector,
-    classifier_det: AudioClassifierDetector,
-) -> tuple[float | None, float | None, str, bool]:
-    if buf.size == 0 or not np.all(np.isfinite(buf)):
-        return None, None, "Silent", False
+    cfg: Mapping[str, Any],
+    target_peak_db: float,
+    target_rms_db: float,
+) -> tuple[float | None, float | None, str, str | None, str | None]:
+    """Measure unrounded float64 peak/RMS and governing constraint without masking NaN/Inf."""
+    if buf.size == 0:
+        return None, None, "Silent", None, None
+    if not np.all(np.isfinite(buf)):
+        return None, None, "Error", None, "Non-finite samples in signal-flow buffer"
     peak = float(np.max(np.abs(buf)))
     if peak <= 0.0:
-        return None, None, "Silent", False
+        return None, None, "Silent", None, None
     channels = 1 if buf.ndim == 1 else buf.shape[1]
     temp = TrackContext(
         filename="",
@@ -399,20 +406,30 @@ def _measure_buffer(
         duration_sec=buf.shape[0] / float(samplerate),
     )
     sil = silence_det.analyze(temp)
-    temp.detector_results["silence"] = sil
     if sil.data.get("is_silent"):
-        return round(20.0 * math.log10(peak), 2), None, "Silent", False
-    cls = classifier_det.analyze(temp)
-    peak_db = cls.data.get("peak_db")
-    rms_db = cls.data.get("rms_anchor_db")
-    label = str(cls.data.get("classification", "Sustained"))
-    is_trans = bool(cls.data.get("is_transient", False))
-    return (
-        round(float(peak_db), 2) if peak_db is not None and math.isfinite(float(peak_db)) else None,
-        round(float(rms_db), 2) if rms_db is not None and math.isfinite(float(rms_db)) else None,
-        label,
-        is_trans,
+        return float(20.0 * math.log10(peak)), None, "Silent", None, None
+    peak_db = get_peak_db(temp)
+    anchor = resolve_rms_anchor(
+        temp,
+        int(cfg.get("window", 400)),
+        str(cfg.get("stereo_mode", "avg")),
+        float(cfg.get("gate_relative_db", 40.0)),
+        str(cfg.get("rms_anchor", "percentile")),
+        float(cfg.get("rms_percentile", 95.0)),
     )
+    rms_db = float(anchor["rms_anchor_db"])
+    governing, _gain, _clamped = compute_peak_capped_gain(
+        peak_db, rms_db, target_peak_db, target_rms_db,
+    )
+    if governing == "Silent":
+        return None, None, "Silent", None, None
+    if governing == "NoiseFloor":
+        return peak_db, (rms_db if math.isfinite(rms_db) else None), "Noise Floor", None, None
+    return peak_db, rms_db, governing, governing, None
+
+
+def _round_opt(val: float | None) -> float | None:
+    return round(float(val), 2) if (val is not None and math.isfinite(float(val))) else None
 
 
 def _accumulate_into(acc: np.ndarray | None, contrib: np.ndarray) -> np.ndarray:
@@ -434,24 +451,28 @@ def _accumulate_into(acc: np.ndarray | None, contrib: np.ndarray) -> np.ndarray:
 
 
 def _compute_unconstrained_bus_gain(
-    is_transient: bool,
     pre_peak_db: float | None,
     pre_rms_db: float | None,
     target_peak_db: float,
     target_rms_db: float,
+    *,
+    max_gain_db: float = 24.0,
 ) -> float:
-    if pre_peak_db is None or not math.isfinite(pre_peak_db) or pre_peak_db <= _MIN_SIGNAL_DB:
+    if pre_peak_db is None or not math.isfinite(pre_peak_db) or pre_peak_db <= NOISE_FLOOR_PEAK_DB:
         return 0.0
-    gain_for_peak = target_peak_db - pre_peak_db
-    if is_transient or pre_rms_db is None or not math.isfinite(pre_rms_db):
-        raw = gain_for_peak
-    else:
-        raw = min(target_rms_db - pre_rms_db, gain_for_peak)
-    return raw if math.isfinite(raw) else 0.0
+    mode = "Peak" if (pre_rms_db is None or not math.isfinite(pre_rms_db)) else "Auto"
+    _gov, gain, _clamped = compute_peak_capped_gain(
+        pre_peak_db,
+        pre_rms_db if pre_rms_db is not None else float("-inf"),
+        target_peak_db,
+        target_rms_db,
+        max_gain_db=max_gain_db,
+        mode=mode,
+    )
+    return float(gain) if math.isfinite(gain) else 0.0
 
 
 def _compute_bus_target_fader(
-    is_transient: bool,
     pre_peak_db: float | None,
     pre_rms_db: float | None,
     target_peak_db: float,
@@ -460,8 +481,11 @@ def _compute_bus_target_fader(
     attenuate_only: bool,
     max_fader_db: float,
     base_fader_db: float = 0.0,
+    max_gain_db: float = 24.0,
 ) -> float:
-    raw = _compute_unconstrained_bus_gain(is_transient, pre_peak_db, pre_rms_db, target_peak_db, target_rms_db)
+    raw = _compute_unconstrained_bus_gain(
+        pre_peak_db, pre_rms_db, target_peak_db, target_rms_db, max_gain_db=max_gain_db,
+    )
     upper = base_fader_db if attenuate_only else max(base_fader_db, min(_FADER_MAX_DB, max_fader_db))
     return round(max(_FADER_MIN_DB, min(upper, raw)), 1)
 
@@ -761,11 +785,11 @@ def _plan_bus_node_staging(
     node: SignalFlowNode,
     pre_in_pk: float | None,
     pre_in_rms: float | None,
-    is_trans: bool,
     *,
     stage_bus_faders: bool,
     attenuate_only: bool,
     max_bus_fader_db: float,
+    max_gain_db: float,
     has_downstream_trim: bool,
     is_terminal: bool,
     is_post_terminal: bool,
@@ -779,15 +803,19 @@ def _plan_bus_node_staging(
 ) -> float:
     if (
         not stage_bus_faders
+        or is_post_terminal
         or node.is_muted
         or node.is_inactive
         or node.is_parallel_parked
+        or node.non_finite_error
         or pre_in_pk is None
-        or pre_in_pk <= _MIN_SIGNAL_DB
+        or pre_in_pk <= NOISE_FLOOR_PEAK_DB
     ):
         return carry_db
     active_feeders = len(node.upstream_tracks)
-    raw = _compute_unconstrained_bus_gain(is_trans, pre_in_pk, pre_in_rms, target_peak_db, target_rms_db)
+    raw = _compute_unconstrained_bus_gain(
+        pre_in_pk, pre_in_rms, target_peak_db, target_rms_db, max_gain_db=max_gain_db,
+    )
     base_fader = _norm_zero(round(node.template_fader_db, 1))
     active_tpl = node.template_trim_db if node.slot_a_trim_active else 0.0
     if attenuate_only and is_terminal:
@@ -822,8 +850,9 @@ def _plan_bus_node_staging(
         node.staged = True
         node.staging_strategy = "fader_only"
         auto_db = _norm_zero(_compute_bus_target_fader(
-            is_trans, pre_in_pk, pre_in_rms, target_peak_db, target_rms_db,
-            attenuate_only=attenuate_only, max_fader_db=max_bus_fader_db, base_fader_db=base_fader,
+            pre_in_pk, pre_in_rms, target_peak_db, target_rms_db,
+            attenuate_only=attenuate_only, max_fader_db=max_bus_fader_db,
+            base_fader_db=base_fader, max_gain_db=max_gain_db,
         ))
         node.auto_fader_db = auto_db
         node.recommended_fader_db, node.is_overridden = _apply_fader_override(auto_db, bus_override_db)
@@ -888,7 +917,9 @@ def _evaluate_leaf_node(
     leaf: LeafAudioInput,
     session_sr: int,
     silence_det: SilenceDetector,
-    classifier_det: AudioClassifierDetector,
+    cfg: Mapping[str, Any],
+    target_peak_db: float,
+    target_rms_db: float,
     *,
     leaf_fader_shift_db: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -897,16 +928,22 @@ def _evaluate_leaf_node(
     norm = _normalize_track_buffer(leaf.samples, is_mono)
     if norm is None:
         log.warning("Signal-flow DAG skipped non-finite audio on track %r", trk.name)
+        node.classification = "Error"
+        node.non_finite_error = "Non-finite samples in leaf audio"
         return empty, empty
     base_buf = _resample_if_needed(norm, leaf.samplerate, session_sr)
     pre_buf = base_buf * _db_to_lin(_clamp_clip_gain(leaf.clip_gain_db))
-    pre_pk, pre_rms, cls_label, is_trans = _measure_buffer(pre_buf, session_sr, silence_det, classifier_det)
-    node.pre_fader_peak_db, node.pre_fader_rms_db, node.classification, node.is_transient = pre_pk, pre_rms, cls_label, is_trans
+    pre_pk, pre_rms, cls_label, gov, err = _measure_buffer(
+        pre_buf, session_sr, silence_det, cfg, target_peak_db, target_rms_db,
+    )
+    node.pre_fader_peak_db, node.pre_fader_rms_db = _round_opt(pre_pk), _round_opt(pre_rms)
+    node.classification, node.governing, node.is_transient = cls_label, gov, (gov == "Peak")
+    node.non_finite_error = err
     eff_fader = _clamp_fader_db(leaf.fader_db + leaf_fader_shift_db)
     node.baked_gain_db = round(_clamp_baked_gain(leaf.baked_gain_db), 2)
     node.recommended_fader_db = eff_fader
     node.net_gain_delta_db = _norm_zero(round(node.baked_gain_db + node.clip_gain_db + eff_fader, 2))
-    if node.is_muted or node.is_inactive:
+    if node.is_muted or node.is_inactive or err:
         return empty, empty
     total_db = eff_fader + node.vca_offset_db
     post_gain = _db_to_lin(total_db)
@@ -915,51 +952,26 @@ def _evaluate_leaf_node(
     post_buf = pre_buf * post_gain
     if not _has_audible_energy(post_buf):
         return pre_buf, empty
-    node.post_fader_peak_db = round(pre_pk + total_db, 2) if pre_pk is not None else None
-    node.post_fader_rms_db = round(pre_rms + total_db, 2) if pre_rms is not None else None
+    node.post_fader_peak_db = _round_opt(pre_pk + total_db) if pre_pk is not None else None
+    node.post_fader_rms_db = _round_opt(pre_rms + total_db) if pre_rms is not None else None
     return pre_buf, post_buf
 
 
-def _evaluate_bus_node(
+def _apply_bus_trim_and_post_fader(
     trk: PtxTrack,
     node: SignalFlowNode,
-    pre_buf: np.ndarray | None,
+    pre_buf: np.ndarray,
+    pre_in_pk: float | None,
+    pre_in_rms: float | None,
     session_sr: int,
     pan_law_db: float,
     target_peak_db: float,
     target_rms_db: float,
-    stage_bus_faders: bool,
-    attenuate_only: bool,
-    max_bus_fader_db: float,
-    has_downstream_trim: bool,
-    is_terminal: bool,
-    is_post_terminal: bool,
-    has_template_trims: bool,
-    donor_trim_by_format: Mapping[str, SlotATrimInfo],
     silence_det: SilenceDetector,
-    classifier_det: AudioClassifierDetector,
-    *,
-    bus_override_db: float | None = None,
-    strict_slot_a: bool = True,
-    carry_db: float = 0.0,
-) -> tuple[np.ndarray, np.ndarray, float]:
+    cfg: Mapping[str, Any],
+) -> tuple[np.ndarray, np.ndarray]:
     is_mono = trk.format == "Mono"
     empty = _empty_like_format(is_mono)
-    if pre_buf is None or pre_buf.shape[0] == 0:
-        return empty, empty, carry_db
-    pre_in_pk, pre_in_rms, cls_label, is_trans = _measure_buffer(pre_buf, session_sr, silence_det, classifier_det)
-    node.pre_insert_peak_db, node.pre_insert_rms_db = pre_in_pk, pre_in_rms
-    node.classification, node.is_transient = cls_label, is_trans
-
-    out_carry = _plan_bus_node_staging(
-        trk, node, pre_in_pk, pre_in_rms, is_trans,
-        stage_bus_faders=stage_bus_faders, attenuate_only=attenuate_only,
-        max_bus_fader_db=max_bus_fader_db, has_downstream_trim=has_downstream_trim,
-        is_terminal=is_terminal, is_post_terminal=is_post_terminal,
-        has_template_trims=has_template_trims, donor_trim_by_format=donor_trim_by_format,
-        target_peak_db=target_peak_db, target_rms_db=target_rms_db,
-        bus_override_db=bus_override_db, strict_slot_a=strict_slot_a, carry_db=carry_db,
-    )
     if node.staged and node.staging_strategy in ("trim_and_fader", "trim_only"):
         eff_trim_db = node.recommended_trim_db
     elif trk.slot_a_trim is not None and trk.slot_a_trim.is_active and not trk.slot_a_trim.is_bypassed:
@@ -973,32 +985,91 @@ def _evaluate_bus_node(
         node.pre_fader_peak_db, node.pre_fader_rms_db = None, None
     elif abs(eff_trim_db) < 0.005:
         post_trim_buf = pre_buf
-        node.pre_fader_peak_db, node.pre_fader_rms_db = pre_in_pk, pre_in_rms
+        node.pre_fader_peak_db, node.pre_fader_rms_db = _round_opt(pre_in_pk), _round_opt(pre_in_rms)
     else:
         post_trim_buf = pre_buf * trim_lin
-        node.pre_fader_peak_db = round(pre_in_pk + eff_trim_db, 2) if pre_in_pk is not None else None
-        node.pre_fader_rms_db = round(pre_in_rms + eff_trim_db, 2) if pre_in_rms is not None else None
+        node.pre_fader_peak_db = _round_opt(pre_in_pk + eff_trim_db) if pre_in_pk is not None else None
+        node.pre_fader_rms_db = _round_opt(pre_in_rms + eff_trim_db) if pre_in_rms is not None else None
 
     if node.is_muted or node.is_inactive:
-        return empty, empty, out_carry
+        return empty, empty
     total_db = node.recommended_fader_db + node.vca_offset_db
     post_gain = _db_to_lin(total_db)
     if post_gain <= 0.0 or not _has_audible_energy(post_trim_buf):
-        return post_trim_buf, empty, out_carry
+        return post_trim_buf, empty
     post_buf = post_trim_buf * post_gain
     if not _has_audible_energy(post_buf):
-        return post_trim_buf, empty, out_carry
+        return post_trim_buf, empty
     has_non_identity_stereo_pan = (not is_mono) and (
         (trk.pan_left is not None and trk.pan_left != -100)
         or (trk.pan_right is not None and trk.pan_right != 100)
     )
     if has_non_identity_stereo_pan:
         panned_post = _pan_stereo(post_buf, trk.pan_left, trk.pan_right, pan_law_db)
-        post_pk, post_rms, _, _ = _measure_buffer(panned_post, session_sr, silence_det, classifier_det)
-        node.post_fader_peak_db, node.post_fader_rms_db = post_pk, post_rms
+        post_pk, post_rms, _, _, _ = _measure_buffer(
+            panned_post, session_sr, silence_det, cfg, target_peak_db, target_rms_db,
+        )
+        node.post_fader_peak_db, node.post_fader_rms_db = _round_opt(post_pk), _round_opt(post_rms)
     else:
-        node.post_fader_peak_db = round(node.pre_fader_peak_db + total_db, 2) if node.pre_fader_peak_db is not None else None
-        node.post_fader_rms_db = round(node.pre_fader_rms_db + total_db, 2) if node.pre_fader_rms_db is not None else None
+        base_pk = pre_in_pk + eff_trim_db if pre_in_pk is not None else None
+        base_rms = pre_in_rms + eff_trim_db if pre_in_rms is not None else None
+        node.post_fader_peak_db = _round_opt(base_pk + total_db) if base_pk is not None else None
+        node.post_fader_rms_db = _round_opt(base_rms + total_db) if base_rms is not None else None
+    return post_trim_buf, post_buf
+
+
+def _evaluate_bus_node(
+    trk: PtxTrack,
+    node: SignalFlowNode,
+    pre_buf: np.ndarray | None,
+    session_sr: int,
+    pan_law_db: float,
+    target_peak_db: float,
+    target_rms_db: float,
+    stage_bus_faders: bool,
+    attenuate_only: bool,
+    max_bus_fader_db: float,
+    max_gain_db: float,
+    has_downstream_trim: bool,
+    is_terminal: bool,
+    is_post_terminal: bool,
+    has_template_trims: bool,
+    donor_trim_by_format: Mapping[str, SlotATrimInfo],
+    silence_det: SilenceDetector,
+    cfg: Mapping[str, Any],
+    *,
+    bus_override_db: float | None = None,
+    strict_slot_a: bool = True,
+    carry_db: float = 0.0,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    empty = _empty_like_format(trk.format == "Mono")
+    if pre_buf is None or pre_buf.shape[0] == 0:
+        return empty, empty, carry_db
+    pre_in_pk, pre_in_rms, cls_label, gov, err = _measure_buffer(
+        pre_buf, session_sr, silence_det, cfg, target_peak_db, target_rms_db,
+    )
+    node.pre_insert_peak_db, node.pre_insert_rms_db = _round_opt(pre_in_pk), _round_opt(pre_in_rms)
+    node.classification, node.is_transient = cls_label, (gov == "Peak")
+    node.non_finite_error = err
+    if err:
+        node.governing = None
+        return empty, empty, carry_db
+
+    out_carry = _plan_bus_node_staging(
+        trk, node, pre_in_pk, pre_in_rms,
+        stage_bus_faders=stage_bus_faders, attenuate_only=attenuate_only,
+        max_bus_fader_db=max_bus_fader_db, max_gain_db=max_gain_db,
+        has_downstream_trim=has_downstream_trim, is_terminal=is_terminal,
+        is_post_terminal=is_post_terminal, has_template_trims=has_template_trims,
+        donor_trim_by_format=donor_trim_by_format, target_peak_db=target_peak_db,
+        target_rms_db=target_rms_db, bus_override_db=bus_override_db,
+        strict_slot_a=strict_slot_a, carry_db=carry_db,
+    )
+    node.governing = gov if node.staged else None
+    post_trim_buf, post_buf = _apply_bus_trim_and_post_fader(
+        trk, node, pre_buf, pre_in_pk, pre_in_rms, session_sr, pan_law_db,
+        target_peak_db, target_rms_db, silence_det, cfg,
+    )
     return post_trim_buf, post_buf, out_carry
 
 
@@ -1047,13 +1118,14 @@ def _run_dag_traversal(
     stage_bus_faders: bool,
     attenuate_only: bool,
     max_bus_fader_db: float,
+    max_gain_db: float,
     downstream_trim_nodes: set[str],
     terminal_nodes: set[str],
     post_terminal_nodes: set[str],
     has_template_trims: bool,
     donor_trim_by_format: Mapping[str, SlotATrimInfo],
     silence_det: SilenceDetector,
-    classifier_det: AudioClassifierDetector,
+    cfg: Mapping[str, Any],
     leaf_loader: Callable[[str], LeafAudioInput | None] | None,
     progress_cb: Callable[[int, int, str], None] | None,
     cancel_cb: Callable[[], bool] | None,
@@ -1084,7 +1156,8 @@ def _run_dag_traversal(
             leaf = None
         if leaf is not None:
             pre_buf, post_buf = _evaluate_leaf_node(
-                trk, node, leaf, session_sr, silence_det, classifier_det, leaf_fader_shift_db=leaf_fader_shift_db,
+                trk, node, leaf, session_sr, silence_det, cfg, target_peak_db, target_rms_db,
+                leaf_fader_shift_db=leaf_fader_shift_db,
             )
             carry_out[name] = 0.0
         else:
@@ -1093,10 +1166,10 @@ def _run_dag_traversal(
             in_carry = (sum(in_carries) / len(in_carries)) if in_carries else 0.0
             pre_buf, post_buf, out_carry = _evaluate_bus_node(
                 trk, node, acc, session_sr, pan_law_db, target_peak_db, target_rms_db,
-                stage_bus_faders, attenuate_only, max_bus_fader_db,
+                stage_bus_faders, attenuate_only, max_bus_fader_db, max_gain_db,
                 name in downstream_trim_nodes, name in terminal_nodes,
                 name in post_terminal_nodes, has_template_trims, donor_trim_by_format,
-                silence_det, classifier_det,
+                silence_det, cfg,
                 bus_override_db=overrides_map.get(lk), strict_slot_a=strict_slot_a, carry_db=in_carry,
             )
             carry_out[name] = out_carry
@@ -1192,14 +1265,13 @@ def build_annotated_signal_flow(
     """Reconstruct the Pro Tools signal-flow DAG, sum audio in float64, and stage bus faders."""
     cfg = dict(config or {})
     target_peak_db, target_rms_db = float(cfg.get("target_peak", -6.0)), float(cfg.get("target_rms", -18.0))
+    max_gain_db = float(cfg.get("max_gain_db", 24.0))
     pan_law_db = float(cfg.get("protools_pan_law_db", -3.0))
     max_bus_fader_db = max(0.0, _FADER_MAX_DB - max(0.0, float(cfg.get("fader_headroom_db", 8.0))))
     dbfs_conv = str(cfg.get("dbfs_convention", "standard"))
 
-    bus_cfg = {**cfg, "force_transient": [], "force_sustained": []}
-    silence_det, classifier_det = SilenceDetector(), AudioClassifierDetector()
-    silence_det.configure(bus_cfg)
-    classifier_det.configure(bus_cfg)
+    silence_det = SilenceDetector()
+    silence_det.configure(cfg)
 
     leaf_map = {k.lower(): v for k, v in (leaf_audio or {}).items()}
     gains_map = {k.lower(): v for k, v in (leaf_gains or {}).items()}
@@ -1229,9 +1301,9 @@ def build_annotated_signal_flow(
         _run_dag_traversal(
             order, audio_tracks, nodes, outgoing, leaf_map, gains_map, overrides_map,
             session_sr, pan_law_db, target_peak_db, target_rms_db,
-            stage_bus_faders, attenuate_only, max_bus_fader_db,
+            stage_bus_faders, attenuate_only, max_bus_fader_db, max_gain_db,
             downstream_trim_nodes, terminal_nodes, post_terminal_nodes,
-            has_template_trims, donor_trim_by_format, silence_det, classifier_det,
+            has_template_trims, donor_trim_by_format, silence_det, cfg,
             leaf_loader, progress_cb if passes == 1 else None, cancel_cb,
             strict_slot_a=strict_slot_a, leaf_fader_shift_db=leaf_shift_db, leaf_cache=leaf_cache,
         )

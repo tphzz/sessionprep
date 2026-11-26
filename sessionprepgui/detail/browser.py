@@ -99,6 +99,7 @@ class ReportBrowser(_HelpBrowser):
     sourceLocationsRequested = Signal(str, bool)
     verificationRetryRequested = Signal()
     repairRequested = Signal(str)
+    peakJumpRequested = Signal(int)
     reportChanged = Signal()
 
     def __init__(self, help_map, parent=None):
@@ -468,7 +469,7 @@ class ReportBrowser(_HelpBrowser):
                 href = cursor.charFormat().anchorHref()
             if QUrl(href).scheme() in {"report-review", "report-details", "report-help", "report-visualize",
                                        "report-repair", "report-repairs", "report-original", "report-corrected",
-                                       "report-retry"}:
+                                       "report-retry", "peak"}:
                 self.activate_report_link(QUrl(href))
                 event.accept()
                 return
@@ -511,6 +512,13 @@ class ReportBrowser(_HelpBrowser):
             if key in self._states[self._track_key] and any(
                     row["id"] == key and row.get("review_repair") for row in self._prepared["rows"]):
                 self.repairRequested.emit(key)
+        elif scheme == "peak":
+            try:
+                sample = int(key)
+            except ValueError:
+                return
+            if sample >= 0:
+                self.peakJumpRequested.emit(sample)
         elif scheme == "report-details" and any(r["id"] == key for r in self._prepared["rows"]):
             anchor = self.capture_reading_anchor()
             self._states[self._track_key].symmetric_difference_update({key})

@@ -148,7 +148,7 @@ def comparison_readings(check, track, config):
         if any(r and key in r.data for r in sources):
             def format_value(r, _key=key, _unit=unit, _places=places):
                 value = r.data.get(_key)
-                if _key in {"dc_db", "l_rms_db", "r_rms_db"} and isinstance(value, (int, float)):
+                if _key in {"l_rms_db", "r_rms_db"} and isinstance(value, (int, float)):
                     value += offset
                 return _level(value, _unit, _places)
             rows.append((name, *(reading(r, format_value) for r in sources)))
@@ -164,7 +164,7 @@ def comparison_readings(check, track, config):
                                               for r in sources)))
     detail = ""
     if detector_id == "dc_offset":
-        detail = "Warning threshold " + _level(config.get("dc_offset_warn_db", -40) + offset, " dBFS")
+        detail = "Warning threshold " + _level(config.get("dc_offset_warn_db", -40), " dBFS")
     elif detector_id == "subsonic":
         detail = subsonic_note(config)
     location = ""

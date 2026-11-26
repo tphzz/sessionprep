@@ -171,9 +171,9 @@ def test_normalization_uses_corrected_peak_and_each_render_starts_from_original(
     pipeline, session = analyze([track], repair_auto_ultrasonic=True)
     pipeline.plan(session)
 
-    assert track.detector_results["audio_classifier"].data["peak_db"] == pytest.approx(original_peak)
     normalization = track.processor_results["bimodal_normalize"]
     gain = normalization.gain_db
+    assert normalization.data["detected_peak_db"] == pytest.approx(corrected_peak, abs=1e-5)
     assert gain == pytest.approx(-6 - corrected_peak, abs=1e-5)
     assert normalization.data["fader_offset"] == pytest.approx(-gain)
     output = tmp_path / "output"
@@ -209,16 +209,14 @@ def test_gain_linked_group_uses_the_corrected_sustained_rms_before_rebalancing(t
     second = source_track(tmp_path, "Second.wav", 0.25 * note, rate)
     for track in [first, second]:
         track.group = "Pair"
-        track.classification_override = "Sustained"
+        track.classification_override = "Auto"
     pipeline, session = analyze([first, second], repair_auto_ultrasonic=True)
-    original_rms = first.detector_results["audio_classifier"].data["rms_anchor_db"]
     pipeline.plan(session)
 
     first_result = first.processor_results["bimodal_normalize"]
     second_result = second.processor_results["bimodal_normalize"]
     first_gain = -18 - 20 * math.log10(0.07 / math.sqrt(2))
     second_gain = -18 - 20 * math.log10(0.25 / math.sqrt(2))
-    assert first.detector_results["audio_classifier"].data["rms_anchor_db"] == original_rms
     assert first_result.data["gain_db_individual"] == pytest.approx(first_gain, abs=0.03)
     for result in [first_result, second_result]:
         assert result.gain_db == pytest.approx(second_gain, abs=0.03)

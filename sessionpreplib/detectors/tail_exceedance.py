@@ -12,6 +12,8 @@ from ..audio import (
     is_silent,
     linear_to_db,
     format_duration,
+    parse_rms_anchor_override,
+    resolve_rms_anchor,
 )
 
 
@@ -19,7 +21,7 @@ class TailExceedanceDetector(TrackDetector):
     id = "tail_exceedance"
     name = "Tail Regions Exceeded Anchor"
     shorthand = "TE"
-    depends_on = ["silence", "audio_classifier"]
+    depends_on = ["silence"]
 
     @classmethod
     def config_params(cls) -> list[ParamSpec]:
@@ -28,7 +30,7 @@ class TailExceedanceDetector(TrackDetector):
                 key="tail_min_exceed_db", type=(int, float), default=3.0,
                 min=0.0, min_exclusive=True,
                 label="Minimum tail exceedance (dB)",
-                description="RMS windows exceeding the anchor by at least this many dB are flagged.",
+                description="RMS windows exceeding the anchor by more than this many dB are flagged.",
             ),
             ParamSpec(
                 key="tail_max_regions", type=int, default=20, min=1,
@@ -63,16 +65,17 @@ class TailExceedanceDetector(TrackDetector):
         )
 
     def is_relevant(self, result: DetectorResult, track: TrackContext | None = None) -> bool:
-        """Tail exceedance is only meaningful when normalizing to the RMS anchor.
-
-        If the processor chose a peak-based method (Transient peak targeting
-        or Sustained peak-limited), the anchor is irrelevant and this
-        detector's result would be noise.
-        """
-        if track and track.processor_results:
-            pr = next(iter(track.processor_results.values()), None)
-            if pr and pr.method and "RMS" not in pr.method:
+        """Tail exceedance is only meaningful when effective normalization is RMS-anchored."""
+        if track is not None:
+            if "bimodal_normalize" in (track.processor_skip or ()):
                 return False
+            if track.processor_results:
+                pr = track.processor_results.get("bimodal_normalize")
+                if pr is not None:
+                    if "rms_anchor_active" in pr.data:
+                        return bool(pr.data["rms_anchor_active"])
+                    if pr.method and "RMS" not in pr.method:
+                        return False
         return True
 
     def configure(self, config):
@@ -105,6 +108,8 @@ class TailExceedanceDetector(TrackDetector):
 
     def _scan_tail_regions(self, track: TrackContext, anchor_mean: float) -> list[dict]:
         window_means = get_rms_window_means(track, self.window_ms, self.stereo_mode)
+        if window_means.size == 0:
+            return []
         gated = get_gated_rms_data(
             track, self.window_ms, self.stereo_mode, self.gate_relative_db
         )
@@ -113,26 +118,41 @@ class TailExceedanceDetector(TrackDetector):
         samplerate = track.samplerate
         floor = np.finfo(np.float64).tiny
 
-        hop_samples = max(1, int((self.tail_hop_ms / 1000) * samplerate))
+        # Peak-preserving max-pooling per hop ensures no mid-hop RMS burst is missed.
+        hop_samples = max(1, round(self.tail_hop_ms * samplerate / 1000))
         starts_all = np.arange(0, window_means.size, hop_samples, dtype=np.int64)
-        active_hop_indices = starts_all[active_mask[starts_all]]
-        sampled_means = window_means[active_hop_indices]
+        active_means = np.where(active_mask, window_means, 0.0)
+        pooled_means = np.maximum.reduceat(active_means, starts_all)
+        hop_active = np.maximum.reduceat(active_mask.astype(np.uint8), starts_all).astype(bool)
+        active_hop_indices = starts_all[hop_active]
+        sampled_means = pooled_means[hop_active]
+        if sampled_means.size == 0:
+            return []
 
         exceed_db = 10.0 * np.log10(np.maximum(sampled_means, floor) / anchor_mean)
         idx = np.flatnonzero(exceed_db > float(self.tail_min_exceed_db))
         if idx.size == 0:
             return []
 
-        splits = np.flatnonzero(np.diff(active_hop_indices[idx]) > min(hop_samples, window_samples))
+        splits = np.flatnonzero(np.diff(active_hop_indices[idx]) > hop_samples)
         starts = np.concatenate(([0], splits + 1))
         ends = np.concatenate((splits, [idx.size - 1]))
 
         data_shape_0 = int(track.audio_data.shape[0]) if track.audio_data is not None else 0
+        thresh_mean = anchor_mean * (10.0 ** (float(self.tail_min_exceed_db) / 10.0))
         regions = []
         for s_i, e_i in zip(starts, ends):
             i_start, i_end = int(idx[s_i]), int(idx[e_i])
-            sample_start = int(active_hop_indices[i_start])
-            sample_end = min(int(active_hop_indices[i_end]) + window_samples, data_shape_0)
+            h_start = int(active_hop_indices[i_start])
+            h_end = int(active_hop_indices[i_end])
+            # Refine region bounds to exact first/last exceeding active windows in boundary hops.
+            s_slice = active_means[h_start:min(h_start + hop_samples, window_means.size)]
+            s_hits = np.flatnonzero(s_slice > thresh_mean)
+            sample_start = h_start + (int(s_hits[0]) if s_hits.size else 0)
+            e_slice = active_means[h_end:min(h_end + hop_samples, window_means.size)]
+            e_hits = np.flatnonzero(e_slice > thresh_mean)
+            last_win = h_end + (int(e_hits[-1]) if e_hits.size else 0)
+            sample_end = min(last_win + window_samples, data_shape_0)
             regions.append({
                 "start_sample": sample_start,
                 "end_sample": sample_end,
@@ -152,6 +172,7 @@ class TailExceedanceDetector(TrackDetector):
         regions: list[dict],
         samplerate: int,
         rms_anchor_db: float,
+        rms_anchor_label: str = "",
     ) -> DetectorResult:
         covered_samples = 0
         covered_end = 0
@@ -166,6 +187,7 @@ class TailExceedanceDetector(TrackDetector):
             "total_duration_sec": covered_samples / samplerate,
             "max_exceed_db": float(max_exceed),
             "anchor_db": float(rms_anchor_db),
+            "anchor_label": rms_anchor_label,
         }
         summary_text = (
             f"{len(regions)} tail region(s) exceed anchor "
@@ -187,7 +209,11 @@ class TailExceedanceDetector(TrackDetector):
             detector_id=self.id,
             severity=Severity.ATTENTION,
             summary=summary_text,
-            data={"tail_regions": regions, "tail_summary": tail_summary},
+            data={
+                "tail_regions": regions,
+                "tail_summary": tail_summary,
+                "rms_anchor_label": rms_anchor_label,
+            },
             hint="check for section-based riding",
             issues=issues,
         )
@@ -196,22 +222,23 @@ class TailExceedanceDetector(TrackDetector):
         if is_silent(track):
             return self._non_applicable("silent track")
 
-        ov = getattr(track, "rms_anchor_override", None)
-        if ov == "max":
-            effective_mode = "max"
-        elif ov and ov.startswith("p"):
-            effective_mode = "percentile"
-        else:
-            effective_mode = self.rms_anchor_mode
+        effective_mode, _ = parse_rms_anchor_override(
+            getattr(track, "rms_anchor_override", None), self.rms_anchor_mode, self.rms_percentile,
+        )
         if effective_mode != "percentile":
             return self._non_applicable("tail reporting only for percentile anchoring")
 
-        crest_result = track.detector_results.get("audio_classifier")
-        if crest_result is None:
-            return self._non_applicable("audio_classifier result missing")
-
-        anchor_mean = crest_result.data.get("rms_anchor_mean", 0.0)
-        rms_anchor_db = crest_result.data.get("rms_anchor_db", float(-np.inf))
+        anchor = resolve_rms_anchor(
+            track,
+            self.window_ms,
+            self.stereo_mode,
+            self.gate_relative_db,
+            self.rms_anchor_mode,
+            self.rms_percentile,
+        )
+        anchor_mean = anchor["rms_anchor_mean"]
+        rms_anchor_db = anchor["rms_anchor_db"]
+        rms_anchor_label = str(anchor.get("rms_anchor_label", ""))
         if anchor_mean <= 0:
             return self._non_applicable("anchor is zero", anchor_db=rms_anchor_db)
 
@@ -223,12 +250,14 @@ class TailExceedanceDetector(TrackDetector):
                 summary="no significant tail exceedances",
                 data={
                     "tail_regions": [],
+                    "rms_anchor_label": rms_anchor_label,
                     "tail_summary": {
                         "regions": 0,
                         "total_duration_sec": 0.0,
                         "max_exceed_db": 0.0,
                         "anchor_db": float(rms_anchor_db),
+                        "anchor_label": rms_anchor_label,
                     },
                 },
             )
-        return self._build_tail_result(regions, track.samplerate, rms_anchor_db)
+        return self._build_tail_result(regions, track.samplerate, rms_anchor_db, rms_anchor_label)

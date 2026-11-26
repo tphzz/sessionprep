@@ -481,13 +481,12 @@ sessionpreplib/
         dual_mono.py             # DualMonoDetector
         one_sided_silence.py     # OneSidedSilenceDetector
         subsonic.py              # SubsonicDetector
-        audio_classifier.py      # AudioClassifierDetector
-        tail_exceedance.py       # TailExceedanceDetector
+        tail_exceedance.py       # TailExceedanceDetector (depends on silence)
         format_consistency.py    # FormatConsistencyDetector (session-level)
         length_consistency.py    # LengthConsistencyDetector (session-level)
     processors/
         __init__.py              # Exports all processors; provides default_processors()
-        bimodal_normalize.py     # BimodalNormalizeProcessor
+        bimodal_normalize.py     # BimodalNormalizeProcessor (Peak-Capped RMS, id="bimodal_normalize")
         mono_downmix.py          # MonoDownmixProcessor (stub)
     daw_processors/
         __init__.py              # Exports all DAW processors; provides default_daw_processors()
@@ -1035,30 +1034,23 @@ cycles.
 - **Severity:** `INFO` if a channel meets the threshold, `CLEAN` otherwise.
 - **Hint:** `"consider HPF ~{cutoff_hz} Hz"`
 
-#### 6.3.9 AudioClassifierDetector (`audio_classifier.py`)
+#### 6.3.9 TailExceedanceDetector (`tail_exceedance.py`)
 
-- **ID:** `audio_classifier` | **Depends on:** `["silence"]`
-- **Config:** `window`, `stereo_mode`, `rms_anchor`, `rms_percentile`, `gate_relative_db`, `crest_threshold`, `decay_lookahead_ms`, `decay_db_threshold`, `sparse_density_threshold`, `force_transient`, `force_sustained`
-- **Data:** `peak_db`, `rms_max_db`, `rms_anchor_db`, `rms_anchor_mean`, `crest`, `decay_db`, `density`, `classification`, `is_transient`, and `near_threshold`. When `decay_at_floor` is true, the decay reading is a lower bound. Normalization stores the classifier metrics used for the gain decision in its processor result.
-- **Classification logic:** Three-metric system — crest factor (peak-to-RMS ratio), envelope decay rate (energy drop after loudest moment), and density (fraction of active RMS windows). Sparse tracks with at least one agreeing dynamic metric are classified as Transient (catches toms, crashes, FX hits). For non-sparse tracks, crest and decay vote together with decay as tiebreaker: high crest + slow decay → Sustained (plucked/piano); low crest + fast decay → Transient (compressed drums).
-- **Severity:** Always `INFO`
-
-#### 6.3.10 TailExceedanceDetector (`tail_exceedance.py`)
-
-- **ID:** `tail_exceedance` | **Depends on:** `["silence", "audio_classifier"]`
+- **ID:** `tail_exceedance` | **Depends on:** `["silence"]` (no separate audio classifier; `AudioClassifierDetector` was retired in the Peak-Capped RMS rework)
 - **Config:** `window`, `stereo_mode`, `rms_anchor`, `rms_percentile`, `gate_relative_db`, `tail_min_exceed_db`, `tail_max_regions`, `tail_hop_ms`
-- **Data:** `{"tail_regions": list[dict], "tail_summary": {"regions", "total_duration_sec", "max_exceed_db", "anchor_db"}}`
+- **Data:** `{"tail_regions": list[dict], "tail_summary": {"regions", "total_duration_sec", "max_exceed_db", "anchor_db", "anchor_label"}, "rms_anchor_label": str}`
+- **Algorithm:** Uses `resolve_rms_anchor()` over cancellation-free `block_window_sums()` windows and peak-preserving max-pooling (`np.maximum.reduceat`) per hop with boundary-hop refinement so mid-hop bursts are never missed. `is_relevant()` checks `bimodal_normalize` `rms_anchor_active` and `processor_skip`.
 - **Issues:** Per-region `IssueLocation` (all channels) for each exceedance region
 - **Severity:** `ATTENTION` if regions found, `CLEAN` otherwise
 
-#### 6.3.11 FormatConsistencyDetector (`format_consistency.py`)
+#### 6.3.10 FormatConsistencyDetector (`format_consistency.py`)
 
 - **Type:** SessionDetector | **ID:** `format_consistency`
 - **Data (per mismatch):** `{"filename", "expected_sr", "expected_bd", "actual_sr", "actual_bd", "mismatch_reasons"}`
 - Stores `_most_common_sr` and `_most_common_bd` on `session.config`.
 - **Severity:** `PROBLEM` per mismatched file
 
-#### 6.3.12 LengthConsistencyDetector (`length_consistency.py`)
+#### 6.3.11 LengthConsistencyDetector (`length_consistency.py`)
 
 - **Type:** SessionDetector | **ID:** `length_consistency`
 - **Data (per mismatch):** `{"filename", "expected_samples", "expected_duration_fmt", "actual_samples", "actual_duration_fmt"}`
@@ -1139,15 +1131,17 @@ sorting by priority.
   audio.
 - **`apply()`** — performs the audio transformation. Only called in execute mode.
 
-### 7.3 BimodalNormalizeProcessor (`bimodal_normalize.py`)
+### 7.3 BimodalNormalizeProcessor (`bimodal_normalize.py` — Peak-Capped RMS)
 
-- **ID:** `bimodal_normalize` | **Shorthand:** `BN` | **Priority:** `PRIORITY_NORMALIZE` (100)
-- **Reads:** `silence.data["is_silent"]`, `audio_classifier.data["peak_db", "rms_anchor_db", "classification", "is_transient"]`
-- **Config:** `target_rms`, `target_peak`
+- **ID:** `bimodal_normalize` (retained for backward compatibility) | **Name:** `"Peak-Capped RMS"` | **Shorthand:** `BN` | **Priority:** `PRIORITY_NORMALIZE` (100)
+- **Shared leaf helpers (`sessionpreplib/audio.py`):** `block_window_sums()`, `resolve_rms_anchor()`, `find_governing_and_next_peak(exclusion_ms=100.0)`, `measure_true_peak_db()` (bounded-memory overlap-save `resample_poly`, `4× <= 48k`, `2× < 192k`, `1× >= 192k`), `compute_peak_capped_gain()`, `INACTIVE_NORMALIZATION_CLASSIFICATIONS`, `NOISE_FLOOR_PEAK_DB = -70.0`, `AES17_OFFSET = 10 * log10(2)`.
+- **Config:** `target_rms` (`-18.0`), `target_peak` (`-6.0`, validated `target_rms <= target_peak`), `max_gain_db` (`24.0`, `0..36`), `force_peak` (regex string).
 - **Logic:**
-  - Silent -> gain 0, classification "Silent"
-  - Transient -> gain = target_peak - peak
-  - Sustained -> gain = min(target_rms - rms, target_peak - peak)
+  - `Silent` / `Skip` / `Noise Floor` (`peak <= -70.0 dBFS`) → `0.0 dB` bit-exact passthrough
+  - `Auto` → `min(target_rms - rms_anchor, target_peak - peak, max_gain_db)` (`1e-9` tie-break to `Peak`)
+  - `Peak` (override or `force_peak` match) → `min(target_peak - peak, max_gain_db)`
+  - `RMS` (override) → `min(target_rms - rms_anchor, max_gain_db)` with lazy `dBTP` warnings above `-5.5 dBFS`
+- **Verification:** `RepairVerification` evidence schema version `7` (`dbfs_convention` marked `presentation_only=True`); headless DSP matrix M1–M13 in `tests/unit/test_peak_capped_rms_dsp.py` and GUI/CLI/v7→v8 migration tests in `tests/unit/test_peak_capped_rms_gui.py`.
 
 ### 7.4 MonoDownmixProcessor (`mono_downmix.py`)
 
@@ -1571,9 +1565,9 @@ built-in defaults  ->  preset file  ->  CLI args / GUI overrides
 ### 11.2 Functions
 
 - `default_config() -> dict` — all built-in defaults
-- `merge_configs(*configs) -> dict` — left-to-right merge; list keys (`force_transient`, `force_sustained`, `group`) are concatenated
-- `validate_config(config) -> None` — raises `ConfigError` on invalid values
-- `load_preset(path) -> dict` — loads a JSON preset, strips `schema_version` and `_description` metadata
+- `merge_configs(*configs) -> dict` — left-to-right merge; list keys (`group`) are concatenated
+- `validate_config(config) -> None` — raises `ConfigError` on invalid values (including `target_rms > target_peak` and invalid `force_peak` regex)
+- `load_preset(path) -> dict` — loads a JSON preset, strips `schema_version` and `_description` metadata, and migrates legacy 3-metric keys automatically
 - `save_preset(config, path, *, description=None) -> None` — saves non-default, non-internal keys with `schema_version`
 
 Internal/CLI-only keys (`execute`, `overwrite`, `output_folder`, `backup`,
@@ -1591,8 +1585,8 @@ Example `metal_session.json`:
     "_description": "Metal session preset",
     "target_rms": -16.0,
     "target_peak": -3.0,
-    "crest_threshold": 15.0,
-    "force_transient": ["kick", "snare", "tom"]
+    "max_gain_db": 24.0,
+    "force_peak": "kick|snare|tom"
 }
 ```
 
@@ -1601,21 +1595,21 @@ Example `metal_session.json`:
 ```python
 {
     "target_rms": -18.0,           "target_peak": -6.0,
-    "crest_threshold": 12.0,       "clip_consecutive": 3,
-    "clip_report_max_ranges": 10,  "dc_offset_warn_db": -40.0,
-    "corr_warn": -0.3,            "dual_mono_eps": 1e-5,
-    "mono_loss_warn_db": 6.0,     "one_sided_silence_db": -80.0,
-    "subsonic_hz": 30.0,          "subsonic_warn_ratio_db": -20.0,
-    "window": 400,                "stereo_mode": "avg",
-    "rms_anchor": "percentile",   "rms_percentile": 95.0,
-    "gate_relative_db": 40.0,     "tail_max_regions": 20,
-    "tail_min_exceed_db": 3.0,    "tail_hop_ms": 10,
-    "force_transient": [],         "force_sustained": [],
-    "group": [],
-    "anchor": None,                "normalize_faders": False,
-    "execute": False,              "overwrite": False,
-    "output_folder": "processed",  "backup": "_originals",
-    "report": "sessionprep.txt",   "json": "sessionprep.json",
+    "max_gain_db": 24.0,           "force_peak": "",
+    "clip_consecutive": 3,         "clip_report_max_ranges": 10,
+    "dc_offset_warn_db": -40.0,    "corr_warn": -0.3,
+    "dual_mono_eps": 1e-5,         "mono_loss_warn_db": 6.0,
+    "one_sided_silence_db": -80.0, "subsonic_hz": 30.0,
+    "subsonic_warn_ratio_db": -20.0, "window": 400,
+    "stereo_mode": "avg",          "rms_anchor": "percentile",
+    "rms_percentile": 95.0,        "gate_relative_db": 40.0,
+    "dbfs_convention": "standard", "tail_max_regions": 20,
+    "tail_min_exceed_db": 3.0,     "tail_hop_ms": 10,
+    "group": [],                   "anchor": None,
+    "fader_headroom_db": 8.0,      "execute": False,
+    "overwrite": False,            "output_folder": "processed",
+    "backup": "_originals",        "report": "sessionprep.txt",
+    "json": "sessionprep.json",
 }
 ```
 
@@ -2301,7 +2295,7 @@ preferences directory:
                 "...": "..."
             },
             "processors": {
-                "bimodal_normalize": { "target_rms": -18.0, "target_peak": -6.0 }
+                "bimodal_normalize": { "target_rms": -18.0, "target_peak": -6.0, "max_gain_db": 24.0, "force_peak": "" }
             },
             "daw_processors": {
                 "protools": { "protools_enabled": true },
@@ -2337,9 +2331,7 @@ preferences directory:
   with name, color, gain-linked, daw-target). Managed via the Preferences
   dialog (Global → Groups) and the toolbar "Group:" combo.
 
-Session-specific values (`force_transient`, `force_sustained`, `group`,
-`anchor`) are **not** stored in the config file — they are per-session
-and will be saved in session project files in the future.
+Session-specific values (`group`, `anchor`) are **not** stored in the config file — they are per-session and saved in session project files.
 
 **Config presets vs. session config:**
 

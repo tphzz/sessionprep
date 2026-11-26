@@ -599,7 +599,7 @@ def colorize_tracks(
 #        +12.0  →  +12 dB  (fader fully up)
 #          0.0  →    0 dB  (unity gain)
 #         -6.0  →   -6 dB
-#        -18.0  →  -18 dB  (SessionPrep sustained target)
+#        -18.0  →  -18 dB  (SessionPrep target RMS)
 #        -80.0  →  -80 dB  (near silence)
 #      The proto's -1.0/+1.0 range likely applies only to pan, mute,
 #      LFE, and plugin parameter controls — not volume.

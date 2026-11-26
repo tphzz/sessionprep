@@ -89,7 +89,7 @@ class Phase2Page(QWidget):
         table = _DraggableTrackTable()
         table.setColumnCount(len(TrackCol))
         table.setHorizontalHeaderLabels(
-            ["File", "Ch", "Analysis", "Classification", "Gain", "RMS Anchor", "Group", "Processing"]
+            ["File", "Ch", "Analysis", "Mode", "Gain", "RMS Anchor", "Group", "Processing"]
         )
         table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)

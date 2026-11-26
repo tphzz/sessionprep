@@ -234,7 +234,7 @@ def test_file_title_and_sections_use_shared_roles(monkeypatch):
     html = render_prepared_track_report(data)
     assert "font-size:x-large; font-weight:600;" in html  # title role
     headings = re.findall(rf'<p style="{re.escape(REPORT_SECTION_HEADING)}[^"]*">(?:<a name="[^"]+"></a>)?([^<]+)</p>', html)
-    assert headings == ["Bimodal Normalization", "Detector findings"]
+    assert headings == ["Peak-Capped RMS", "Detector findings"]
     assert "margin-left:8px" not in data["header"]
 
 
@@ -248,12 +248,12 @@ def test_report_browser_keeps_heading_roles_and_finding_body_size(qapp, monkeypa
     size = lambda text: browser.document().find(text).charFormat().font().pointSizeF()
     body = browser.font().pointSizeF()
     assert size("Lead Vocal.wav") == pytest.approx(body * 1.5)
-    assert size("Bimodal Normalization") == pytest.approx(body)
+    assert size("Peak-Capped RMS") == pytest.approx(body)
     assert size("Detector findings") == pytest.approx(body)
     # Normalization content uses the finding body role, like the findings table.
     assert not browser.document().find("Problem").isNull()
-    assert size("Chosen") == pytest.approx(size("Problem"))
-    assert size("Chosen") < body
+    assert size("Governs") == pytest.approx(size("Problem"))
+    assert size("Governs") < body
 
 
 # ── Normalization ────────────────────────────────────────
@@ -265,24 +265,27 @@ def _render(classification, method, compact=False, **data):
 
 
 def test_normalization_names_the_chosen_measure_in_text():
-    html = _render("Sustained", "RMS → -16 dB", fader_rebalance_shift=2.0)
-    assert "RMS &rarr; &minus;16.0 dBFS" in html
-    assert re.search(r"RMS \(p95\)</td>.*Chosen", html)
+    html = _render("Auto (RMS)", "RMS → -16.0 dBFS", governing="RMS", fader_rebalance_shift=2.0)
+    assert "Result: peak" in html
+    assert re.search(r"RMS \(p95\)</td>.*Governs", html)
     for value in ("&minus;15.0 dBFS", "&minus;6.0 dBFS", "+9.0 dB", "&minus;21.0 dBFS", "&minus;16.0 dBFS", "+5.0 dB"):
         assert value in html
     assert "background-color:#2d2d2d" in html  # findings-table header band
     assert "Fader rebalanced: &minus;2.0 dB shift &rarr; fader offset &minus;3.0 dB" in html
     assert "#cc8844" not in html and "#44cc44" not in html
-    assert 'color:#44cccc; font-weight:600;">Chosen' in html
+    assert 'color:#44cccc; font-weight:600;">Governs' in html
 
 
 def test_normalization_transient_and_peak_limited_notes():
-    transient = _render("Transient", "Peak → -6 dB")
-    assert "Peak &rarr; &minus;6.0 dBFS" in transient
-    assert re.search(r"Peak</td>.*Chosen</span>", transient)
-    limited = _render("Sustained", "Peak Limited")
-    assert "Peak (limited) &rarr; &minus;6.0 dBFS" in limited
-    assert "Chosen &middot; limiting" in limited and "Would exceed peak" in limited
+    peak_mode = _render("Peak", "Peak (manual) → -6.0 dBFS", mode="Peak", governing="Peak")
+    assert "Peak" in peak_mode
+    assert re.search(r"Peak</td>.*Governs</span>", peak_mode)
+    limited = _render(
+        "Auto (Peak)", "Peak (ceiling) → -6.0 dBFS",
+        mode="Auto", governing="Peak", detected_peak_db=-9.0, gain_for_peak=3.0, post_rms_db=-18.0,
+    )
+    assert "Auto (Peak)" in limited
+    assert "Governs" in limited and "below" in limited
 
 
 @pytest.mark.parametrize("classification", ["Skip", "Silent", "Unknown"])
@@ -293,19 +296,19 @@ def test_normalization_skip_states_are_one_line(classification):
 
 
 def test_normalization_non_finite_values_keep_their_sign():
-    html = _render("Transient", "Peak → -6 dB", detected_rms_db=-math.inf,
+    html = _render("Peak", "Peak → -6 dB", governing="Peak", detected_rms_db=-math.inf,
                    gain_for_rms=math.inf)
     assert "&minus;&infin; dBFS" in html
     assert "+&infin; dB" in html
 
 
 def test_compact_normalization_uses_percentage_columns_and_note_under_measure(monkeypatch):
-    html = _render("Sustained", "Peak Limited", compact=True)
+    html = _render("Auto (Peak)", "Peak (ceiling) → -6.0 dBFS", governing="Peak", compact=True)
     assert 'table width="100%"' in html
     assert 'width="30%"' in html and 'width="150"' not in html
-    assert re.search(r"Peak<br><span[^>]*>Chosen &middot; limiting", html)
+    assert re.search(r"Peak<br><span[^>]*>Governs", html)
     monkeypatch.setattr(report, "chunk_sizes", lambda path: [])
-    _processor, track, session = _normalized_session(method="Peak Limited")
+    _processor, track, session = _normalized_session("Auto (Peak)", "Peak (ceiling) → -6.0 dBFS", governing="Peak")
     data = prepare_track_report(track, session)
     assert 'width="100%"' in data["header_compact"] and 'width="100%"' not in data["header"]
     assert data["header_compact"] in render_prepared_track_report(data, compact=True)
@@ -389,7 +392,7 @@ def test_report_browser_gap_below_findings_heading(qapp, monkeypatch):
     qapp.processEvents()
     rect = lambda text: browser.cursorRect(browser.document().find(text))
     heading_gap = rect("Severity").top() - rect("Detector findings").bottom()
-    summary_gap = rect("Measure").top() - rect("Sustained").bottom()
+    summary_gap = rect("Measure").top() - rect("Auto (RMS)").bottom()
     assert heading_gap == summary_gap >= 8 + 4  # 8 px table margin + 4 px cell padding
     browser.close()
 

@@ -33,6 +33,7 @@ from sessionpreplib.config import (
     PRESENTATION_PARAMS,
     build_structured_defaults,
     get_app_dir,
+    migrate_legacy_config,
     validate_structured_config,
 )
 from .theme import PT_DEFAULT_COLORS
@@ -464,13 +465,16 @@ def _merge_structured(
         for preset_name, preset_data in overrides["config_presets"].items():
             if not isinstance(preset_data, dict):
                 continue
+            migrated_preset, _ = migrate_legacy_config(preset_data)
             if preset_name not in default_presets:
-                # User-created preset — take as-is
-                default_presets[preset_name] = copy.deepcopy(preset_data)
+                # User-created preset — backfill any newly added default keys while preserving user values
+                base = _build_default_config_preset()
+                _merge_config_preset(base, migrated_preset)
+                default_presets[preset_name] = base
                 continue
             # Merge into default preset structure
             dp = default_presets[preset_name]
-            _merge_config_preset(dp, preset_data)
+            _merge_config_preset(dp, migrated_preset)
 
     # -- group_presets: replace wholesale per preset --
     if "group_presets" in overrides and isinstance(overrides["group_presets"], dict):

@@ -121,11 +121,13 @@ def _role_badge(role: str, node: dict[str, Any]) -> tuple[str, str]:
         return "POST-TERM", COLORS["metadata"]
     if role == "master":
         return "MASTER", COLORS["metadata"]
-    cls = str(node.get("classification", ""))
-    if cls == "Transient":
-        return "Trans", FILE_COLOR_TRANSIENT.name()
-    if cls == "Sustained":
-        return "Sust", FILE_COLOR_SUSTAINED.name()
+    if node.get("classification") == "Error":
+        return "ERR", COLORS["problems"]
+    gov = node.get("governing")
+    if node.get("staged") and gov == "Peak":
+        return "Peak", FILE_COLOR_TRANSIENT.name()
+    if node.get("staged") and gov == "RMS":
+        return "RMS", FILE_COLOR_SUSTAINED.name()
     return "", COLORS["metadata"]
 
 

@@ -71,6 +71,7 @@ class GroupsController(QObject):
     groups_modified = Signal()
     setup_table_refresh_requested = Signal()
     file_tab_refresh_requested = Signal(object)
+    mode_cells_refresh_requested = Signal()
     prepare_stale_requested = Signal()
     detail_tab_dirty_changed = Signal(int, str, bool)
     auto_fit_requested = Signal()
@@ -736,6 +737,7 @@ class GroupsController(QObject):
                     gain_sort.setText(f"{pr.gain_db:+.1f}")
                     gain_sort._sort_key = pr.gain_db
             self._track_table.setSortingEnabled(True)
+            self.mode_cells_refresh_requested.emit()
         self.setup_table_refresh_requested.emit()
         if self._state.current_track and self._state.current_track.status == "OK":
             self.file_tab_refresh_requested.emit(self._state.current_track)

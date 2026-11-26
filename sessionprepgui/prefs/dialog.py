@@ -495,6 +495,18 @@ class PreferencesDialog(QDialog):
         self._groups_page.commit(self._config)
 
         self._save_cfg_preset_widgets()
+        from sessionpreplib.config import validate_structured_config
+
+        for preset_name, preset_data in self._config_presets_data.items():
+            errs = validate_structured_config(preset_data)
+            if errs:
+                QMessageBox.warning(
+                    self,
+                    "Invalid Configuration Preset",
+                    f"Preset \u201c{preset_name}\u201d has an invalid setting:\n\n{errs[0].message}",
+                )
+                return
+
         self._config["config_presets"] = copy.deepcopy(self._config_presets_data)
         self._config.setdefault("app", {})[
             "active_config_preset"] = self._cfg_panel.current_name

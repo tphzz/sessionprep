@@ -605,6 +605,7 @@ class SessionPrepWindow(QMainWindow):
             lambda key: self._detail_ctrl.open_track_repairs(self._state.current_track, key)
         )
         p2.file_report.visualizeRequested.connect(self._detail_ctrl.visualize_detector)
+        p2.file_report.peakJumpRequested.connect(self._detail_ctrl.jump_to_peak)
         p2.file_report.sourceLocationsRequested.connect(self._detail_ctrl.show_source_locations)
         p2.file_report.verificationRetryRequested.connect(self._detail_ctrl.retry_detector_verification)
         p2.file_report.reportChanged.connect(self._detail_ctrl.on_file_report_context_changed)
@@ -648,6 +649,7 @@ class SessionPrepWindow(QMainWindow):
 
         self._groups_ctrl.setup_table_refresh_requested.connect(self._table_ctrl.populate_setup_table)
         self._groups_ctrl.file_tab_refresh_requested.connect(self._table_ctrl.refresh_file_tab)
+        self._groups_ctrl.mode_cells_refresh_requested.connect(self._table_ctrl.refresh_mode_column)
         self._groups_ctrl.prepare_stale_requested.connect(self._analysis_ctrl.mark_prepare_stale)
         self._groups_ctrl.prepare_stale_requested.connect(self._daw_ctrl.mark_signal_flow_stale)
         self._groups_ctrl.detail_tab_dirty_changed.connect(self._config_ctrl.set_detail_tab_dirty)

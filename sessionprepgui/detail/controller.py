@@ -529,12 +529,38 @@ class TrackDetailController(QObject):
 
     def refresh_waveform_issues(self) -> None:
         issues: list[Any] = []
+        gov_sample: int | None = None
+        gov_peak_db: float | None = None
         if self.visualization_context_is_current():
             results = self.audition_results()
             for key in results:
                 issues.extend(self.detector_visualization_issues(key, results))
+            track = self._state.current_track
+            pr = track.processor_results.get("bimodal_normalize") if track is not None else None
+            show_norm_peak = (
+                track is not None
+                and pr is not None
+                and pr.classification not in ("Silent", "Error")
+                and pr.data.get("governing_peak_sample") is not None
+                and (self.audition_is_corrected() or not track.repair_recipe.active)
+            )
+            if show_norm_peak and pr is not None:
+                gov_sample = int(pr.data["governing_peak_sample"])
+                gov_peak_db = pr.data.get("detected_peak_db")
         self._wf_panel.waveform.set_issues(issues)
+        self._wf_panel.waveform.set_governing_peak(gov_sample, gov_peak_db)
         self.update_overlay_menu(issues)
+
+    @Slot(int)
+    def jump_to_peak(self, sample_index: int) -> None:
+        """Expand the waveform panel and move the cursor to *sample_index*."""
+        if not self.visualization_context_is_current() or sample_index < 0:
+            return
+        self._wf_panel.set_expanded(True)
+        wf = self._wf_panel.waveform
+        wf.center_on_sample(sample_index)
+        wf.set_cursor(sample_index)
+        self.update_time_label(wf._cursor_sample)
 
     def on_file_report_context_changed(self) -> None:
         if not self.visualization_context_is_current():

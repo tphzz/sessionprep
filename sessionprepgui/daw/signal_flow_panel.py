@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from typing import Any
 
-from PySide6.QtCore import QEvent, QSize, Qt, Signal
+from PySide6.QtCore import QEvent, QLocale, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QKeyEvent, QKeySequence, QPalette, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -179,6 +179,7 @@ class BusFaderSpinBox(QDoubleSpinBox):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self.setLocale(QLocale.c())
         self.setProperty("tableNumericEditor", True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setKeyboardTracking(False)
@@ -377,9 +378,10 @@ def _node_notes(node: dict[str, Any], *, staging_enabled: bool = True) -> str:
     return " \u00b7 ".join(parts)
 
 
-def _collect_unsimulated_inserts(graph_dict: dict[str, Any]) -> list[str]:
+def _collect_unsimulated_inserts(graph_dict: dict[str, Any]) -> tuple[list[str], int]:
     nodes = graph_dict.get("nodes") or {}
     items: list[str] = []
+    plugin_count = 0
     for name, n in nodes.items():
         if not isinstance(n, dict) or n.get("track_type") in ("Audio", "Instrument"):
             continue
@@ -390,8 +392,9 @@ def _collect_unsimulated_inserts(graph_dict: dict[str, Any]) -> list[str]:
         if trim_name and unsim and unsim[0] == trim_name:
             unsim = unsim[1:]
         if unsim:
+            plugin_count += len(unsim)
             items.append(f"{name} ({', '.join(str(p) for p in unsim)})")
-    return items
+    return items, plugin_count
 
 
 class SignalFlowPanel(QWidget):
@@ -660,7 +663,7 @@ class SignalFlowPanel(QWidget):
     def _build_table(self) -> QTableWidget:
         tbl = QTableWidget(0, 9)
         tbl.setHorizontalHeaderLabels([
-            "Node", "Class", "Bus In (Pk / RMS)", "Slot A Trim", "To Inserts",
+            "Node", "Governs", "Bus In (Pk / RMS)", "Slot A Trim (est.)", "To Inserts",
             "Bus Fader", "Bus Out (Pk / RMS)", "Net \u0394", "Feeders / Notes",
         ])
         tbl.setItemDelegate(_SelectedWhiteTextDelegate(tbl))
@@ -892,7 +895,8 @@ class SignalFlowPanel(QWidget):
         conv = str(graph_dict.get("dbfs_convention", "standard"))
         rms_off = dbfs_offset({"dbfs_convention": conv})
         self.target_label.setText(
-            f"Target: {target_pk:.1f} dBFS pk / {target_rms + rms_off:.1f} dBFS RMS \u00b7 Pan law: {pan_law:.1f} dB"
+            f"Target: {target_pk:.1f} dBFS pk / {target_rms + rms_off:.1f} dBFS RMS \u00b7 "
+            f"Pan law: {pan_law:.1f} dB \u00b7 Initial linear estimates"
         )
         self._update_balance_strip(graph_dict, staging_enabled)
         self._update_graph_banners(graph_dict, staging_enabled)
@@ -927,7 +931,8 @@ class SignalFlowPanel(QWidget):
         val = graph_dict.get("balance_validation") or {}
         status = str(val.get("status", "verified"))
         summary = str(val.get("summary") or "")
-        unsim = _collect_unsimulated_inserts(graph_dict)
+        unsim, plugin_count = _collect_unsimulated_inserts(graph_dict)
+        total_ins = int(val.get("unsimulated_insert_count") or plugin_count)
         if not staging_enabled and status != "blocked":
             self.balance_banner.hide()
             return
@@ -947,7 +952,11 @@ class SignalFlowPanel(QWidget):
             f"QWidget#sfBanner {{ background-color: {bg}; border: 1px solid {bdr}; "
             f"border-left: 3px solid {acc}; border-radius: 2px; }}"
         )
-        ins_cue = f" \u00b7 {len(unsim)} active insert{'s' if len(unsim) != 1 else ''} unsimulated \u24d8" if unsim else ""
+        ins_cue = (
+            f" \u00b7 {total_ins} active insert{'s' if total_ins != 1 else ''} unsimulated \u24d8"
+            if total_ins > 0
+            else ""
+        )
         self._balance_lbl.setText(f"{glyph}  {summary or 'Balance summary unavailable'}{ins_cue}")
         tips: list[str] = [
             "Bus levels and Slot A trims are initial linear estimates (unity non-trim inserts, initial faders, post-fader sends excluded)."
@@ -1084,7 +1093,15 @@ class SignalFlowPanel(QWidget):
         dim_row = cls == "Silent" and not staged and not blocked
         name_col = COLORS["dim"] if dim_row else (COLORS["heading"] if (staged or ttype == "Master" or blocked) else COLORS["text"])
         meta_col = COLORS["dim"] if dim_row else COLORS["metadata"]
-        cls_col = FILE_COLOR_TRANSIENT if cls == "Transient" else (FILE_COLOR_SUSTAINED if cls == "Sustained" else COLORS["dim"])
+        gov = node.get("governing")
+        if cls == "Error":
+            gov_txt, gov_col, gov_bold = "Error", COLORS["problems"], True
+        elif staged and gov in ("Peak", "RMS"):
+            gov_txt = str(gov)
+            gov_col = FILE_COLOR_TRANSIENT.name() if gov == "Peak" else FILE_COLOR_SUSTAINED.name()
+            gov_bold = True
+        else:
+            gov_txt, gov_col, gov_bold = "\u2014", COLORS["dim"], False
 
         in_pk = node.get("pre_insert_peak_db") if node.get("pre_insert_peak_db") is not None else node.get("pre_fader_peak_db")
         in_rms = node.get("pre_insert_rms_db") if node.get("pre_insert_rms_db") is not None else node.get("pre_fader_rms_db")
@@ -1098,7 +1115,7 @@ class SignalFlowPanel(QWidget):
         out_hot = out_pk is not None and _safe_float(out_pk, -999.0) > target_pk + 0.05
 
         self.table.setItem(r, 0, _mk(name, name_col, bold=(staged or ttype == "Master" or blocked)))
-        self.table.setItem(r, 1, _mk(cls, cls_col, bold=(cls != "Silent")))
+        self.table.setItem(r, 1, _mk(gov_txt, gov_col, bold=gov_bold))
         self.table.setItem(r, 2, _mk(_format_pk_rms_pair(in_pk, in_rms, rms_off), in_col, bold=(in_clip or in_hot)))
 
         trim_txt, trim_col, trim_bold = _format_slot_a_cell(node, staging_enabled)
@@ -1206,7 +1223,7 @@ class SignalFlowPanel(QWidget):
             if master_pk is None:
                 master_pk = master.get("pre_fader_peak_db")
         master_txt = f" \u00b7 Master Peak: {_format_db(master_pk)}" if master_pk is not None else ""
-        scale_txt = "AES17 (+3.01 dB)" if conv == "aes17" else "Standard dBFS"
+        scale_txt = "AES17 RMS (+3.01 dB, peaks unshifted)" if conv == "aes17" else "Standard dBFS"
         self.footer_label.setText(
             f"Staged on Create: {staged_txt}{master_txt} \u00b7 Initial linear estimates \u00b7 Scale: {scale_txt} \u00b7 Atomic post-close .ptx pass with rollback"
         )

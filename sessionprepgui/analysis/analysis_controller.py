@@ -365,7 +365,7 @@ class AnalysisPrepareController(QObject):
                 overrides["classification_override"] = t.classification_override
             if t.rms_anchor_override:
                 overrides["rms_anchor_override"] = t.rms_anchor_override
-            if t.processor_skip or "audio_classifier" in t.detector_results:
+            if t.processor_skip or "bimodal_normalize" in t.processor_results:
                 overrides["processor_skip"] = set(t.processor_skip)
             if t.repair_overrides:
                 overrides["repair_overrides"] = dict(t.repair_overrides)
@@ -896,11 +896,13 @@ class AnalysisPrepareController(QObject):
         adjustment = session.config.get("_output_gain_adjustments", {}).get(track.filename)
         if not adjustment:
             return
+        from sessionpreplib.audio import INACTIVE_NORMALIZATION_CLASSIFICATIONS
+
         norm = track.processor_results.get("bimodal_normalize")
         normalizing = (
             norm is not None
             and "bimodal_normalize" not in track.processor_skip
-            and norm.classification not in ("Skip", "Silent")
+            and norm.classification not in INACTIVE_NORMALIZATION_CLASSIFICATIONS
         )
         current = norm.gain_db if normalizing else float(track.manual_gain_db or 0)
         previous = adjustment.get("gain_db", current)

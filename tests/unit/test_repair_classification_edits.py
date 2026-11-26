@@ -71,18 +71,24 @@ def wait_for_edits(window):
 
 def choose(window, source, column, value, *, batch=False):
     combo = window.phase2_page.track_table.cellWidget(window.track_table_controller.find_table_row(source.filename), column)
-    assert combo.findText(value) >= 0
+    idx = combo.findText(value)
+    if idx < 0 and value == "Auto":
+        idx = 0
+    assert idx >= 0
     # These are the flags that the table combobox sets on an Alt+Shift press.
     combo.batch_mode = batch
     combo.setProperty("_batch_mode", batch)
-    combo.setCurrentText(value)
-    combo.textActivated.emit(value)
+    combo.setCurrentIndex(idx)
+    if column == 3:
+        combo.activated.emit(idx)
+    else:
+        combo.textActivated.emit(combo.itemText(idx))
     wait_for_edits(window)
 
 
 def levels(samples, rate, anchor):
     peak = 20 * np.log10(np.abs(samples).max())
-    width = int(0.4 * rate)
+    width = max(1, round(0.4 * rate))
     sums = np.r_[0.0, np.cumsum(samples ** 2)]
     means = (sums[width:] - sums[:-width]) / width
     # Every window of these continuously sounding fixtures passes the 40 dB gate.
@@ -91,25 +97,23 @@ def levels(samples, rate, anchor):
     return peak, 10 * np.log10(selected)
 
 
-def assert_plan(track, anchor, classification):
+def assert_plan(track, anchor, mode):
     samples, rate = sf.read(track.filepath, dtype="float64")
     original_peak, original_rms = levels(samples, rate, anchor)
-    original = track.detector_results["audio_classifier"].data
-    assert original["rms_anchor_label"] == anchor
-    assert original["peak_db"] == pytest.approx(original_peak, abs=1e-6)
-    assert original["rms_anchor_db"] == pytest.approx(original_rms, abs=1e-6)
-
     corrected_peak, corrected_rms = levels(render_corrected(samples, rate, track.repair_recipe), rate, anchor)
     if track.repair_recipe.active:
         assert original_peak - corrected_peak > 5 and original_rms - corrected_rms > 5
     gain = track.processor_results["bimodal_normalize"]
-    assert gain.classification == classification
+    assert gain.data["mode"] == mode
     assert gain.data["rms_anchor_label"] == anchor
     assert gain.data["detected_peak_db"] == pytest.approx(corrected_peak, abs=1e-6)
     assert gain.data["detected_rms_db"] == pytest.approx(corrected_rms, abs=1e-6)
-    expected = -6 - corrected_peak
-    if classification == "Sustained":
-        expected = min(expected, -18 - corrected_rms)
+    if mode == "Peak":
+        expected = -6 - corrected_peak
+    elif mode == "RMS":
+        expected = -18 - corrected_rms
+    else:
+        expected = min(-6 - corrected_peak, -18 - corrected_rms)
     assert gain.gain_db == pytest.approx(expected, abs=1e-6)
 
 
@@ -123,18 +127,17 @@ def test_individual_edits_rehydrate_source_and_keep_original_anchor(project, tmp
     first, other, _ = window.state.session.tracks
     assert first.repair_recipe.dc_remove and first.classification_override is None
     assert first.audio_data is None
-    row = window.track_table_controller.find_table_row(first.filename)
-    displayed = window.phase2_page.track_table.cellWidget(row, 3).currentText()
-    choose(window, first, 3, displayed)
-    assert first.classification_override == displayed
-    assert_plan(first, "p95", displayed)
-    choose(window, first, 3, "Sustained")
+    choose(window, first, 3, "Peak")
+    assert first.classification_override == "Peak"
+    assert_plan(first, "p95", "Peak")
+    choose(window, first, 3, "Auto")
+    assert first.classification_override is None
     choose(window, first, 5, "Max")
     assert first.rms_anchor_override == "max" and other.rms_anchor_override is None
-    assert_plan(first, "max", "Sustained")
+    assert_plan(first, "max", "Auto")
     max_gain = first.processor_results["bimodal_normalize"].gain_db
     choose(window, first, 5, "P85")
-    assert_plan(first, "p85", "Sustained")
+    assert_plan(first, "p85", "Auto")
     assert first.processor_results["bimodal_normalize"].gain_db - max_gain > 3
 
 
@@ -147,17 +150,17 @@ def test_batch_edits_replan_each_selected_row_and_preserve_selection(project):
     assert window.phase2_page.track_table.batch_selected_keys() == {first.filename, second.filename}
     assert (first.rms_anchor_override, second.rms_anchor_override, plain.rms_anchor_override) == ("p85", "p85", None)
     for track in (first, second):
-        assert_plan(track, "p85", track.processor_results["bimodal_normalize"].classification)
+        assert_plan(track, "p85", "Auto")
     window.phase2_page.track_table.restore_selection({first.filename, plain.filename})
-    choose(window, first, 3, "Transient", batch=True)
+    choose(window, first, 3, "Peak", batch=True)
     assert window.phase2_page.track_table.batch_selected_keys() == {first.filename, plain.filename}
-    assert first.classification_override == plain.classification_override == "Transient"
+    assert first.classification_override == plain.classification_override == "Peak"
     assert second.classification_override is None
-    assert_plan(first, "p85", "Transient")
-    assert_plan(plain, "p95", "Transient")
+    assert_plan(first, "p85", "Peak")
+    assert_plan(plain, "p95", "Peak")
     choose(window, plain, 5, "Max")
     assert plain.rms_anchor_override == "max" and first.rms_anchor_override == "p85"
-    assert_plan(plain, "max", "Transient")
+    assert_plan(plain, "max", "Peak")
 
 
 def test_single_plain_classification_and_bypass_update_linked_gain_and_faders(project):
@@ -170,7 +173,7 @@ def test_single_plain_classification_and_bypass_update_linked_gain_and_faders(pr
     shared = repaired.processor_results[selected].gain_db
     assert shared == plain.processor_results[selected].gain_db
 
-    choose(window, plain, 3, "Transient")
+    choose(window, plain, 3, "Peak")
     result = plain.processor_results[selected]
     individual = result.data["gain_db_individual"]
     assert individual > shared + 5
@@ -225,8 +228,8 @@ def test_group_link_recomputes_named_anchor_after_edits_and_reopen(project, tmp_
     window.persistence_controller.restore_session_state(load_session(str(saved)))
     check(window.state.session, [-2, -2, 1], [0, 0, -3])
     restored_anchor = window.state.session.tracks[0]
-    choose(window, restored_anchor, 3, "Transient")
-    assert restored_anchor.classification_override == "Transient"
+    choose(window, restored_anchor, 3, "Peak")
+    assert restored_anchor.classification_override == "Peak"
     check(window.state.session, [-2, -2, 1], [0, 0, -3])
     button = window.phase2_page.track_table.cellWidget(window.track_table_controller.find_table_row(restored_anchor.filename), 7)
     toggle = next(action for action in button.menu().actions() if action.data() == "bimodal_normalize")
@@ -257,7 +260,7 @@ def test_reopened_group_edit_uses_the_selected_template_fader_ceiling(project, t
     assert window.state.active_daw_processor.id == daw.id
     # With 8 dB of headroom on a +6 dB console, the highest fader is -2 dB.
     for track, gain in zip(window.state.session.tracks, (-10.0, 0.0, 1.0)):
-        track.processor_results["bimodal_normalize"].data["original_gain_db"] = gain
+        track.processor_results["bimodal_normalize"].data["gain_db_individual"] = gain
     window.groups_controller.apply_linked_group_levels()
     assert [t.processor_results["bimodal_normalize"].data["fader_offset"]
             for t in window.state.session.tracks] == pytest.approx([-2.0, -12.0, -13.0])

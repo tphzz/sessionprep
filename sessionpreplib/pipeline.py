@@ -19,6 +19,7 @@ from collections.abc import Collection
 import numpy as np
 
 from .gain_staging import apply_group_gains
+from .processors.bimodal_normalize import update_post_gain_metrics
 from .models import (
     ConfigError,
     DetectorResult,
@@ -35,7 +36,7 @@ from .repair_verification import RepairVerification, measure_detector
 from .repairs import OutputHeadroomError, check_output_headroom, render_corrected
 from .events import EventBus
 from .file_io import ensure_audio_backup
-from .audio import file_revision, load_track, linear_to_db
+from .audio import INACTIVE_NORMALIZATION_CLASSIFICATIONS, db_to_linear, file_revision, load_track, linear_to_db
 from .utils import (
     parse_group_specs,
     assign_groups,
@@ -283,9 +284,21 @@ class Pipeline:
                 self._emit("processor.start", processor_id=proc.id,
                            filename=track.filename)
                 t0 = time.perf_counter()
+                if gain_track.audio_data is None and track.filepath:
+                    gain_track = source_for_render(gain_track)
                 result = proc.process(gain_track)
-                if proc.id == "bimodal_normalize" and track.manual_gain_db is not None:
-                    result.gain_db = track.manual_gain_db
+                if (
+                    proc.id == "bimodal_normalize"
+                    and track.manual_gain_db is not None
+                    and not result.error
+                    and proc.id not in track.processor_skip
+                    and result.classification not in INACTIVE_NORMALIZATION_CLASSIFICATIONS
+                ):
+                    result.gain_db = float(track.manual_gain_db)
+                    result.data["gain_db_individual"] = float(track.manual_gain_db)
+                    update_post_gain_metrics(
+                        result, gain_track, float(track.manual_gain_db), source_audio=gain_track.audio_data,
+                    )
                 dt = (time.perf_counter() - t0) * 1000
                 log.debug(f"processor {proc.id} on {track.filename}: {dt:.1f} ms")
                 track.processor_results[proc.id] = result
@@ -333,7 +346,7 @@ class Pipeline:
         workers = min(self.max_workers, n) if ok_items else 1
         anchor_detectors = []
         if refresh_anchors:
-            affected = {"audio_classifier"}
+            affected = {"tail_exceedance"}
             for detector in self.track_detectors:
                 if detector.id in affected or affected.intersection(detector.depends_on):
                     anchor_detectors.append(detector)
@@ -388,20 +401,36 @@ class Pipeline:
         corrected = render_corrected(track.audio_data, track.samplerate, track.repair_recipe)
         audio = corrected
         applied = track.repair_recipe.applied_ids()
+        norm_handled_inactive = False
         for proc in self.audio_processors:
             pr = track.processor_results.get(proc.id)
             if pr is None or proc.id in track.processor_skip:
                 continue
             if pr.error:
                 raise ValueError(f"{proc.name}: {pr.error}")
-            if proc.id == "bimodal_normalize" and pr.classification in ("Silent", "Skip"):
+            if proc.id == "bimodal_normalize" and pr.classification in INACTIVE_NORMALIZATION_CLASSIFICATIONS:
+                norm_handled_inactive = True
                 continue
             temporary = replace(track, audio_data=audio.copy(), _cache={})
             audio = proc.apply(temporary, pr)
-            if pr.classification not in ("Silent", "Skip"):
+            if pr.classification not in INACTIVE_NORMALIZATION_CLASSIFICATIONS:
                 applied.append(proc.id)
-        if track.manual_gain_db is not None and "bimodal_normalize" not in applied:
-            audio = audio * (10.0 ** (track.manual_gain_db / 20))
+        if track.manual_gain_db is not None and "bimodal_normalize" not in applied and not norm_handled_inactive:
+            gain_db = float(track.manual_gain_db)
+            if not np.isfinite(gain_db):
+                raise ValueError(f"Non-finite manual gain: {gain_db}")
+            if gain_db != 0.0:
+                try:
+                    lin = db_to_linear(gain_db)
+                except OverflowError as exc:
+                    raise ValueError(f"Manual gain {gain_db} dB overflows linear scale") from exc
+                if not np.isfinite(lin):
+                    raise ValueError(f"Manual gain {gain_db} dB overflows linear scale")
+                audio = np.asarray(audio, dtype=np.float64) * lin
+                tiny = np.finfo(np.float64).tiny
+                audio = np.where(np.abs(audio) < tiny, 0.0, audio)
+                if not np.all(np.isfinite(audio)):
+                    raise ValueError("Manual gain produced non-finite output samples")
         return corrected, audio, applied
 
     def _render_prepare_sources(self, needed, sources, routed_names, direct_names, expected, progress_cb):
@@ -715,11 +744,7 @@ class Pipeline:
                 self._check_source_headroom(audio, source, source.audio_data, applied)
                 settling = (boundary_settling(source.audio_data, corrected, source.samplerate)
                             if source.repair_recipe.active else [])
-                norm = track.processor_results.get("bimodal_normalize")
-                gain, fader = float(track.manual_gain_db or 0), 0.0
-                if norm and "bimodal_normalize" in applied:
-                    gain = float(norm.gain_db)
-                    fader = float(norm.data.get("fader_offset", -gain))
+                gain, fader = _resolved_output_gain_and_fader(track, applied)
                 if not np.isfinite([gain, fader]).all():
                     raise ValueError("Output gain and fader offset must be finite")
                 peak = linear_to_db(float(np.max(np.abs(audio)))) if audio.size else -np.inf
@@ -753,6 +778,17 @@ class Pipeline:
 # --------------------------------------------------------------------------
 # Helpers
 # --------------------------------------------------------------------------
+
+def _resolved_output_gain_and_fader(track: TrackContext, applied: list[str]) -> tuple[float, float]:
+    """Return executed (gain_db, fader_db) consistent with applied processors."""
+    norm = track.processor_results.get("bimodal_normalize")
+    if norm is not None and "bimodal_normalize" in applied:
+        gain = float(norm.gain_db)
+        return gain, float(norm.data.get("fader_offset", -gain))
+    if norm is not None and "bimodal_normalize" not in track.processor_skip and norm.classification in INACTIVE_NORMALIZATION_CLASSIFICATIONS:
+        return 0.0, 0.0
+    return float(track.manual_gain_db or 0.0), 0.0
+
 
 def _passthrough_entry(entry, sources) -> bool:
     from .topology import passthrough_routes

@@ -564,7 +564,14 @@ def render_fader_table_html(session) -> str:
         if clip_r:
             is_clipped = bool(clip_r.data.get("is_clipped"))
 
-        type_color = FILE_COLOR_TRANSIENT.name() if "Transient" in classification else FILE_COLOR_SUSTAINED.name()
+        if "Peak" in classification:
+            type_color = FILE_COLOR_TRANSIENT.name()
+        elif classification == "Noise Floor":
+            type_color = COLORS["attention"]
+        elif classification == "Skip":
+            type_color = COLORS["dim"]
+        else:
+            type_color = FILE_COLOR_SUSTAINED.name()
         status_color = COLORS["problems"] if is_clipped else COLORS["clean"]
         status_label = "CLIP" if is_clipped else "OK"
 
@@ -584,7 +591,7 @@ def render_fader_table_html(session) -> str:
         '<tr style="border-bottom:1px solid #555;">'
         f'<th align="left" style="color:{COLORS["heading"]}">Track</th>'
         f'<th align="left" style="color:{COLORS["heading"]}">Format</th>'
-        f'<th align="center" style="color:{COLORS["heading"]}">Type</th>'
+        f'<th align="center" style="color:{COLORS["heading"]}">Mode</th>'
         f'<th align="right" style="color:{COLORS["heading"]}">Gain</th>'
         f'<th align="right" style="color:{COLORS["heading"]}">Fader</th>'
         f'<th align="right" style="color:{COLORS["heading"]}">Status</th>'
@@ -642,21 +649,29 @@ def _append_processor_parts(parts: list, track, proc_map: dict, *, verbose: bool
             html_fragment = compact_fragment = narrow_fragment = (
                 f'<div>{esc(pr.classification or "")} &middot; {esc(pr.method)} &middot; {pr.gain_db:+.1f} dB</div>'
             )
+        heading = proc_map[proc_id].name if proc_id in proc_map else proc_id
+        if proc_id == "bimodal_normalize" and pr.data.get("mode") in ("Peak", "RMS", "Skip"):
+            heading = "Normalization"
         parts.append(
             f'<p style="{REPORT_SECTION_HEADING} color:{COLORS["heading"]};">'
             '<a name="report-processors"></a>'
-            f'{esc(proc_map[proc_id].name if proc_id in proc_map else proc_id)}</p>'
+            f'{esc(heading)}</p>'
         )
         parts.append((html_fragment, compact_fragment, narrow_fragment))
         if track.group:
-            original = pr.data.get("original_gain_db", pr.gain_db)
+            original = pr.data.get("gain_db_individual", pr.data.get("original_gain_db", pr.gain_db))
             delta = pr.gain_db - original
+            limiter = ""
+            if pr.data.get("group_limited") and pr.data.get("group_governing_track"):
+                gov_c = str(pr.data.get("group_governing_constraint") or "").lower()
+                gov_suffix = f", {gov_c}" if gov_c else ""
+                limiter = f' &nbsp;&middot;&nbsp; limited by <b>{esc(str(pr.data["group_governing_track"]))}</b>{esc(gov_suffix)}'
             parts.append(
                 f'<div style="color:{COLORS["metadata"]}; margin-top:8px;">'
                 f'Group: <b>{esc(track.group)}</b>'
                 f' &nbsp;&middot;&nbsp; Group level: <b>{_signed(pr.gain_db)} dB</b>'
                 f' (individual: {_signed(original)} dB,'
-                f' &Delta; {_signed(delta)} dB)</div>'
+                f' &Delta; {_signed(delta)} dB){limiter}</div>'
             )
 
 
@@ -728,11 +743,16 @@ def _build_finding_row_dict(
     if callable(help_html):
         help_html = help_html()
     title = detector.name if detector else det_id
+    summary_text = (
+        detector.format_summary(result)
+        if detector is not None and hasattr(detector, "format_summary")
+        else result.summary
+    )
     return {
         "id": row_id,
         "title": f"{title} · local energy" if is_local else title,
         "severity": severity,
-        "summary": result.summary,
+        "summary": summary_text,
         "fragment": fragment,
         "location": location,
         "locations": locations,

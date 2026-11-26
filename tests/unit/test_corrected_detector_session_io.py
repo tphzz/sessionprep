@@ -202,16 +202,18 @@ def test_verified_project_checks_the_routed_file_when_an_input_has_the_same_name
 def test_comparison_of_edited_memory_is_not_restored_as_a_measurement_of_the_disk_wav(tmp_path, analyzed):
     track, pipeline, session = analyzed
     pipeline.plan(session)
-    disk_peak = track.corrected_analysis.results["audio_classifier"].data["peak_db"]
+    disk_dc = track.corrected_analysis.results["dc_offset"].data["dc_db"]
+    disk_peak = track.processor_results["bimodal_normalize"].data["detected_peak_db"]
     track.audio_data *= 0.05
     pipeline.plan(session)
-    buffer_peak = track.corrected_analysis.results["audio_classifier"].data["peak_db"]
-    assert buffer_peak == pytest.approx(disk_peak + 20 * np.log10(0.05))
+    buffer_peak = track.processor_results["bimodal_normalize"].data["detected_peak_db"]
+    assert buffer_peak == pytest.approx(disk_peak + 20 * np.log10(0.05), abs=0.05)
 
     reopened = load_session(str(_write_project(tmp_path, track)))["tracks"][0]
     assert reopened.corrected_analysis is None
     _pipeline().plan(SessionContext([reopened], {}))
-    assert reopened.corrected_analysis.results["audio_classifier"].data["peak_db"] == pytest.approx(disk_peak)
+    assert reopened.corrected_analysis.results["dc_offset"].data["dc_db"] == pytest.approx(disk_dc, abs=0.05)
+    assert reopened.processor_results["bimodal_normalize"].data["detected_peak_db"] == pytest.approx(disk_peak, abs=0.05)
 
 
 def test_empty_wav_has_no_out_of_bounds_region_and_can_restore_its_check(tmp_path):

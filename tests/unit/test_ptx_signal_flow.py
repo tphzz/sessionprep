@@ -206,9 +206,9 @@ def test_correlated_kick_sum_stages_kik_folder_and_leaves_single_input_aux_and_m
     assert graph.cycles == []
 
     kik = graph.nodes["KIK"]
-    assert kik.classification == "Transient" and kik.is_transient is True
-    assert kik.pre_fader_peak_db == pytest.approx(0.0, abs=0.15)
-    assert kik.staged is True and kik.recommended_fader_db == pytest.approx(-6.0, abs=0.2)
+    assert kik.governing == "Peak" and kik.is_transient is True
+    assert kik.pre_fader_peak_db == pytest.approx(0.0, abs=0.1)
+    assert kik.staged is True and kik.recommended_fader_db == pytest.approx(-6.0, abs=0.1)
     assert graph.nodes["cKIK"].staged is False and graph.nodes["cSNR"].staged is False
     assert graph.nodes["ALLDRM"].staged is True and set(graph.nodes["ALLDRM"].upstream_tracks) == {"cKIK", "cSNR"}
     assert graph.nodes["MIX1"].staged is True
@@ -227,8 +227,8 @@ def test_uncorrelated_rms_sum_plus_3db_and_exact_out_of_phase_cancellation():
         ptx, {"K1": LeafAudioInput(t1, sr), "K2": LeafAudioInput(t2, sr)},
         {"target_peak": -6.0, "target_rms": -18.0}, stage_bus_faders=True,
     )
-    assert g_unc.nodes["KIK"].pre_fader_rms_db == pytest.approx(-15.0, abs=0.25)
-    assert g_unc.nodes["KIK"].recommended_fader_db == pytest.approx(-3.0, abs=0.3)
+    assert g_unc.nodes["KIK"].pre_fader_rms_db == pytest.approx(-14.99, abs=0.1)
+    assert g_unc.nodes["KIK"].recommended_fader_db == pytest.approx(-3.0, abs=0.1)
 
     # Exact out-of-phase cancellation (+x + -x == 0) -> Silent, unstaged, not counted downstream
     g_cancel = build_annotated_signal_flow(
@@ -247,8 +247,8 @@ def test_mono_leaf_pre_pan_metering_and_mono_bus_no_lr_tilt():
     # 1. Mono leaf -> Stereo bus: pre-fader leaf meter is PRE-PAN (-18 dBFS), stereo bus receives -3 dB pan law (-21 dBFS)
     ptx_stereo_bus = PtxSession.from_bytes(_build_console_ptx(k1_mono=True, k1_pan=0, mono_kik_bus=False))
     g1 = build_annotated_signal_flow(ptx_stereo_bus, {"K1": LeafAudioInput(mono_sig, sr)}, {"target_peak": -6.0, "target_rms": -18.0})
-    assert g1.nodes["K1"].pre_fader_rms_db == pytest.approx(-18.0, abs=0.2)
-    assert g1.nodes["KIK"].pre_fader_rms_db == pytest.approx(-21.01, abs=0.25)
+    assert g1.nodes["K1"].pre_fader_rms_db == pytest.approx(-18.0, abs=0.1)
+    assert g1.nodes["KIK"].pre_fader_rms_db == pytest.approx(-21.01, abs=0.1)
 
     # 2. Mono leaf -> Mono bus -> Stereo cKIK: unity into Mono KIK (-18 dBFS), then clean -3 dB center pan into Stereo cKIK (-21 dBFS, no L/R tilt!)
     ptx_mono_bus = PtxSession.from_bytes(_build_console_ptx(k1_mono=True, k1_pan=0, mono_kik_bus=True))
@@ -256,8 +256,8 @@ def test_mono_leaf_pre_pan_metering_and_mono_bus_no_lr_tilt():
         ptx_mono_bus, {"K1": LeafAudioInput(mono_sig, sr)},
         {"target_peak": -6.0, "target_rms": -18.0}, stage_bus_faders=False,
     )
-    assert g2.nodes["KIK"].pre_fader_rms_db == pytest.approx(-18.0, abs=0.2)
-    assert g2.nodes["cKIK"].pre_fader_rms_db == pytest.approx(-21.01, abs=0.25)
+    assert g2.nodes["KIK"].pre_fader_rms_db == pytest.approx(-18.0, abs=0.1)
+    assert g2.nodes["cKIK"].pre_fader_rms_db == pytest.approx(-21.01, abs=0.1)
 
 
 def test_stereo_bus_narrow_pan_updates_post_fader_levels_accurately():
@@ -266,8 +266,8 @@ def test_stereo_bus_narrow_pan_updates_post_fader_levels_accurately():
     ptx = PtxSession.from_bytes(_build_console_ptx(mus_pan=(0, 0)))
     pad_sig = _sustained_tone(sr, 2.0, 10.0 ** (-18.0 / 20.0), freq=220.0)
     g = build_annotated_signal_flow(ptx, {"Pad": LeafAudioInput(pad_sig, sr)}, stage_bus_faders=False)
-    assert g.nodes["MUS"].pre_fader_rms_db == pytest.approx(-18.0, abs=0.2)
-    assert g.nodes["MUS"].post_fader_rms_db == pytest.approx(-15.0, abs=0.25)
+    assert g.nodes["MUS"].pre_fader_rms_db == pytest.approx(-18.0, abs=0.1)
+    assert g.nodes["MUS"].post_fader_rms_db == pytest.approx(-14.99, abs=0.1)
 
 
 def test_attenuate_only_preserves_quiet_folder_and_headroom_caps_boost():
@@ -289,16 +289,16 @@ def test_attenuate_only_preserves_quiet_folder_and_headroom_caps_boost():
     )
     assert g_boost.nodes["MUS"].recommended_fader_db == pytest.approx(4.0, abs=0.1)
 
-    # Sustained bus with a sharp peak excursion is peak-limited to target_peak (never pushes peak above -6 dBFS)
+    # Sustained bus with a sharp peak excursion is peak-capped to target_peak (never pushes peak above -5.9 dBFS)
     spiky = _sustained_tone(sr, 2.0, 10.0 ** (-22.0 / 20.0), freq=220.0)
     spiky[sr // 2, :] = 10.0 ** (-5.0 / 20.0)  # single -5 dBFS peak while RMS stays ~ -22 dBFS
     g_plim = build_annotated_signal_flow(
         ptx, {"Pad": LeafAudioInput(spiky, sr)},
         {"target_peak": -6.0, "target_rms": -18.0}, stage_bus_faders=True, attenuate_only=False,
     )
-    assert g_plim.nodes["MUS"].classification == "Sustained"
-    assert g_plim.nodes["MUS"].recommended_fader_db == pytest.approx(-1.0, abs=0.2)
-    assert g_plim.nodes["MUS"].post_fader_peak_db <= -5.8
+    assert g_plim.nodes["MUS"].governing == "Peak"
+    assert g_plim.nodes["MUS"].recommended_fader_db == pytest.approx(-1.0, abs=0.1)
+    assert g_plim.nodes["MUS"].post_fader_peak_db <= -5.9
 
 
 def test_vca_attenuation_inactive_vca_resampling_mixed_lengths_aes17_nan_and_sends():
@@ -312,13 +312,13 @@ def test_vca_attenuation_inactive_vca_resampling_mixed_lengths_aes17_nan_and_sen
     g_vca = build_annotated_signal_flow(
         ptx_vca,
         {"K1": LeafAudioInput(tone_44, 44100), "Pad": LeafAudioInput(tone_48_long, sr)},
-        {"target_peak": -6.0, "target_rms": -18.0, "dbfs_convention": "aes17", "force_transient": "bus"},
+        {"target_peak": -6.0, "target_rms": -18.0, "dbfs_convention": "aes17", "force_peak": "bus"},
         stage_bus_faders=False,
     )
     assert g_vca.dbfs_convention == "aes17"
     assert g_vca.nodes["K1"].vca_offset_db == -6.0
-    assert g_vca.nodes["KIK"].pre_fader_rms_db == pytest.approx(-24.0, abs=0.35)
-    assert g_vca.nodes["MUS"].classification == "Sustained"  # force_transient="bus" did not corrupt bus node
+    assert g_vca.nodes["KIK"].pre_fader_rms_db == pytest.approx(-24.0, abs=0.1)
+    assert g_vca.nodes["MUS"].classification == "RMS"  # force_peak="bus" did not corrupt bus node
 
     # Inactive VCA at -6 dB does NOT attenuate K1
     raw_inact = _build_console_ptx(vca_db=-6.0, vca_inactive=True)
@@ -326,7 +326,7 @@ def test_vca_attenuation_inactive_vca_resampling_mixed_lengths_aes17_nan_and_sen
     g_inact = build_annotated_signal_flow(PtxSession.from_bytes(raw_inact), {"K1": LeafAudioInput(tone_48_long, sr)}, stage_bus_faders=False)
     assert g_inact.nodes["K1"].vca_offset_db == 0.0
 
-    # Non-finite NaN leaf is isolated cleanly without crashing other tracks
+    # Non-finite NaN leaf is explicitly quarantined as Error (never silently marked Silent) without crashing other tracks
     bad_buf = tone_48_long.copy()
     bad_buf[100, 0] = float("nan")
     g_nan = build_annotated_signal_flow(
@@ -334,8 +334,9 @@ def test_vca_attenuation_inactive_vca_resampling_mixed_lengths_aes17_nan_and_sen
         {"K1": LeafAudioInput(bad_buf, sr), "Pad": LeafAudioInput(tone_48_long, sr)},
         stage_bus_faders=False,
     )
-    assert g_nan.nodes["K1"].classification == "Silent"
-    assert g_nan.nodes["MUS"].pre_fader_rms_db == pytest.approx(-18.0, abs=0.25)
+    assert g_nan.nodes["K1"].classification == "Error"
+    assert g_nan.nodes["K1"].non_finite_error is not None
+    assert g_nan.nodes["MUS"].pre_fader_rms_db == pytest.approx(-18.0, abs=0.1)
 
     # Muted track must not leak into pre-fader send
     ptx_muted_send = PtxSession.from_bytes(_build_console_ptx(k1_muted=True, send_pre=True))
@@ -409,9 +410,9 @@ def test_recursive_two_level_slot_a_trim_preserves_balance_and_drives_bus_insert
     for rf in ("KIK", "EB", "VOX"):
         assert g.nodes[rf].staging_strategy == "none" and g.nodes[rf].recommended_fader_db == 0.0
     assert g.nodes["cBAS"].staging_strategy == "trim_and_fader"
-    assert g.nodes["cBAS"].recommended_trim_db == pytest.approx(8.0, abs=0.2)
-    assert g.nodes["cBAS"].recommended_fader_db == pytest.approx(-8.0, abs=0.2)
-    assert g.nodes["cBAS"].pre_fader_rms_db == pytest.approx(-18.0, abs=0.2)
+    assert g.nodes["cBAS"].recommended_trim_db == pytest.approx(8.0, abs=0.1)
+    assert g.nodes["cBAS"].recommended_fader_db == pytest.approx(-8.0, abs=0.1)
+    assert g.nodes["cBAS"].pre_fader_rms_db == pytest.approx(-18.0, abs=0.1)
     assert g.nodes["cVOX"].staging_strategy == "none" and "cVOX" not in g.recommended_slot_a_trims()
     assert g.nodes["ALLMUS"].recommended_trim_db + g.nodes["ALLMUS"].recommended_fader_db == pytest.approx(0.0, abs=1e-6)
     # Terminal MIX1 has empty Slot A -> auto-inserts TrackControl (-trim_only, fader=0.0 dB), protecting MIX1 & Master!
@@ -419,8 +420,8 @@ def test_recursive_two_level_slot_a_trim_preserves_balance_and_drives_bus_insert
     assert g.nodes["MIX1"].slot_a_trim_auto_insert is True
     assert g.nodes["MIX1"].recommended_trim_db < 0.0 and g.nodes["MIX1"].recommended_fader_db == 0.0
     assert "MIX1" in g.recommended_slot_a_trims()
-    assert g.nodes["MIX1"].pre_fader_rms_db == pytest.approx(-18.0, abs=0.2)
-    assert g.nodes["Master"].pre_fader_rms_db == pytest.approx(-18.0, abs=0.2)
+    assert g.nodes["MIX1"].pre_fader_rms_db == pytest.approx(-18.0, abs=0.1)
+    assert g.nodes["Master"].pre_fader_rms_db == pytest.approx(-18.0, abs=0.1)
 
     g_raw = build_annotated_signal_flow(ptx, leaves, {"target_peak": -6.0, "target_rms": -18.0}, stage_bus_faders=False)
     assert g.nodes["ALLRYT"].post_fader_rms_db == pytest.approx(g_raw.nodes["ALLRYT"].post_fader_rms_db, abs=0.1)
@@ -454,13 +455,13 @@ def test_slot_a_trim_serial_mix_chains_unity_overrides_and_non_zero_template_fad
         _wrap(tracks), leaves, {"target_peak": -6.0, "target_rms": -18.0},
         stage_bus_faders=True, attenuate_only=True, include_sends=True,
     )
-    assert g.nodes["cVOX"].recommended_trim_db == pytest.approx(6.0, abs=0.2)
-    assert g.nodes["cVOX"].recommended_fader_db == pytest.approx(-18.0, abs=0.2)
-    assert g.nodes["PRE_FX"].pre_fader_rms_db == pytest.approx(-18.0, abs=0.2)
-    assert g.nodes["POST_FX"].pre_fader_rms_db == pytest.approx(-36.0, abs=0.2)
+    assert g.nodes["cVOX"].recommended_trim_db == pytest.approx(6.0, abs=0.1)
+    assert g.nodes["cVOX"].recommended_fader_db == pytest.approx(-18.0, abs=0.1)
+    assert g.nodes["PRE_FX"].pre_fader_rms_db == pytest.approx(-18.0, abs=0.1)
+    assert g.nodes["POST_FX"].pre_fader_rms_db == pytest.approx(-36.0, abs=0.1)
     assert g.nodes["MIX1"].staging_strategy == "none"
     assert g.nodes["MIX2"].staging_strategy == "trim_only" and g.nodes["MIX2"].recommended_trim_db < 0.0
-    assert g.nodes["Master"].pre_fader_rms_db == pytest.approx(-18.0, abs=0.2)
+    assert g.nodes["Master"].pre_fader_rms_db == pytest.approx(-18.0, abs=0.1)
 
     g_u = build_annotated_signal_flow(_wrap(tracks), leaves, {"target_peak": -6.0, "target_rms": -18.0}, stage_bus_faders=True, attenuate_only=False)
     assert g_u.nodes["cVOX"].staging_strategy == "trim_only" and g_u.nodes["cVOX"].recommended_fader_db == -12.0
@@ -468,7 +469,7 @@ def test_slot_a_trim_serial_mix_chains_unity_overrides_and_non_zero_template_fad
         _wrap(tracks), leaves, {"target_peak": -6.0, "target_rms": -18.0},
         stage_bus_faders=True, attenuate_only=True, bus_fader_overrides={"cVOX": -15.0},
     )
-    assert g_ovr.nodes["cVOX"].is_overridden is True and g_ovr.nodes["cVOX"].recommended_trim_db == pytest.approx(6.0, abs=0.2)
+    assert g_ovr.nodes["cVOX"].is_overridden is True and g_ovr.nodes["cVOX"].recommended_trim_db == pytest.approx(6.0, abs=0.1)
     assert g_ovr.nodes["cVOX"].recommended_fader_db == -15.0
 
 

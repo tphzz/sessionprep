@@ -21,8 +21,13 @@ from dataclasses import asdict
 from typing import Any
 from collections.abc import Callable
 
-from sessionpreplib.audio import file_revision
-from sessionpreplib.config import resolve_session_config, validate_structured_config
+from sessionpreplib.audio import file_revision, legacy_patterns_to_regex
+from sessionpreplib.config import (
+    migrate_legacy_config,
+    migrate_legacy_override,
+    resolve_session_config,
+    validate_structured_config,
+)
 from sessionpreplib.file_io import atomic_writer
 from sessionpreplib.detector import TrackDetector
 from sessionpreplib.detectors import default_detectors
@@ -48,7 +53,77 @@ from sessionpreplib.repairs import RepairRecipe
 # Version & migration table
 # ---------------------------------------------------------------------------
 
-CURRENT_VERSION: int = 7
+CURRENT_VERSION: int = 8
+
+
+def _migrate_v7_processor_result(pr: dict[str, Any], orig_override: str | None) -> None:
+    """Normalize legacy Transient/Sustained ProcessorResult fields to Peak-Capped RMS."""
+    cls = str(pr.get("classification", ""))
+    data = pr.setdefault("data", {})
+    if not isinstance(data, dict):
+        data = {}
+        pr["data"] = data
+    if cls.startswith("Transient"):
+        pr["classification"] = "Peak" if orig_override == "Transient" else "Auto (Peak)"
+        data.setdefault("mode", "Peak" if orig_override == "Transient" else "Auto")
+        data.setdefault("governing", "Peak")
+        data.setdefault("rms_anchor_active", False)
+    elif cls.startswith("Sustained"):
+        pr["classification"] = "Auto (RMS)"
+        data.setdefault("mode", "Auto")
+        data.setdefault("governing", "RMS")
+        data.setdefault("rms_anchor_active", True)
+
+
+def _migrate_v7_to_v8(d: dict) -> dict:
+    """Migrate v7 bimodal classifier sessions to v8 Peak-Capped RMS."""
+    out = deepcopy(d)
+    out["version"] = 8
+    out["_migrated_from_v7"] = True
+    if isinstance(out.get("session_config"), dict):
+        out["session_config"], _ = migrate_legacy_config(out["session_config"])
+    if isinstance(out.get("session_config_overrides"), dict):
+        cleaned_ov: dict[str, Any] = {}
+        for path, val in out["session_config_overrides"].items():
+            if not isinstance(path, str) or path.startswith("detectors.audio_classifier"):
+                continue
+            if path in ("processors.bimodal_normalize.force_sustained", "force_sustained"):
+                continue
+            if path in ("processors.bimodal_normalize.force_transient", "force_transient"):
+                pattern = legacy_patterns_to_regex(val)
+                if pattern:
+                    cleaned_ov["processors.bimodal_normalize.force_peak"] = pattern
+                continue
+            cleaned_ov[path] = val
+        out["session_config_overrides"] = cleaned_ov
+    has_auto_gain_shift = False
+    for bucket in ("tracks", "output_tracks"):
+        tracks = out.get(bucket)
+        if not isinstance(tracks, dict):
+            continue
+        for tdata in tracks.values():
+            if not isinstance(tdata, dict):
+                continue
+            orig_override = tdata.get("classification_override")
+            skipped = "bimodal_normalize" in (tdata.get("processor_skip") or ())
+            pr = (tdata.get("processor_results") or {}).get("bimodal_normalize")
+            if isinstance(pr, dict):
+                if bucket == "tracks" and not skipped and orig_override is None and str(pr.get("classification", "")).startswith("Transient"):
+                    has_auto_gain_shift = True
+                _migrate_v7_processor_result(pr, orig_override)
+            tdata["classification_override"] = migrate_legacy_override(orig_override)
+            det_res = tdata.get("detector_results")
+            if isinstance(det_res, dict):
+                det_res.pop("audio_classifier", None)
+            ca = tdata.get("corrected_analysis")
+            if isinstance(ca, dict):
+                for sub in ("results", "support_results"):
+                    if isinstance(ca.get(sub), dict):
+                        ca[sub].pop("audio_classifier", None)
+    if out.get("prepare_state") == "ready" and has_auto_gain_shift:
+        out["prepare_state"] = "stale"
+    return out
+
 
 # Each entry upgrades from key-version to key+1.
 _MIGRATIONS: dict[int, Callable[[dict], dict]] = {
@@ -79,6 +154,7 @@ _MIGRATIONS: dict[int, Callable[[dict], dict]] = {
         "version": 6,
     },
     6: lambda d: {**d, "version": 7},
+    7: _migrate_v7_to_v8,
 }
 
 
@@ -203,23 +279,41 @@ def _read_verified_results(records: dict, track: TrackContext) -> dict[str, Dete
 
 
 def _ser_processor_result(r: ProcessorResult) -> dict:
-    return {
+    nonfinite: list = []
+    gain_val = r.gain_db if isinstance(r.gain_db, (int, float)) and math.isfinite(float(r.gain_db)) else None
+    result = {
         "processor_id": r.processor_id,
-        "gain_db": r.gain_db,
+        "gain_db": gain_val,
         "classification": r.classification,
         "method": r.method,
-        "data": _make_json_safe(r.data),
+        "data": _make_json_safe(r.data, nonfinite),
         "error": r.error,
     }
+    if gain_val is None and isinstance(r.gain_db, (int, float)):
+        result["gain_db_nonfinite"] = str(r.gain_db)
+    if nonfinite:
+        result["nonfinite"] = nonfinite
+    return result
 
 
 def _deser_processor_result(d: dict) -> ProcessorResult:
+    data = deepcopy(d.get("data", {}))
+    for path, value in d.get("nonfinite", []):
+        parent: Any = data
+        for part in path[:-1]:
+            parent = parent[part]
+        parent[path[-1]] = float(value)
+    if "gain_db_nonfinite" in d:
+        gain_db = float(d["gain_db_nonfinite"])
+    else:
+        raw_g = d.get("gain_db", 0.0)
+        gain_db = float(raw_g) if raw_g is not None else 0.0
     return ProcessorResult(
         processor_id=d["processor_id"],
-        gain_db=d.get("gain_db", 0.0),
+        gain_db=gain_db,
         classification=d.get("classification", ""),
         method=d.get("method", ""),
-        data=d.get("data", {}),
+        data=data,
         error=d.get("error"),
     )
 
@@ -714,6 +808,7 @@ def deserialize_session_state(raw: dict) -> dict:
         "recursive_scan": raw.get("recursive_scan", False),
         "project_name": raw.get("project_name", ""),
         "active_daw_processor_id": raw.get("active_daw_processor_id"),
+        "migrated_from_v7": bool(raw.get("_migrated_from_v7", False)),
     }
 
 def save_session(path: str, data: dict) -> None:

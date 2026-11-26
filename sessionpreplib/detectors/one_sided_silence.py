@@ -73,10 +73,9 @@ class OneSidedSilenceDetector(TrackDetector):
     ) -> DetectorResult:
         data["topology_action"] = "extract_channel"
         data["topology_channel"] = 1 if side == "L" else 0
-        off = self._db_offset
 
         def fmt_db(x: float) -> str:
-            return f"{float(x) + off:.1f}" if np.isfinite(x) else "-inf"
+            return f"{float(x):.1f}" if np.isfinite(x) else "-inf"
 
         side_prefix = f"one-sided silence ({side})" if side else "one-sided silence"
         summary = f"{side_prefix} (L {fmt_db(l_rms_db)} dBFS, R {fmt_db(r_rms_db)} dBFS)"
@@ -97,6 +96,25 @@ class OneSidedSilenceDetector(TrackDetector):
             hint="check stereo export / channel routing",
             issues=issues,
         )
+
+    def format_summary(self, result: DetectorResult, offset: float | None = None) -> str:
+        """Render the one-sided silence summary using live dBFS RMS convention."""
+        if not result.data.get("one_sided_silence"):
+            return result.summary
+        off = self._db_offset if offset is None else offset
+        side = result.data.get("one_sided_silence_side")
+        l_db = result.data.get("l_rms_db", float(-np.inf))
+        r_db = result.data.get("r_rms_db", float(-np.inf))
+        l_str = f"{float(l_db) + off:.1f}" if isinstance(l_db, (int, float)) and np.isfinite(l_db) else "-inf"
+        r_str = f"{float(r_db) + off:.1f}" if isinstance(r_db, (int, float)) and np.isfinite(r_db) else "-inf"
+        prefix = f"one-sided silence ({side})" if side else "one-sided silence"
+        return f"{prefix} (L {l_str} dBFS, R {r_str} dBFS)"
+
+    def render_html(self, result: DetectorResult, track: TrackContext | None = None) -> str:
+        if result.data.get("one_sided_silence"):
+            from dataclasses import replace
+            result = replace(result, summary=self.format_summary(result))
+        return super().render_html(result, track)
 
     def analyze(self, track: TrackContext) -> DetectorResult:
         if is_silent(track):

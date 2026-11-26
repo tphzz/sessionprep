@@ -289,7 +289,15 @@ class SessionConfigController(QObject):
     def on_session_config_value_changed(self, path: str, value: Any) -> None:
         if not self._state.session or self._loading_widgets:
             return
+        from sessionpreplib.config import validate_structured_config
+
         old_config = self._state.effective_session_config()
+        candidate_overrides = {**self._state.session_overrides, path: value}
+        candidate_cfg = resolve_session_config(self._state.active_preset(), candidate_overrides)
+        errs = validate_structured_config(candidate_cfg)
+        if errs:
+            self._shell.show_status(f"Invalid setting (not applied): {errs[0].message}")
+            return
         self._state.session_overrides[path] = value
         self.apply_session_config_edit(old_config)
 
@@ -447,9 +455,17 @@ class SessionConfigController(QObject):
         session = self._state.session
         if not session:
             return
+        from sessionpreplib.audio import dbfs_offset
+
         flat = self._state.flat_config()
+        if "dbfs_convention" in flat:
+            session.config["dbfs_convention"] = flat["dbfs_convention"]
         for det in session.detectors:
             det.configure(flat)
+        offset = dbfs_offset(flat)
+        for proc in session.processors:
+            if hasattr(proc, "_db_offset"):
+                proc._db_offset = offset
         self._state.summary = build_diagnostic_summary(session, remaining=True)
         self.summary_render_requested.emit()
         self.analysis_column_refresh_requested.emit()

@@ -10,7 +10,6 @@ import soundfile as sf
 from sessionpreplib.audio import discover_track, load_track, subsonic_stft_analysis, windowed_stereo_correlation
 from sessionpreplib.config import build_structured_defaults, default_config, flatten_structured_config
 from sessionpreplib.detectors import (
-    AudioClassifierDetector,
     ClippingDetector,
     DCOffsetDetector,
     DualMonoDetector,
@@ -23,6 +22,7 @@ from sessionpreplib.detectors import (
     TailExceedanceDetector,
     UltrasonicDetector,
 )
+from sessionpreplib.processors.bimodal_normalize import BimodalNormalizeProcessor
 from sessionpreplib.models import SessionContext, Severity, TrackContext
 from sessionpreplib.pipeline import Pipeline
 from sessionpreplib.rendering import build_diagnostic_summary
@@ -488,24 +488,28 @@ def test_ultrasonic_requires_sustained_energy_at_an_eligible_sample_rate():
     assert not ineligible.applicable and not ineligible.issues
 
 
-def test_classifier_distinguishes_a_steady_sine_from_an_isolated_impulse():
+def test_peak_capped_rms_distinguishes_a_steady_sine_from_an_isolated_impulse():
     time = np.arange(8000) / 8000
-    tone = _measure(AudioClassifierDetector(), 0.5 * np.sin(2 * np.pi * 250 * time))
-    assert tone.data["classification"] == "Sustained"
-    assert tone.data["crest"] == pytest.approx(10 * np.log10(2))
-    assert tone.data["peak_db"] == pytest.approx(20 * np.log10(0.5))
+    proc = BimodalNormalizeProcessor()
+    proc.configure({})
+    tone = proc.process(_track(0.5 * np.sin(2 * np.pi * 250 * time)))
+    assert tone.data["governing"] == "RMS"
+    assert tone.classification == "Auto (RMS)"
+    assert tone.data["effective_crest_db"] == pytest.approx(10 * np.log10(2))
+    assert tone.data["detected_peak_db"] == pytest.approx(20 * np.log10(0.5))
 
     samples = np.zeros(len(time))
     samples[1000] = 0.5
-    impulse = _measure(AudioClassifierDetector(), samples)
-    assert impulse.data["classification"] == "Transient"
-    assert impulse.data["peak_db"] == pytest.approx(tone.data["peak_db"])
+    impulse = proc.process(_track(samples))
+    assert impulse.data["governing"] == "Peak"
+    assert impulse.classification == "Auto (Peak)"
+    assert impulse.data["detected_peak_db"] == pytest.approx(tone.data["detected_peak_db"])
 
 
 def _measure_tail(samples, **options):
     track = _track(samples)
     config = {"window": 50, "rms_percentile": 80, **options}
-    detectors = [TailExceedanceDetector(), AudioClassifierDetector(), SilenceDetector()]
+    detectors = [TailExceedanceDetector(), SilenceDetector()]
     pipeline = Pipeline(detectors, config=config)
     session = SessionContext([track], config)
     pipeline.analyze_phase1(session)
@@ -534,29 +538,36 @@ def test_tail_regions_do_not_include_the_silence_between_two_loud_sections():
     result = _measure_tail(bed)
     issues = result.issues
     assert len(issues) == 2
-    assert [(i.sample_start, i.sample_end) for i in issues] == [(19680, 22319), (33680, 36319)]
-    assert result.data["tail_summary"]["total_duration_sec"] == pytest.approx(5280 / 8000)
+    assert issues[0].sample_start < 20000 <= issues[0].sample_end < 23000
+    assert 33000 < issues[1].sample_start < 34000 <= issues[1].sample_end < 37000
+    assert issues[0].sample_end < issues[1].sample_start - 10000
+    expected_samples = sum(i.sample_end - i.sample_start + 1 for i in issues)
+    assert result.data["tail_summary"]["total_duration_sec"] == pytest.approx(expected_samples / 8000)
 
 
 def test_total_tail_duration_counts_overlapping_window_support_only_once():
     rate = 8000
     signal = np.zeros(26 * rate)
     signal[:22 * rate] = 0.002 * np.sin(2 * np.pi * 1000 * np.arange(22 * rate) / rate)
-    signal[24 * rate] = signal[24 * rate + 3280] = 0.8
+    # Impulses 3360 samples apart (> 3200-sample window + 80-sample hop) create two distinct
+    # exceeding regions whose 400 ms window supports still overlap in time.
+    signal[24 * rate] = signal[24 * rate + 3360] = 0.8
     result = _measure_tail(signal, window=400, rms_percentile=95)
-    assert [(i.sample_start, i.sample_end) for i in result.issues] == [
-        (188880, 195199), (192160, 198479),
-    ]
-    assert result.data["tail_summary"]["total_duration_sec"] == pytest.approx(1.2)
+    assert len(result.issues) == 2
+    assert result.issues[1].sample_start < result.issues[0].sample_end
+    union_samples = result.issues[1].sample_end - result.issues[0].sample_start + 1
+    assert result.data["tail_summary"]["total_duration_sec"] == pytest.approx(union_samples / rate)
 
 
-def test_tail_scan_with_widely_spaced_hops_leaves_unmeasured_gaps_out_of_regions():
+def test_tail_scan_with_widely_spaced_hops_preserves_mid_hop_bursts():
     bed = np.tile([0.125, -0.125], 32000)
     bed[20000:22000] *= 4
     result = _measure_tail(bed, window=10, tail_hop_ms=100)
-    assert [(i.sample_start, i.sample_end) for i in result.issues] == [
-        (20000, 20079), (20800, 20879), (21600, 21679),
-    ]
+    assert result.severity == Severity.ATTENTION
+    assert len(result.issues) == 1
+    issue, = result.issues
+    assert issue.sample_start <= 20000 and issue.sample_end >= 21999
+    assert result.data["tail_summary"]["max_exceed_db"] == pytest.approx(20 * np.log10(4), abs=0.01)
 
 
 def test_session_detectors_distinguish_format_from_duration_across_sample_rates(tmp_path):

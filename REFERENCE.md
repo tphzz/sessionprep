@@ -352,34 +352,36 @@ The anchor is then used to:
   - `--gate_relative_db 40` means "keep windows within 40 dB of the loudest RMS
     window." It is not an absolute dBFS value (so it is not `-40`).
 
-### 3.5 Audio classification (crest factor + envelope decay + density)
+### 3.5 Peak-Capped RMS Normalization & Governing Constraint
 
 **What it is:**
-  - A three-metric classifier that combines crest factor (peak-to-RMS ratio),
-    envelope decay rate (how fast energy drops after the loudest moment), and
-    density (fraction of the track containing active content above the gate).
-  - Crest factor alone can misclassify compressed drums (low crest but transient)
-    and plucked instruments (high crest but sustained). The decay metric acts as
-    a tiebreaker when the two metrics disagree. Density catches sparse percussion
-    (toms, crashes, FX hits) that may have ambiguous crest and decay values.
-  - Decay uses the first 10 ms window within 0.001 dB of the maximum energy.
-    This anchors repeated, held notes consistently across input trims.
-    A tail at least 120 dB below the peak is reported as ≥120 dB.
-
-**Classification logic (in priority order):**
-  1. Keyword overrides (`--force_transient`, `--force_sustained`)
-  2. Sparse + at least one dynamic metric agrees → Transient (toms, crashes, FX)
-  3. High crest + fast decay → Transient (drums, percussion)
-  4. Low crest + slow decay → Sustained (pads, bass, vocals)
-  5. High crest + slow decay → Sustained (plucked/piano — decay overrides)
-  6. Low crest + fast decay → Transient (compressed drums — decay overrides)
-
-**Why it matters:**
-  - Helps pick a more appropriate normalization strategy.
-  - Explains why certain tracks behave differently when you drive dynamics and
-    saturation processing.
-  - Sparse tracks (e.g., toms that only play occasionally) are caught by the
-    density metric even when crest and decay are ambiguous.
+  - Every non-silent track above the `-70.0 dBFS` noise-floor hold is normalized
+    with one continuous rule:
+    `gain = min(target_rms - rms_anchor, target_peak - sample_peak, max_gain_db)`.
+  - At the default targets (`-18.0 dBFS` unweighted RMS / `-6.0 dBFS` Peak
+    ceiling), tracks with effective crest `≥ 12.0 dB` are governed by **Peak**
+    (`Auto (Peak)`), while tracks with effective crest `< 12.0 dB` (sustained
+    sources and compressed drum loops) are governed by **RMS** (`Auto (RMS)`).
+  - Tracks at or below `-70.0 dBFS` peak hold at `0.0 dB` (**Noise Floor**) to
+    prevent room-tone or dither wind-up. Automatic boost is capped by
+    `--max_gain_db` (default `+24.0 dB`, range `0–36 dB`).
+  - **Governing & Next-Highest Peak:** Reports the clickable timestamp of the
+    global sample peak alongside the next-highest distinct peak outside a
+    stereo-linked `±100 ms` exclusion window (`—` when no non-zero sample lies
+    outside `±100 ms`).
+  - **Lazy True-Peak Headroom Warnings:** When post-gain sample peak exceeds
+    `-5.5 dBFS` (for example under an `RMS` override or manual gain edit),
+    SessionPrep computes oversampled true peak (`dBTP`) on the post-repair audio
+    and flags **Amber** (`> −1.0 dBFS/dBTP`) or **Red** (`> 0.0 dBFS/dBTP`).
+  - **CLI Flags & Legacy Compatibility:**
+    - `--target_rms` (default `-18.0`), `--target_peak` (default `-6.0`, must
+      satisfy `target_rms <= target_peak`), `--max_gain_db` (default `24.0`),
+      `--force_peak <regex>` (force Peak mode on matching filenames).
+    - Deprecated flags `--force_transient` (mapped to `--force_peak`),
+      `--crest_threshold`, and `--force_sustained` are accepted with deprecation
+      warnings to stderr. Legacy `.spsession` (v7 → v8) and preset files migrate
+      automatically (`Transient → Peak`, `Sustained → Auto`, `Skip → Skip`;
+      prepared outputs with auto-shifted tracks are marked stale).
 
 ### 3.6 Tail exceedance report (significant regions above anchor)
 
@@ -628,7 +630,7 @@ Supported batch dropdowns:
 | Dropdown           | Column | Effect                                                                            |
 |--------------------|--------|-----------------------------------------------------------------------------------|
 | **RMS Anchor**     | 5      | Override per-track RMS anchor; triggers full re-analysis (detectors + processors) |
-| **Classification** | 3      | Override per-track classification; triggers processor-only re-calculation         |
+| **Mode**           | 3      | Override per-track normalization mode (`Auto`, `Peak`, `RMS`, `Skip`)             |
 
 ### 7.4 RMS Anchor Override
 
@@ -647,19 +649,18 @@ Changing the anchor re-runs all detectors and processors for the affected
 track(s), since the anchor value influences both tail exceedance detection and
 gain calculation.
 
-### 7.5 Classification Override
+### 7.5 Mode Override (`Auto`, `Peak`, `RMS`, `Skip`)
 
-Per-track dropdown overriding the auto-detected audio classification.
+Per-track **Mode** dropdown in Phase 2 controlling how Peak-Capped RMS normalizes each track (manual overrides display a blue change marker; grouped tracks limited by a sibling display `Auto (Grp)`, `Peak (Grp)`, or `RMS (Grp)` with a tooltip naming the governing track):
 
-| Label     | Effect                                                         |
-|-----------|----------------------------------------------------------------|
-| Transient | Force peak-based normalization (`target_peak`)                 |
-| Sustained | Force RMS-based normalization (`target_rms`)                   |
-| Skip      | Exclude track from processing (gain = 0 dB, spin box disabled) |
+| Label       | Effect                                                                               |
+|-------------|--------------------------------------------------------------------------------------|
+| Auto        | Peak-Capped RMS (`Auto (RMS)` or `Auto (Peak)`, or `Noise Floor` at `≤ −70.0 dBFS`)  |
+| Peak        | Ignore `target_rms` and normalize directly to `target_peak` (capped by `max_gain_db`) |
+| RMS         | Ignore `target_peak` and normalize to `target_rms` (capped by `max_gain_db`, with lazy `dBTP` warnings) |
+| Skip        | Exclude track from normalization (bit-exact `0.0 dB` gain, `0.0 dB` fader offset)     |
 
-Changing the classification re-runs processors only (no detector re-analysis
-needed), since the classification affects only the normalization method and
-gain calculation.
+Changing the Mode re-runs processors only (no detector re-analysis needed) and clears any prior manual gain override on that track.
 
 
 ## 8. Pro Tools Utils Window
@@ -691,10 +692,10 @@ post-close pass with automatic rollback if Pro Tools fails to reopen the session
   preserving folders with pre-existing tracks, externally routed busses, and
   standalone submix/master channels.
 - **Two-Level Gain Staging (`protools_gain_mode`, default `clip_gain_and_fader`):**
-  - `clip_gain_and_fader`: On un-normalized source audio, writes bimodal
+  - `clip_gain_and_fader`: On un-normalized source audio, writes Peak-Capped RMS
     normalization gain (`+gain_db`) to Pro Tools Clip Gain (pre-insert, mono and
     stereo `.L`/`.R` clips) and the inverse offset (`fader_offset`) to the Track
-    Fader (post-insert), preserving rough-mix balance without requiring
+    Fader (post-insert), preserving incoming file-level balance without requiring
     gain-baked WAV files. On already-prepared WAVs, Clip Gain stays `0.0 dB` so
     gain is never double-applied (displayed as `0.0 dB (baked)` in Phase 3).
   - `clip_gain_unity`: Writes `+gain_db` to Clip Gain on un-normalized audio and
@@ -709,11 +710,12 @@ post-close pass with automatic rollback if Pro Tools fails to reopen the session
 - **Signal-Flow Bus Gain Staging, Slot A Trim Plugins & Phase 3 Inspector (`protools_stage_bus_faders`, default `true`; `protools_pan_law_db`, default `-3.0`):**
   Reconstructs the template's audio routing graph, sums the time-aligned,
   gain-adjusted audio tracks in topological order to measure summed Peak dBFS,
-  active RMS dBFS, and Transient/Sustained classification at every folder/bus
-  node. When template busses carry a validated Insert Slot A gain-trim plugin
-  (**DMG Audio TrackControl**, **Avid Trim** in default `+6 dB` mode, or
+  active RMS dBFS, and the governing Peak-Capped RMS constraint (**Governs**:
+  `Peak` / `RMS` on staged busses, `—` on non-staged summing folders and
+  `Master`). When template busses carry a validated Insert Slot A gain-trim
+  plugin (**DMG Audio TrackControl**, **Avid Trim** in default `+6 dB` mode, or
   **Process.Audio Protility**), SessionPrep applies recursive multi-stage
-  bimodal gain staging: pure summing folders stay at `0.0 dB` unity, intermediate
+  Peak-Capped RMS gain staging: pure summing folders stay at `0.0 dB` unity, intermediate
   insert-bearing busses receive pre-insert Slot A Trim gain (`+g`, activating an
   inactive Slot A Trim automatically while respecting bypassed inserts) paired
   with an inverse post-insert Bus Fader offset (`-g` relative to the template

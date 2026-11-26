@@ -13,7 +13,7 @@ For development setup and architecture, see [DEVELOPMENT.md](DEVELOPMENT.md).
 ## Table of Contents
 
 1. [Physics vs. Flow](#1-physics-vs-flow)
-2. [Bimodal Normalization](#2-bimodal-normalization)
+2. [Peak-Capped RMS Normalization](#2-peak-capped-rms-normalization)
 3. [Signal Chain & Workflow](#3-signal-chain--workflow)
 4. [Why This Is Not Circular Logic](#4-why-this-is-not-circular-logic)
 5. [What Happens Next (The Manual Mix Phase)](#5-what-happens-next-the-manual-mix-phase)
@@ -124,10 +124,10 @@ The Script's Solution:
 
 ---
 
-## 2. Bimodal Normalization
+## 2. Peak-Capped RMS Normalization
 
 Most normalizers are "dumb" — they treat a Kick drum and a Synth Pad the same.
-If you normalize a Kick drum to -18 dB RMS, you can severely compromise it (the peak
+If you normalize an acoustic Kick drum to -18 dB RMS, you can severely compromise it (the peak
 may exceed 0 dBFS and clip, because the body is so thin relative to the transient).
 
 ### Calibration Note
@@ -143,17 +143,15 @@ Practical reality:
   - Other analog-modeled chains (channel strips, tape, transformers/tubes, some
     compressors) can still be noticeably level-dependent.
 
-For that reason, target levels are intentionally adjustable via command line:
-  - `--target_rms` for sustained sources
-  - `--target_peak` for transient sources / peak ceiling
-
-Defaults:
-  - `--target_rms -18`
-  - `--target_peak -6`
+For that reason, target levels are intentionally adjustable via CLI or Preferences:
+  - `--target_rms` (default `-18.0 dBFS`): operating unweighted RMS target (anchored to gated loud sections)
+  - `--target_peak` (default `-6.0 dBFS`): sample-peak ceiling (`target_rms <= target_peak`)
+  - `--max_gain_db` (default `+24.0 dB`, range `0–36 dB`): automatic boost cap
+  - `--force_peak <regex>`: optional regex for tracks that always target the peak ceiling (e.g. `kick|snare|tom`)
 
 If your chain is mostly modern, wide-headroom plugins, you can run hotter by
-raising `--target_rms` (e.g. -16). If your chain is heavy on saturation/tape/legacy
-calibrated plugins, -18 remains a safe default.
+raising `--target_rms` (e.g. `-16` or `-14`). If your chain is heavy on
+saturation/tape/legacy calibrated plugins, `-18` remains a safe default.
 
 Example (modern/hotter chain):
   - `--target_rms -14 --target_peak -3`
@@ -161,36 +159,45 @@ Example (modern/hotter chain):
 Even with the correct target, edge-case outliers (or section-to-section macro
 dynamics) may still require manual clip gain adjustments in the DAW.
 
-### The Bimodal Classification Strategy
+### The Continuous Peak-Capped RMS Law
 
-  Classification uses three metrics: **crest factor** (peak-to-RMS ratio),
-  **envelope decay rate** (how fast energy drops after the loudest moment),
-  and **density** (fraction of the track containing active content).
-  Very sparse tracks with at least one agreeing dynamic metric are classified
-  as Transient (catches toms, crashes, FX hits). For non-sparse tracks, crest
-  and decay vote together with decay as tiebreaker.
+Instead of sorting tracks into discrete buckets with heuristic decay/density
+classifiers, SessionPrep applies one continuous, monotonic rule to every track:
 
-  **TYPE 1: TRANSIENT MATERIAL** (High Crest + Fast Decay)
-  (Drums, Percussion, Stabs)
-  -> The Script normalizes these to PEAK Level (-6 dBFS).
-  -> Goal: Preserve impact and headroom. We don't care about RMS voltage here;
-     we care about not clipping the transient.
-  -> Also catches compressed drums (low crest but fast decay) that crest factor
-     alone would misclassify as sustained.
+```text
+gain_db = min(target_rms - rms_anchor_db, target_peak - sample_peak_db, max_gain_db)
+```
 
-  **TYPE 2: SUSTAINED MATERIAL** (Low Crest + Slow Decay)
-  (Bass, Vocals, Guitars, Synths)
-  -> The Script targets RMS Level (-18 dBFS) but is peak-limited by the
-     configured peak ceiling (-6 dBFS).
-  -> Goal: Ensure consistent "Body" and Voltage. These tracks drive the saturation
-     characteristics of your plugins (Tubes, Tape, Transformers).
-     If a file hits the peak ceiling before reaching the RMS target, it will end
-     up below the RMS target by design.
-  -> Also catches plucked instruments and piano (high crest but slow decay) that
-     crest factor alone would misclassify as transient.
+At the default targets (`-18 dBFS` RMS / `-6 dBFS` Peak), the natural crossover
+sits at **12 dB effective crest** (`peak − rms_anchor`):
 
-This hybrid approach ensures that drums remain punchy while sustained instruments
-get the "thick" analog sound you want.
+  - **Peak-governed (`Auto (Peak)`):** High-crest sources (uncompressed kicks,
+    snares, percussion, isolated spikes; effective crest ≥ 12 dB) automatically
+    stop at `--target_peak` (`-6 dBFS`), preserving clean transient headroom.
+    Exact ties within `1e-9 dB` resolve deterministically to `Peak`.
+  - **RMS-governed (`Auto (RMS)`):** Sustained instruments (vocals, bass, 808s,
+    guitars, synths, pads) *and* dense compressed drum loops (effective crest
+    < 12 dB) target `--target_rms` (`-18 dBFS`), delivering predictable electrical
+    drive into compressors and saturators without pushing compressed loops 4–6 dB
+    over target.
+  - **Noise Floor Hold (`≤ −70.0 dBFS` peak):** Silent stems, room tone, and
+    16/24-bit dither hold at `0.0 dB` (`Noise Floor`) so quiet tracks never wind up.
+  - **Explicit Overrides:** Per-track **Peak** mode (or `--force_peak`) targets
+    the peak ceiling when peak-sensitive drum processing (gates, transient
+    designers, fast 1176s) expects fixed peak levels; per-track **RMS** mode
+    bypasses the peak ceiling (for example, when one isolated plosive caps an
+    otherwise quiet vocal) and triggers lazy oversampled true-peak (`dBTP`)
+    warnings whenever post-gain sample peak exceeds `-5.5 dBFS`.
+
+### Governing Peak & Next-Highest Peak (`±100 ms`)
+
+To help you immediately distinguish an isolated vocal plosive from a consistently
+hot kick drum, SessionPrep reports both the global governing peak (with clickable
+timestamp) and the **next-highest distinct peak** outside a stereo-linked
+`±100 ms` exclusion window (`—` when no non-zero sample falls outside `±100 ms`).
+A large gap (e.g. `-3.6 dBFS` vs next `-12.4 dBFS`) points to a single outlier
+worth fixing with clip gain or an `RMS` override; a tight gap confirms that
+every hit sits near the ceiling.
 
 ---
 
@@ -260,14 +267,14 @@ For Pro Tools templates, SessionPrep reconstructs the template's directed
 acyclic signal-flow graph (Audio → Routing Folders → Subgroup/Stem Auxes →
 Mix Bus → Master), sums the time-aligned, gain-adjusted Main Output audio in
 topological order (respecting Mono/Stereo pan geometry, mutes, and VCAs), and
-applies the same bimodal classification and two-level gain-staging principle
+applies the same Peak-Capped RMS rule and two-level gain-staging principle
 recursively at each bus stage:
 
 ```
 [SUMMED BUS INPUT]
         |
 [SLOT A TRIM (+g)]  <--- Pre-insert gain stage (TrackControl / Avid Trim / Protility)
-        |                Calibrates summed signal to bimodal target (-6 pk / -18 RMS)
+        |                Calibrates summed signal to Peak-Capped RMS target (-18 RMS / -6 pk cap)
 [BUS INSERTS]       <--- Bus compressors, EQs, tape/console models hit nominal drive
         |
 [BUS FADER (-g)]    <--- Inverse post-insert offset cancels +g so downstream
@@ -380,44 +387,49 @@ You are now in a superior starting position:
 
 ## 6. Core Concepts & Practical Notes
 
-### RMS vs. LUFS
+### Unweighted RMS vs. LUFS & Stereo Mode (`avg` vs. `sum`)
 
 LUFS is an excellent standard for broadcast delivery and perceived loudness, but
-its K-weighting and gating are designed to match hearing, not electrical energy.
-For gain-staging analog modelled and drive-sensitive processing, a momentary RMS
-measure is a simple and predictable proxy for average signal energy. It does not
-perfectly model analog circuit behavior, but its simplicity makes it practical
-for setting consistent starting levels.
+its K-weighting filter rolls off low bass and boosts upper midrange (~9.5 dB
+divergence between 40 Hz and 4 kHz). For gain-staging analog-modeled and
+drive-sensitive processing on Pop/Rock/R&B stems (808 sub bass, kick drums,
+guitars, vocals), **unweighted momentary RMS** matches electrical voltage drive
+directly rather than ear sensitivity.
+
+For stereo tracks, `--stereo_mode avg` (default, half-power mean across L/R)
+keeps centered stereo tracks consistent with mono tracks; hard-panned mono
+material inside a stereo file reads 3.01 dB lower than in `--stereo_mode sum`
+(full-power sum). Both modes are strictly L↔R swap symmetric.
+
+### AES17 Scale Convention (`dbfs_convention`)
+
+`standard` (default) displays full-scale square-wave `0 dBFS` (`-3.01 dBFS` for
+a full-scale sine). `aes17` adds `+3.0103 dB` (`10 · log10(2)`) strictly as a
+**presentation-only offset on RMS readouts and RMS targets** so a full-scale sine
+reads `0.0 dBFS RMS`. Sample Peak, Peak Ceiling, Next-Highest Peak, `dBTP`, clip
+warnings, and DC offset always remain unshifted digital dBFS, and toggling
+`standard` ↔ `aes17` never alters gains or rendered samples.
 
 ### Internal gain structure (why clip gain and fader offsets both exist)
 
-Changing clip gain and applying the inverse fader offset can preserve the rough
-balance while still changing the level feeding inserts. This can matter for
-calibrated plugins and non-linear stages where drive changes tone/dynamics.
-It can also improve fader control resolution in cases where the resulting fader
-positions end up closer to unity, but that is not guaranteed.
+Changing clip gain and applying the inverse fader offset can preserve the
+incoming file-level balance (matching the rough mix on post-fader exports) while
+still changing the level feeding inserts. This can matter for calibrated plugins
+and non-linear stages where drive changes tone/dynamics. It can also improve
+fader control resolution in cases where the resulting fader positions end up
+closer to unity, but that is not guaranteed.
 
-### Classification is heuristic (transient vs sustained)
+### Explicit Overrides (`Peak`, `RMS`, `--force_peak`)
 
-The transient/sustained split is intentionally a heuristic based on three metrics:
-crest factor (peak-to-RMS ratio), envelope decay rate (energy drop after the
-loudest moment), and density (fraction of active content). Classification priority:
-  1. Sparse + at least one dynamic metric agrees → Transient (toms, crashes, FX)
-  2. High crest + slow decay → Sustained (plucked instruments, piano)
-  3. Low crest + fast decay → Transient (compressed drums, loops)
-
-It will still be wrong for some sources. The script supports explicit overrides:
-  - `--force_transient ...`
-  - `--force_sustained ...`
-
-Thresholds are adjustable:
-  - `--crest_threshold 12` (default) — crest factor above this suggests transient
-  - `--decay_db_threshold 12` (default) — energy drop above this suggests transient
-  - `--decay_lookahead_ms 200` (default) — time window for measuring decay
-  - `--sparse_density_threshold 0.25` (default) — tracks with less active content are sparse
-
-If you see systematic misclassification, adjust thresholds for the session,
-and use the force flags to lock edge cases.
+Peak-Capped RMS removes heuristic threshold failures, while keeping two targeted
+manual overrides when an engineer wants different behavior:
+  - **`Peak` / `--force_peak <regex>`**: ignores `--target_rms` and targets
+    `--target_peak` directly (useful for compressed drums feeding peak-sensitive
+    gates, transient designers, or fast 1176 chains).
+  - **`RMS`**: ignores `--target_peak` (still bounded by `--max_gain_db`) to
+    prevent one isolated transient or vocal plosive from under-gaining the whole
+    track. Post-gain peaks above `-5.5 dBFS` trigger lazy oversampled true-peak
+    checks (`amber > -1.0`, `red > 0.0` dBFS/dBTP).
 
 ### Multi-mic sources (phase vs non-linearity)
 
@@ -446,9 +458,12 @@ first matching group and a warning is printed.
 Sustained-material gain is computed against a single representative RMS value
 called the **anchor**. Finding this anchor is a multi-step process:
 
-1. **Window**: Slice the track into overlapping short-time RMS windows (default
-   400 ms). Each window produces one momentary RMS value. Together they form a
-   distribution of momentary loudness across the file.
+1. **Window**: Slice the track into overlapping unweighted short-time RMS windows
+   (default 400 ms, `round(window_ms * sr / 1000)` samples) computed via
+   cancellation-free block suffix+prefix summation so quiet passages after loud
+   sections keep full `float64` precision. Each window produces one momentary
+   RMS value. Together they form a distribution of momentary loudness across
+   the file.
 
 2. **Gate**: Discard windows that are far below the loudest window
    (`--gate_relative_db`, default 40 dB). This removes silence and very quiet
@@ -488,9 +503,18 @@ exceedances above the anchor:
 
 ### True peaks / inter-sample peaks (ISP) and headroom
 
-This tool is designed for mixing headroom, not mastering. By enforcing a conservative
-sample-peak ceiling (default `--target_peak -6`), the signal retains enough margin
-that typical ISP overshoots are not a practical problem in the session context.
+Under default `Auto` or `Peak` targeting (`--target_peak -6`), signals retain at
+least 6 dB of sample-peak margin, so oversampled true-peak measurement is skipped
+lazily for speed. Whenever an `RMS` override, manual gain edit, or elevated
+ceiling pushes the post-gain sample peak above `-5.5 dBFS`, SessionPrep computes
+bounded-memory oversampled true peak (`4×` at `≤ 48 kHz`, `2×` at `< 192 kHz`
+including `176.4 kHz`, `1×` at `≥ 192 kHz`, keeping oversampled rate `≥ 192 kHz`)
+on the exact post-repair audio:
+
+- **Amber notice:** `post_peak > −1.0 dBFS` or `post_true_peak > −1.0 dBTP`
+- **Red warning:** `post_peak > 0.0 dBFS` (over 0 dBFS into first insert; Prepare
+  to fixed-point PCM would clip) or `post_true_peak > 0.0 dBTP` (inter-sample
+  over into oversampled inserts or DAC reconstruction)
 
 ### Pre-session workflow and automation
 

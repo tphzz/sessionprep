@@ -115,8 +115,8 @@ def test_repair_can_introduce_a_clipping_run_before_output_trim(tmp_path):
     assert before.severity == Severity.CLEAN and before.issues == []
     assert after.severity == Severity.PROBLEM and after.data["runs"] == 1
     assert _locations(after) == [(144000, 145795, None, None, None)]
-    before_peak = track.detector_results["audio_classifier"].data["peak_db"]
-    after_peak = track.corrected_analysis.results["audio_classifier"].data["peak_db"]
+    before_peak = 20 * np.log10(float(np.max(np.abs(audio))))
+    after_peak = 20 * np.log10(float(np.max(np.abs(render_corrected(audio, rate, track.repair_recipe)))))
     assert before_peak == pytest.approx(20 * np.log10(0.8))
     assert after_peak == pytest.approx(20 * np.log10(1.5997906), abs=0.00001)
     gain = track.processor_results["bimodal_normalize"]
@@ -186,9 +186,11 @@ def test_changed_samples_cannot_reuse_either_sources_peak_reading(tmp_path, chan
     audio = 0.1 + 0.2 * np.sin(2 * np.pi * 440 * time)
     track = _plan(tmp_path, audio, rate, {"dc_remove": True})
     previous = track.corrected_analysis
-    original_peak = track.detector_results["audio_classifier"].data["peak_db"]
-    corrected_peak = previous.results["audio_classifier"].data["peak_db"]
-    assert original_peak == pytest.approx(20 * np.log10(0.3))
+    original_dc = track.detector_results["dc_offset"].data["dc_db"]
+    corrected_peak = track.processor_results["bimodal_normalize"].data["detected_peak_db"]
+    expected_corrected_peak = 20 * np.log10(float(np.max(np.abs(render_corrected(audio, rate, track.repair_recipe)))))
+    assert original_dc == pytest.approx(20 * np.log10(0.1), abs=0.05)
+    assert corrected_peak == pytest.approx(expected_corrected_peak, abs=0.01)
 
     if change == "same-stat-file-replacement":
         path = Path(track.filepath)
@@ -198,7 +200,7 @@ def test_changed_samples_cannot_reuse_either_sources_peak_reading(tmp_path, chan
         track.audio_data *= 0.1
 
     session = SessionContext([track], {})
-    pipeline = Pipeline(default_detectors())
+    pipeline = Pipeline(default_detectors(), default_processors())
     if change == "resident-edit-and-reanalyze":
         pipeline.analyze_phase1(session)
         pipeline.analyze_phase2(session)
@@ -208,9 +210,10 @@ def test_changed_samples_cannot_reuse_either_sources_peak_reading(tmp_path, chan
         assert track._cache.get("repair_error")
     else:
         assert track.corrected_analysis.key != previous.key
-        assert track.detector_results["audio_classifier"].data["peak_db"] == pytest.approx(original_peak - 20)
-        new_peak = track.corrected_analysis.results["audio_classifier"].data["peak_db"]
-        assert new_peak == pytest.approx(corrected_peak - 20)
+        assert track.processor_results["bimodal_normalize"].data["detected_peak_db"] == pytest.approx(
+            corrected_peak - 20.0, abs=0.05
+        )
+        assert track.detector_results["dc_offset"].data["dc_db"] == pytest.approx(original_dc - 20.0, abs=0.05)
 
 
 def test_prepare_rejects_source_replaced_between_signature_check_and_read(tmp_path, monkeypatch):

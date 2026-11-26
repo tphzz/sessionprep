@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 import soundfile as sf
 
-from sessionpreplib.detectors import AudioClassifierDetector, SilenceDetector, TailExceedanceDetector
+from sessionpreplib.detectors import SilenceDetector, TailExceedanceDetector
 from sessionpreplib.pipeline import Pipeline, load_session
 from sessionpreplib.rendering import build_diagnostic_summary, render_diagnostic_summary_text
 from sessionpreplib.reports import build_warnings, generate_report, save_json
@@ -48,18 +48,18 @@ def test_report_uses_measured_tail_with_mixed_anchors(tmp_path, default, overrid
     tracks = {t.filename: t for t in session.tracks}
     tracks["A.wav"].rms_anchor_override, tracks["B.wav"].rms_anchor_override = overrides
     tracks["Clean.wav"].rms_anchor_override = "p80"
-    pipeline = Pipeline([TailExceedanceDetector(), AudioClassifierDetector(), SilenceDetector()], config=config)
+    pipeline = Pipeline([TailExceedanceDetector(), SilenceDetector()], config=config)
     pipeline.analyze_phase1(session)
     pipeline.analyze_phase2(session)
     result = tracks["A.wav"].detector_results["tail_exceedance"]
-    assert [(i.sample_start, i.sample_end) for i in result.issues] == [(19680, 22319)]
+    assert [(i.sample_start, i.sample_end) for i in result.issues] == [(19627, 22372)]
     assert result.data["tail_summary"]["max_exceed_db"] == pytest.approx(20 * np.log10(4))
     assert not tracks["B.wav"].detector_results["tail_exceedance"].applicable
     assert not tracks["Clean.wav"].detector_results["tail_exceedance"].issues
     text = generate_report(session, config, str(tmp_path / "report.txt"), [])
     tail = text.split("MOMENTARY RMS UPPER TAIL")[1].split("FILE OVERVIEW")[0]
     assert "A.wav" in tail and "B.wav" not in tail and "Clean.wav" not in tail
-    assert "samples 19680-22319" in tail and "+12.04 dB" in tail and "0.330s" in tail
+    assert "samples 19627-22372" in tail and "+12.04 dB" in tail and "0.343s" in tail
     assert "Anchor RMS: -18.06 dBFS (p80)" in tail
     summary = build_diagnostic_summary(session)
     ref, = next(g["item_refs"] for g in summary["attention"] if g["detector_id"] == "tail_exceedance")
@@ -72,7 +72,7 @@ def test_report_distinguishes_no_measurement_from_a_clean_measured_track(tmp_pat
     session = load_session(str(tmp_path), config)
     report = tmp_path / "out.txt"
     assert "No applicable tail measurements" in generate_report(session, config, str(report), [])
-    pipeline = Pipeline([TailExceedanceDetector(), SilenceDetector(), AudioClassifierDetector()], config=config)
+    pipeline = Pipeline([TailExceedanceDetector(), SilenceDetector()], config=config)
     pipeline.analyze_phase1(session)
     pipeline.analyze_phase2(session)
     assert "No significant tail exceedances" in generate_report(session, config, str(report), [])

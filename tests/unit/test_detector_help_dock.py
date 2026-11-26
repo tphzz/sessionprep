@@ -425,7 +425,7 @@ def test_stock_normalization_report_stays_readable_with_help_at_large_scale(qapp
     _settle(qapp, pane)
     assert pane.help_browser.isVisible()
     assert pane.report.horizontalScrollBar().maximum() == 0
-    chosen = pane.report.document().find("Chosen")
+    chosen = pane.report.document().find("Governs")
     assert not chosen.isNull()
     assert pane.report.cursorRect(chosen).right() <= pane.report.viewport().width()
 

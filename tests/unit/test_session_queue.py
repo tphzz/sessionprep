@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 import soundfile as sf
 
-from sessionpreplib.detectors import AudioClassifierDetector, DCOffsetDetector, SilenceDetector
+from sessionpreplib.detectors import DCOffsetDetector, SilenceDetector
 from sessionpreplib.events import EventBus
 from sessionpreplib.models import JobStatus
 from sessionpreplib.pipeline import Pipeline
@@ -13,7 +13,7 @@ from sessionpreplib.queue import SessionQueue
 
 
 def pipeline(config):
-    return Pipeline([SilenceDetector(), AudioClassifierDetector(), DCOffsetDetector()],
+    return Pipeline([SilenceDetector(), DCOffsetDetector()],
                     default_processors(), config)
 
 
@@ -23,7 +23,7 @@ def test_real_pipeline_measures_both_phases_and_renders_only_on_execute(tmp_path
     source = tmp_path / "Keys.wav"
     sf.write(source, samples, 48000, subtype="PCM_16")
     original = source.read_bytes()
-    queue = SessionQueue({"force_transient": ["Keys"], "target_peak": 20 * np.log10(0.5)})
+    queue = SessionQueue({"force_peak": "Keys", "target_peak": 20 * np.log10(0.5)})
     queue.add(str(tmp_path), {"execute": execute, "overwrite": overwrite})
     job = queue.run_next(pipeline)
     assert job.status == JobStatus.COMPLETED, job.error
@@ -86,15 +86,16 @@ def test_unusable_input_job_cannot_report_success(tmp_path, broken):
 
 def test_jobs_own_captured_settings_and_have_unambiguous_ids(tmp_path):
     defaults = {"group": ["Kit:Kick"]}
-    individual = {"force_transient": ["Kick"]}
+    individual = {"group": ["Snare:Snare"], "force_peak": "kick"}
     queue = SessionQueue(defaults)
     first = queue.add(str(tmp_path), individual, label="one")
     defaults["group"].clear()
-    individual["force_transient"].append("Bass")
+    individual["group"].append("Bass")
     second = queue.add(str(tmp_path))
     first.config["group"].append("Bass:DI")
     assert second.config["group"] == ["Kit:Kick"]
-    assert first.config["force_transient"] == ["Kick"]
+    assert first.config["group"] == ["Snare:Snare", "Bass:DI"]
+    assert first.config["force_peak"] == "kick"
     with pytest.raises(ValueError, match="one"):
         queue.add(str(tmp_path), label="one")
 

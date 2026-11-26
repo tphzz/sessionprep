@@ -16,8 +16,11 @@ from PySide6.QtWidgets import (
     QToolButton,
 )
 
+from sessionpreplib.audio import NOISE_FLOOR_PEAK_DB
+from sessionpreplib.processors.bimodal_normalize import update_post_gain_metrics
 from sessionpreplib.utils import protools_sort_key
 
+from ..change_marker import change_marker_icon
 from ..detail.repair_options import REPAIR_NAMES, track_repair_options
 from ..helpers import track_analysis_label
 from ..shell import MainWindowShell
@@ -51,13 +54,56 @@ _ANCHOR_TO_OVERRIDE: dict[str, str | None] = {
 _OVERRIDE_TO_LABEL: dict[str | None, str] = {v: k for k, v in _ANCHOR_TO_OVERRIDE.items()}
 
 
-def _base_classification(cls_text: str | None) -> str:
-    text = cls_text or "Unknown"
-    if "Transient" in text:
-        return "Transient"
-    if text == "Skip":
-        return "Skip"
-    return "Sustained"
+_MODE_CHOICES: tuple[tuple[str, str | None], ...] = (
+    ("Auto", None),
+    ("Peak", "Peak"),
+    ("RMS", "RMS"),
+    ("Skip", "Skip"),
+)
+
+
+def _mode_display_info(track: Any, pr: Any) -> tuple[str, str | None, str, str]:
+    """Return ``(display_label, override, color_hex, tooltip)`` for the Mode cell."""
+    override = getattr(track, "classification_override", None)
+    if override not in {"Peak", "RMS", "Skip"}:
+        override = None
+    data = pr.data if pr and isinstance(pr.data, dict) else {}
+    cls = pr.classification if pr else "Unknown"
+    gov = data.get("governing") or ("Peak" if "Peak" in cls else "RMS")
+    grp_limited = bool(data.get("group_limited"))
+    grp_track = data.get("group_governing_track")
+    grp_constraint = data.get("group_governing_constraint") or gov
+
+    if override == "Skip" or (override is None and cls == "Skip"):
+        return ("Skip", "Skip", FILE_COLOR_SILENT.name(),
+                "Manual override: Skip (select Auto to restore Peak-Capped RMS)" if override else "")
+    if cls == "Noise Floor":
+        return ("Noise Floor", override, COLORS["attention"],
+                f"Held at 0.0 dB (peak <= {NOISE_FLOOR_PEAK_DB:.1f} dBFS noise floor)")
+    if override is None and cls == "Error":
+        return ("Error", None, FILE_COLOR_ERROR.name(), pr.error or "Normalization error")
+
+    if override is None:
+        if grp_limited:
+            label = "Auto (Grp)"
+            color = FILE_COLOR_TRANSIENT.name() if grp_constraint == "Peak" else FILE_COLOR_SUSTAINED.name()
+        else:
+            label = f"Auto ({gov})"
+            color = FILE_COLOR_TRANSIENT.name() if gov == "Peak" else FILE_COLOR_SUSTAINED.name()
+    else:
+        label = f"{override} (Grp)" if grp_limited else override
+        color = FILE_COLOR_TRANSIENT.name() if override == "Peak" else FILE_COLOR_SUSTAINED.name()
+
+    tips: list[str] = []
+    if grp_limited and grp_track:
+        tips.append(f"Group gain limited by {grp_track} ({str(grp_constraint).lower()})")
+    if override is not None:
+        tips.append(f"Manual override: {override} (select Auto to restore Peak-Capped RMS)")
+    elif data.get("forced_by_pattern"):
+        tips.append("Matched by force_peak pattern")
+    if data.get("boost_clamped"):
+        tips.append("Auto gain clamped to max boost ceiling")
+    return label, override, color, "\n".join(tips)
 
 
 class TrackTableController(QObject):
@@ -186,7 +232,7 @@ class TrackTableController(QObject):
         self._track_table.setItem(row, TrackCol.ANALYSIS, item)
         self._track_table.setCellWidget(row, TrackCol.ANALYSIS, lbl)
 
-        pr = next(iter(track.processor_results.values()), None) if track.processor_results else None
+        pr = track.processor_results.get("bimodal_normalize") if track.processor_results else None
         if track.status != "OK":
             self._set_static_cls_gain(row, "Error", "error", FILE_COLOR_ERROR, "", 0.0)
         elif pr and pr.classification == "Silent":
@@ -220,9 +266,9 @@ class TrackTableController(QObject):
         self._track_table.setItem(row, TrackCol.GAIN, gain_item)
 
     def _install_classification_and_gain_widgets(self, row: int, track: Any, pr: Any) -> None:
-        base_cls = _base_classification(pr.classification)
-        self._track_table.setItem(row, TrackCol.CLASSIFICATION, _SortableItem(base_cls, base_cls.lower()))
-        self.replace_classification_combo(row, base_cls, track.filename)
+        label, override, _color, _tip = _mode_display_info(track, pr)
+        self._track_table.setItem(row, TrackCol.CLASSIFICATION, _SortableItem(label, label.lower()))
+        self.replace_classification_combo(row, track, pr)
 
         gain_db = pr.gain_db
         self._track_table.setItem(row, TrackCol.GAIN, _SortableItem(f"{gain_db:+.1f}", gain_db))
@@ -235,7 +281,7 @@ class TrackTableController(QObject):
         spin.setValue(gain_db)
         spin.blockSignals(False)
         spin.setProperty("track_filename", track.filename)
-        spin.setEnabled(base_cls != "Skip")
+        spin.setEnabled(override != "Skip" and pr.classification != "Skip")
         spin.valueChanged.connect(lambda value, s=spin: self.on_gain_changed(value, s))
         self._track_table.setCellWidget(row, TrackCol.GAIN, spin)
 
@@ -409,31 +455,42 @@ class TrackTableController(QObject):
                 clip_gain, fader_gain = 0.0, 0.0
         return self._fmt_signed_db(clip_gain), clip_gain, self._fmt_signed_db(fader_gain), fader_gain
 
-    # ── Classification & gain overrides ──────────────────────────────────
+    # ── Mode & gain overrides ────────────────────────────────────────────
 
     @staticmethod
-    def style_classification_combo(combo: QComboBox, cls_text: str) -> None:
-        if cls_text == "Transient":
-            color = FILE_COLOR_TRANSIENT.name()
-        elif cls_text == "Sustained":
-            color = FILE_COLOR_SUSTAINED.name()
-        else:
-            color = FILE_COLOR_SILENT.name()
-        combo.setStyleSheet(f"QComboBox {{ color: {color}; font-weight: bold; }}")
+    def style_classification_combo(combo: QComboBox, color_hex: str) -> None:
+        combo.setStyleSheet(f"QComboBox {{ color: {color_hex}; font-weight: bold; }}")
 
-    def replace_classification_combo(self, row: int, cls_text: str, fname: str) -> BatchComboBox:
+    def _populate_mode_combo_items(self, combo: BatchComboBox, track: Any, pr: Any) -> str:
+        """Populate/update *combo* items in place and return the displayed Mode label."""
+        label, override, color_hex, tooltip = _mode_display_info(track, pr)
+        selected_idx = 0
+        marker = change_marker_icon()
+        with QSignalBlocker(combo):
+            combo.clear()
+            for idx, (choice_label, choice_val) in enumerate(_MODE_CHOICES):
+                if choice_val == override:
+                    selected_idx = idx
+                    if override is not None:
+                        combo.addItem(marker, label, choice_val)
+                    else:
+                        combo.addItem(label, choice_val)
+                else:
+                    combo.addItem(choice_label, choice_val)
+            combo.setCurrentIndex(selected_idx)
+        combo.setProperty("track_filename", track.filename)
+        combo.setToolTip(tooltip)
+        self.style_classification_combo(combo, color_hex)
+        return label
+
+    def replace_classification_combo(self, row: int, track: Any, pr: Any) -> BatchComboBox:
         combo = BatchComboBox()
-        combo.addItems(["Transient", "Sustained", "Skip"])
-        combo.blockSignals(True)
-        combo.setCurrentText(cls_text)
-        combo.blockSignals(False)
-        combo.setProperty("track_filename", fname)
-        self.style_classification_combo(combo, cls_text)
-        combo.textActivated.connect(lambda text, c=combo: self.on_classification_changed(text, c))
+        self._populate_mode_combo_items(combo, track, pr)
+        combo.activated.connect(lambda idx, c=combo: self.on_classification_changed(idx, c))
         self._track_table.setCellWidget(row, TrackCol.CLASSIFICATION, combo)
         return combo
 
-    def on_classification_changed(self, text: str, combo: Any = None) -> None:
+    def on_classification_changed(self, idx_or_text: int | str, combo: Any = None) -> None:
         if combo is None:
             combo = self.sender()
         session = self._state.session
@@ -443,21 +500,30 @@ class TrackTableController(QObject):
         track = next((t for t in session.tracks if t.filename == fname), None) if fname else None
         if not track:
             return
-
+        if isinstance(idx_or_text, int):
+            new_override = combo.itemData(idx_or_text, Qt.ItemDataRole.UserRole)
+        else:
+            new_override = None if idx_or_text.startswith("Auto") else idx_or_text
         if getattr(combo, "batch_mode", False) or combo.property("_batch_mode"):
             combo.setProperty("_batch_mode", False)
             combo.batch_mode = False
+
+            def _apply_mode(t: Any) -> None:
+                t.classification_override = new_override
+
             self.batch_apply_combo(
-                combo, TrackCol.CLASSIFICATION, text, lambda t: setattr(t, "classification_override", text), run_detectors=False
+                combo,
+                TrackCol.CLASSIFICATION,
+                "Auto" if new_override is None else str(new_override),
+                _apply_mode,
+                run_detectors=False,
+                user_data=new_override,
             )
         else:
-            if track.classification_override == text:
+            if track.classification_override == new_override:
                 return
-            track.classification_override = text
+            track.classification_override = new_override
             self.recalculate_processor(track)
-            row = self.find_table_row(fname)
-            if row >= 0:
-                self.replace_classification_combo(row, text, fname)
             self.update_track_row(fname)
             self.refresh_file_tab(track)
         self.prepare_stale_requested.emit()
@@ -475,11 +541,14 @@ class TrackTableController(QObject):
 
         track.manual_gain_db = float(value)
         pr = track.processor_results.get("bimodal_normalize")
+        needs_tp_hydration = False
         if pr:
-            pr.gain_db = value
-            pr.data["original_gain_db"] = value
+            pr.gain_db = float(value)
+            pr.data["gain_db_individual"] = float(value)
+            update_post_gain_metrics(pr, track, float(value), allow_disk_reload=False)
+            needs_tp_hydration = bool(pr.data.get("true_peak_unverified"))
         self.linked_group_levels_requested.emit()
-        if self._on_is_repair_running is not None and self._on_is_repair_running():
+        if needs_tp_hydration or (self._on_is_repair_running is not None and self._on_is_repair_running()):
             self.repair_plan_requested.emit([track], False)
         self.prepare_stale_requested.emit()
 
@@ -487,19 +556,21 @@ class TrackTableController(QObject):
         if row >= 0:
             gain_sort = self._track_table.item(row, TrackCol.GAIN)
             if isinstance(gain_sort, _SortableItem):
-                gain_sort.setText(f"{value:+.1f}")
-                gain_sort._sort_key = value
+                effective = float(pr.gain_db) if pr else float(value)
+                gain_sort.setText(f"{effective:+.1f}")
+                gain_sort._sort_key = effective
         if self._state.current_track and self._state.current_track.filename == fname:
             self.file_report_refresh_requested.emit(track)
 
     # ── RMS Anchor column ────────────────────────────────────────────────
 
     def create_anchor_combo(self, row: int, track: Any) -> None:
-        self._track_table.setItem(row, TrackCol.ANCHOR, _SortableItem("Default", "default"))
+        anchor_label = _OVERRIDE_TO_LABEL.get(track.rms_anchor_override, "Default")
+        self._track_table.setItem(row, TrackCol.ANCHOR, _SortableItem(anchor_label, anchor_label.lower()))
         combo = BatchComboBox()
         combo.addItems(_ANCHOR_LABELS)
         combo.blockSignals(True)
-        combo.setCurrentText(_OVERRIDE_TO_LABEL.get(track.rms_anchor_override, "Default"))
+        combo.setCurrentText(anchor_label)
         combo.blockSignals(False)
         combo.setProperty("track_filename", track.filename)
         combo.setStyleSheet(f"QComboBox {{ color: {COLORS['text']}; }}")
@@ -640,25 +711,37 @@ class TrackTableController(QObject):
         value: str,
         prepare_fn: Callable[[Any], None],
         run_detectors: bool = True,
+        *,
+        user_data: Any = ...,
     ) -> None:
         session = self._state.session
         if not session or (self._on_is_analysis_running is not None and self._on_is_analysis_running()):
             return
         track_map = {t.filename: t for t in session.tracks}
-        batch_keys = self._track_table.batch_selected_keys()
+        batch_keys = list(self._track_table.batch_selected_keys())
+        src_fname = source_combo.property("track_filename") if source_combo is not None else None
+        if src_fname and src_fname not in batch_keys:
+            batch_keys.append(src_fname)
         tracks_to_reanalyze: list[Any] = []
         self._track_table.setSortingEnabled(False)
         for fname in batch_keys:
             track = track_map.get(fname)
             if not track or track.status != "OK":
                 continue
+            pr = track.processor_results.get("bimodal_normalize")
+            if pr is not None and pr.classification == "Silent":
+                continue
             prepare_fn(track)
             tracks_to_reanalyze.append(track)
             row = self.find_table_row(fname)
             if row >= 0 and isinstance(w := self._track_table.cellWidget(row, column), BatchComboBox):
-                w.blockSignals(True)
-                w.setCurrentText(value)
-                w.blockSignals(False)
+                with QSignalBlocker(w):
+                    if user_data is not ...:
+                        idx = w.findData(user_data, Qt.ItemDataRole.UserRole)
+                        if idx >= 0:
+                            w.setCurrentIndex(idx)
+                    else:
+                        w.setCurrentText(value)
         if not tracks_to_reanalyze:
             self._track_table.setSortingEnabled(True)
             return
@@ -697,7 +780,8 @@ class TrackTableController(QObject):
         if not session or not session.processors:
             return
         if (
-            track.repair_recipe.active
+            track.audio_data is None
+            or track.repair_recipe.active
             or track.repair_overrides
             or track.manual_gain_db is not None
             or (self._on_is_repair_running is not None and self._on_is_repair_running())
@@ -706,9 +790,39 @@ class TrackTableController(QObject):
             return
         for proc in session.processors:
             result = proc.process(track)
-            result.data["original_gain_db"] = result.gain_db
+            result.data["gain_db_individual"] = result.gain_db
             track.processor_results[proc.id] = result
         self.linked_group_levels_requested.emit()
+
+    @Slot()
+    def refresh_mode_column(self) -> None:
+        """Refresh Mode column widgets in-place and preserve row group tinting."""
+        session = self._state.session
+        if not session:
+            return
+        track_map = {t.filename: t for t in session.tracks}
+        sorting = self._track_table.isSortingEnabled()
+        self._track_table.setSortingEnabled(False)
+        for row in range(self._track_table.rowCount()):
+            fname_item = self._track_table.item(row, TrackCol.FILE)
+            track = track_map.get(fname_item.text()) if fname_item else None
+            if not track or track.status != "OK":
+                continue
+            pr = track.processor_results.get("bimodal_normalize")
+            if not pr or pr.classification == "Silent":
+                continue
+            existing = self._track_table.cellWidget(row, TrackCol.CLASSIFICATION)
+            if isinstance(existing, BatchComboBox):
+                label = self._populate_mode_combo_items(existing, track, pr)
+            else:
+                self.replace_classification_combo(row, track, pr)
+                label, _, _, _ = _mode_display_info(track, pr)
+            sort_item = self._track_table.item(row, TrackCol.CLASSIFICATION)
+            if isinstance(sort_item, _SortableItem):
+                sort_item.setText(label)
+                sort_item._sort_key = label.lower()
+            group_utils.apply_row_group_color(self._track_table, self._state, row, track.group)
+        self._track_table.setSortingEnabled(sorting)
 
     def update_track_row(self, filename: str) -> None:
         session = self._state.session
@@ -724,20 +838,15 @@ class TrackTableController(QObject):
         self._track_table.setItem(row, TrackCol.ANALYSIS, item)
         self._track_table.setCellWidget(row, TrackCol.ANALYSIS, lbl)
 
-        pr = next(iter(track.processor_results.values()), None)
+        pr = track.processor_results.get("bimodal_normalize")
         new_gain = pr.gain_db if pr else (track.manual_gain_db or 0.0)
-        base_cls = (
-            track.classification_override
-            if track.classification_override
-            else (_base_classification(pr.classification) if pr else None)
-        )
+        is_skip = (track.classification_override == "Skip") or (pr is not None and pr.classification == "Skip")
 
         spin = self._track_table.cellWidget(row, TrackCol.GAIN)
         if isinstance(spin, QDoubleSpinBox):
             spin.blockSignals(True)
             spin.setValue(new_gain)
-            if base_cls is not None:
-                spin.setEnabled(base_cls != "Skip")
+            spin.setEnabled(not is_skip)
             spin.blockSignals(False)
         gain_sort = self._track_table.item(row, TrackCol.GAIN)
         if isinstance(gain_sort, _SortableItem):
@@ -748,12 +857,13 @@ class TrackTableController(QObject):
             )
             gain_sort._sort_key = new_gain
 
-        if base_cls is not None:
-            self.replace_classification_combo(row, base_cls, track.filename)
+        if pr is not None and pr.classification != "Silent":
+            label, _override, _color, _tip = _mode_display_info(track, pr)
+            self.replace_classification_combo(row, track, pr)
             sort_item = self._track_table.item(row, TrackCol.CLASSIFICATION)
             if isinstance(sort_item, _SortableItem):
-                sort_item.setText(base_cls)
-                sort_item._sort_key = base_cls.lower()
+                sort_item.setText(label)
+                sort_item._sort_key = label.lower()
 
         group_utils.apply_row_group_color(self._track_table, self._state, row, track.group)
         self.populate_setup_table()

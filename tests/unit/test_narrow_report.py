@@ -79,20 +79,20 @@ def _normalization(**kw):
 
 
 def test_narrow_normalization_has_a_legend_and_one_entry_per_measure():
-    processor, result, track = _normalization(classification="Sustained", method="Peak Limited",
-                                              fader_rebalance_shift=2.0)
+    processor, result, track = _normalization(classification="Auto (Peak)", method="Peak (ceiling) → -6.0 dBFS",
+                                              governing="Peak", fader_rebalance_shift=2.0)
     html = processor.render_html(result, track, narrow=True)
     assert "Measure<br>Detected &rarr; Target &middot; Gain" in html
     # One single-cell row per measure: legend + Peak + RMS.
     assert html.count("<tr>") == 3 and "<td width" not in html
     entries = html.split("<tr>")
     peak = next(e for e in entries if "Peak</span>" in e)
-    assert "Chosen &middot; limiting" in peak
+    assert "Governs" in peak
     assert ("<nobr>&minus;9.1 dBFS</nobr> &rarr; <nobr>&minus;6.0 dBFS</nobr>"
             " &middot; <nobr>+3.1 dB</nobr>") in peak
-    assert "font-weight:bold" in peak  # the chosen measure, also named in text
+    assert "font-weight:bold" in peak  # the governing measure, also named in text
     rms = next(e for e in entries if "RMS (p95)</span>" in e)
-    assert "Would exceed peak" in rms and "font-weight:bold" not in rms
+    assert "below" in rms and "font-weight:bold" not in rms
     assert "Fader rebalanced" in html
 
 

@@ -14,6 +14,7 @@ import numpy as np
 import soundfile as sf
 
 from ..daw_processor import resolve_transfer_audio
+from ..audio import INACTIVE_NORMALIZATION_CLASSIFICATIONS
 from ..models import ParamSpec, SessionContext, TrackContext
 from ..ptx import (
     LeafAudioInput,
@@ -59,7 +60,7 @@ def ptx_config_params() -> list[ParamSpec]:
             choices=list(VALID_GAIN_MODES),
             label="Gain Staging Mode",
             description=(
-                "How bimodal normalization is applied in Pro Tools: Clip Gain pre-insert + inverse Fader "
+                "How Peak-Capped RMS normalization is applied in Pro Tools: Clip Gain pre-insert + inverse Fader "
                 "balance (default), Clip Gain with unity faders, Fader only, or None."
             ),
         ),
@@ -154,14 +155,16 @@ def _planned_normalization_gains(session: SessionContext, track: TrackContext) -
     enabled = bool(session.config.get(f"{proc_id}_enabled", True))
     skipped = proc_id in track.processor_skip or proc_id in source.processor_skip
     result = track.processor_results.get(proc_id) or source.processor_results.get(proc_id)
-    if enabled and not skipped and result is not None and not result.error and result.classification not in ("Skip", "Silent"):
-        gain = float(result.gain_db)
-        fader = float(result.data.get("fader_offset", -gain))
-        if math.isfinite(gain) and math.isfinite(fader):
-            return gain, fader
+    if result is not None:
+        if enabled and not skipped and not result.error and result.classification not in INACTIVE_NORMALIZATION_CLASSIFICATIONS:
+            gain = float(result.gain_db)
+            fader = float(result.data.get("fader_offset", -gain))
+            if math.isfinite(gain) and math.isfinite(fader):
+                return gain, fader
+        return 0.0, 0.0
     manual = track.manual_gain_db if track.manual_gain_db is not None else source.manual_gain_db
     if manual is not None and math.isfinite(float(manual)):
-        return float(manual), 0.0
+        return float(manual), -float(manual)
     return 0.0, 0.0
 
 

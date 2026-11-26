@@ -83,10 +83,12 @@ def _add_analysis_and_output_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--anchor", type=str, default=None, help="Anchor track filename (fader stays at 0dB)")
     parser.add_argument("--fader_headroom_db", type=float, default=8.0,
                         help="Minimum dB of headroom at top of DAW fader range (default: 8.0, 0=disable)")
+    parser.add_argument("--force_peak", type=str, default="",
+                        help="Case-insensitive regex pattern to force Peak-target mode (e.g. 'kick|snare|tom')")
     parser.add_argument("--force_transient", nargs='+', default=[], action='extend',
-                        help="Keywords to force TRANSIENT mode. Supports: substring ('kick'), glob patterns ('Kick*.wav'), or exact match ('Kick_01.wav$')")
+                        help=argparse.SUPPRESS)
     parser.add_argument("--force_sustained", nargs='+', default=[], action='extend',
-                        help="Keywords to force SUSTAINED mode. Supports: substring ('pad'), glob patterns ('Synth_*.wav'), or exact match ('Bass_01.wav$')")
+                        help=argparse.SUPPRESS)
     parser.add_argument("--group", action="append", default=[],
                         help="Named gain-linked group. Syntax: Name:pattern1,pattern2  (e.g. --group Kick:kick,kick_sub). Patterns support substring, glob (*/?), or exact match (suffix $). First match wins; overlaps produce a warning.")
     parser.add_argument("--overwrite", action="store_true",
@@ -107,10 +109,11 @@ def parse_arguments():
     )
     parser.add_argument("--version", action="version", version=f"sessionprep {__version__}")
     parser.add_argument("directory", type=str, help="Source directory containing audio tracks (.wav, .aif, .aiff)")
-    parser.add_argument("--target_rms", type=float, default=-18.0, help="Target RMS for sustained sources (dBFS)")
-    parser.add_argument("--target_peak", type=float, default=-6.0, help="Target/max peak level (dBFS)")
-    parser.add_argument("--crest_threshold", type=float, default=12.0,
-                        help="Crest factor threshold for transient detection (dB)")
+    parser.add_argument("--target_rms", type=float, default=-18.0, help="Target RMS level (dBFS)")
+    parser.add_argument("--target_peak", type=float, default=-6.0, help="Peak ceiling / Peak-target level (dBFS)")
+    parser.add_argument("--max_gain_db", type=float, default=24.0,
+                        help="Maximum automatic boost cap in dB (0.0 to 36.0)")
+    parser.add_argument("--crest_threshold", type=float, default=None, help=argparse.SUPPRESS)
     _add_detection_args(parser)
     _add_analysis_and_output_args(parser)
 
@@ -254,11 +257,29 @@ def _prepare_cli_destinations(source, output, backup, filenames, report, json_re
         directory.mkdir(parents=True, exist_ok=True)
 
 
+def _resolve_cli_force_peak(args) -> str:
+    """Resolve --force_peak and emit deprecation warnings for legacy flags."""
+    from sessionpreplib.audio import legacy_patterns_to_regex
+
+    if getattr(args, "crest_threshold", None) is not None:
+        print("Warning: --crest_threshold is deprecated and ignored under Peak-Capped RMS.", file=sys.stderr)
+    if getattr(args, "force_sustained", None):
+        print("Warning: --force_sustained is deprecated and ignored (Auto uses Peak-Capped RMS).", file=sys.stderr)
+    force_peak = str(getattr(args, "force_peak", "") or "")
+    legacy_trans = list(getattr(args, "force_transient", None) or [])
+    if legacy_trans:
+        print("Warning: --force_transient is deprecated; use --force_peak <regex> instead.", file=sys.stderr)
+        if not force_peak:
+            force_peak = legacy_patterns_to_regex(legacy_trans)
+    return force_peak
+
+
 def _build_cli_config(args, source_dir: str) -> dict:
     cli_overrides = {
         "target_rms": args.target_rms,
         "target_peak": args.target_peak,
-        "crest_threshold": args.crest_threshold,
+        "max_gain_db": args.max_gain_db,
+        "force_peak": _resolve_cli_force_peak(args),
         "clip_consecutive": args.clip_consecutive,
         "clip_report_max_ranges": args.clip_report_max_ranges,
         "dc_offset_warn_db": args.dc_offset_warn_db,
@@ -280,8 +301,6 @@ def _build_cli_config(args, source_dir: str) -> dict:
         "tail_max_regions": args.tail_max_regions,
         "tail_min_exceed_db": args.tail_min_exceed_db,
         "tail_hop_ms": args.tail_hop_ms,
-        "force_transient": args.force_transient,
-        "force_sustained": args.force_sustained,
         "group": args.group,
         "anchor": args.anchor,
         "fader_headroom_db": args.fader_headroom_db,
@@ -324,10 +343,21 @@ def _print_header_and_groups(args, is_overwriting: bool, session=None) -> None:
     group_table.add_column("Group", style="bold cyan")
     group_table.add_column("Gain", justify="right", style="bold green")
     group_table.add_column("Members", style="dim")
+    from sessionpreplib.audio import INACTIVE_NORMALIZATION_CLASSIFICATIONS
+
     for gname in sorted(grouped):
         members = grouped[gname]
-        pr = members[0].processor_results.get("bimodal_normalize")
-        gain_str = f"{pr.gain_db:+.1f} dB" if pr else "—"
+        active_pr = next(
+            (
+                p for m in members
+                if (p := m.processor_results.get("bimodal_normalize")) is not None
+                and not p.error
+                and p.classification not in INACTIVE_NORMALIZATION_CLASSIFICATIONS
+                and "bimodal_normalize" not in m.processor_skip
+            ),
+            None,
+        )
+        gain_str = f"{active_pr.gain_db:+.1f} dB" if active_pr is not None else "—"
         group_table.add_row(gname, gain_str, ", ".join(m.filename for m in members))
     console.print(group_table)
     console.print("")
@@ -391,7 +421,7 @@ def _print_fader_table(session, write_errors: dict[str, str]) -> None:
     table = Table(box=box.ROUNDED, title="Fader Offsets")
     table.add_column("Track", style="cyan", max_width=30)
     table.add_column("Format", style="dim")
-    table.add_column("Type", justify="center")
+    table.add_column("Mode", justify="center")
     table.add_column("Gain", justify="right")
     table.add_column("Fader", justify="right", style="bold green")
     table.add_column("Status", justify="right")
@@ -409,7 +439,14 @@ def _print_fader_table(session, write_errors: dict[str, str]) -> None:
         receipt = receipts[t.filename]
         clip_r = t.detector_results.get("clipping")
         is_clipped = bool(clip_r.data.get("is_clipped")) if clip_r else False
-        type_color = "magenta" if "Transient" in classification else "cyan"
+        if "Peak" in classification:
+            type_color = "magenta"
+        elif classification == "Noise Floor":
+            type_color = "yellow"
+        elif classification == "Skip":
+            type_color = "dim"
+        else:
+            type_color = "cyan"
         table.add_row(
             t.filename, fmt_str, f"[{type_color}]{classification}[/]",
             f"{receipt['gain_db']:+.1f} dB", f"{receipt['fader_db']:+.1f} dB",

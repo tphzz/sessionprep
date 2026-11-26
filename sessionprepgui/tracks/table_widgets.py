@@ -28,6 +28,7 @@ class TrackCol(IntEnum):
     CHANNELS = 1
     ANALYSIS = 2
     CLASSIFICATION = 3
+    MODE = 3
     GAIN = 4
     ANCHOR = 5
     GROUP = 6

@@ -527,12 +527,14 @@ class TrackRepairEditor(QFrame):
             self.recovery.setText(
                 f"Lower output Gain by at least {adjustment['reduction_db']:.1f} dB, then retry Prepare."
             )
+            from sessionpreplib.audio import INACTIVE_NORMALIZATION_CLASSIFICATIONS
+
             norm = track.processor_results.get("bimodal_normalize")
             if (
                 not config.get("bimodal_normalize_enabled", True)
                 or "bimodal_normalize" in track.processor_skip
                 or norm is None
-                or norm.classification in ("Skip", "Silent")
+                or norm.classification in INACTIVE_NORMALIZATION_CLASSIFICATIONS
             ):
                 details.append("With normalization bypassed, Adjust Gain opens a manual output gain for this track.")
             if options.has_stale_output:
