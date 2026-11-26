@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import shiboken6
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QPalette
-from PySide6.QtWidgets import QApplication, QProxyStyle, QStyle, QStyleOptionSlider
+from PySide6.QtWidgets import QApplication, QProxyStyle, QStyle, QStyleOptionSlider, QWidget
 from .icons import icon_path
 
 
@@ -372,8 +373,27 @@ class _DesktopStyle(QProxyStyle):
             painter.fillRect(thumb.adjusted(*inset), color)
 
 
-def apply_dark_theme(window) -> None:
+_desktop_style: _DesktopStyle | None = None
+
+
+def _has_desktop_style(app: QApplication) -> bool:
+    """Return True when _DesktopStyle is active, even under a QStyleSheetStyle wrapper."""
+    current = app.style()
+    if isinstance(current, _DesktopStyle):
+        return True
+    return bool(
+        app.styleSheet()
+        and _desktop_style is not None
+        and shiboken6.isValid(_desktop_style)
+        and _desktop_style.parent() is current
+    )
+
+
+def apply_dark_theme(window: QWidget) -> None:
     """Apply the dark palette and stylesheet to the application and window."""
+    global _desktop_style
+    if isinstance(window, QApplication):
+        raise TypeError("apply_dark_theme() expects a QWidget, not QApplication")
     app = QApplication.instance()
 
     palette = QPalette()
@@ -401,7 +421,9 @@ def apply_dark_theme(window) -> None:
     palette.setColor(QPalette.Disabled, QPalette.Text, QColor("#666666"))
     palette.setColor(QPalette.Disabled, QPalette.ButtonText, QColor("#666666"))
 
-    if not isinstance(app.style(), _DesktopStyle):
-        app.setStyle(_DesktopStyle("Fusion"))
+    if not _has_desktop_style(app):
+        style = _DesktopStyle("Fusion")
+        app.setStyle(style)
+        _desktop_style = style
     app.setPalette(palette)
     window.setStyleSheet(STYLESHEET)

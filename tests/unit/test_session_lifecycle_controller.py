@@ -6,9 +6,11 @@ from types import SimpleNamespace
 
 import numpy as np
 import soundfile as sf
+from PySide6.QtCore import QEvent
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import QStackedWidget, QTabWidget, QWidget
 
+from qt_helpers import dispose_window
 from sessionpreplib.models import SessionContext, TrackContext
 from sessionprepgui.analysis.analysis_controller import AnalysisPrepareController
 from sessionprepgui.analysis.persistence_controller import SessionPersistenceController
@@ -203,6 +205,7 @@ def test_persistence_and_analysis_capture_and_mark_prepare_stale(_font_app, tmp_
         persistence.deleteLater()
         for w in widgets:
             w.deleteLater()
+        _font_app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         _font_app.processEvents()
 
 
@@ -226,6 +229,7 @@ def test_persistence_clear_workspace_resets_state_and_empty_dir_status(_font_app
         persistence.deleteLater()
         for w in widgets:
             w.deleteLater()
+        _font_app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         _font_app.processEvents()
 
 
@@ -254,6 +258,7 @@ def test_repair_plan_worker_progress_value_matches_analysis_slot(_font_app, tmp_
         persistence.deleteLater()
         for w in widgets:
             w.deleteLater()
+        _font_app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         _font_app.processEvents()
 
 
@@ -279,6 +284,7 @@ def test_persistence_parents_peak_worker_and_drains_on_dispose(_font_app, tmp_pa
         persistence.deleteLater()
         for w in widgets:
             w.deleteLater()
+        _font_app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         _font_app.processEvents()
 
 
@@ -346,6 +352,7 @@ def test_load_directory_defaults_phase3_project_name_and_preserves_on_reanalyze(
         persistence.deleteLater()
         for w in widgets:
             w.deleteLater()
+        _font_app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         _font_app.processEvents()
 
 
@@ -405,6 +412,7 @@ def test_prepare_and_analyze_stop_phase2_playback(_font_app, tmp_path, monkeypat
         persistence.deleteLater()
         for w in widgets:
             w.deleteLater()
+        _font_app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         _font_app.processEvents()
 
 
@@ -464,9 +472,7 @@ def test_phase_switches_stop_active_playback(_font_app, monkeypatch):
         win.switch_to_phase(_PHASE_SETUP)
         assert not playing[0] and len(stop_calls) == 5
     finally:
-        win.close()
-        win.deleteLater()
-        _font_app.processEvents()
+        dispose_window(win)
 
 
 def test_topology_apply_overwrite_and_clear_stop_preview(_font_app, tmp_path, monkeypatch):
@@ -516,6 +522,4 @@ def test_topology_apply_overwrite_and_clear_stop_preview(_font_app, tmp_path, mo
         assert not win.topology_controller.page.wf_panel.stop_btn.isEnabled()
         assert not win.topology_controller.page.wf_panel.play_btn.isEnabled()
     finally:
-        win.close()
-        win.deleteLater()
-        _font_app.processEvents()
+        dispose_window(win)

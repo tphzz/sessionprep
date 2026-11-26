@@ -13,6 +13,7 @@ from PySide6.QtWidgets import QApplication
 import pytest
 import soundfile as sf
 
+from qt_helpers import dispose_window
 from sessionprepgui.icons import icon, icon_path
 from sessionprepgui.mainwindow import SessionPrepWindow
 from sessionprepgui.status_prompt import StatusBarPromptWidget
@@ -184,41 +185,41 @@ def test_warning_icon_asset_loads(qapp):
 
 
 def test_prompt_elides_long_filename_in_middle_without_expanding_width(qapp):
-    apply_dark_theme(qapp)
     prefix = "1 existing file in sp_01_tracklayout/ could not be verified ("
     filename = "01_Kick_Close_Mic_Super_Long_Take_Name_Final_Master_Take04.wav"
     suffix = "). Overwrite it?"
     prompt = StatusBarPromptWidget()
-    prompt.show()
-    prompt.show_prompt(prefix, filename, suffix, tooltip="Full details")
-    qapp.processEvents()
+    try:
+        apply_dark_theme(prompt)
+        prompt.show()
+        prompt.show_prompt(prefix, filename, suffix, tooltip="Full details")
+        qapp.processEvents()
 
-    fm = prompt.message_label.fontMetrics()
-    chrome_w = prompt.width() - prompt.message_label.width()
-    fixed_w = fm.horizontalAdvance(f"{prefix}{suffix}")
-    half_name_w = fm.horizontalAdvance(filename) // 2
-    # Give enough room for boilerplate + half the filename so middle-elision activates
-    prompt.resize(chrome_w + fixed_w + half_name_w, 34)
-    qapp.processEvents()
+        fm = prompt.message_label.fontMetrics()
+        chrome_w = prompt.width() - prompt.message_label.width()
+        fixed_w = fm.horizontalAdvance(f"{prefix}{suffix}")
+        half_name_w = fm.horizontalAdvance(filename) // 2
+        # Give enough room for boilerplate + half the filename so middle-elision activates
+        prompt.resize(chrome_w + fixed_w + half_name_w, 34)
+        qapp.processEvents()
 
-    rendered = prompt.message_label.text()
-    assert prompt.message_label.minimumSizeHint().width() == 0
-    assert "sp_01_tracklayout/" in rendered
-    assert "Overwrite it?" in rendered
-    assert "\u2026" in rendered
-    assert rendered != f"{prefix}{filename}{suffix}"
+        rendered = prompt.message_label.text()
+        assert prompt.message_label.minimumSizeHint().width() == 0
+        assert "sp_01_tracklayout/" in rendered
+        assert "Overwrite it?" in rendered
+        assert "\u2026" in rendered
+        assert rendered != f"{prefix}{filename}{suffix}"
 
-    # Even at ultra-narrow width, the label never forces the container wider
-    prompt.resize(400, 34)
-    qapp.processEvents()
-    assert prompt.message_label.minimumSizeHint().width() == 0
-    assert "\u2026" in prompt.message_label.text()
-    prompt.close()
-    prompt.deleteLater()
+        # Even at ultra-narrow width, the label never forces the container wider
+        prompt.resize(400, 34)
+        qapp.processEvents()
+        assert prompt.message_label.minimumSizeHint().width() == 0
+        assert "\u2026" in prompt.message_label.text()
+    finally:
+        dispose_window(prompt)
 
 
 def test_status_prompt_space_cancels_and_suppresses_status_messages(qapp, monkeypatch):
-    apply_dark_theme(qapp)
     window = SessionPrepWindow()
     try:
         _show_and_activate(qapp, window)
@@ -261,13 +262,10 @@ def test_status_prompt_space_cancels_and_suppresses_status_messages(qapp, monkey
         assert not window.status_prompt.is_active
         assert apply_btn is not None and apply_btn.hasFocus()
     finally:
-        window.close()
-        window.deleteLater()
-        qapp.processEvents()
+        dispose_window(window)
 
 
 def test_status_prompt_enter_accepts_and_escape_cancels(qapp, monkeypatch):
-    apply_dark_theme(qapp)
     window = SessionPrepWindow()
     try:
         _show_and_activate(qapp, window)
@@ -316,9 +314,7 @@ def test_status_prompt_enter_accepts_and_escape_cancels(qapp, monkeypatch):
         assert not window.status_prompt.is_active
         assert apply_btn is not None and apply_btn.hasFocus()
     finally:
-        window.close()
-        window.deleteLater()
-        qapp.processEvents()
+        dispose_window(window)
 
 
 # ── End-to-end GUI Apply & Stale-State Lifecycle tests ───────────────────────
@@ -398,9 +394,7 @@ def test_apply_prompts_on_unverified_then_cancel_and_overwrite(qapp, tmp_path, m
         _wait_until(qapp, lambda: len(applied_dirs) == 2)
         assert not window.status_prompt.is_active
     finally:
-        window.close()
-        window.deleteLater()
-        qapp.processEvents()
+        dispose_window(window)
 
 
 def test_stale_state_events_dismiss_overwrite_prompt(qapp, tmp_path):
@@ -432,9 +426,7 @@ def test_stale_state_events_dismiss_overwrite_prompt(qapp, tmp_path):
         window.topology_controller.clear_workspace()
         assert not window.status_prompt.is_active
     finally:
-        window.close()
-        window.deleteLater()
-        qapp.processEvents()
+        dispose_window(window)
 
 
 def test_reclicking_apply_after_moving_files_aside_succeeds_without_prompt(
@@ -458,9 +450,7 @@ def test_reclicking_apply_after_moving_files_aside_succeeds_without_prompt(
         assert not window.status_prompt.is_active
         assert (layout_dir / "01_Kick.wav").is_file()
     finally:
-        window.close()
-        window.deleteLater()
-        qapp.processEvents()
+        dispose_window(window)
 
 
 def test_gui_overwrite_refuses_if_file_changes_while_prompt_is_open(
@@ -488,9 +478,7 @@ def test_gui_overwrite_refuses_if_file_changes_while_prompt_is_open(
         assert (layout_dir / "01_Kick.wav").read_bytes() == modified_bytes
         assert "could not be verified" in window._status_bar.currentMessage()
     finally:
-        window.close()
-        window.deleteLater()
-        qapp.processEvents()
+        dispose_window(window)
 
 
 def test_inflight_preflight_discarded_after_phase_switch_or_batch_toggle(qapp, tmp_path):
@@ -533,6 +521,4 @@ def test_inflight_preflight_discarded_after_phase_switch_or_batch_toggle(qapp, t
         _wait_until(qapp, lambda: window.status_prompt.is_active)
         assert window.status_prompt.is_active
     finally:
-        window.close()
-        window.deleteLater()
-        qapp.processEvents()
+        dispose_window(window)

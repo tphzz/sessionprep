@@ -1,6 +1,7 @@
 import json
 import os
 from pathlib import Path
+import sys
 from unittest.mock import MagicMock
 
 import pytest
@@ -20,6 +21,21 @@ def pytest_addoption(parser):
 
 def pytest_configure(config):
     config.addinivalue_line("markers", "ptsl_live: mark test to require a live Pro Tools connection")
+
+
+@pytest.fixture(autouse=True)
+def _flush_qt_deferred_deletes():
+    """Flush pending Qt DeferredDelete events after each test when QApplication exists."""
+    yield
+    if "PySide6.QtWidgets" not in sys.modules:
+        return
+    from PySide6.QtCore import QEvent
+    from PySide6.QtWidgets import QApplication
+
+    app = QApplication.instance()
+    if app is not None:
+        app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        app.processEvents()
 
 
 @pytest.fixture(scope="session")

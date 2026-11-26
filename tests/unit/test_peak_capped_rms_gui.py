@@ -14,6 +14,7 @@ pytest.importorskip("PySide6")
 from PySide6.QtCore import QLocale, QUrl
 from PySide6.QtWidgets import QApplication
 
+from qt_helpers import dispose_window
 from sessionprepgui.daw.signal_flow_graph_view import _role_badge
 from sessionprepgui.daw.signal_flow_panel import BusFaderSpinBox, SignalFlowPanel
 from sessionprepgui.detail.browser import ReportBrowser
@@ -38,14 +39,16 @@ def _mk_track(name: str = "Kick.wav", override: str | None = None) -> TrackConte
 
 def test_phase2_mode_column_header_and_locale(qapp):
     page = Phase2Page({})
-    assert page.track_table.horizontalHeaderItem(3).text() == "Mode"
     spin = TableCellDoubleSpinBox()
-    assert spin.locale().decimalPoint() == QLocale.c().decimalPoint() == "."
     bus_spin = BusFaderSpinBox()
-    assert bus_spin.locale().decimalPoint() == "."
-    page.deleteLater()
-    spin.deleteLater()
-    bus_spin.deleteLater()
+    try:
+        assert page.track_table.horizontalHeaderItem(3).text() == "Mode"
+        assert spin.locale().decimalPoint() == QLocale.c().decimalPoint() == "."
+        assert bus_spin.locale().decimalPoint() == "."
+    finally:
+        dispose_window(bus_spin)
+        dispose_window(spin)
+        dispose_window(page)
 
 
 def test_mode_display_info_labels_and_group_tooltips():
@@ -91,13 +94,15 @@ def test_report_browser_peak_link_emits_peak_jump_requested(qapp):
     )
     sess = SessionContext([tr], {}, processors=[proc])
     browser = ReportBrowser({})
-    jumped: list[int] = []
-    browser.peakJumpRequested.connect(jumped.append)
-    browser.present_track(tr, sess)
-    assert 'href="peak:68160"' in browser.toHtml()
-    browser.activate_report_link(QUrl("peak:68160"))
-    assert jumped == [68160]
-    browser.deleteLater()
+    try:
+        jumped: list[int] = []
+        browser.peakJumpRequested.connect(jumped.append)
+        browser.present_track(tr, sess)
+        assert 'href="peak:68160"' in browser.toHtml()
+        browser.activate_report_link(QUrl("peak:68160"))
+        assert jumped == [68160]
+    finally:
+        dispose_window(browser)
 
 
 def test_signal_flow_panel_governs_column_estimates_and_exact_insert_count(qapp):
@@ -141,19 +146,21 @@ def test_signal_flow_panel_governs_column_estimates_and_exact_insert_count(qapp)
             },
         },
     }
-    panel.show_graph(graph, staging_enabled=True)
-    assert panel.table.horizontalHeaderItem(1).text() == "Governs"
-    assert panel.table.horizontalHeaderItem(3).text() == "Slot A Trim (est.)"
-    assert "Initial linear estimates" in panel.target_label.text()
-    assert "2 active inserts unsimulated" in panel._balance_lbl.text()
-    # Non-staged Tier 1 RoutingFolder & Master show em-dash; staged cBAS shows RMS
-    assert panel.table.item(panel._row_by_node["KIK"], 1).text() == "\u2014"
-    assert panel.table.item(panel._row_by_node["cBAS"], 1).text() == "RMS"
-    assert panel.table.item(panel._row_by_node["Master"], 1).text() == "\u2014"
-    # Graph view badge shows RMS for staged bus and blank for non-staged folder
-    assert _role_badge("bus", graph["nodes"]["cBAS"])[0] == "RMS"
-    assert _role_badge("folder", graph["nodes"]["KIK"])[0] == ""
-    panel.deleteLater()
+    try:
+        panel.show_graph(graph, staging_enabled=True)
+        assert panel.table.horizontalHeaderItem(1).text() == "Governs"
+        assert panel.table.horizontalHeaderItem(3).text() == "Slot A Trim (est.)"
+        assert "Initial linear estimates" in panel.target_label.text()
+        assert "2 active inserts unsimulated" in panel._balance_lbl.text()
+        # Non-staged Tier 1 RoutingFolder & Master show em-dash; staged cBAS shows RMS
+        assert panel.table.item(panel._row_by_node["KIK"], 1).text() == "\u2014"
+        assert panel.table.item(panel._row_by_node["cBAS"], 1).text() == "RMS"
+        assert panel.table.item(panel._row_by_node["Master"], 1).text() == "\u2014"
+        # Graph view badge shows RMS for staged bus and blank for non-staged folder
+        assert _role_badge("bus", graph["nodes"]["cBAS"])[0] == "RMS"
+        assert _role_badge("folder", graph["nodes"]["KIK"])[0] == ""
+    finally:
+        dispose_window(panel)
 
 
 def test_v7_to_v8_session_migration_overrides_config_and_stale(tmp_path):
@@ -248,10 +255,12 @@ def test_gui_live_aes17_toggle_and_preferences_validation_and_mode_refresh(qapp,
     warnings_shown: list[str] = []
     monkeypatch.setattr(QMessageBox, "warning", lambda *args: warnings_shown.append(str(args[2])))
     dlg = PreferencesDialog(cfg)
-    dlg._on_save()
-    assert not dlg._saved and warnings_shown
-    assert "must not exceed" in warnings_shown[0]
-    dlg.deleteLater()
+    try:
+        dlg._on_save()
+        assert not dlg._saved and warnings_shown
+        assert "must not exceed" in warnings_shown[0]
+    finally:
+        dispose_window(dlg)
 
     # 2. Live dbfs_convention toggle updates session.config and processor _db_offset
     page = Phase2Page(build_defaults())
@@ -300,8 +309,48 @@ def test_gui_live_aes17_toggle_and_preferences_validation_and_mode_refresh(qapp,
         assert combo_before is combo_after
         assert combo_after.currentText() == "Auto (Grp)"
     finally:
-        page.deleteLater()
-        qapp.processEvents()
+        dispose_window(page)
+
+
+def test_apply_dark_theme_preserves_desktop_style_under_app_stylesheet(qapp):
+    """apply_dark_theme rejects QApplication and keeps _DesktopStyle under QStyleSheetStyle."""
+    import shiboken6
+    from PySide6.QtCore import QEvent
+    from PySide6.QtWidgets import QWidget
+    from sessionprepgui import theme
+
+    host = QWidget()
+    old_sheet = qapp.styleSheet()
+    try:
+        with pytest.raises(TypeError, match="QWidget"):
+            theme.apply_dark_theme(qapp)
+
+        qapp.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        qapp.setStyle("Fusion")
+        theme.apply_dark_theme(host)
+        installed = theme._desktop_style
+        assert installed is not None and shiboken6.isValid(installed)
+
+        # Simulate a global QApplication stylesheet wrapping _DesktopStyle in QStyleSheetStyle
+        qapp.setStyleSheet(theme.STYLESHEET)
+        theme.apply_dark_theme(host)
+        assert theme._desktop_style is installed and shiboken6.isValid(installed)
+        assert installed.parent() is qapp.style()
+
+        # Clearing the global stylesheet unwraps back to the same _DesktopStyle instance
+        qapp.setStyleSheet("")
+        assert qapp.style() is installed
+
+        # Replacing the application style invalidates the old _DesktopStyle so it gets reinstalled
+        qapp.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        qapp.setStyle("Fusion")
+        assert not shiboken6.isValid(installed)
+        theme.apply_dark_theme(host)
+        assert theme._desktop_style is not installed and shiboken6.isValid(theme._desktop_style)
+    finally:
+        qapp.setStyleSheet(old_sheet)
+        dispose_window(host)
+        qapp.sendPostedEvents(None, QEvent.Type.DeferredDelete)
 
 
 def test_cli_force_peak_and_deprecated_flag_warnings(tmp_path):
