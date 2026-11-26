@@ -329,10 +329,14 @@ def test_signal_flow_panel_states_spinbox_focus_wheel_narrow_and_formatting(qapp
     assert panel.graph_view.view.zoom_percent() > 100
     panel.graph_view.zoom_reset()
     assert panel.graph_view.view.zoom_percent() == 100
-    # Narrow 360 px pane stays valid without clipping
-    panel.resize(360, 640)
+    # Narrow pane stays valid without graph/table/hidden-page bloat pushing width past controls_bar's row 1
+    assert panel.graph_view.minimumSizeHint().width() <= 360
+    assert panel.table.minimumSizeHint().width() <= 360
+    narrow_w = max(360, panel.controls_bar.minimumSizeHint().width())
+    assert panel.minimumSizeHint().width() <= narrow_w
+    panel.resize(narrow_w, 640)
     qapp.processEvents()
-    assert panel.width() == 360
+    assert panel.width() == narrow_w
     panel.view_toggle.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Left, Qt.KeyboardModifier.NoModifier))
     assert panel.view_stack.currentIndex() == 0
 

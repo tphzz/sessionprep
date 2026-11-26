@@ -90,6 +90,22 @@ class _SelectedWhiteTextDelegate(QStyledItemDelegate):
             option.palette.setColor(QPalette.ColorRole.HighlightedText, white)
 
 
+class _CurrentPageStackedWidget(QStackedWidget):
+    """Stacked widget whose size hints track only the active page."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.currentChanged.connect(lambda _index: self.updateGeometry())
+
+    def minimumSizeHint(self) -> QSize:
+        current = self.currentWidget()
+        return current.minimumSizeHint() if current is not None else super().minimumSizeHint()
+
+    def sizeHint(self) -> QSize:
+        current = self.currentWidget()
+        return current.sizeHint() if current is not None else super().sizeHint()
+
+
 class _ShortcutSafeButton(QPushButton):
     """PushButton that claims Space via ShortcutOverride so global playback does not steal it."""
 
@@ -455,7 +471,7 @@ class SignalFlowPanel(QWidget):
         self.excluded_banner, self._excluded_lbl, _ = _make_banner(_AMBER_BG, COLORS["attention"], _AMBER_BORDER)
         root.addWidget(self.excluded_banner)
 
-        self.stack = QStackedWidget()
+        self.stack = _CurrentPageStackedWidget()
         self.stack.addWidget(self._build_empty_page())
         self.stack.addWidget(self._build_busy_page())
         self.stack.addWidget(self._build_error_page())
