@@ -12,9 +12,31 @@ from functools import wraps
 import zipfile
 from typing import Any
 
-from ..daw_processor import DawProcessor, resolve_transfer_audio
+from ..daw_processor import DawProcessor
 from ..file_io import atomic_writer
-from ..models import DawCommand, DawCommandResult, SessionContext
+from ..models import DawCommand, DawCommandResult, ParamSpec, SessionContext, TrackContext
+from ..signal_flow import (
+    GAIN_MODE_TRIM_AND_FADER,
+    GAIN_MODE_TRIM_UNITY,
+    LeafAudioInput,
+    SignalFlowGraph,
+    TrackStagingPlan,
+    build_signal_flow,
+)
+from .dawproject_signal_flow import (
+    dawproject_config_params,
+    dawproject_host_limits,
+    dawproject_xml_to_mixer_session,
+    patch_dawproject_channel_volumes_xml,
+    prune_orphaned_submix_channels_xml,
+    resolve_dawproject_track_staging,
+)
+from .dawproject_vst3 import (
+    has_calibrated_vst3_trim_donor,
+    insert_vst3_trim_slot1_xml,
+    patch_vst3_trim_slot1_xml,
+    select_vst3_trim_donor,
+)
 
 
 log = logging.getLogger(__name__)
@@ -185,17 +207,18 @@ def _is_prunable_vca_only_folder(elem: Any, child_tracks: list[Any], other_folde
     return True
 
 
-def _prune_empty_dawproject_folders(root: Any) -> list[str]:
+def _prune_empty_dawproject_folders(root: Any) -> tuple[list[str], set[str]]:
     """Remove empty folder ``<Track>`` subtrees (bottom-up) and their dangling XML references.
 
     Preserves folders with non-VCA child tracks, dedicated VCA-organizer folders,
     and folders (or dependent lanes) referenced externally via ``@destination`` / ``@reference``.
-    Returns removed folder names in removal order.
+    Returns ``(removed_folder_names, removed_channel_destinations)``.
     """
     structure = root.find("Structure")
     if structure is None:
-        return []
+        return [], set()
     removed_names: list[str] = []
+    removed_dests: set[str] = set()
     changed = True
     while changed:
         changed = False
@@ -220,23 +243,330 @@ def _prune_empty_dawproject_folders(root: Any) -> list[str]:
                 all_removed_ids.update(nid for nid in dep.xpath(".//@id") if nid)
             if _has_external_routing_ref(root, elem, dep_nodes, all_removed_ids):
                 continue
+            for ch in elem.iter("Channel"):
+                dest = (ch.get("destination") or "").strip()
+                if dest:
+                    removed_dests.add(dest)
+            for snd in elem.iter("Send"):
+                sdest = (snd.get("destination") or "").strip()
+                if sdest:
+                    removed_dests.add(sdest)
             name = elem.get("name") or elem.get("id") or "(unnamed)"
             elem.getparent().remove(elem)
             _remove_dependent_nodes(dep_nodes)
             removed_names.append(name)
             changed = True
-    return removed_names
+    return removed_names, removed_dests
+
+
+def _make_lxml_element(tag: str, attrib: dict[str, str] | None = None) -> Any:
+    from lxml import etree
+
+    return etree.Element(tag, attrib or {})
+
+
+def _next_xml_id_factory(root: Any) -> Any:
+    existing = [int(n[2:]) for n in root.xpath("//@id") if n.startswith("id") and n[2:].isdecimal()]
+    counter = [max(existing, default=-1) + 1]
+
+    def _alloc() -> str:
+        val = f"id{counter[0]}"
+        counter[0] += 1
+        return val
+
+    return _alloc
+
+
+def _load_transfer_leaf_audio(track: TrackContext, plan: TrackStagingPlan) -> LeafAudioInput | None:
+    import numpy as np
+    import soundfile as sf
+
+    same_src = track.audio_data is not None and (
+        os.path.normcase(os.path.realpath(plan.filepath))
+        == os.path.normcase(os.path.realpath(track.filepath))
+    )
+    if same_src and track.audio_data is not None:
+        return LeafAudioInput(
+            np.asarray(track.audio_data, dtype=np.float64),
+            track.samplerate,
+            clip_gain_db=0.0,
+            fader_db=plan.fader_db,
+            baked_gain_db=plan.baked_gain_db,
+            trim_gain_db=plan.trim_gain_db,
+        )
+    try:
+        samples, sr = sf.read(plan.filepath, dtype="float64", always_2d=False)
+    except Exception as exc:
+        log.warning("Could not read audio for DAWproject signal-flow summing (%s): %s", plan.filepath, exc)
+        return None
+    return LeafAudioInput(
+        np.asarray(samples, dtype=np.float64),
+        int(sr),
+        clip_gain_db=0.0,
+        fader_db=plan.fader_db,
+        baked_gain_db=plan.baked_gain_db,
+        trim_gain_db=plan.trim_gain_db,
+    )
+
+
+def _insert_leaf_vst3_trims(
+    root: Any,
+    leaf_xml_records: list[tuple[str, Any, TrackContext, TrackStagingPlan, str]],
+    donors: tuple[Any, ...],
+    *,
+    apply_trim_gain: bool,
+    next_id: Any,
+    used_members: set[str],
+    state_counter: list[int],
+    extra_blobs: dict[str, bytes],
+) -> dict[str, TrackStagingPlan]:
+    """Insert Slot 1 VST3 trims onto leaf audio tracks; fail-closed leaf faders if gain patch fails."""
+    plan_overrides: dict[str, TrackStagingPlan] = {}
+    reset_vols: dict[str, float] = {}
+    for _tname, trk_el, _tc, plan, fmt in leaf_xml_records:
+        ch_el = trk_el.find("Channel")
+        if ch_el is None:
+            continue
+        cid = (ch_el.get("id") or "").strip()
+        need_gain = apply_trim_gain and abs(plan.trim_gain_db) >= 0.05
+        donor = select_vst3_trim_donor(donors, fmt, require_calibrated=need_gain) if donors else None
+        gain_applied = False
+        if donor is not None:
+            meta = insert_vst3_trim_slot1_xml(
+                ch_el, donor, make_element=_make_lxml_element, next_xml_id=next_id,
+                used_members=used_members, state_counter=state_counter,
+                extra_archive_blobs=extra_blobs, apply_gain_db=plan.trim_gain_db if need_gain else None,
+            )
+            gain_applied = bool(meta.get("gain_applied"))
+        if need_gain and not gain_applied and abs(plan.baked_gain_db) < 1e-9:
+            log.warning("VST3 Trim gain patch skipped/failed on leaf %r; resetting fader to 0.0 dB.", cid)
+            if cid:
+                reset_vols[cid] = 0.0
+                plan_overrides[cid] = TrackStagingPlan(
+                    filepath=plan.filepath, clip_gain_db=0.0, trim_gain_db=0.0,
+                    fader_db=0.0, baked_gain_db=0.0, prepared_fader_db=plan.prepared_fader_db,
+                )
+    if reset_vols:
+        patch_dawproject_channel_volumes_xml(
+            root, reset_vols, make_element=_make_lxml_element, next_xml_id=next_id,
+        )
+    return plan_overrides
+
+
+def _patch_graph_bus_trims(
+    root: Any,
+    graph: SignalFlowGraph,
+    mmap: Any,
+    read_member: Any,
+    *,
+    next_id: Any,
+    used_members: set[str],
+    state_counter: list[int],
+    extra_blobs: dict[str, bytes],
+) -> set[str]:
+    """Patch or auto-insert calibrated Slot 1 VST3 trims on staged busses; return failed channel IDs."""
+    rec_trims = graph.recommended_slot_a_trims()
+    if not rec_trims:
+        return set()
+    by_cid = {(ch.get("id") or "").strip(): ch for ch in root.iter("Channel") if (ch.get("id") or "").strip()}
+    failed_cids: set[str] = set()
+    for bus_name, target_db in rec_trims.items():
+        cid = mmap.channel_id_by_node.get(bus_name)
+        node = graph.nodes.get(bus_name)
+        ch_el = by_cid.get(cid) if cid else None
+        if not cid or node is None or ch_el is None:
+            if cid:
+                failed_cids.add(cid)
+            continue
+        if node.slot_a_trim_auto_insert:
+            donor = select_vst3_trim_donor(mmap.donors, node.format, require_calibrated=True)
+            if donor is None:
+                log.warning("No calibrated VST3 donor to auto-insert Slot 1 Trim on bus %r.", bus_name)
+                failed_cids.add(cid)
+                continue
+            meta = insert_vst3_trim_slot1_xml(
+                ch_el, donor, make_element=_make_lxml_element, next_xml_id=next_id,
+                used_members=used_members, state_counter=state_counter,
+                extra_archive_blobs=extra_blobs, apply_gain_db=target_db,
+            )
+            if not meta.get("gain_applied"):
+                failed_cids.add(cid)
+        elif not patch_vst3_trim_slot1_xml(
+            ch_el, target_db, read_member, make_element=_make_lxml_element,
+            next_xml_id=next_id, used_members=used_members,
+            state_counter=state_counter, extra_archive_blobs=extra_blobs,
+        ):
+            log.warning("Could not patch Slot 1 VST3 Trim on bus %r; skipping compensating fader.", bus_name)
+            failed_cids.add(cid)
+    return failed_cids
+
+
+def _patch_graph_channel_volumes(
+    root: Any,
+    graph: SignalFlowGraph,
+    mmap: Any,
+    leaf_cids: list[str],
+    next_id: Any,
+    *,
+    skip_cids: set[str] | None = None,
+) -> None:
+    blocked = skip_cids or set()
+    vols_to_patch: dict[str, float] = {}
+    if abs(graph.leaf_fader_shift_db) >= 0.05 and not blocked:
+        for cid in leaf_cids:
+            nm = mmap.node_by_channel_id.get(cid)
+            if nm and nm in graph.nodes:
+                vols_to_patch[cid] = round(graph.nodes[nm].recommended_fader_db, 1)
+    for bus_name, bus_db in graph.recommended_bus_faders().items():
+        cid = mmap.channel_id_by_node.get(bus_name)
+        if cid and cid not in blocked and cid not in vols_to_patch:
+            vols_to_patch[cid] = bus_db
+    if vols_to_patch:
+        patch_dawproject_channel_volumes_xml(
+            root, vols_to_patch, make_element=_make_lxml_element, next_xml_id=next_id,
+        )
+
+
+def _collect_leaf_signal_flow_inputs(
+    leaf_xml_records: list[tuple[str, Any, TrackContext, TrackStagingPlan, str]],
+    plan_overrides: dict[str, TrackStagingPlan],
+    mmap: Any,
+) -> tuple[list[str], dict[str, tuple[TrackContext, TrackStagingPlan]], dict[str, tuple[float, float, float, float]]]:
+    leaf_cids: list[str] = []
+    leaf_entries: dict[str, tuple[TrackContext, TrackStagingPlan]] = {}
+    leaf_gains: dict[str, tuple[float, float, float, float]] = {}
+    for _tname, trk_el, tc, plan, _fmt in leaf_xml_records:
+        ch_el = trk_el.find("Channel")
+        cid = (ch_el.get("id") or "").strip() if ch_el is not None else ""
+        eff_plan = plan_overrides.get(cid, plan)
+        node_name = mmap.node_by_channel_id.get(cid) if cid else None
+        if cid and node_name:
+            leaf_cids.append(cid)
+            leaf_entries[node_name.lower()] = (tc, eff_plan)
+            leaf_gains[node_name] = (0.0, eff_plan.fader_db, eff_plan.baked_gain_db, eff_plan.trim_gain_db)
+    return leaf_cids, leaf_entries, leaf_gains
+
+
+def _apply_signal_flow_and_trims(
+    source: zipfile.ZipFile,
+    root: Any,
+    session: SessionContext,
+    leaf_xml_records: list[tuple[str, Any, TrackContext, TrackStagingPlan, str]],
+    *,
+    gain_mode: str,
+    insert_track_trim: bool,
+    apply_trim_gain: bool,
+    stage_bus_faders: bool,
+    pan_law_db: float,
+    fader_ceiling_db: float,
+    bus_fader_overrides: dict[str, float] | None,
+    used_members: set[str],
+    extra_blobs: dict[str, bytes],
+) -> SignalFlowGraph | None:
+    """Insert Slot 1 VST3 trims on leaves/busses, run signal-flow DAG, and patch staged channel volumes."""
+    if not leaf_xml_records:
+        return None
+    names_lc = {m.replace("\\", "/").lower(): m for m in source.namelist()}
+
+    def _read_member(rel: str) -> bytes | None:
+        actual = names_lc.get(rel.replace("\\", "/").lower())
+        return source.read(actual) if actual else None
+
+    next_id = _next_xml_id_factory(root)
+    state_counter = [0]
+    mmap = dawproject_xml_to_mixer_session(root, _read_member, apply_trim_gain=apply_trim_gain)
+    plan_overrides = (
+        _insert_leaf_vst3_trims(
+            root, leaf_xml_records, mmap.donors, apply_trim_gain=apply_trim_gain,
+            next_id=next_id, used_members=used_members, state_counter=state_counter, extra_blobs=extra_blobs,
+        )
+        if insert_track_trim
+        else {}
+    )
+    leaf_cids, leaf_entries, leaf_gains = _collect_leaf_signal_flow_inputs(leaf_xml_records, plan_overrides, mmap)
+    cal_donor = select_vst3_trim_donor(mmap.donors, "Stereo", require_calibrated=True)
+    limits = dawproject_host_limits(
+        fader_ceiling_db,
+        leaf_trim_min_db=cal_donor.trim_info.min_db if cal_donor else None,
+        leaf_trim_max_db=cal_donor.trim_info.max_db if cal_donor else None,
+    )
+    allow_conv = (
+        apply_trim_gain
+        and has_calibrated_vst3_trim_donor(mmap.donors)
+        and gain_mode == GAIN_MODE_TRIM_AND_FADER
+        and stage_bus_faders
+    )
+    graph = build_signal_flow(
+        mmap.mixer, None, dict(session.config),
+        host_limits=limits, pan_law_db=pan_law_db,
+        stage_bus_faders=stage_bus_faders, attenuate_only=(gain_mode != GAIN_MODE_TRIM_UNITY),
+        strict_slot_a=False, allow_leaf_convergence=allow_conv,
+        leaf_loader=lambda nm: _load_transfer_leaf_audio(*leaf_entries[nm.lower()]) if nm.lower() in leaf_entries else None,
+        leaf_gains=leaf_gains, bus_fader_overrides=bus_fader_overrides,
+    )
+    failed_bus_cids = (
+        _patch_graph_bus_trims(
+            root, graph, mmap, _read_member, next_id=next_id,
+            used_members=used_members, state_counter=state_counter, extra_blobs=extra_blobs,
+        )
+        if apply_trim_gain
+        else set()
+    )
+    _patch_graph_channel_volumes(root, graph, mmap, leaf_cids, next_id, skip_cids=failed_bus_cids)
+    return graph
+
+
+def _write_dawproject_archive(
+    stream: Any,
+    source: zipfile.ZipFile,
+    root: Any,
+    extra_blobs: dict[str, bytes],
+    embedded_files: list[tuple[str, str]],
+) -> None:
+    from lxml import etree
+
+    extra_lc = {p.replace("\\", "/").lower() for p in extra_blobs}
+    with zipfile.ZipFile(stream, "w", allowZip64=True, strict_timestamps=False) as archive:
+        archive.comment = source.comment
+        archive.writestr(
+            "project.xml",
+            etree.tostring(root, xml_declaration=True, encoding="UTF-8"),
+            compress_type=zipfile.ZIP_DEFLATED,
+        )
+        if "metadata.xml" not in source.namelist():
+            archive.writestr("metadata.xml", "<MetaData/>", compress_type=zipfile.ZIP_DEFLATED)
+        for member in source.infolist():
+            norm = member.filename.replace("\\", "/").lower()
+            if norm == "project.xml" or norm in extra_lc:
+                continue
+            _copy_zip_member(source, archive, member)
+        for blob_path, blob_bytes in extra_blobs.items():
+            archive.writestr(blob_path, blob_bytes, compress_type=zipfile.ZIP_DEFLATED)
+        for src_filepath, arcname in embedded_files:
+            archive.write(src_filepath, arcname=arcname, compress_type=zipfile.ZIP_STORED)
 
 
 def _save_template(
-    source, root, output_path, project, additions, embedded_files, replace_existing,
-) -> list[str]:
-    """Append new tracks, prune empty folders, and embed audio into a DAWproject archive."""
+    source,
+    root,
+    output_path,
+    project,
+    additions,
+    embedded_files,
+    replace_existing,
+    *,
+    session: SessionContext | None = None,
+    stage_options: dict[str, Any] | None = None,
+    used_members: set[str] | None = None,
+) -> tuple[list[str], list[str], SignalFlowGraph | None]:
+    """Append new tracks, prune empty folders/buses, apply VST3 trims/signal flow, and write ZIP."""
     from lxml import etree
 
     template = Path(source.filename)
+    opts = stage_options or {}
+    members_seen = used_members if used_members is not None else {m.replace("\\", "/").lower() for m in source.namelist()}
+    extra_blobs: dict[str, bytes] = {}
     with atomic_writer(output_path, binary=True, replace_existing=replace_existing) as stream:
-        # Relative external files in the template are relative to its original directory.
         for item in root.iterfind(".//*[@path]"):
             path = item.get("path")
             if (item.get("external") in ("true", "1") and path and "://" not in path
@@ -252,31 +582,40 @@ def _save_template(
         if lanes is None:
             lanes = etree.Element("Lanes", timeUnit="seconds")
             arrangement.insert(0, lanes)
-        for folder, track, lane, dest_channel in additions:
+
+        leaf_xml_records: list[tuple[str, Any, TrackContext, TrackStagingPlan, str]] = []
+        for folder, track, lane, dest_channel, out_tc, plan in additions:
             element = folders[folder.id]
             if dest_channel is not None and dest_channel.id in channels:
                 channels[dest_channel.id].set("id", dest_channel.id)
-            element.append(track.to_xml())
+            trk_el = track.to_xml()
+            element.append(trk_el)
             lanes.append(lane.to_xml())
+            fmt = "Stereo" if (out_tc.channels and out_tc.channels >= 2) else "Mono"
+            leaf_xml_records.append((track.name or "", trk_el, out_tc, plan, fmt))
 
-        removed_folders = _prune_empty_dawproject_folders(root)
-
-        with zipfile.ZipFile(stream, "w", allowZip64=True, strict_timestamps=False) as archive:
-            archive.comment = source.comment
-            archive.writestr(
-                "project.xml",
-                etree.tostring(root, xml_declaration=True, encoding="UTF-8"),
-                compress_type=zipfile.ZIP_DEFLATED,
+        removed_folders, removed_dests = _prune_empty_dawproject_folders(root)
+        removed_buses = (
+            prune_orphaned_submix_channels_xml(root, removed_dests)
+            if bool(opts.get("remove_unused_buses", True))
+            else []
+        )
+        graph: SignalFlowGraph | None = None
+        if session is not None and leaf_xml_records:
+            graph = _apply_signal_flow_and_trims(
+                source, root, session, leaf_xml_records,
+                gain_mode=str(opts.get("gain_mode", GAIN_MODE_TRIM_AND_FADER)),
+                insert_track_trim=bool(opts.get("insert_track_trim", True)),
+                apply_trim_gain=bool(opts.get("apply_trim_gain", False)),
+                stage_bus_faders=bool(opts.get("stage_bus_faders", True)),
+                pan_law_db=float(opts.get("pan_law_db", -3.0)),
+                fader_ceiling_db=float(opts.get("fader_ceiling_db", 6.0)),
+                bus_fader_overrides=opts.get("bus_fader_overrides"),
+                used_members=members_seen,
+                extra_blobs=extra_blobs,
             )
-            if "metadata.xml" not in source.namelist():
-                archive.writestr("metadata.xml", "<MetaData/>", compress_type=zipfile.ZIP_DEFLATED)
-            for member in source.infolist():
-                if member.filename == "project.xml":
-                    continue
-                _copy_zip_member(source, archive, member)
-            for src_filepath, arcname in embedded_files:
-                archive.write(src_filepath, arcname=arcname, compress_type=zipfile.ZIP_STORED)
-    return removed_folders
+        _write_dawproject_archive(stream, source, root, extra_blobs, embedded_files)
+    return removed_folders, removed_buses, graph
 
 
 def _allocate_archive_audio_path(
@@ -373,6 +712,14 @@ class DawProjectDawProcessor(DawProcessor):
     @property
     def template_identity(self) -> tuple[str, ...]:
         return ("dawproject", self._template_name, self._template_path)
+
+    @property
+    def template_path(self) -> str:
+        return self._template_path
+
+    @classmethod
+    def config_params(cls) -> list[ParamSpec]:
+        return super().config_params() + dawproject_config_params()
 
     def __init__(
         self,
@@ -471,7 +818,7 @@ class DawProjectDawProcessor(DawProcessor):
         self._walk_structure(
             project.structure, folders, parent_id=None, counter=[0])
 
-        # Preserve existing assignments where folder IDs still match
+        # Preserve existing assignments, track order, and bus overrides where IDs still match
         dp_state = session.daw_state.get(self.id, {})
         old_assignments: dict[str, str] = dp_state.get("assignments", {})
         valid_ids = {f["id"] for f in folders}
@@ -479,11 +826,23 @@ class DawProjectDawProcessor(DawProcessor):
             fname: fid for fname, fid in old_assignments.items()
             if fid in valid_ids
         }
+        old_order: dict[str, list[str]] = dp_state.get("track_order", {})
+        track_order = {
+            fid: [eid for eid in eids if assignments.get(eid) == fid]
+            for fid, eids in old_order.items()
+            if fid in valid_ids
+        }
+        track_order = {fid: eids for fid, eids in track_order.items() if eids}
 
-        session.daw_state[self.id] = {
+        new_state: dict[str, Any] = {
             "folders": folders,
             "assignments": assignments,
         }
+        if track_order:
+            new_state["track_order"] = track_order
+        if isinstance(dp_state.get("bus_fader_overrides"), dict) and dp_state["bus_fader_overrides"]:
+            new_state["bus_fader_overrides"] = dict(dp_state["bus_fader_overrides"])
+        session.daw_state[self.id] = new_state
         return session
 
     def _walk_structure(
@@ -571,7 +930,7 @@ class DawProjectDawProcessor(DawProcessor):
         return work
 
     def _build_track_addition(
-        self, session, folder_track, dest_channel, entry, out_tc, media, archive_audio_path: str,
+        self, session, folder_track, dest_channel, entry, out_tc, plan: TrackStagingPlan, archive_audio_path: str,
     ):
         from dawproject import (
             Audio, BoolParameter, Channel, Clip, Clips, ContentType,
@@ -580,7 +939,7 @@ class DawProjectDawProcessor(DawProcessor):
 
         track_name = os.path.splitext(entry.daw_track_name)[0]
         track_color = self._resolve_track_color(entry.group, session)
-        volume = _db_to_linear(media.fader_db)
+        volume = _db_to_linear(plan.fader_db)
         audio_channels = out_tc.channels if (out_tc.channels and out_tc.channels > 0) else 2
         channel = Channel(
             role=MixerRole.REGULAR,
@@ -617,22 +976,45 @@ class DawProjectDawProcessor(DawProcessor):
             color=track_color,
         )
         track_lane = Lanes(track=new_track, time_unit=TimeUnit.SECONDS, lanes=[Clips(clips=[clip])])
-        return track_name, (folder_track, new_track, track_lane, dest_channel)
+        return track_name, (folder_track, new_track, track_lane, dest_channel, out_tc, plan)
+
+    def _stage_options_from_session(self, session: SessionContext) -> dict[str, Any]:
+        cfg = session.config or {}
+        dp_state = session.daw_state.get(self.id, {})
+        overrides = dp_state.get("bus_fader_overrides")
+        return {
+            "gain_mode": str(cfg.get("dawproject_gain_mode", GAIN_MODE_TRIM_AND_FADER)),
+            "insert_track_trim": bool(cfg.get("dawproject_insert_track_trim", True)),
+            "apply_trim_gain": bool(cfg.get("dawproject_apply_trim_gain", False)),
+            "stage_bus_faders": bool(cfg.get("dawproject_stage_bus_faders", True)),
+            "pan_law_db": float(cfg.get("dawproject_pan_law_db", -3.0)),
+            "remove_unused_buses": bool(cfg.get("dawproject_remove_unused_buses", True)),
+            "fader_ceiling_db": float(self.fader_ceiling_db),
+            "bus_fader_overrides": overrides if isinstance(overrides, dict) else None,
+        }
 
     def _save_dawproject_output(
         self, session, output_path, template, root, project, additions, embedded_files, results,
+        *, used_members: set[str] | None = None,
     ) -> None:
         try:
             path = Path(output_path)
             if path.resolve() == Path(template.filename).resolve():
                 raise ValueError("Choose a different output path to preserve the DAWproject template.")
             path.parent.mkdir(parents=True, exist_ok=True)
-            removed_folders = _save_template(
+            removed_folders, removed_buses, graph = _save_template(
                 template, root, path, project, additions, embedded_files,
                 replace_existing=not session.config.get("_batch_transfer", False),
+                session=session,
+                stage_options=self._stage_options_from_session(session),
+                used_members=used_members,
             )
+            if graph is not None:
+                session.daw_state.setdefault(self.id, {})["signal_flow"] = graph.to_dict()
             for fname in removed_folders:
                 results.append(DawCommandResult(DawCommand("remove_empty_folder", fname, {}), True))
+            for bname in removed_buses:
+                results.append(DawCommandResult(DawCommand("remove_unused_bus", bname, {}), True))
             results.append(DawCommandResult(DawCommand("save_project", output_path, {}), True))
             log.info("DAWproject saved to %s", output_path)
         except Exception as exc:
@@ -642,8 +1024,31 @@ class DawProjectDawProcessor(DawProcessor):
                     result.error = "Track could not be published because the project save failed."
             results.append(DawCommandResult(DawCommand("save_project", output_path, {}), False, f"Failed to save: {exc}"))
 
+    @staticmethod
+    def _resolve_leaf_trim_capability(
+        template: zipfile.ZipFile,
+        root: Any,
+        opts: dict[str, Any],
+    ) -> tuple[bool, float | None, float | None]:
+        """Verify upfront whether calibrated leaf Trim gain can be applied without balance inversion."""
+        if not (opts["apply_trim_gain"] and opts["insert_track_trim"]):
+            return False, None, None
+        names_lc = {m.replace("\\", "/").lower(): m for m in template.namelist()}
+
+        def _read_member(rel: str) -> bytes | None:
+            actual = names_lc.get(rel.replace("\\", "/").lower())
+            return template.read(actual) if actual else None
+
+        mmap = dawproject_xml_to_mixer_session(root, _read_member, apply_trim_gain=True)
+        donor = select_vst3_trim_donor(mmap.donors, "Stereo", require_calibrated=True)
+        if donor is None:
+            return False, None, None
+        return True, donor.trim_info.min_db, donor.trim_info.max_db
+
     def _add_tracks(self, session, output_path, progress_cb, template, root, project):
         dp_state = session.daw_state.get(self.id, {})
+        opts = self._stage_options_from_session(session)
+        eff_leaf_apply, lt_min, lt_max = self._resolve_leaf_trim_capability(template, root, opts)
         folder_track_map: dict[str, Any] = {}
         folder_parent_map: dict[str, Any] = {}
         self._build_folder_map(project.structure, folder_track_map, folder_parent_map)
@@ -674,21 +1079,28 @@ class DawProjectDawProcessor(DawProcessor):
                 ))
                 continue
             try:
-                media = resolve_transfer_audio(session, out_tc)
+                plan = resolve_dawproject_track_staging(
+                    session, out_tc,
+                    gain_mode=opts["gain_mode"],
+                    apply_trim_gain=eff_leaf_apply,
+                    fader_ceiling_db=opts["fader_ceiling_db"],
+                    leaf_trim_min_db=lt_min,
+                    leaf_trim_max_db=lt_max,
+                )
             except ValueError as exc:
                 results.append(DawCommandResult(DawCommand("add_track", eid, {"folder_id": fid}), False, str(exc)))
                 continue
-            arcname, needs_write = _allocate_archive_audio_path(media.filepath, used_members, embedded_by_source)
+            arcname, needs_write = _allocate_archive_audio_path(plan.filepath, used_members, embedded_by_source)
             if needs_write:
-                embedded_files.append((media.filepath, arcname))
+                embedded_files.append((plan.filepath, arcname))
             dest_channel = _resolve_channel_destination(folder_track, folder_parent_map, master_channel)
-            log.debug("%s: file=%s -> %s, fader=%+.2f dB", eid, media.filepath, arcname, media.fader_db)
+            log.debug("%s: file=%s -> %s, trim=%+.2f dB, fader=%+.2f dB", eid, plan.filepath, arcname, plan.trim_gain_db, plan.fader_db)
             track_name, addition = self._build_track_addition(
-                session, folder_track, dest_channel, entry, out_tc, media, arcname,
+                session, folder_track, dest_channel, entry, out_tc, plan, arcname,
             )
             additions.append(addition)
             results.append(DawCommandResult(
-                DawCommand("add_track", eid, {"folder": folder_dict.get("name", ""), "fader_db": media.fader_db}), True,
+                DawCommand("add_track", eid, {"folder": folder_dict.get("name", ""), "fader_db": plan.fader_db}), True,
             ))
             if progress_cb:
                 progress_cb(step + 1, total, f"Added {track_name} ({step + 1}/{total})")
@@ -696,6 +1108,7 @@ class DawProjectDawProcessor(DawProcessor):
         if not (results and not any(result.success for result in results)):
             self._save_dawproject_output(
                 session, output_path, template, root, project, additions, embedded_files, results,
+                used_members=used_members,
             )
         session.daw_command_log.extend(results)
         return results

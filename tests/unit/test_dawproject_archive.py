@@ -458,16 +458,19 @@ def test_prunes_empty_folders_vcas_and_dangling_lanes_while_protecting_routed_bu
     assert template.read_bytes() == template_bytes_before
     removed_targets = {r.command.target for r in results if r.command.command_type == "remove_empty_folder"}
     assert removed_targets == {"Snare", "ChainA", "ChainB", "InnerEmpty", "OuterEmpty", "BitwigUnused"}
+    removed_buses = {r.command.target for r in results if r.command.command_type == "remove_unused_bus"}
+    assert removed_buses == {"cSnare"}
 
     with ZipFile(output) as archive:
         root = ET.fromstring(archive.read("project.xml"))
-        # Populated Kick, externally-fed DrumBus, externally-referenced RefProtected, VCAs organizer, FX, cSnare survive
+        # Populated Kick, externally-fed DrumBus, externally-referenced RefProtected, VCAs organizer, FX survive
         assert root.find(".//Track[@id='f_kick']") is not None
         assert root.find(".//Track[@id='f_drum_bus']") is not None
         assert root.find(".//Track[@id='f_ref_protected']") is not None
         assert root.find(".//Track[@id='f_vcas']") is not None
         assert root.find(".//Track[@id='f_fx']") is not None
-        assert root.find(".//Channel[@id='ch_sub_snare']") is not None
+        # Orphaned standalone submix cSnare (previously fed only by removed f_snare) is pruned by default
+        assert root.find(".//Channel[@id='ch_sub_snare']") is None
         # Empty Snare (VCA only), chained ChainA->ChainB, nested OuterEmpty/InnerEmpty, ID-less BitwigUnused removed
         for gone_id in ("f_snare", "t_snare_vca", "f_chain_a", "f_chain_b", "f_outer_empty", "f_inner_empty"):
             assert root.find(f".//Track[@id='{gone_id}']") is None
@@ -484,3 +487,18 @@ def test_prunes_empty_folders_vcas_and_dangling_lanes_while_protecting_routed_bu
                 ref = el.get(attr)
                 if ref is not None:
                     assert ref in all_ids, f"Dangling {attr}={ref!r} on <{el.tag}>"
+
+    # When dawproject_remove_unused_buses=False, standalone submix cSnare is preserved
+    keep_session = SessionContext(
+        [track], {"_use_processed": False, "dawproject_remove_unused_buses": False}, output_tracks=[track],
+        prepare_state="ready", transfer_manifest=[TransferEntry("e1", track.filename, "Kick")],
+    )
+    adapter.fetch(keep_session)
+    keep_session.daw_state[adapter.id]["assignments"] = {"e1": "f_kick"}
+    keep_out = tmp_path / "KeptSubmix.dawproject"
+    keep_results = adapter.transfer(keep_session, str(keep_out))
+    assert all(r.success for r in keep_results), [r.error for r in keep_results]
+    assert not any(r.command.command_type == "remove_unused_bus" for r in keep_results)
+    with ZipFile(keep_out) as archive:
+        keep_root = ET.fromstring(archive.read("project.xml"))
+        assert keep_root.find(".//Channel[@id='ch_sub_snare']") is not None

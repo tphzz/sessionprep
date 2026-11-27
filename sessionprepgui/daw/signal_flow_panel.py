@@ -29,7 +29,7 @@ from PySide6.QtWidgets import (
 )
 
 from sessionpreplib.audio import dbfs_offset
-from sessionpreplib.ptx.signal_flow_analysis import trace_signal_flow_path
+from sessionpreplib.signal_flow import trace_signal_flow_path
 
 from ..controls import FormActionButton
 from ..icons import icon, icon_path
@@ -278,7 +278,31 @@ def _classify_tier(node: dict[str, Any]) -> int:
     return 2
 
 
-def _tier_heading(tier: int, *, has_trims: bool) -> str:
+def _tier_heading(
+    tier: int,
+    *,
+    has_trims: bool,
+    daw_mode: str = "protools",
+    fader_ceiling_db: float = 12.0,
+) -> str:
+    if daw_mode == "dawproject":
+        if tier == 1:
+            return (
+                "TIER 1 \u00b7 ROUTING FOLDERS (PURE SUMMING \u00b7 UNITY 0.0 dB)"
+                if has_trims
+                else "TIER 1 \u00b7 ROUTING FOLDERS (ELIGIBLE FOR BUS STAGING)"
+            )
+        if tier == 2:
+            return (
+                f"TIER 2 \u00b7 SUBMIX BUSES (SLOT 1 VST3 TRIM + INVERSE FADER \u2264 +{fader_ceiling_db:.1f} dB = 0.0 dB NET)"
+                if has_trims
+                else f"TIER 2 \u00b7 SUBMIX BUSES (FADER STAGING \u2264 +{fader_ceiling_db:.1f} dB CEILING)"
+            )
+        return (
+            "TIER 3 \u00b7 MIX BUS & MASTER (TERMINAL HEADROOM TRIM \u00b7 POST-TERMINAL EXEMPT)"
+            if has_trims
+            else "TIER 3 \u00b7 MIX BUS & MASTER (MASTER ANNOTATED ONLY)"
+        )
     if tier == 1:
         return (
             "TIER 1 \u00b7 ROUTING FOLDERS (PASS-THROUGH \u00b7 STAGED DOWNSTREAM)"
@@ -352,9 +376,11 @@ def _format_non_staged_fader(node: dict[str, Any], staging_enabled: bool) -> str
     return f"{db_txt} (fixed)"
 
 
-def _format_slot_a_cell(node: dict[str, Any], staging_enabled: bool) -> tuple[str, str, bool]:
+def _format_slot_a_cell(
+    node: dict[str, Any], staging_enabled: bool, *, daw_mode: str = "protools",
+) -> tuple[str, str, bool]:
     if node.get("slot_a_blocked_error"):
-        return "SLOT A BLOCKED", COLORS["problems"], True
+        return ("SLOT 1 BLOCKED" if daw_mode == "dawproject" else "SLOT A BLOCKED"), COLORS["problems"], True
     if node.get("is_post_terminal"):
         return "\u2014 (exempt)", COLORS["metadata"], False
     if not staging_enabled:
@@ -368,7 +394,7 @@ def _format_slot_a_cell(node: dict[str, Any], staging_enabled: bool) -> tuple[st
     return "\u2014", COLORS["metadata"], False
 
 
-def _node_notes(node: dict[str, Any], *, staging_enabled: bool = True) -> str:
+def _node_notes(node: dict[str, Any], *, staging_enabled: bool = True, daw_mode: str = "protools") -> str:
     if node.get("slot_a_blocked_error"):
         return str(node["slot_a_blocked_error"])
     parts: list[str] = []
@@ -387,8 +413,9 @@ def _node_notes(node: dict[str, Any], *, staging_enabled: bool = True) -> str:
     elif staging_enabled:
         strat = str(node.get("staging_strategy") or "")
         if node.get("staged") and trim_plug and strat in ("trim_and_fader", "trim_only"):
+            slot_lbl = "Slot 1" if daw_mode == "dawproject" else "Slot A"
             tag = " (auto-insert)" if node.get("slot_a_trim_auto_insert") else ""
-            parts.append(f"Slot A {trim_plug}{tag}: {_format_db(_safe_float(node.get('recommended_trim_db')), signed=True)}")
+            parts.append(f"{slot_lbl} {trim_plug}{tag}: {_format_db(_safe_float(node.get('recommended_trim_db')), signed=True)}")
         elif node.get("staged") and not node.get("is_overridden") and abs(_safe_float(node.get("recommended_fader_db"))) >= 0.05:
             parts.append("auto-staged")
     return " \u00b7 ".join(parts)
@@ -430,6 +457,9 @@ class SignalFlowPanel(QWidget):
         self._populating = False
         self._last_graph: dict[str, Any] | None = None
         self._staging_enabled = True
+        self._daw_mode = "protools"
+        self._fader_ceiling_db = 12.0
+        self._apply_trim_gain = False
         self._selected_node: str | None = None
         self._spin_by_bus: dict[str, BusFaderSpinBox] = {}
         self._row_by_node: dict[str, int] = {}
@@ -747,6 +777,26 @@ class SignalFlowPanel(QWidget):
         finally:
             self._populating = False
 
+    def set_daw_context(
+        self,
+        daw_mode: str,
+        *,
+        fader_ceiling_db: float = 12.0,
+        apply_trim_gain: bool = False,
+    ) -> None:
+        """Configure DAW-specific terminology, Slot 1 vs. Slot A headers, and fader ceiling."""
+        self._daw_mode = "dawproject" if daw_mode == "dawproject" else "protools"
+        self._fader_ceiling_db = float(fader_ceiling_db) if math.isfinite(float(fader_ceiling_db)) else 12.0
+        self._apply_trim_gain = bool(apply_trim_gain)
+        col3_hdr = self.table.horizontalHeaderItem(3)
+        if col3_hdr is not None:
+            col3_hdr.setText("Slot 1 Trim" if self._daw_mode == "dawproject" else "Slot A Trim (est.)")
+        self.active_only_cb.setToolTip(
+            "Hide silent or -\u221e dB parked submix buses"
+            if self._daw_mode == "dawproject"
+            else "Hide silent or -\u221e dB parked parallel aux tracks"
+        )
+
     def _open_bus_override_dialog(self, bus_name: str) -> None:
         if self._last_graph is None or not self._staging_enabled:
             return
@@ -761,6 +811,7 @@ class SignalFlowPanel(QWidget):
             cur_db = _safe_float(node.get("recommended_fader_db"), auto_db)
             lay.addWidget(QLabel(f"Target bus fader for {bus_name} (auto: {_format_db(auto_db, signed=True)}):"))
             spin = BusFaderSpinBox(dlg)
+            spin.setRange(-144.0, self._fader_ceiling_db)
             spin.setValue(cur_db)
             lay.addWidget(spin)
             btns = QDialogButtonBox(
@@ -834,7 +885,8 @@ class SignalFlowPanel(QWidget):
         self.refresh_btn.setEnabled(assigned_count > 0)
         self.reset_all_btn.setEnabled(False)
         if assigned_count <= 0:
-            self.empty_title.setText("Assign at least one track to a Pro Tools template folder")
+            daw_label = "DAWproject" if self._daw_mode == "dawproject" else "Pro Tools"
+            self.empty_title.setText(f"Assign at least one track to a {daw_label} template folder")
             self.empty_detail.setText(
                 "Drag tracks into Routing Folders or click Auto-Assign to enable offline Signal Flow preview."
             )
@@ -910,10 +962,16 @@ class SignalFlowPanel(QWidget):
         pan_law = _safe_float(graph_dict.get("pan_law_db", -3.0), -3.0)
         conv = str(graph_dict.get("dbfs_convention", "standard"))
         rms_off = dbfs_offset({"dbfs_convention": conv})
-        self.target_label.setText(
-            f"Target: {target_pk:.1f} dBFS pk / {target_rms + rms_off:.1f} dBFS RMS \u00b7 "
-            f"Pan law: {pan_law:.1f} dB \u00b7 Initial linear estimates"
-        )
+        if self._daw_mode == "dawproject":
+            trim_lbl = "Calibrated (Exp.)" if self._apply_trim_gain else "Unity 0.0 dB (Default)"
+            self.target_label.setText(
+                f"Trim: {trim_lbl} \u00b7 Ceiling: +{self._fader_ceiling_db:.1f} dB \u00b7 Pan: {pan_law:.1f} dB"
+            )
+        else:
+            self.target_label.setText(
+                f"Target: {target_pk:.1f} dBFS pk / {target_rms + rms_off:.1f} dBFS RMS \u00b7 "
+                f"Pan law: {pan_law:.1f} dB \u00b7 Initial linear estimates"
+            )
         self._update_balance_strip(graph_dict, staging_enabled)
         self._update_graph_banners(graph_dict, staging_enabled)
         self._populate_table(graph_dict, target_pk, rms_off, staging_enabled)
@@ -927,6 +985,7 @@ class SignalFlowPanel(QWidget):
             active_only=self.active_only_cb.isChecked(),
             staging_enabled=staging_enabled,
             selected_node=self._selected_node,
+            daw_mode=self._daw_mode,
         )
         self._update_path_bar(self._selected_node)
         self._update_footer(graph_dict, conv, staging_enabled)
@@ -973,13 +1032,19 @@ class SignalFlowPanel(QWidget):
             if total_ins > 0
             else ""
         )
-        self._balance_lbl.setText(f"{glyph}  {summary or 'Balance summary unavailable'}{ins_cue}")
+        summary_display = (
+            summary.replace("busses", "buses").replace("Slot A", "Slot 1")
+            if self._daw_mode == "dawproject"
+            else summary
+        )
+        self._balance_lbl.setText(f"{glyph}  {summary_display or 'Balance summary unavailable'}{ins_cue}")
+        slot_lbl = "Slot 1" if self._daw_mode == "dawproject" else "Slot A"
         tips: list[str] = [
-            "Bus levels and Slot A trims are initial linear estimates (unity non-trim inserts, initial faders, post-fader sends excluded)."
+            f"Bus levels and {slot_lbl} trims are initial linear estimates (unity non-trim inserts, initial faders, post-fader sends excluded)."
         ]
         blocked_map = val.get("blocked_busses") or {}
         if isinstance(blocked_map, dict) and blocked_map:
-            tips.append("Blocked Slot A busses:\n" + "\n".join(f"{k}: {v}" for k, v in blocked_map.items()))
+            tips.append(f"Blocked {slot_lbl} buses:\n" + "\n".join(f"{k}: {v}" for k, v in blocked_map.items()))
         if unsim:
             tips.append("Unsimulated active inserts (linear estimate):\n" + "\n".join(unsim))
         for cav in val.get("pre_fader_send_caveats") or ():
@@ -1048,7 +1113,14 @@ class SignalFlowPanel(QWidget):
                 rows = tiers[tier_id]
                 if not rows:
                     continue
-                self._append_tier_row(_tier_heading(tier_id, has_trims=has_trims))
+                self._append_tier_row(
+                    _tier_heading(
+                        tier_id,
+                        has_trims=has_trims,
+                        daw_mode=self._daw_mode,
+                        fader_ceiling_db=self._fader_ceiling_db,
+                    )
+                )
                 for node in rows:
                     self._append_bus_row(node, target_pk, rms_off, staging_enabled)
         finally:
@@ -1134,7 +1206,7 @@ class SignalFlowPanel(QWidget):
         self.table.setItem(r, 1, _mk(gov_txt, gov_col, bold=gov_bold))
         self.table.setItem(r, 2, _mk(_format_pk_rms_pair(in_pk, in_rms, rms_off), in_col, bold=(in_clip or in_hot)))
 
-        trim_txt, trim_col, trim_bold = _format_slot_a_cell(node, staging_enabled)
+        trim_txt, trim_col, trim_bold = _format_slot_a_cell(node, staging_enabled, daw_mode=self._daw_mode)
         self.table.setItem(r, 3, _mk(trim_txt, trim_col, bold=trim_bold))
 
         ins_col = COLORS["attention"] if ins_hot else (COLORS["clean"] if (staged and ins_pk is not None) else name_col)
@@ -1153,7 +1225,9 @@ class SignalFlowPanel(QWidget):
 
         net_txt, net_col, net_bold = self._format_net_delta_cell(node, blocked=blocked, staged=staged, overridden=overridden, meta_col=meta_col)
         self.table.setItem(r, 7, _mk(net_txt, net_col, bold=net_bold))
-        self.table.setItem(r, 8, _mk(_node_notes(node, staging_enabled=staging_enabled), COLORS["problems"] if blocked else meta_col))
+        self.table.setItem(
+            r, 8, _mk(_node_notes(node, staging_enabled=staging_enabled, daw_mode=self._daw_mode), COLORS["problems"] if blocked else meta_col),
+        )
 
     def _set_fader_editor_cell(
         self, row: int, bus_name: str, value_db: float, auto_db: float, overridden: bool,
@@ -1167,6 +1241,7 @@ class SignalFlowPanel(QWidget):
         lay.setContentsMargins(4, 2, 4, 2)
         lay.setSpacing(4)
         spin = BusFaderSpinBox(cell)
+        spin.setRange(-144.0, self._fader_ceiling_db)
         spin.setAccessibleName(f"{bus_name} target fader (dB)")
         spin.setValue(value_db)
         spin.valueChanged.connect(lambda val, bn=bus_name: self._emit_override(bn, val))
@@ -1204,7 +1279,11 @@ class SignalFlowPanel(QWidget):
         if self._last_graph is None or not node_name:
             self.path_bar.hide()
             return
-        trace = trace_signal_flow_path(self._last_graph, node_name)
+        trace = trace_signal_flow_path(
+            self._last_graph,
+            node_name,
+            leaf_pre_label="Trim" if self._daw_mode == "dawproject" else "CG",
+        )
         if not trace.equation_text:
             self.path_bar.hide()
             return
@@ -1240,7 +1319,15 @@ class SignalFlowPanel(QWidget):
                 master_pk = master.get("pre_fader_peak_db")
         master_txt = f" \u00b7 Master Peak: {_format_db(master_pk)}" if master_pk is not None else ""
         scale_txt = "AES17 RMS (+3.01 dB, peaks unshifted)" if conv == "aes17" else "Standard dBFS"
-        self.footer_label.setText(
-            f"Staged on Create: {staged_txt}{master_txt} \u00b7 Initial linear estimates \u00b7 Scale: {scale_txt} \u00b7 Atomic post-close .ptx pass with rollback"
-        )
+        if self._daw_mode == "dawproject":
+            mode_tag = "Calibrated" if self._apply_trim_gain else "Unity 0.0 dB"
+            self.footer_label.setText(
+                f"Auto-staged on Create ({mode_tag}): {staged_txt}{master_txt} \u00b7 "
+                f"Initial linear estimates \u00b7 {scale_txt} \u00b7 Atomic .dawproject ZIP export (template preserved)"
+            )
+        else:
+            self.footer_label.setText(
+                f"Staged on Create: {staged_txt}{master_txt} \u00b7 Initial linear estimates \u00b7 "
+                f"Scale: {scale_txt} \u00b7 Atomic post-close .ptx pass with rollback"
+            )
         self.footer_label.show()

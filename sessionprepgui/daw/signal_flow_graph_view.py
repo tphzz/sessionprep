@@ -35,7 +35,7 @@ from PySide6.QtWidgets import (
 )
 
 from sessionpreplib.audio import dbfs_offset
-from sessionpreplib.ptx.signal_flow_analysis import (
+from sessionpreplib.signal_flow import (
     GraphLayoutEdge,
     GraphLayoutNode,
     PathTraceResult,
@@ -109,9 +109,9 @@ def _fmt_pair(pk: Any, rms: Any, rms_off: float) -> str:
     return f"{_fmt_num(pk)} / {_fmt_num(rms, rms_off)}"
 
 
-def _role_badge(role: str, node: dict[str, Any]) -> tuple[str, str]:
+def _role_badge(role: str, node: dict[str, Any], *, daw_mode: str = "protools") -> tuple[str, str]:
     if role == "blocked":
-        return "SLOT A BLOCKED", COLORS["problems"]
+        return ("SLOT 1 BLOCKED" if daw_mode == "dawproject" else "SLOT A BLOCKED"), COLORS["problems"]
     if node.get("is_overridden"):
         diff = _safe_float(node.get("recommended_fader_db")) - _safe_float(node.get("auto_fader_db"))
         return f"{_fmt_num(diff, signed=True)} \u26a0", _OVERRIDE_BORDER
@@ -137,22 +137,30 @@ def _card_metric_lines(
     rms_off: float,
     target_pk: float,
     staging_enabled: bool,
+    *,
+    daw_mode: str = "protools",
 ) -> list[tuple[str, str, str]]:
     """Return ``(label, value, color_hex)`` lines for one DAG node card."""
+    is_dp = daw_mode == "dawproject"
     if role == "blocked":
         in_txt = _fmt_pair(node.get("pre_insert_peak_db"), node.get("pre_insert_rms_db"), rms_off)
         return [
             ("In", in_txt, COLORS["text"]),
-            ("Slot A", "Occupied / Blocked", COLORS["problems"]),
-            ("Action", "Move plugin to Slot B", COLORS["attention"]),
+            ("S1" if is_dp else "Slot A", "Occupied / Blocked", COLORS["problems"]),
+            ("Action", "Move plugin to Slot 2" if is_dp else "Move plugin to Slot B", COLORS["attention"]),
         ]
     if role == "leaf":
         baked = _safe_float(node.get("baked_gain_db"))
         cg = _safe_float(node.get("clip_gain_db"))
+        ltrim = _safe_float(node.get("leaf_trim_db"))
         fdr = _fmt_num(node.get("recommended_fader_db", 0.0), signed=True)
         net = _fmt_num(node.get("net_gain_delta_db", 0.0), signed=True)
-        lbl = "Bk / Fdr" if (abs(baked) >= 0.05 and abs(cg) < 0.05) else "CG / Fdr"
-        src_v = _fmt_num(baked if (abs(baked) >= 0.05 and abs(cg) < 0.05) else cg, signed=True)
+        if abs(baked) >= 0.05 and abs(cg) < 0.05 and abs(ltrim) < 0.05:
+            lbl, src_v = "Bk / Fdr", _fmt_num(baked, signed=True)
+        elif is_dp or abs(ltrim) >= 0.05:
+            lbl, src_v = "S1 / Fdr", _fmt_num(ltrim, signed=True)
+        else:
+            lbl, src_v = "CG / Fdr", _fmt_num(cg, signed=True)
         return [
             (lbl, f"{src_v} / {fdr} dB", COLORS["text"]),
             ("Out / \u0394", f"{_fmt_num(node.get('post_fader_peak_db'))} pk \u00b7 {net}", COLORS["metadata"]),
@@ -190,7 +198,7 @@ def _card_metric_lines(
     )
     return [
         ("In", _fmt_pair(in_pk, in_rms, rms_off), COLORS["metadata"]),
-        ("Slot A", trim_txt, trim_col),
+        ("S1" if is_dp else "Slot A", trim_txt, trim_col),
         ("Ins", _fmt_pair(ins_pk, ins_rms, rms_off), COLORS["attention"] if ins_hot else COLORS["clean"]),
         ("Fdr", fdr_txt, fdr_col),
         ("Out", f"{_fmt_num(out_pk)}/{_fmt_num(out_rms, rms_off)} \u0394{_fmt_num(net_val, signed=True)}", net_col),
@@ -211,14 +219,18 @@ class _NodeCardItem(QGraphicsRectItem):
         on_click: Any,
         on_double_click: Any,
         on_hover: Any,
+        daw_mode: str = "protools",
     ) -> None:
         super().__init__(0.0, 0.0, layout_node.width, layout_node.height)
         self.setPos(layout_node.x, layout_node.y)
         self.layout_node = layout_node
         self.node_dict = node_dict
         self.node_name = layout_node.name
-        self._lines = _card_metric_lines(layout_node.role, node_dict, rms_off, target_pk, staging_enabled)
-        self._badge_txt, self._badge_col = _role_badge(layout_node.role, node_dict)
+        self._daw_mode = daw_mode
+        self._lines = _card_metric_lines(
+            layout_node.role, node_dict, rms_off, target_pk, staging_enabled, daw_mode=daw_mode,
+        )
+        self._badge_txt, self._badge_col = _role_badge(layout_node.role, node_dict, daw_mode=daw_mode)
         self._on_click = on_click
         self._on_double_click = on_double_click
         self._on_hover = on_hover
@@ -240,7 +252,8 @@ class _NodeCardItem(QGraphicsRectItem):
             return
         lines = [f"{self.node_name} ({n.get('track_type', '')})"]
         if n.get("slot_a_trim_plugin"):
-            lines.append(f"Slot A: {n['slot_a_trim_plugin']} ({_fmt_num(n.get('recommended_trim_db', 0.0), signed=True)} dB)")
+            slot_lbl = "Slot 1" if self._daw_mode == "dawproject" else "Slot A"
+            lines.append(f"{slot_lbl}: {n['slot_a_trim_plugin']} ({_fmt_num(n.get('recommended_trim_db', 0.0), signed=True)} dB)")
         if n.get("active_inserts"):
             lines.append("Inserts: " + ", ".join(str(x) for x in n["active_inserts"]))
         if n.get("staged"):
@@ -600,12 +613,13 @@ class SignalFlowGraphView(QWidget):
         active_only: bool = True,
         staging_enabled: bool = True,
         selected_node: str | None = None,
+        daw_mode: str = "protools",
     ) -> None:
         self._graph = graph_dict
         self._staging_enabled = staging_enabled
         self._hovered_node = None
         self._layout = compute_signal_flow_graph_layout(graph_dict, active_only=active_only)
-        self._rebuild_scene(graph_dict, self._layout, staging_enabled)
+        self._rebuild_scene(graph_dict, self._layout, staging_enabled, daw_mode=daw_mode)
         order = list(graph_dict.get("topological_order") or self._layout.nodes.keys())
         self.view.set_navigation_graph(order, self._layout.nodes)
         target_sel = selected_node if selected_node in self._card_items else None
@@ -616,6 +630,8 @@ class SignalFlowGraphView(QWidget):
         graph_dict: dict[str, Any],
         layout: SignalFlowGraphLayout,
         staging_enabled: bool,
+        *,
+        daw_mode: str = "protools",
     ) -> None:
         self.scene.clear()
         self._card_items.clear()
@@ -629,7 +645,8 @@ class SignalFlowGraphView(QWidget):
         hdr_font.setPointSizeF(7.5)
         hdr_font.setBold(True)
         for _col, title, cx, _cw in layout.columns:
-            lbl = QGraphicsSimpleTextItem(title)
+            col_title = title.replace("SUBGROUP AUXES", "SUBMIX BUSES").replace("STEM AUXES", "STEM BUSES") if daw_mode == "dawproject" else title
+            lbl = QGraphicsSimpleTextItem(col_title)
             lbl.setFont(hdr_font)
             lbl.setBrush(QBrush(QColor(COLORS["metadata"])))
             lbl.setPos(cx, 12.0)
@@ -655,6 +672,7 @@ class SignalFlowGraphView(QWidget):
                 on_click=lambda nm=name: self.select_node(nm, emit=True),
                 on_double_click=self._on_card_double_clicked,
                 on_hover=self._on_card_hover,
+                daw_mode=daw_mode,
             )
             card.setZValue(2.0)
             self.scene.addItem(card)

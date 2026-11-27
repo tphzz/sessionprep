@@ -12,20 +12,32 @@ Supports three verified AAX gain-trim plugins in Insert Slot A:
 from __future__ import annotations
 
 from dataclasses import dataclass
-import json
 import logging
 import math
-import re
 import struct
 from typing import Any
 import zlib
 
+from ..signal_flow.trim_codecs import (
+    PROTILITY_MAX_DB,
+    PROTILITY_MIN_DB,
+    TRACKCONTROL_MAX_DB,
+    TRACKCONTROL_MIN_DB,
+    decode_trackcontrol_dgct_zip,
+    extract_trackcontrol_gain,
+    norm_zero as _norm_zero,
+    patch_protility_vc2_xml,
+    patch_trackcontrol_dgct_zip,
+    protility_db_to_norm,
+    read_protility_vc2_xml,
+    select_preferred_trim_donor,
+    trackcontrol_norm_to_db,
+)
 from .codec import decrypt_ptx, encrypt_ptx, find_subchunks, shift_index_0002, validate_index_0002
 from .models import PtxPluginInfo, SlotATrimInfo
 
 log = logging.getLogger(__name__)
 
-_MAX_DGCT_JSON_BYTES = 2 * 1024 * 1024
 _AVID_OFF_I32 = -0x80000000
 
 
@@ -62,8 +74,8 @@ SLOT_A_TRIM_SPECS: tuple[SlotATrimSpec, ...] = (
         product_4cc="TrCt",
         type_4ccs=("RTMN", "RTST"),
         bundle_ids=("com.dmgaudio.TrackControl.aax",),
-        min_db=-200.0,
-        max_db=18.0,
+        min_db=TRACKCONTROL_MIN_DB,
+        max_db=TRACKCONTROL_MAX_DB,
     ),
     SlotATrimSpec(
         plugin_id="trim",
@@ -82,8 +94,8 @@ SLOT_A_TRIM_SPECS: tuple[SlotATrimSpec, ...] = (
         product_4cc="PrTy",
         type_4ccs=("jcbb", "jccc"),
         bundle_ids=("com.Process.Audio.Protility",),
-        min_db=-60.0,
-        max_db=24.0,
+        min_db=PROTILITY_MIN_DB,
+        max_db=PROTILITY_MAX_DB,
     ),
 )
 
@@ -103,48 +115,8 @@ _AVID_TRIM_TAPER: tuple[tuple[float, int], ...] = (
     (6.0, 1023),
 )
 
-_PROTILITY_ACTIVE_SLOT_RE = re.compile(r'activeSlot="([AB])"')
-_PROTILITY_GAIN_RE = re.compile(r'(<PARAM\s+id="GAIN"\s+value=")([^"]*)(")')
-_PROTILITY_PARAM_RE = re.compile(r'<PARAM\s+id="([^"]+)"\s+value="([^"]*)"')
-_PROTILITY_MODIFIED_RE = re.compile(r'PRESET_MODIFIED="0"')
 _MONO_ONLY_4CCS = frozenset({"RTMN", "jcbb"})
 _STEREO_ONLY_4CCS = frozenset({"RTST", "jccc"})
-_PROTILITY_CLEAN_DEFAULTS: dict[str, float] = {
-    "BASS_MONO_ENABLED": 0.0,
-    "BASS_MONO_FREQ": 10.0,
-    "DUAL_PAN_L": -100.0,
-    "DUAL_PAN_R": 100.0,
-    "GAIN_L": 0.0,
-    "GAIN_MODE": 0.0,
-    "GAIN_R": 0.0,
-    "HP_ENABLED": 0.0,
-    "HP_FREQ": 10.0,
-    "HP_SLOPE": 1.0,
-    "MID_GAIN": 100.0,
-    "MONO_MODE": 0.0,
-    "PAN": 0.0,
-    "PAN_MODE": 0.0,
-    "PHASE_INVERT_L": 0.0,
-    "PHASE_INVERT_LINK": 1.0,
-    "PHASE_INVERT_R": 0.0,
-    "PHASE_SHIFT": 10.0,
-    "PHASE_SHIFT_ENABLED": 0.0,
-    "SIDE_GAIN": 100.0,
-    "STEREO_MODE": 0.0,
-    "TIMING_ENABLED": 0.0,
-    "TIMING_LINK": 1.0,
-    "TIMING_MS_L": 0.0,
-    "TIMING_MS_R": 0.0,
-    "TIMING_SAMPLES_L": 0.0,
-    "TIMING_SAMPLES_R": 0.0,
-    "TIMING_TYPE": 0.0,
-    "TRIM": 100.0,
-    "WIDTH": 100.0,
-    "WIDTH_ENABLED": 1.0,
-    "WIDTH_MODE": 0.0,
-    "BALANCE_LAW": 0.0,
-    "PAN_LAW": 1.0,
-}
 
 
 def match_slot_a_trim_spec(pinfo: PtxPluginInfo) -> SlotATrimSpec | None:
@@ -158,23 +130,6 @@ def match_slot_a_trim_spec(pinfo: PtxPluginInfo) -> SlotATrimSpec | None:
         ):
             return spec
     return None
-
-
-def _f32_round(val: float) -> float:
-    return float(struct.unpack("<f", struct.pack("<f", val))[0])
-
-
-def _norm_zero(val: float) -> float:
-    return 0.0 if abs(val) < 1e-9 else val
-
-
-def _decompress_bounded(data: bytes, max_bytes: int = _MAX_DGCT_JSON_BYTES) -> bytes:
-    """Decompress *data* enforcing a strict *max_bytes* ceiling against decompression bombs."""
-    decomp = zlib.decompressobj()
-    out = decomp.decompress(data, max_bytes + 1)
-    if len(out) > max_bytes or not decomp.eof:
-        raise ValueError(f"Compressed plugin payload exceeds {max_bytes} byte safety limit.")
-    return out
 
 
 def avid_trim_db_to_step(db: float) -> int:
@@ -220,34 +175,6 @@ def _avid_trim_i32_to_step(raw_i32: int) -> int:
     return max(0, min(1023, int(round(u * 1023.0))))
 
 
-def _find_protility_active_slot_span(xml_str: str) -> tuple[int, int] | None:
-    """Return ``(start, end)`` character span of Protility's active ``<slotA>`` or ``<slotB>`` block."""
-    slot_match = _PROTILITY_ACTIVE_SLOT_RE.search(xml_str)
-    slot_tag = f"slot{slot_match.group(1)}" if slot_match else "slotA"
-    m = re.search(rf"<{slot_tag}\b[^>]*>.*?</{slot_tag}>", xml_str, flags=re.DOTALL)
-    return (m.start(), m.end()) if m else None
-
-
-def _is_protility_slot_clean(xml_str: str, slot_xml: str) -> bool:
-    slot_match = _PROTILITY_ACTIVE_SLOT_RE.search(xml_str)
-    if slot_match and slot_match.group(1) != "A":
-        return False
-    found_any = False
-    for pid, val_s in _PROTILITY_PARAM_RE.findall(slot_xml):
-        found_any = True
-        if pid == "GAIN":
-            continue
-        expected = _PROTILITY_CLEAN_DEFAULTS.get(pid)
-        if expected is None:
-            return False
-        try:
-            if abs(float(val_s) - expected) > 1e-3:
-                return False
-        except ValueError:
-            return False
-    return found_any
-
-
 def _read_trackcontrol_state(b1038: bytes, expected_tag: bytes) -> tuple[float, bool] | None:
     if expected_tag not in b1038[:64]:
         return None
@@ -262,25 +189,12 @@ def _read_trackcontrol_state(b1038: bytes, expected_tag: bytes) -> tuple[float, 
     if zpos == -1 or z_end > len(b1038) or zpos + 4 >= z_end:
         return None
     try:
-        raw_json = _decompress_bounded(b1038[zpos + 4 : z_end])
-        js = json.loads(raw_json.rstrip(b"\x00 ").decode("utf-8"))
-        if not isinstance(js, dict):
-            return None
-        settings = js.get("settings")
-        cur_ab = int(settings.get("currentAB", 0)) if isinstance(settings, dict) else 0
-        ab_list = js.get("ab")
-        if isinstance(ab_list, list) and 0 <= cur_ab < len(ab_list) and isinstance(ab_list[cur_ab], dict):
-            params = ab_list[cur_ab].get("parameters")
-            if params == "default":
-                return 0.0, (cur_ab == 0)
-            if isinstance(params, dict) and "kOpGain" in params:
-                val = float(params["kOpGain"])
-                if not math.isfinite(val):
-                    return None
-                clean = cur_ab == 0 and set(params.keys()) <= {"kOpGain"}
-                return _norm_zero(round(val * 218.0 - 200.0, 2)), clean
+        js, _trailing = decode_trackcontrol_dgct_zip(b1038[zpos + 4 : z_end])
+        parsed = extract_trackcontrol_gain(js)
+        if parsed is not None:
+            return parsed
         elck_val = struct.unpack_from(">d", b1038, ep + 8)[0]
-        return (_norm_zero(round(elck_val * 218.0 - 200.0, 2)), False) if math.isfinite(elck_val) else None
+        return (trackcontrol_norm_to_db(elck_val), False) if math.isfinite(elck_val) else None
     except (ValueError, TypeError, KeyError, zlib.error, UnicodeDecodeError):
         return None
 
@@ -315,24 +229,7 @@ def _read_protility_state(b1038: bytes, expected_tag: bytes) -> tuple[float, boo
     xml_start = vc2 + 8
     if xml_start + xml_len > chunk_end:
         return None
-    try:
-        xml_str = b1038[xml_start : xml_start + xml_len].rstrip(b"\x00").decode("utf-8")
-    except UnicodeDecodeError:
-        return None
-    span = _find_protility_active_slot_span(xml_str)
-    if span is None:
-        return None
-    slot_xml = xml_str[span[0] : span[1]]
-    match = _PROTILITY_GAIN_RE.search(slot_xml)
-    if not match:
-        return None
-    try:
-        val = float(match.group(2))
-    except ValueError:
-        return None
-    if not math.isfinite(val):
-        return None
-    return _norm_zero(round(val, 2)), _is_protility_slot_clean(xml_str, slot_xml)
+    return read_protility_vc2_xml(b1038[xml_start : xml_start + xml_len])
 
 
 def inspect_slot_a_trim(
@@ -393,25 +290,6 @@ def inspect_slot_a_trim(
     )
 
 
-def _update_trackcontrol_json(js: dict[str, Any], norm_rounded: float) -> None:
-    settings = js.get("settings")
-    cur_ab = int(settings.get("currentAB", 0)) if isinstance(settings, dict) else 0
-    ab_list = js.get("ab")
-    if isinstance(ab_list, list) and 0 <= cur_ab < len(ab_list) and isinstance(ab_list[cur_ab], dict):
-        params = ab_list[cur_ab].get("parameters")
-        if not isinstance(params, dict):
-            params = {}
-        params["kOpGain"] = norm_rounded
-        ab_list[cur_ab]["parameters"] = params
-    presets = js.get("presets")
-    if isinstance(presets, list) and len(presets) == 1 and isinstance(presets[0], dict):
-        p_params = presets[0].get("parameters")
-        if not isinstance(p_params, dict):
-            p_params = {}
-        p_params["kOpGain"] = norm_rounded
-        presets[0]["parameters"] = p_params
-
-
 def _patch_trackcontrol_1038(b1038: bytes, gain_db: float, expected_tag: bytes) -> bytes:
     if len(b1038) < 21 or expected_tag not in b1038[:64]:
         raise ValueError("TrackControl 0x1038 chunk missing expected AAX header.")
@@ -419,12 +297,10 @@ def _patch_trackcontrol_1038(b1038: bytes, gain_db: float, expected_tag: bytes) 
     if 17 + old_inner_len > len(b1038):
         raise ValueError("TrackControl 0x1038 inner length out of bounds.")
     buf = bytearray(b1038)
-    norm = _f32_round((gain_db + 200.0) / 218.0)
     dgct = buf.find(b"DGCT")
     ep = buf.find(b"d_2dl \x00\x00", 0, dgct) if dgct >= 20 else -1
     if ep == -1 or ep + 16 > dgct:
         raise ValueError("TrackControl 0x1038 chunk missing expected elck/DGCT structure.")
-    struct.pack_into(">d", buf, ep + 8, norm)
 
     chunk_start = dgct - 20
     old_chunk_len = struct.unpack_from(">I", buf, chunk_start)[0]
@@ -432,14 +308,9 @@ def _patch_trackcontrol_1038(b1038: bytes, gain_db: float, expected_tag: bytes) 
     z_end = chunk_start + old_chunk_len
     if zpos == -1 or z_end > len(buf) or zpos + 4 >= z_end:
         raise ValueError("TrackControl DGCT ZIP payload out of bounds.")
-    raw_json = _decompress_bounded(bytes(buf[zpos + 4 : z_end]))
-    trailing = raw_json[len(raw_json.rstrip(b"\x00 ")) :]
-    js = json.loads(raw_json.rstrip(b"\x00 ").decode("utf-8"))
-    if not isinstance(js, dict):
-        raise ValueError("TrackControl DGCT JSON root is not an object.")
-    _update_trackcontrol_json(js, round(norm, 10))
+    new_zip, norm = patch_trackcontrol_dgct_zip(bytes(buf[zpos + 4 : z_end]), gain_db)
+    struct.pack_into(">d", buf, ep + 8, norm)
 
-    new_zip = zlib.compress(json.dumps(js, indent="\t").encode("utf-8") + trailing)
     delta = len(new_zip) - (z_end - (zpos + 4))
     buf[zpos + 4 : z_end] = new_zip
     struct.pack_into(">I", buf, chunk_start, old_chunk_len + delta)
@@ -468,7 +339,7 @@ def _patch_protility_1038(b1038: bytes, gain_db: float, expected_tag: bytes) -> 
     if 17 + old_inner_len > len(b1038):
         raise ValueError("Protility 0x1038 inner length out of bounds.")
     buf = bytearray(b1038)
-    norm = _f32_round((gain_db + 60.0) / 84.0)
+    norm = protility_db_to_norm(gain_db)
     juce = buf.find(b"juce")
     gp = buf.find(b"d_GAIN\x00\x00", 0, juce) if juce >= 20 else -1
     if gp == -1 or gp + 16 > juce:
@@ -487,20 +358,7 @@ def _patch_protility_1038(b1038: bytes, gain_db: float, expected_tag: bytes) -> 
     xml_start = vc2 + 8
     if xml_start + old_xml_len > chunk_end:
         raise ValueError("Protility XML payload out of bounds.")
-    xml_bytes = bytes(buf[xml_start : xml_start + old_xml_len])
-    had_nul = xml_bytes.endswith(b"\x00")
-    xml_str = xml_bytes.rstrip(b"\x00").decode("utf-8")
-    span = _find_protility_active_slot_span(xml_str)
-    if span is None:
-        raise ValueError("Protility XML missing active slot element.")
-    slot_xml = xml_str[span[0] : span[1]]
-    val_str = f"{_norm_zero(gain_db):.1f}"
-    new_slot_xml, count = _PROTILITY_GAIN_RE.subn(rf"\g<1>{val_str}\g<3>", slot_xml, count=1)
-    if count != 1:
-        raise ValueError("Protility active slot XML missing <PARAM id='GAIN'> element.")
-    new_slot_xml = _PROTILITY_MODIFIED_RE.sub('PRESET_MODIFIED="1"', new_slot_xml, count=1)
-    new_xml_str = xml_str[: span[0]] + new_slot_xml + xml_str[span[1] :]
-    new_xml_bytes = new_xml_str.encode("utf-8") + (b"\x00" if had_nul else b"")
+    new_xml_bytes = patch_protility_vc2_xml(bytes(buf[xml_start : xml_start + old_xml_len]), gain_db)
     delta = len(new_xml_bytes) - old_xml_len
     buf[xml_start : xml_start + old_xml_len] = new_xml_bytes
     struct.pack_into("<I", buf, vc2 + 4, len(new_xml_bytes))
@@ -530,36 +388,9 @@ class _SlotAEmptyLocation:
     slot0_end: int
 
 
-_PLUGIN_TIE_ORDER = {"trackcontrol": 0, "trim": 1, "protility": 2}
-
-
 def select_preferred_slot_a_trim_donor(session: Any, track_format: str) -> Any | None:
     """Return the cleanest verified donor track for the most-used Slot A Trim matching *track_format*."""
-    if track_format not in ("Mono", "Stereo"):
-        return None
-    clean_candidates = [
-        trk for trk in session.tracks
-        if trk.slot_a_trim is not None and trk.slot_a_trim.is_clean_donor and trk.format == track_format
-    ]
-    if not clean_candidates:
-        return None
-    # Count usage across all validated same-format Slot A trims, selecting the highest-used plugin that has a clean donor
-    total_counts: dict[str, int] = {}
-    for trk in session.tracks:
-        if trk.slot_a_trim is not None and trk.format == track_format:
-            pid = trk.slot_a_trim.plugin_id
-            total_counts[pid] = total_counts.get(pid, 0) + 1
-    avail_pids = {trk.slot_a_trim.plugin_id for trk in clean_candidates}
-    best_pid = min(avail_pids, key=lambda pid: (-total_counts.get(pid, 0), _PLUGIN_TIE_ORDER.get(pid, 99), pid))
-    matching = [trk for trk in clean_candidates if trk.slot_a_trim.plugin_id == best_pid]
-    matching.sort(
-        key=lambda t: (
-            t.slot_a_trim.is_bypassed,
-            abs(t.slot_a_trim.gain_db) >= 0.05,
-            t.index,
-        )
-    )
-    return matching[0]
+    return select_preferred_trim_donor(session.tracks, track_format)
 
 
 def _first_slot_in_2627(b2627: bytes, p2627: int) -> tuple[int, int, int] | None:

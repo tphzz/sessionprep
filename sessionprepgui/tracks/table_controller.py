@@ -134,6 +134,7 @@ class TrackTableController(QObject):
         on_create_group_combo: Callable[[int, Any], None] | None = None,
         on_is_analysis_running: Callable[[], bool] | None = None,
         on_is_repair_running: Callable[[], bool] | None = None,
+        on_get_dawproject_topology: Callable[[], Any] | None = None,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
@@ -147,6 +148,7 @@ class TrackTableController(QObject):
         self._on_create_group_combo = on_create_group_combo
         self._on_is_analysis_running = on_is_analysis_running
         self._on_is_repair_running = on_is_repair_running
+        self._on_get_dawproject_topology = on_get_dawproject_topology
 
         self.batch_filenames: set[str] = set()
 
@@ -308,32 +310,43 @@ class TrackTableController(QObject):
             gcm_rank = group_utils.group_rank_map(self._state)
             glm = group_utils.gain_linked_map(self._state)
 
+            from sessionpreplib.daw_processors.dawproject import DawProjectDawProcessor
             from sessionpreplib.daw_processors.protools import ProToolsDawProcessor
 
             assignments: dict[str, str] = {}
             leaf_shift_db = 0.0
+            fader_ceiling_db = 12.0
             if session.daw_state and self._state.active_daw_processor:
                 dp_state = session.daw_state.get(self._state.active_daw_processor.id, {})
                 assignments = dp_state.get("assignments", {})
             else:
                 dp_state = {}
             pt_gain_mode = "clip_gain_and_fader"
-            if isinstance(self._state.active_daw_processor, ProToolsDawProcessor):
+            active_dp = self._state.active_daw_processor
+            if isinstance(active_dp, ProToolsDawProcessor):
                 flat = self._state.flat_config()
                 pt_gain_mode = str(flat.get("protools_gain_mode", "clip_gain_and_fader"))
-                if pt_gain_mode == "clip_gain_and_fader" and bool(flat.get("protools_stage_bus_faders", True)):
-                    sf = dp_state.get("signal_flow")
-                    if isinstance(sf, dict):
-                        raw_sh = sf.get("leaf_fader_shift_db", 0.0)
-                        try:
-                            sh_f = float(raw_sh) if raw_sh is not None and not isinstance(raw_sh, bool) else 0.0
-                        except (TypeError, ValueError):
-                            sh_f = 0.0
-                        leaf_shift_db = sh_f if math.isfinite(sh_f) else 0.0
+                can_shift = pt_gain_mode == "clip_gain_and_fader" and bool(flat.get("protools_stage_bus_faders", True))
+                leaf_shift_db = self._read_leaf_shift_db(dp_state) if can_shift else 0.0
+            elif isinstance(active_dp, DawProjectDawProcessor):
+                flat = self._state.flat_config()
+                pt_gain_mode = str(flat.get("dawproject_gain_mode", "trim_and_fader"))
+                fader_ceiling_db = float(active_dp.fader_ceiling_db)
+                topo = self._on_get_dawproject_topology() if self._on_get_dawproject_topology is not None else None
+                has_cal = bool(getattr(topo, "has_calibrated_donor", False))
+                can_shift = (
+                    bool(flat.get("dawproject_apply_trim_gain", False))
+                    and bool(flat.get("dawproject_insert_track_trim", True))
+                    and has_cal
+                    and pt_gain_mode == "trim_and_fader"
+                    and bool(flat.get("dawproject_stage_bus_faders", True))
+                )
+                leaf_shift_db = self._read_leaf_shift_db(dp_state) if can_shift else 0.0
 
             for row, entry in enumerate(manifest):
                 self._populate_setup_row(
-                    row, entry, out_map, assignments, gcm, gcm_rank, glm, pt_gain_mode, leaf_shift_db,
+                    row, entry, out_map, assignments, gcm, gcm_rank, glm,
+                    pt_gain_mode, leaf_shift_db, fader_ceiling_db,
                 )
         finally:
             table.setSortingEnabled(True)
@@ -348,6 +361,18 @@ class TrackTableController(QObject):
         self.setup_column_modes_requested.emit()
         self.setup_splitter_fit_requested.emit()
 
+    @staticmethod
+    def _read_leaf_shift_db(dp_state: dict[str, Any]) -> float:
+        sf = dp_state.get("signal_flow")
+        if not isinstance(sf, dict):
+            return 0.0
+        raw_sh = sf.get("leaf_fader_shift_db", 0.0)
+        try:
+            sh_f = float(raw_sh) if raw_sh is not None and not isinstance(raw_sh, bool) else 0.0
+        except (TypeError, ValueError):
+            sh_f = 0.0
+        return sh_f if math.isfinite(sh_f) else 0.0
+
     def _populate_setup_row(
         self,
         row: int,
@@ -359,6 +384,7 @@ class TrackTableController(QObject):
         glm: dict[str, bool],
         pt_gain_mode: str = "clip_gain_and_fader",
         leaf_shift_db: float = 0.0,
+        fader_ceiling_db: float = 12.0,
     ) -> None:
         table = self._setup_table
         assert table is not None
@@ -393,7 +419,7 @@ class TrackTableController(QObject):
         clip_text, clip_val, fader_text, fader_val = self._setup_gain_display(track, pr, pt_gain_mode)
         shifted_row = assigned and abs(leaf_shift_db) >= 0.05
         if shifted_row:
-            fader_val = round(max(-144.0, min(12.0, fader_val + leaf_shift_db)), 1)
+            fader_val = round(max(-144.0, min(fader_ceiling_db, fader_val + leaf_shift_db)), 1)
             fader_text = self._fmt_signed_db(fader_val)
         cg_item = _SortableItem(clip_text, clip_val)
         cg_item.setFlags(cg_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
@@ -404,8 +430,11 @@ class TrackTableController(QObject):
         fg_item.setFlags(fg_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
         fg_item.setForeground(QColor(COLORS["information"] if shifted_row else COLORS["text"]))
         if shifted_row:
+            from sessionpreplib.daw_processors.dawproject import DawProjectDawProcessor
+
+            bus_word = "buses" if isinstance(self._state.active_daw_processor, DawProjectDawProcessor) else "busses"
             fg_item.setToolTip(
-                f"Includes {leaf_shift_db:+.1f} dB global leaf headroom shift so downstream busses converge."
+                f"Includes {leaf_shift_db:+.1f} dB global leaf headroom shift so downstream {bus_word} converge."
             )
         table.setItem(row, 5, fg_item)
 
@@ -424,6 +453,8 @@ class TrackTableController(QObject):
         return "0.0 dB" if abs(val) < 0.05 else f"{val:+.1f} dB"
 
     def _setup_gain_display(self, track: Any, pr: Any, pt_gain_mode: str) -> tuple[str, float, str, float]:
+        from sessionpreplib.daw_processors.dawproject import DawProjectDawProcessor
+        from sessionpreplib.daw_processors.dawproject_signal_flow import resolve_dawproject_track_staging
         from sessionpreplib.daw_processors.protools import ProToolsDawProcessor
         from sessionpreplib.daw_processors.protools_ptx import (
             GAIN_MODE_CLIP_UNITY,
@@ -436,6 +467,31 @@ class TrackTableController(QObject):
         session = self._state.session
         clip_gain = pr.gain_db if pr else 0.0
         fader_gain = pr.data.get("fader_offset", 0.0) if pr else 0.0
+        if isinstance(dp, DawProjectDawProcessor) and track is not None and session is not None:
+            flat = self._state.flat_config()
+            topo = self._on_get_dawproject_topology() if self._on_get_dawproject_topology is not None else None
+            has_cal = bool(getattr(topo, "has_calibrated_donor", False))
+            apply_trim = (
+                bool(flat.get("dawproject_apply_trim_gain", False))
+                and bool(flat.get("dawproject_insert_track_trim", True))
+                and has_cal
+            )
+            try:
+                dp_staging = resolve_dawproject_track_staging(
+                    session, track, gain_mode=pt_gain_mode,
+                    apply_trim_gain=apply_trim, fader_ceiling_db=float(dp.fader_ceiling_db),
+                    leaf_trim_min_db=getattr(topo, "donor_min_db", None) if has_cal else None,
+                    leaf_trim_max_db=getattr(topo, "donor_max_db", None) if has_cal else None,
+                )
+            except ValueError:
+                dp_staging = None
+            if dp_staging is not None:
+                if abs(dp_staging.baked_gain_db) >= 0.05 and abs(dp_staging.trim_gain_db) < 0.05:
+                    trim_text = "0.0 dB (baked)"
+                else:
+                    trim_text = self._fmt_signed_db(dp_staging.trim_gain_db)
+                return trim_text, dp_staging.trim_gain_db, self._fmt_signed_db(dp_staging.fader_db), dp_staging.fader_db
+            return "0.0 dB", 0.0, "0.0 dB", 0.0
         if isinstance(dp, ProToolsDawProcessor) and track is not None and session is not None:
             try:
                 staging = resolve_protools_track_staging(session, track, gain_mode=pt_gain_mode)
