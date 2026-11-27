@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 import logging
-import math
 import os
 from pathlib import Path
 from typing import Any
@@ -13,32 +12,28 @@ from typing import Any
 import numpy as np
 import soundfile as sf
 
-from ..daw_processor import resolve_transfer_audio
-from ..audio import INACTIVE_NORMALIZATION_CLASSIFICATIONS
 from ..models import ParamSpec, SessionContext, TrackContext
 from ..ptx import (
     LeafAudioInput,
+    PtxPatchBuilder,
     PtxSession,
+    PtxSessionAudit,
     PtxTrack,
     SignalFlowGraph,
-    apply_atomic_ptx_patch,
     build_annotated_signal_flow,
-    patch_add_group,
-    patch_clear_track_inputs,
-    patch_clip_gains,
-    patch_modify_group,
-    patch_slot_a_trim_gains,
-    patch_track_volumes,
 )
 from ..ptx.models import PTX_MAGIC
+from ..signal_flow import (
+    GAIN_MODE_CLIP_AND_FADER,
+    GAIN_MODE_CLIP_UNITY,
+    GAIN_MODE_FADER_ONLY,
+    GAIN_MODE_NONE,
+    resolve_track_staging,
+)
 from . import ptsl_helpers as ptslh
 
 log = logging.getLogger(__name__)
 
-GAIN_MODE_CLIP_AND_FADER = "clip_gain_and_fader"
-GAIN_MODE_CLIP_UNITY = "clip_gain_unity"
-GAIN_MODE_FADER_ONLY = "fader_only"
-GAIN_MODE_NONE = "none"
 VALID_GAIN_MODES = (
     GAIN_MODE_CLIP_AND_FADER,
     GAIN_MODE_CLIP_UNITY,
@@ -148,26 +143,6 @@ class EmptyTrackCleanupPlan:
     orphaned_auxes: tuple[PtxTrack, ...] = ()
 
 
-def _planned_normalization_gains(session: SessionContext, track: TrackContext) -> tuple[float, float]:
-    """Return ``(forward_gain_db, inverse_fader_db)`` planned for *track*."""
-    proc_id = "bimodal_normalize"
-    source = next((t for t in session.tracks if t.filename == track.filename), track)
-    enabled = bool(session.config.get(f"{proc_id}_enabled", True))
-    skipped = proc_id in track.processor_skip or proc_id in source.processor_skip
-    result = track.processor_results.get(proc_id) or source.processor_results.get(proc_id)
-    if result is not None:
-        if enabled and not skipped and not result.error and result.classification not in INACTIVE_NORMALIZATION_CLASSIFICATIONS:
-            gain = float(result.gain_db)
-            fader = float(result.data.get("fader_offset", -gain))
-            if math.isfinite(gain) and math.isfinite(fader):
-                return gain, fader
-        return 0.0, 0.0
-    manual = track.manual_gain_db if track.manual_gain_db is not None else source.manual_gain_db
-    if manual is not None and math.isfinite(float(manual)):
-        return float(manual), -float(manual)
-    return 0.0, 0.0
-
-
 def resolve_protools_track_staging(
     session: SessionContext,
     track: TrackContext,
@@ -175,40 +150,17 @@ def resolve_protools_track_staging(
 ) -> ProToolsTrackStaging:
     """Resolve transfer media plus pre-insert Clip Gain and post-insert Track Fader offsets.
 
-    Respects the user's selected audio source (``_use_processed``) while guaranteeing
-    normalization gain is never double-applied or cancelled pre-insert:
-      - Un-normalized audio (``_use_processed=False`` or no prepared WAV):
-        * ``clip_gain_and_fader`` (default): Clip Gain ``+gain_db`` (pre-insert) and
-          Track Fader ``fader_offset`` (post-insert balance).
-        * ``clip_gain_unity``: Clip Gain ``+gain_db`` and Track Fader ``0.0 dB``.
-        * ``fader_only``: Clip Gain ``0.0 dB`` and Track Fader ``0.0 dB``
-          (avoids applying an unmatched inverse fader without pre-insert gain).
-      - Prepared (already gain-baked) WAV (``_use_processed=True``):
-        * Clip Gain stays ``0.0 dB`` (gain is already baked pre-insert) and Track Fader
-          carries ``prepared_fader_db`` (unless mode is ``clip_gain_unity`` or ``none``).
-      - ``none``: both Clip Gain and Track Fader stay ``0.0 dB``.
+    Delegates core staging resolution to :func:`sessionpreplib.signal_flow.resolve_track_staging`
+    while clamping *gain_mode* to Pro Tools' supported modes.
     """
     mode = gain_mode if gain_mode in VALID_GAIN_MODES else GAIN_MODE_CLIP_AND_FADER
-    forward_gain, planned_fader = _planned_normalization_gains(session, track)
-    media = resolve_transfer_audio(session, track)
-    proc_path = track.processed_filepath
-    is_prepared = proc_path is not None and bool(proc_path) and (
-        os.path.normcase(os.path.realpath(media.filepath))
-        == os.path.normcase(os.path.realpath(proc_path))
-    )
-    baked = forward_gain if is_prepared else 0.0
-    if mode == GAIN_MODE_NONE:
-        return ProToolsTrackStaging(media.filepath, 0.0, 0.0, baked_gain_db=baked, legacy_ptsl_fader_db=media.fader_db)
-    if mode == GAIN_MODE_FADER_ONLY:
-        # Inverse fader offsets only apply when normalization gain is actually baked into a prepared WAV.
-        return ProToolsTrackStaging(
-            media.filepath, 0.0, media.fader_db if is_prepared else 0.0,
-            baked_gain_db=baked, legacy_ptsl_fader_db=media.fader_db,
-        )
-    clip_db = 0.0 if is_prepared else forward_gain
-    fader_db = (media.fader_db if is_prepared else planned_fader) if mode == GAIN_MODE_CLIP_AND_FADER else 0.0
+    plan = resolve_track_staging(session, track, mode)
     return ProToolsTrackStaging(
-        media.filepath, clip_db, fader_db, baked_gain_db=baked, legacy_ptsl_fader_db=media.fader_db,
+        filepath=plan.filepath,
+        clip_gain_db=plan.clip_gain_db,
+        fader_db=plan.fader_db,
+        baked_gain_db=plan.baked_gain_db,
+        legacy_ptsl_fader_db=plan.prepared_fader_db,
     )
 
 
@@ -739,6 +691,40 @@ def execute_empty_folder_cleanup(
     return deleted_folders, deleted_vcas, deleted_auxes, errors
 
 
+def _queue_group_actions(builder: PtxPatchBuilder, group_actions: Sequence[FolderGroupAction]) -> None:
+    for act in group_actions:
+        if act.op == "add":
+            builder.add_group(
+                act.group_name,
+                list(act.member_tracks),
+                vca_track=act.vca_track,
+                group_type=act.group_type,
+            )
+        elif act.vca_track is not None:
+            builder.modify_group(act.group_name, add_tracks=list(act.member_tracks), vca_track=act.vca_track)
+        else:
+            builder.modify_group(act.group_name, add_tracks=list(act.member_tracks))
+
+
+def log_ptx_audit_caveats(audit: PtxSessionAudit, context_label: str) -> None:
+    """Log concise warnings when a ``.ptx``/``.ptxt`` contains dynamic features relevant to static staging."""
+    caveats: list[str] = []
+    if audit.automated_volume_tracks:
+        caveats.append(f"automated volume on {', '.join(audit.automated_volume_tracks)}")
+    if audit.automated_pan_tracks:
+        caveats.append(f"automated pan on {', '.join(audit.automated_pan_tracks)}")
+    if audit.automated_mute_tracks:
+        caveats.append(f"automated mute on {', '.join(audit.automated_mute_tracks)}")
+    if audit.dynamic_clip_gain_tracks:
+        caveats.append(f"dynamic clip-gain lines on {', '.join(audit.dynamic_clip_gain_tracks)}")
+    if audit.ara_tracks:
+        caveats.append(f"ARA2 edits on {', '.join(audit.ara_tracks)}")
+    if audit.has_unparsed_tempo_ramps:
+        caveats.append("unparsed tempo ramps")
+    if caveats:
+        log.warning("Pro Tools session audit (%s): %s.", context_label, "; ".join(caveats))
+
+
 def apply_post_close_ptx_patches(
     session_path: str | Path,
     *,
@@ -749,40 +735,18 @@ def apply_post_close_ptx_patches(
     group_actions: list[FolderGroupAction] | None = None,
 ) -> tuple[bytes, dict[str, Any]]:
     """Apply No Input, Clip Gain, Slot A Trim, Track/Bus Faders, and Folder Groups/VCAs in one atomic pass."""
-    empty_meta: dict[str, Any] = {
-        "cleared_inputs": {}, "clip_gains": {}, "slot_a_trims": {}, "volumes": {}, "groups": [],
-    }
-    if not (clear_input_tracks or clip_gains_db or slot_a_trims_db or track_volumes_db or group_actions):
-        return Path(session_path).read_bytes(), empty_meta
-
-    def _transform(raw: bytes) -> tuple[bytes, dict[str, Any]]:
-        cur = raw
-        meta: dict[str, Any] = {
-            "cleared_inputs": {}, "clip_gains": {}, "slot_a_trims": {}, "volumes": {}, "groups": [],
-        }
+    with PtxPatchBuilder.from_file(session_path) as builder:
         if clear_input_tracks:
-            cur, meta["cleared_inputs"] = patch_clear_track_inputs(cur, clear_input_tracks)
+            builder.clear_track_inputs(clear_input_tracks)
         if clip_gains_db:
-            cur, meta["clip_gains"] = patch_clip_gains(cur, clip_gains_db)
+            builder.set_clip_gains(clip_gains_db)
         if slot_a_trims_db:
-            cur, meta["slot_a_trims"] = patch_slot_a_trim_gains(cur, slot_a_trims_db, activate_if_inactive=True)
+            builder.set_slot_a_trim_gains(slot_a_trims_db, activate_if_inactive=True)
         if track_volumes_db:
-            cur, meta["volumes"] = patch_track_volumes(cur, track_volumes_db)
-        for act in group_actions or ():
-            if act.op == "add":
-                cur, info = patch_add_group(
-                    cur, act.group_name, list(act.member_tracks),
-                    vca_track=act.vca_track, group_type=act.group_type,
-                )
-            else:
-                kwargs: dict[str, Any] = {"add_tracks": list(act.member_tracks)}
-                if act.vca_track is not None:
-                    kwargs["vca_track"] = act.vca_track
-                cur, info = patch_modify_group(cur, act.group_name, **kwargs)
-            meta["groups"].append(info)
-        return cur, meta
-
-    return apply_atomic_ptx_patch(session_path, _transform)
+            builder.set_track_volumes(track_volumes_db)
+        if group_actions:
+            _queue_group_actions(builder, group_actions)
+        return builder.commit()
 
 
 def is_valid_ptx_file(path: str | Path) -> bool:
@@ -841,19 +805,10 @@ def _load_leaf_audio_input(track: TrackContext, staging: ProToolsTrackStaging) -
 
 def _apply_group_actions_in_memory(raw_ptx: bytes, group_actions: list[FolderGroupAction]) -> PtxSession:
     """Apply planned group/VCA links to an in-memory ``.ptx`` copy so DAG summing sees active VCA offsets."""
-    cur = raw_ptx
-    for act in group_actions:
-        if act.op == "add":
-            cur, _ = patch_add_group(
-                cur, act.group_name, list(act.member_tracks),
-                vca_track=act.vca_track, group_type=act.group_type,
-            )
-        else:
-            kwargs: dict[str, Any] = {"add_tracks": list(act.member_tracks)}
-            if act.vca_track is not None:
-                kwargs["vca_track"] = act.vca_track
-            cur, _ = patch_modify_group(cur, act.group_name, **kwargs)
-    return PtxSession.from_bytes(cur)
+    builder = PtxPatchBuilder.from_bytes(raw_ptx)
+    _queue_group_actions(builder, group_actions)
+    patched, _ = builder.build()
+    return PtxSession.from_bytes(patched)
 
 
 def _merge_graph_volumes(
@@ -893,6 +848,7 @@ def run_post_close_ptx_enhancement(
 
     raw_bytes = Path(session_path).read_bytes()
     ptx = PtxSession.from_bytes(raw_bytes)
+    log_ptx_audit_caveats(ptx.audit(), str(session_path))
     clip_gains_db: dict[str, float] = {}
     track_volumes_db: dict[str, float] = {}
     leaf_entries: dict[str, tuple[TrackContext, ProToolsTrackStaging]] = {}

@@ -1,4 +1,4 @@
-"""Binary codec, Z-chunk traversal, and ``0x0002`` offset-index maintenance for ``.ptx``."""
+"""Binary codec, Z-chunk traversal, control curves, and ``0x0002`` offset-index maintenance for ``.ptx``."""
 
 from __future__ import annotations
 
@@ -8,7 +8,15 @@ from pathlib import Path
 import struct
 import tempfile
 
-from .models import PTX_MAGIC, SLOT_LETTERS_LOWER, PtxChunk
+from .models import (
+    FPS_CODE_MAP,
+    PT12_COLOR_PALETTE,
+    PTX_MAGIC,
+    SLOT_LETTERS_LOWER,
+    ZERO_TICKS,
+    PtxAutomationPoint,
+    PtxChunk,
+)
 
 
 def format_ptsl_uuid(raw16: bytes) -> str:
@@ -55,6 +63,52 @@ def group_id_to_label(id_number: int) -> str:
     return str(id_number)
 
 
+def lookup_pt_color_rgb(color_index: int) -> tuple[int, int, int] | None:
+    """Return ``(r, g, b)`` for a known Pro Tools 12 track colour palette index, or ``None``."""
+    return PT12_COLOR_PALETTE.get(color_index)
+
+
+def decode_ticks_relative(raw_ticks: int) -> int:
+    """Convert an unsigned Pro Tools tick timestamp into ticks relative to ``ZERO_TICKS``."""
+    return max(0, int(raw_ticks) - ZERO_TICKS) if raw_ticks >= ZERO_TICKS else int(raw_ticks)
+
+
+def format_timecode(start_frames: int, fps_code: int) -> str:
+    """Format an integer frame offset using a Pro Tools ``0x204d`` frame-rate code."""
+    entry = FPS_CODE_MAP.get(fps_code)
+    if entry is None or start_frames < 0:
+        return ""
+    _real_fps, nominal_fps, _label, is_drop = entry
+    frames = start_frames
+    if is_drop:
+        ten_min, one_min = 17982, 1798
+        q, rem = divmod(frames, ten_min)
+        frames += 18 * q + (2 * ((rem - 2) // one_min) if rem > 1 else 0)
+    hours = frames // (3600 * nominal_fps)
+    minutes = (frames // (60 * nominal_fps)) % 60
+    seconds = (frames // nominal_fps) % 60
+    rem_frames = frames % nominal_fps
+    sep = ";" if is_drop else ":"
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}{sep}{rem_frames:02d}"
+
+
+def _derive_ptx_xor_delta(xor_value: int) -> int:
+    """Derive the deterministic 4 KB rolling-XOR delta for ``xor_type == 0x05``."""
+    for i in range(256):
+        if ((i * 11) & 0xFF) == xor_value:
+            return (-i) & 0xFF
+    return 0
+
+
+def _estimate_mode_xor_delta(raw: bytes, nblocks: int) -> int:
+    modes = [
+        Counter(raw[b * 0x1000 : min(len(raw), (b + 1) * 0x1000)]).most_common(1)[0][0]
+        for b in range(min(6, nblocks))
+    ]
+    deltas = [(modes[i + 1] - modes[i]) & 0xFF for i in range(len(modes) - 1)]
+    return Counter(deltas).most_common(1)[0][0]
+
+
 def _apply_block_xor(data: bytes, delta: int, k0: int) -> bytes:
     out = bytearray(data)
     nblocks = (len(out) + 0xFFF) // 0x1000
@@ -69,25 +123,41 @@ def _apply_block_xor(data: bytes, delta: int, k0: int) -> bytes:
     return bytes(out)
 
 
+def _is_plausible_ptx_plaintext(buf: bytes) -> bool:
+    if len(buf) <= 0x1F or buf[0x14] != 0x5A or buf[0x1F] != 0x5A:
+        return False
+    chunks = iter_top_chunks(buf)
+    if not chunks:
+        return False
+    last = chunks[-1]
+    return last.offset + 7 + last.size == len(buf)
+
+
 def decrypt_ptx(raw: bytes) -> tuple[bytes, int]:
     """Decrypt a Pro Tools v10+ ``.ptx``/``.ptxt`` buffer and return ``(decrypted, xor_delta)``."""
     if len(raw) < 0x20:
         raise ValueError(f"File too small to be a .ptx session ({len(raw)} bytes)")
     if not raw.startswith(PTX_MAGIC):
         raise ValueError(f"Unrecognized .ptx magic header: {raw[:20]!r}")
+    if raw[0x11] != 0:
+        raise ValueError("Big-endian legacy Pro Tools sessions are not supported (.ptx v10+ only)")
+    xor_type = raw[0x12]
+    if xor_type == 0x01:
+        raise ValueError("Legacy Pro Tools v5-v9 (.pts/.ptf) encryption is not supported (.ptx v10+ only)")
 
     k0 = raw[0x14] ^ 0x5A
     nblocks = (len(raw) + 0xFFF) // 0x1000
     if nblocks <= 1:
         return _apply_block_xor(raw, 0, k0), 0
 
-    modes = [
-        Counter(raw[b * 0x1000 : min(len(raw), (b + 1) * 0x1000)]).most_common(1)[0][0]
-        for b in range(min(6, nblocks))
-    ]
-    deltas = [(modes[i + 1] - modes[i]) & 0xFF for i in range(len(modes) - 1)]
-    delta = Counter(deltas).most_common(1)[0][0]
-    return _apply_block_xor(raw, delta, k0), delta
+    if xor_type == 0x05:
+        alg_delta = _derive_ptx_xor_delta(raw[0x13])
+        alg_dec = _apply_block_xor(raw, alg_delta, k0)
+        if _is_plausible_ptx_plaintext(alg_dec):
+            return alg_dec, alg_delta
+
+    mode_delta = _estimate_mode_xor_delta(raw, nblocks)
+    return _apply_block_xor(raw, mode_delta, k0), mode_delta
 
 
 def encrypt_ptx(decrypted: bytes, delta: int, k0: int = 0) -> bytes:
@@ -118,23 +188,64 @@ def iter_top_chunks(buf: bytes, *, strict: bool = False) -> list[PtxChunk]:
     return chunks
 
 
+def _parse_chunk_node(buf: bytes, pos: int, max_end: int, depth: int) -> PtxChunk | None:
+    if depth > 32 or pos + 9 > max_end or buf[pos] != 0x5A:
+        return None
+    version = struct.unpack_from("<H", buf, pos + 1)[0]
+    if version >= 0x1000:
+        return None
+    size = struct.unpack_from("<I", buf, pos + 3)[0]
+    end = pos + 7 + size
+    if size < 2 or end > max_end:
+        return None
+    tag = struct.unpack_from("<H", buf, pos + 7)[0]
+    children: list[PtxChunk] = []
+    scan = pos + 9
+    while scan < end:
+        hit = buf.find(b"\x5A", scan, end)
+        if hit == -1:
+            break
+        child = _parse_chunk_node(buf, hit, end, depth + 1)
+        if child is not None:
+            children.append(child)
+            scan = child.offset + 7 + child.size
+        else:
+            scan = hit + 1
+    return PtxChunk(offset=pos, version=version, size=size, tag=tag, raw=buf[pos:end], children=children)
+
+
+def parse_chunk_tree(buf: bytes, start: int = 0x1F) -> list[PtxChunk]:
+    """Recursively parse nested Z-chunks starting at *start* for inspection and debugging."""
+    nodes: list[PtxChunk] = []
+    pos = start
+    limit = len(buf)
+    while pos < limit:
+        node = _parse_chunk_node(buf, pos, limit, 0)
+        if node is None:
+            break
+        nodes.append(node)
+        pos = node.offset + 7 + node.size
+    return nodes
+
+
 def find_subchunks(buf: bytes, tag16: int, start: int = 9) -> list[bytes]:
     """Return all valid Z-subchunks with ``tag16`` inside *buf* starting at *start*."""
     results: list[bytes] = []
     needle = struct.pack("<H", tag16)
-    pos = start
+    min_start = max(0, start)
+    pos = min_start + 7
     limit = len(buf)
-    while True:
+    while pos < limit:
         hit = buf.find(needle, pos)
         if hit == -1:
             break
-        if hit >= 7 and buf[hit - 7] == 0x5A:
-            cstart = hit - 7
+        cstart = hit - 7
+        if cstart >= min_start and buf[cstart] == 0x5A:
             version = struct.unpack_from("<H", buf, cstart + 1)[0]
             size = struct.unpack_from("<I", buf, cstart + 3)[0]
             if 2 <= size <= limit - cstart - 7 and version < 0x1000:
                 results.append(buf[cstart : cstart + 7 + size])
-                pos = cstart + 7 + size
+                pos = cstart + 7 + size + 7
                 continue
         pos = hit + 1
     return results
@@ -142,13 +253,64 @@ def find_subchunks(buf: bytes, tag16: int, start: int = 9) -> list[bytes]:
 
 def read_lp_str(buf: bytes, offset: int, max_len: int = 512) -> tuple[str, int]:
     """Read a length-prefixed UTF-8 string (``<I`` length + bytes) at *offset*."""
-    if offset + 4 > len(buf):
-        return "", offset
+    if offset < 0 or offset + 4 > len(buf):
+        return "", max(0, offset)
     length = struct.unpack_from("<I", buf, offset)[0]
     if length == 0 or length > max_len or offset + 4 + length > len(buf):
         return "", offset + 4
     text = buf[offset + 4 : offset + 4 + length].decode("utf-8", errors="replace")
     return text, offset + 4 + length
+
+
+def _decode_control_value(buf: bytes, pos: int, vsize: int, *, signed_int32: bool) -> float:
+    if vsize == 2:
+        return float(struct.unpack_from("<h", buf, pos)[0])
+    if vsize == 4:
+        if signed_int32:
+            return float(struct.unpack_from("<i", buf, pos)[0])
+        return float(struct.unpack_from("<f", buf, pos)[0])
+    if vsize == 8:
+        return float(struct.unpack_from("<Q", buf, pos)[0])
+    raise ValueError(f"Unsupported control-curve value width {vsize}")
+
+
+def parse_control_curve(
+    buf: bytes,
+    offset: int = 0,
+    *,
+    signed_int32: bool = False,
+) -> tuple[str, list[PtxAutomationPoint], int] | None:
+    """Decode a Pro Tools ``0x46`` (``'F'``) control curve at *offset*.
+
+    Returns ``(timebase, points, next_offset)`` or ``None`` if no valid curve starts at *offset*.
+    """
+    if offset < 0 or offset + 8 > len(buf) or buf[offset + 1] != 0x46:
+        return None
+    version = struct.unpack_from("<H", buf, offset + 2)[0]
+    payload_len = struct.unpack_from("<I", buf, offset + 4)[0]
+    end = offset + 8 + payload_len
+    if version != 1 or payload_len < 18 or end > len(buf):
+        return None
+    q = offset + 8
+    tb_code = struct.unpack_from("<H", buf, q)[0]
+    vsize = struct.unpack_from("<H", buf, q + 6)[0]
+    extra_count = struct.unpack_from("<H", buf, q + 8)[0]
+    if vsize not in (2, 4, 8) or q + 18 + vsize > end:
+        return None
+    timebase = "Ticks" if tb_code == 1 else "Samples"
+    pos0_raw = struct.unpack_from("<Q", buf, q + 10)[0]
+    pos0 = decode_ticks_relative(pos0_raw) if tb_code == 1 else pos0_raw
+    val0 = _decode_control_value(buf, q + 18, vsize, signed_int32=signed_int32)
+    points = [PtxAutomationPoint(position=pos0, value=val0)]
+    stride = 4 + vsize
+    cursor = q + 18 + vsize
+    max_extra = (end - cursor) // stride
+    for _ in range(min(extra_count, max_extra)):
+        delta_pos = struct.unpack_from("<I", buf, cursor)[0]
+        val = _decode_control_value(buf, cursor + 4, vsize, signed_int32=signed_int32)
+        points.append(PtxAutomationPoint(position=pos0 + delta_pos, value=val))
+        cursor += stride
+    return timebase, points, end
 
 
 def _shift_index_entry(buf: bytearray, pos: int, body_end: int, threshold: int, delta: int) -> int:
@@ -202,7 +364,6 @@ def validate_index_0002(buf: bytes) -> bool:
         ptr = struct.unpack_from("<I", buf, 0x1B)[0]
         if ptr != c2.offset:
             raise RuntimeError(f"Root 0x1B pointer 0x{ptr:x} does not match 0x0002 at 0x{c2.offset:x}")
-    # Dry-run bounds & Z-chunk check using shift helper on a copy with delta=0
     body_end = c2.offset + 7 + c2.size
     pos = c2.offset + 9
     if pos + 4 > body_end:

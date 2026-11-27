@@ -16,6 +16,7 @@ from ..ptx import (
     LeafAudioInput,
     PtxGroup,
     PtxSession,
+    PtxSessionAudit,
     PtxSignalPathRef,
     PtxTrack,
     SignalFlowGraph,
@@ -26,6 +27,7 @@ from .protools_ptx import (
     GAIN_MODE_CLIP_UNITY,
     ProToolsTrackStaging,
     _find_folder_vca,
+    log_ptx_audit_caveats,
     plan_empty_folders_and_vcas,
     plan_folder_groups_and_vcas,
     resolve_protools_track_staging,
@@ -52,6 +54,7 @@ class TemplateTopologySummary:
     ptxt_path: str
     by_id: dict[str, TemplateFolderMeta] = field(default_factory=dict)
     by_name: dict[str, TemplateFolderMeta] = field(default_factory=dict)
+    audit: PtxSessionAudit | None = None
 
     def lookup(self, folder_id: str, folder_name: str) -> TemplateFolderMeta | None:
         return self.by_id.get(folder_id) or self.by_name.get(folder_name.lower())
@@ -116,7 +119,38 @@ def inspect_protools_template_topology(ptxt_path: str | Path) -> TemplateTopolog
         if trk.uuid_braced:
             by_id[trk.uuid_braced] = meta
         by_name[trk.name.lower()] = meta
-    return TemplateTopologySummary(ptxt_path=str(ptxt_path), by_id=by_id, by_name=by_name)
+    return TemplateTopologySummary(ptxt_path=str(ptxt_path), by_id=by_id, by_name=by_name, audit=ptx.audit())
+
+
+def read_template_folders_from_ptxt(ptxt_path: str | Path) -> list[dict[str, Any]]:
+    """Read RoutingFolder and BasicFolder entries directly from a local ``.ptxt`` file offline.
+
+    Returns dictionaries matching the PTSL Fetch schema:
+    ``{"id", "name", "folder_type", "index", "parent_id"}``.
+    Raises ``ValueError`` if any folder has a missing or duplicate UUID.
+    """
+    ptx = PtxSession.from_file(ptxt_path)
+    if not ptx.chunks or 0x2519 not in ptx.chunk_map:
+        raise ValueError(f"Invalid or corrupt .ptxt template (missing track directory): {ptxt_path}")
+    folders: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for trk in ptx.tracks:
+        if trk.track_type not in ("RoutingFolder", "BasicFolder"):
+            continue
+        if not trk.uuid_braced:
+            raise ValueError(f"Template folder {trk.name!r} is missing a UUID in {ptxt_path}")
+        low_id = trk.uuid_braced.lower()
+        if low_id in seen_ids:
+            raise ValueError(f"Duplicate folder UUID {trk.uuid_braced} in {ptxt_path}")
+        seen_ids.add(low_id)
+        folders.append({
+            "id": trk.uuid_braced,
+            "name": trk.name,
+            "folder_type": "routing" if trk.track_type == "RoutingFolder" else "basic",
+            "index": trk.index + 1,
+            "parent_id": trk.parent_folder_uuid or None,
+        })
+    return folders
 
 
 def _find_folder_track(ptx: PtxSession, folder_id: str, folder_lookup: dict[str, dict[str, Any]]) -> PtxTrack | None:
@@ -301,6 +335,7 @@ def preview_protools_signal_flow(
 ) -> SignalFlowGraph:
     """Compute an offline annotated Pro Tools signal-flow preview directly from a ``.ptxt`` template."""
     ptx = PtxSession.from_file(ptxt_path)
+    log_ptx_audit_caveats(ptx.audit(), str(ptxt_path))
     excluded: dict[str, str] = {}
     leaf_entries, leaf_gains = _inject_virtual_leaves(
         ptx, session, assignments, folders,
