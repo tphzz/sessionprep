@@ -37,6 +37,7 @@ from .param_form import (
     _read_widget,
     _set_widget_value,
 )
+from .protools_prefs import ProToolsTemplatesWidget, install_protools_mode_wiring
 
 
 # ---------------------------------------------------------------------------
@@ -531,89 +532,7 @@ class DawProjectTemplatesWidget(QWidget):
         self.templates_changed.emit()
 
 
-# ---------------------------------------------------------------------------
-# ProToolsTemplatesWidget
-# ---------------------------------------------------------------------------
-
-class ProToolsTemplatesWidget(QWidget):
-    """Editable table of Pro Tools mix templates."""
-
-    templates_changed = Signal()
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._init_ui()
-
-    def _init_ui(self):
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(6)
-
-        layout.addWidget(QLabel("<b>Pro Tools Templates</b>"))
-
-        self._table = QTableWidget()
-        self._table.setColumnCount(2)
-        self._table.setHorizontalHeaderLabels(["Template Group", "Template Name"])
-        gh = self._table.horizontalHeader()
-        gh.setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        gh.setSectionResizeMode(0, QHeaderView.Interactive)
-        gh.resizeSection(0, 150)
-        gh.setSectionResizeMode(1, QHeaderView.Stretch)
-        self._table.setSelectionBehavior(QTableWidget.SelectRows)
-        self._table.setSelectionMode(QTableWidget.SingleSelection)
-        self._table.cellChanged.connect(lambda r, c: self.templates_changed.emit())
-
-        # Ensure the table is tall enough to show ~3 rows comfortably
-        self._table.setMinimumHeight(130)
-
-        layout.addWidget(self._table, 1)
-
-        btn_row = QHBoxLayout()
-        btn_row.setContentsMargins(0, 0, 0, 0)
-        btn_row.setSpacing(6)
-        add_btn = QPushButton("Add")
-        add_btn.clicked.connect(self._on_add)
-        btn_row.addWidget(add_btn)
-        remove_btn = QPushButton("Remove")
-        remove_btn.clicked.connect(self._on_remove)
-        btn_row.addWidget(remove_btn)
-        btn_row.addStretch()
-        layout.addLayout(btn_row)
-
-    def set_templates(self, templates: list[dict]):
-        self._table.blockSignals(True)
-        self._table.setRowCount(0)
-        self._table.setRowCount(len(templates))
-        for row, tpl in enumerate(templates):
-            self._table.setItem(row, 0, QTableWidgetItem(tpl.get("group", "")))
-            self._table.setItem(row, 1, QTableWidgetItem(tpl.get("name", "")))
-        self._table.blockSignals(False)
-
-    def get_templates(self) -> list[dict]:
-        templates: list[dict] = []
-        for row in range(self._table.rowCount()):
-            group_item = self._table.item(row, 0)
-            group = group_item.text().strip() if group_item else ""
-            name_item = self._table.item(row, 1)
-            name = name_item.text().strip() if name_item else ""
-            if name or group:
-                templates.append({"group": group, "name": name})
-        return templates
-
-    def _on_add(self):
-        row = self._table.rowCount()
-        self._table.setRowCount(row + 1)
-        self._table.setItem(row, 0, QTableWidgetItem(""))
-        self._table.setItem(row, 1, QTableWidgetItem(""))
-        self._table.editItem(self._table.item(row, 0))
-        self.templates_changed.emit()
-
-    def _on_remove(self):
-        row = self._table.currentRow()
-        if row < 0:
-            return
-        self._table.removeRow(row)
-        self.templates_changed.emit()
+# ProToolsTemplatesWidget is implemented in .protools_prefs and re-exported above.
 
 
 # ---------------------------------------------------------------------------
@@ -660,7 +579,13 @@ def _register_processor_pages(tree, build_page, register_page, repair_params) ->
     register_page(repair_item, repairs, "processors.corrective")
 
 
-def _register_daw_pages(tree, preset: dict[str, Any], build_page, register_page) -> dict[str, QWidget]:
+def _register_daw_pages(
+    tree,
+    preset: dict[str, Any],
+    widgets_dict: dict,
+    build_page,
+    register_page,
+) -> dict[str, QWidget]:
     from sessionpreplib.daw_processors import default_daw_processors
 
     daw_custom_widgets: dict[str, QWidget] = {}
@@ -677,7 +602,8 @@ def _register_daw_pages(tree, preset: dict[str, Any], build_page, register_page)
         if not params:
             continue
         child = QTreeWidgetItem(daw_parent, [dp.name])
-        pg = build_page(f"daw_processors.{dp.id}", params)
+        section_key = f"daw_processors.{dp.id}"
+        pg = build_page(section_key, params)
         if dp.id == "dawproject":
             tpl_widget = DawProjectTemplatesWidget()
             tpl_widget.set_templates(dp_sections.get(dp.id, {}).get("dawproject_templates", []))
@@ -687,8 +613,8 @@ def _register_daw_pages(tree, preset: dict[str, Any], build_page, register_page)
             pt_widget = ProToolsTemplatesWidget()
             pt_widget.set_templates(dp_sections.get(dp.id, {}).get("protools_templates", []))
             daw_custom_widgets["protools"] = pt_widget
-            pg.layout().insertWidget(3, pt_widget)
-        register_page(child, pg, f"daw_processors.{dp.id}")
+            install_protools_mode_wiring(pg, widgets_dict.get(section_key, []), pt_widget)
+        register_page(child, pg, section_key)
     return daw_custom_widgets
 
 
@@ -732,7 +658,7 @@ def build_config_pages(
         register_page(child, build_page(f"detectors.{det.id}", params), f"detectors.{det.id}")
 
     _register_processor_pages(tree, build_page, register_page, REPAIR_PARAMS)
-    return _register_daw_pages(tree, preset, build_page, register_page)
+    return _register_daw_pages(tree, preset, widgets_dict, build_page, register_page)
 
 
 def load_config_widgets(

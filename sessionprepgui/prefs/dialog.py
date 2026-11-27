@@ -47,7 +47,13 @@ _UNSAVED = "Unsaved changes"
 class PreferencesDialog(QDialog):
     """Hierarchical preferences dialog with tree navigation."""
 
-    def __init__(self, config: dict[str, Any], parent=None):
+    def __init__(
+        self,
+        config: dict[str, Any],
+        parent=None,
+        *,
+        initial_preset_section: str | None = None,
+    ):
         super().__init__(parent)
         self.setWindowTitle("Preferences")
         self.resize(1150, 700)
@@ -94,8 +100,20 @@ class PreferencesDialog(QDialog):
         self._original_config_state = self._current_config_state()
         self._connect_dirty_signals()
         self._update_dirty_indicators()
+        if initial_preset_section:
+            self.select_preset_section(initial_preset_section)
 
     # ── Public API ────────────────────────────────────────────────────
+
+    def select_preset_section(self, section_key: str) -> bool:
+        """Switch to the Config Presets tab and select *section_key* if present."""
+        item = self._preset_items.get(section_key)
+        if item is None:
+            return False
+        self._tabs.setCurrentIndex(self._preset_tab_index)
+        self._preset_tree.setCurrentItem(item)
+        self._on_tree_selection(item, self._preset_stack, self._preset_page_index)
+        return True
 
     @property
     def saved(self) -> bool:

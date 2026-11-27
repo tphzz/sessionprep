@@ -671,12 +671,23 @@ The window remains centered and resizable; its height continues to fit the activ
 
 ---
 
-## 9. Pro Tools Transfer Automation (`.ptx` / PTSL)
+## 9. Pro Tools & DAWproject Transfer Automation (`.ptx` / PTSL / `.dawproject`)
 
 When creating a Pro Tools session from a template, SessionPrep combines PTSL
 commands with validated, atomic `.ptx` session-file updates (applied in a single
 post-close pass with automatic rollback if Pro Tools fails to reopen the session):
 
+- **Template Paths, Offline Fetch & Transfer Mode (`protools_transfer_backend`, default `ptsl_hybrid`):**
+  Each entry in **Pro Tools Templates** accepts a `Template Group` + `Template Name`
+  (auto-resolving `~/Documents/Pro Tools/Session Templates/<group>/<name>.ptxt` on
+  Windows and macOS) and an optional explicit `.ptxt` file path (working on Windows,
+  macOS, Linux, and custom template folders). When a valid local `.ptxt` file is
+  present, Phase 3 **Fetch** reads folder topology offline in milliseconds without
+  launching Pro Tools. **Transfer Mode** lets you switch between **Live PTSL + .ptx
+  Hybrid** (`ptsl_hybrid`, active today for full session creation) and **Offline .ptx
+  Writer** (`offline_ptx`, which disables PTSL connection controls in Preferences,
+  validates local template/project readiness offline in Phase 3 without PTSL prompts,
+  and reserves direct PTSL-free `.ptx` session creation for an upcoming release).
 - **Automatic Folder Output Routing (`protools_auto_route_folders`, default `true`), Empty Folder/VCA & Orphaned Aux Cleanup (`protools_remove_unused_aux_tracks`, default `true`), and Audio Track `No Input` Clearing:**
   Routes each newly created audio track's Main Output to its parent Routing
   Folder's input bus (walking up through nested Basic Folders when necessary),
@@ -749,3 +760,13 @@ post-close pass with automatic rollback if Pro Tools fails to reopen the session
   exports the annotated graph (including `recommended_slot_a_trims`,
   `balance_validation`, and `leaf_fader_shift_db`) under `daw_signal_flow` in
   JSON reports.
+- **DAWproject Mix Templates, VST3 Slot 1 Trim & Signal Flow (`dawproject_gain_mode`, `dawproject_insert_track_trim`, `dawproject_apply_trim_gain`, `dawproject_stage_bus_faders`, `dawproject_pan_law_db`, `dawproject_remove_unused_buses`):**
+  DAWproject always exports atomically from a pre-existing `.dawproject` template
+  (preserving the template untouched). In Phase 3, **Routing & Folders** shows each
+  folder's bus channel, VST3 Slot 1 Trim donor status (excluding VST2 plugins), and
+  output routing chain, while **Signal Flow** provides the same **Table** and
+  **Graph** inspector capped at each template's `fader_ceiling_db` (default `+6.0 dB`).
+  Verified VST3 Trim donors (**DMG Audio TrackControl** / **Process.Audio Protility**)
+  clone into Slot 1 at unity (`0.0 dB`) by default; experimental `.vstpreset` gain
+  patching (`dawproject_apply_trim_gain`, default `false`) stays opt-in until
+  calibrated against your target DAW.

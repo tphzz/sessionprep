@@ -789,7 +789,7 @@ def _validate_daw_templates(dp_id: str, section: dict[str, Any]) -> list[ConfigF
     if not isinstance(templates, list):
         return [ConfigFieldError(path, templates, "Expected a list of templates.")]
     errors = []
-    fields = ("name", "group") if dp_id == "protools" else ("name", "template_path")
+    fields = ("name", "group", "ptxt_path", "path") if dp_id == "protools" else ("name", "template_path")
     for index, template in enumerate(templates):
         if not isinstance(template, dict) or any(not isinstance(template.get(f, ""), str) for f in fields):
             errors.append(ConfigFieldError(f"{path}[{index}]", template, "Invalid template row."))

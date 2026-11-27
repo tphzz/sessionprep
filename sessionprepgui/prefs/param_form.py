@@ -151,8 +151,9 @@ def _build_widget(
 
     if spec.choices is not None:
         w: QWidget = QComboBox()
+        choice_labels = getattr(spec, "choice_labels", None) or {}
         for c in spec.choices:
-            w.addItem(str(c), c)
+            w.addItem(choice_labels.get(c, str(c)), c)
         idx = w.findData(value)
         if idx >= 0:
             w.setCurrentIndex(idx)
@@ -245,6 +246,20 @@ def _reference(spec: Any, preset_value: Any) -> tuple[str, Any]:
     return "Preset", "(empty)" if preset_value == "" else preset_value
 
 
+def _format_choice_list(spec: Any) -> str:
+    labels = getattr(spec, "choice_labels", None) or {}
+    if labels:
+        return ", ".join(f"{labels[c]} ({c})" if c in labels else str(c) for c in spec.choices)
+    return ", ".join(str(c) for c in spec.choices)
+
+
+def _format_ref_value(spec: Any, value: Any) -> str:
+    labels = getattr(spec, "choice_labels", None) or {}
+    if value in labels:
+        return labels[value]
+    return str(value)
+
+
 def _build_tooltip(spec: Any, *, preset_value: Any = _BUILT_IN) -> str:
     """Build a rich tooltip with key, reference value, and range info."""
     parts = [f"<b>{spec.label}</b>"]
@@ -252,13 +267,13 @@ def _build_tooltip(spec: Any, *, preset_value: Any = _BUILT_IN) -> str:
         parts.append(f"<br/>{spec.description}")
     parts.append(f"<br/><br/>Config key: <code>{spec.key}</code>")
     label, value = _reference(spec, preset_value)
-    parts.append(f"<br/>{label}: <b>{escape(str(value))}</b>")
+    parts.append(f"<br/>{label}: <b>{escape(_format_ref_value(spec, value))}</b>")
     if spec.min is not None or spec.max is not None:
         lo = str(spec.min) if spec.min is not None else "\u2212\u221e"
         hi = str(spec.max) if spec.max is not None else "\u221e"
         parts.append(f"<br/>Range: {lo} \u2013 {hi}")
     if spec.choices:
-        parts.append(f"<br/>Choices: {', '.join(str(c) for c in spec.choices)}")
+        parts.append(f"<br/>Choices: {escape(_format_choice_list(spec))}")
     return "".join(parts)
 
 
@@ -273,9 +288,9 @@ def _build_subtext(spec: Any, *, preset_value: Any = _BUILT_IN) -> str:
         hi = str(spec.max) if spec.max is not None else "\u221e"
         meta.append(f"Range: {lo} \u2013 {hi}")
     if spec.choices:
-        meta.append(f"Choices: {', '.join(str(c) for c in spec.choices)}")
+        meta.append(f"Choices: {_format_choice_list(spec)}")
     label, value = _reference(spec, preset_value)
-    meta.append(f"{label}: {value}")
+    meta.append(f"{label}: {_format_ref_value(spec, value)}")
     parts.append("  \u2022  ".join(meta))
     return "\n".join(parts)
 
@@ -376,12 +391,13 @@ def _set_param_reference(
     name = spec.label or spec.key
     if preset_value is _BUILT_IN:
         reset.setAccessibleName(f"Reset {name} to default")
-        value = "empty" if spec.default == "" else spec.default
+        value = "empty" if spec.default == "" else _format_ref_value(spec, spec.default)
         reset.setToolTip(f"Reset to default ({value})")
     else:
         reset.setAccessibleName(f"Use preset value for {name}")
         _, value = _reference(spec, preset_value)
-        reset.setToolTip(f"<p>Use preset value for {escape(name)}<br/>{escape(str(value))}</p>")
+        shown = value if value == "(empty)" else _format_ref_value(spec, value)
+        reset.setToolTip(f"<p>Use preset value for {escape(name)}<br/>{escape(str(shown))}</p>")
 
 
 # ---------------------------------------------------------------------------
@@ -596,6 +612,7 @@ def _build_param_page(
         sub_label.setWordWrap(True)
         sub_label.setStyleSheet("color: #888; font-size: 9pt;")
         param_box.addWidget(sub_label)
+        w._param_row_widgets = (name_label, sub_label, reset_btn)
         w._set_param_reference = partial(
             _set_param_reference, spec, w, name_label, sub_label, reset_btn)
         w._set_param_reference(preset_value=reference)

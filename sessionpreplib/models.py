@@ -33,6 +33,7 @@ class ParamSpec:
     min_exclusive: bool = False
     max_exclusive: bool = False
     choices: list[Any] | None = None      # allowed string values
+    choice_labels: dict[Any, str] | None = None  # optional GUI display labels per choice (never read by library)
     item_type: builtins.type | None = None    # element type for list fields
     nullable: bool = False           # True if None is valid
     presentation_only: bool = False  # True → changing this key never requires re-analysis

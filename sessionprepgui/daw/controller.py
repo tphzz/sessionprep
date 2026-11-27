@@ -40,6 +40,7 @@ class DawTransferController(QObject):
     setup_table_refresh_requested = Signal()
     clear_workspace_requested = Signal()
     edit_protools_config_requested = Signal()
+    edit_daw_config_requested = Signal(str)
     open_log_viewer_requested = Signal()
 
     def __init__(
@@ -64,6 +65,7 @@ class DawTransferController(QObject):
         self.fetch_worker: DawFetchWorker | None = None
         self.transfer_worker: DawTransferWorker | None = None
         self.setup_table_populating: bool = False
+        self._offline_ptx_ready: bool | None = None
 
         self.page = DawSetupPage()
         self.signal_flow_ctrl = SignalFlowController(
@@ -71,6 +73,7 @@ class DawTransferController(QObject):
             self.page.signal_flow_panel,
             self.page.right_tabs,
             get_pt_options=self._protools_ptx_options,
+            get_dp_options=self._dawproject_options,
             parent=self,
         )
         self._shell.register_phase_progress_layout(_PHASE_SETUP, self.page.main_layout)
@@ -95,8 +98,9 @@ class DawTransferController(QObject):
         p.open_project_btn.clicked.connect(self._on_open_active_project_folder)
         p.folder_tree.tracks_dropped.connect(self.assign_tracks_to_folder)
         p.folder_tree.tracks_unassigned.connect(self.unassign_tracks)
-        p.edit_config_btn.clicked.connect(self.edit_protools_config_requested.emit)
-        p.signal_flow_panel.edit_config_requested.connect(self.edit_protools_config_requested.emit)
+        p.edit_config_btn.clicked.connect(self._emit_edit_daw_config)
+        p.open_pt_settings_btn.clicked.connect(self._emit_edit_daw_config)
+        p.signal_flow_panel.edit_config_requested.connect(self._emit_edit_daw_config)
         p.open_log_btn.clicked.connect(self.open_log_viewer_requested.emit)
         self.signal_flow_ctrl.signal_flow_updated.connect(self._on_signal_flow_updated)
         self._last_leaf_shift_db: float = 0.0
@@ -114,12 +118,14 @@ class DawTransferController(QObject):
         self.page.setup_table.setRowCount(0)
         self.page.folder_tree.clear()
         self.page.clear_rollback_notice()
+        self.page.set_dawproject_donor_warning("")
         self.page.set_leaf_balance_summary("")
         self._last_leaf_shift_db = 0.0
         self.page.edit_config_btn.setEnabled(False)
         self.signal_flow_ctrl.clear_workspace()
         self.page.right_stack.setCurrentIndex(_SETUP_RIGHT_PLACEHOLDER)
         self.page.project_name_edit.clear()
+        self._refresh_offline_ptx_readiness()
 
     def has_running_workers(self) -> bool:
         for kind in (DawCheckWorker, DawFetchWorker, DawTransferWorker):
@@ -141,6 +147,13 @@ class DawTransferController(QObject):
         """Invalidate any cached Signal Flow preview after Phase 2 or config edits."""
         self.signal_flow_ctrl.mark_stale()
 
+    def _emit_edit_daw_config(self) -> None:
+        if self.signal_flow_ctrl.active_daw_mode() == "dawproject":
+            self.edit_daw_config_requested.emit("DAWproject")
+        else:
+            self.edit_daw_config_requested.emit("Pro Tools")
+            self.edit_protools_config_requested.emit()
+
     def _protools_ptx_options(self) -> dict[str, Any]:
         flat = self._state.flat_config()
         return {
@@ -154,10 +167,38 @@ class DawTransferController(QObject):
             "remove_unused_aux_tracks": bool(flat.get("protools_remove_unused_aux_tracks", True)),
         }
 
+    def _dawproject_options(self) -> dict[str, Any]:
+        flat = self._state.flat_config()
+        dp = self.signal_flow_ctrl.active_dawproject_processor()
+        return {
+            "gain_mode": str(flat.get("dawproject_gain_mode", "trim_and_fader")),
+            "insert_track_trim": bool(flat.get("dawproject_insert_track_trim", True)),
+            "apply_trim_gain": bool(flat.get("dawproject_apply_trim_gain", False)),
+            "stage_bus_faders": bool(flat.get("dawproject_stage_bus_faders", True)),
+            "pan_law_db": float(flat.get("dawproject_pan_law_db", -3.0)),
+            "remove_unused_buses": bool(flat.get("dawproject_remove_unused_buses", True)),
+            "fader_ceiling_db": float(dp.fader_ceiling_db) if dp is not None else 6.0,
+        }
+
     @Slot(object)
     def _on_signal_flow_updated(self, graph_dict: dict[str, Any] | None) -> None:
-        opts = self._protools_ptx_options()
-        can_shift = opts["gain_mode"] == "clip_gain_and_fader" and opts["stage_bus_faders"]
+        mode = self.signal_flow_ctrl.active_daw_mode()
+        if mode == "dawproject":
+            opts = self._dawproject_options()
+            topo = self.signal_flow_ctrl.current_topology
+            has_cal = bool(getattr(topo, "has_calibrated_donor", False))
+            can_shift = (
+                opts["apply_trim_gain"]
+                and opts["insert_track_trim"]
+                and has_cal
+                and opts["gain_mode"] == "trim_and_fader"
+                and opts["stage_bus_faders"]
+            )
+        elif mode == "protools":
+            opts = self._protools_ptx_options()
+            can_shift = opts["gain_mode"] == "clip_gain_and_fader" and opts["stage_bus_faders"]
+        else:
+            can_shift = False
         raw_shift = (graph_dict or {}).get("leaf_fader_shift_db", 0.0) if (can_shift and isinstance(graph_dict, dict)) else 0.0
         shift = float(raw_shift) if isinstance(raw_shift, (int, float)) and not isinstance(raw_shift, bool) else 0.0
         if abs(shift - self._last_leaf_shift_db) >= 0.05:
@@ -166,10 +207,12 @@ class DawTransferController(QObject):
         self._update_leaf_balance_footer(graph_dict)
 
     def _update_leaf_balance_footer(self, graph_dict: dict[str, Any] | None) -> None:
-        if self.signal_flow_ctrl.active_protools_processor() is None or not isinstance(graph_dict, dict):
+        mode = self.signal_flow_ctrl.active_daw_mode()
+        if mode not in ("protools", "dawproject") or not isinstance(graph_dict, dict):
             self.page.set_leaf_balance_summary("")
             return
-        opts = self._protools_ptx_options()
+        is_dp = mode == "dawproject"
+        opts = self._dawproject_options() if is_dp else self._protools_ptx_options()
         nodes = graph_dict.get("nodes") or {}
         leaf_sums: list[float] = []
         for n in nodes.values():
@@ -178,51 +221,122 @@ class DawTransferController(QObject):
             if n.get("post_fader_peak_db") is None or n.get("is_muted") or n.get("is_inactive") or n.get("is_parallel_parked"):
                 continue
             bk = float(n.get("baked_gain_db") or 0.0)
-            cg = float(n.get("clip_gain_db") or 0.0)
+            pre = float(n.get("leaf_trim_db") or 0.0) if is_dp else float(n.get("clip_gain_db") or 0.0)
             fd = float(n.get("recommended_fader_db") or 0.0)
-            leaf_sums.append(round(bk + cg + fd, 1))
+            leaf_sums.append(round(bk + pre + fd, 1))
         if not leaf_sums:
             self.page.set_leaf_balance_summary("")
             return
         spread = round(max(leaf_sums) - min(leaf_sums), 1)
         const_sum = sorted(leaf_sums)[len(leaf_sums) // 2]
-        can_shift = opts["gain_mode"] == "clip_gain_and_fader" and opts["stage_bus_faders"]
+        topo = self.signal_flow_ctrl.current_topology
+        has_cal = bool(getattr(topo, "has_calibrated_donor", False))
+        can_shift = (
+            (opts["apply_trim_gain"] and opts["insert_track_trim"] and has_cal and opts["gain_mode"] == "trim_and_fader" and opts["stage_bus_faders"])
+            if is_dp
+            else (opts["gain_mode"] == "clip_gain_and_fader" and opts["stage_bus_faders"])
+        )
         shift = float(graph_dict.get("leaf_fader_shift_db") or 0.0) if can_shift else 0.0
         sum_txt = "0.0 dB" if abs(const_sum) < 0.05 else f"{const_sum:+.1f} dB"
-        if opts["gain_mode"] == "clip_gain_unity":
-            self.page.set_leaf_balance_summary(f"Unity-fader mode: {len(leaf_sums)} active tracks (per-track Clip Gain, 0.0 dB faders)", shifted=False)
+        pre_lbl = "slot 1 trim" if is_dp else "clip gain"
+        if opts["gain_mode"] in ("clip_gain_unity", "trim_unity"):
+            self.page.set_leaf_balance_summary(
+                f"Unity-fader mode: {len(leaf_sums)} active tracks (per-track {pre_lbl}, 0.0 dB faders)",
+                shifted=False,
+            )
         elif spread > 0.2:
             self.page.set_leaf_balance_summary(f"Leaf balance spread: \u00b1{spread:.1f} dB across {len(leaf_sums)} active tracks", shifted=False)
         elif abs(shift) >= 0.05:
             self.page.set_leaf_balance_summary(
-                f"Leaf balance: each of {len(leaf_sums)} tracks nets {sum_txt} (clip gain + fader; includes {shift:+.1f} dB headroom shift)",
+                f"Leaf balance: each of {len(leaf_sums)} tracks nets {sum_txt} ({pre_lbl} + fader; includes {shift:+.1f} dB headroom shift)",
                 shifted=True,
             )
         else:
             self.page.set_leaf_balance_summary(
-                f"Leaf balance: each of {len(leaf_sums)} tracks nets {sum_txt} (clip gain + fader; \u00b1{spread:.1f} dB)",
+                f"Leaf balance: each of {len(leaf_sums)} tracks nets {sum_txt} ({pre_lbl} + fader; \u00b1{spread:.1f} dB)",
                 shifted=False,
             )
 
+    def _sync_dawproject_summary(self) -> None:
+        opts = self._dawproject_options()
+        topo = self.signal_flow_ctrl.current_topology
+        donor = getattr(topo, "donor_plugin_name", None) if topo is not None else None
+        has_cal = bool(getattr(topo, "has_calibrated_donor", False))
+        if not opts["insert_track_trim"]:
+            trim_s = "Off"
+            self.page.set_dawproject_donor_warning("")
+        elif topo is None:
+            trim_s = "Template unavailable"
+            self.page.set_dawproject_donor_warning("")
+        elif donor:
+            if opts["apply_trim_gain"] and has_cal:
+                mode_tag = "calibrated (Exp.)"
+            elif opts["apply_trim_gain"]:
+                mode_tag = "unity 0.0 dB · uncalibrated"
+            else:
+                mode_tag = "unity 0.0 dB"
+            trim_s = f"{donor} ({mode_tag} \u00b7 VST2 excluded)"
+            self.page.set_dawproject_donor_warning("")
+        else:
+            trim_s = "No VST3 donor (VST2 excluded)"
+            self.page.set_dawproject_donor_warning(
+                "No VST3 Trim donor in template (VST2 excluded) \u2014 Slot 1 insert skipped"
+            )
+        bus_s = f"On (+{opts['fader_ceiling_db']:.1f} dB)" if opts["stage_bus_faders"] else "Off"
+        prune_s = "On" if opts["remove_unused_buses"] else "Off"
+        summary = (
+            f"DAWproject: Mode: {opts['gain_mode']}  \u00b7  VST3 Trim: {trim_s}  \u00b7  "
+            f"Bus staging: {bus_s}  \u00b7  Prune orphan buses: {prune_s}"
+        )
+        self.page.ptx_summary_label.setText(summary)
+        self.page.ptx_summary_label.setToolTip(summary)
+
     def sync_protools_ui_mode(self) -> None:
-        is_pt = self.signal_flow_ctrl.active_protools_processor() is not None
-        self.page.set_protools_mode(is_pt)
+        mode = self.signal_flow_ctrl.active_daw_mode()
+        self.page.set_daw_mode(mode)
         self.page.edit_config_btn.setEnabled(self._state.session is not None)
-        if not is_pt:
+        if mode == "basic":
+            self._last_leaf_shift_db = 0.0
             self.page.set_leaf_balance_summary("")
+            return
+        self.signal_flow_ctrl.sync_from_session()
+        if mode == "dawproject":
+            self._sync_dawproject_summary()
             return
         opts = self._protools_ptx_options()
         route_s = "On" if opts["auto_route"] else "Off"
         grp_s = f"On ({opts['group_type']})" if opts["auto_group_folders"] else "Off"
         vca_s = " + VCAs" if (opts["auto_group_folders"] and opts["link_template_vcas"]) else ""
         bus_s = f"On ({opts['pan_law_db']:.1f} dB pan law)" if opts["stage_bus_faders"] else "Off"
+        is_offline = _is_offline_ptx_processor(self._state.active_daw_processor)
+        prefix = "Pro Tools (Offline .ptx)" if is_offline else "Pro Tools (Live PTSL + .ptx)"
         summary = (
-            f"Pro Tools .ptx: Mode: {opts['gain_mode']}  ·  Auto-route: {route_s}  ·  "
-            f"Groups: {grp_s}{vca_s}  ·  Bus staging: {bus_s}"
+            f"{prefix}: Gain: {opts['gain_mode']}  \u00b7  Auto-route: {route_s}  \u00b7  "
+            f"Groups: {grp_s}{vca_s}  \u00b7  Bus staging: {bus_s}"
         )
         self.page.ptx_summary_label.setText(summary)
         self.page.ptx_summary_label.setToolTip(summary)
-        self.signal_flow_ctrl.sync_from_session()
+
+    def _refresh_offline_ptx_readiness(self) -> None:
+        """Refresh compact toolbar readiness badge & recovery banner for Offline .ptx mode."""
+        proc = self._state.active_daw_processor
+        if not _is_offline_ptx_processor(proc):
+            self._offline_ptx_ready = None
+            self.page.set_offline_not_ready_notice("")
+            return
+        ok, message = proc.check_connectivity()
+        self._offline_ptx_ready = bool(ok)
+        if ok:
+            self.page.daw_check_label.setText("\u25cf Offline .ptx ready")
+            self.page.daw_check_label.setStyleSheet(f"color: {COLORS['clean']};")
+            ptxt = proc.resolve_template_ptxt_path() if hasattr(proc, "resolve_template_ptxt_path") else None
+            self.page.daw_check_label.setToolTip(str(ptxt) if ptxt else message)
+            self.page.set_offline_not_ready_notice("")
+        else:
+            self.page.daw_check_label.setText("\u25b2 Offline .ptx not ready")
+            self.page.daw_check_label.setStyleSheet("color: #e6a23c;")
+            self.page.daw_check_label.setToolTip(message)
+            self.page.set_offline_not_ready_notice(f"Offline .ptx not ready \u2014 {message}")
 
     # ── DAW processor configuration & template bindings ──────────────────
 
@@ -296,6 +410,16 @@ class DawTransferController(QObject):
             self._on_daw_combo_changed(selected)
         else:
             self._state.active_daw_processor = None
+            self._last_leaf_shift_db = 0.0
+            self.page.daw_check_label.setText("")
+            self.page.daw_check_label.setToolTip("")
+            self.page.clear_rollback_notice()
+            self.page.set_dawproject_donor_warning("")
+            self.page.set_offline_not_ready_notice("")
+            self._offline_ptx_ready = None
+            self.signal_flow_ctrl.on_daw_processor_changed()
+            self.sync_protools_ui_mode()
+            self.update_lifecycle_buttons()
 
     def refresh_from_config(self) -> None:
         """Rebuild DAW processors and related Phase 3 UI from current config."""
@@ -303,12 +427,7 @@ class DawTransferController(QObject):
         previous = self._state.daw_template_bindings
         self.configure_daw_processors()
         self.populate_daw_combo(self.matching_daw_id(active_id, previous))
-        self.sync_protools_ui_mode()
         self.signal_flow_ctrl.mark_stale()
-        if self._state.session:
-            self.populate_folder_tree()
-            self.setup_table_refresh_requested.emit()
-        self.page.daw_check_label.setText("")
         self.update_lifecycle_buttons()
 
     def daw_operation_running(self) -> bool:
@@ -346,7 +465,10 @@ class DawTransferController(QObject):
         p.auto_assign_action.setEnabled(has_folders)
         p.unassign_all_action.setEnabled(has_assignments)
         p.transfer_action.setEnabled(
-            has_processor and has_assignments and not self._on_is_prepare_running()
+            has_processor
+            and has_assignments
+            and not self._on_is_prepare_running()
+            and self._offline_ptx_ready is not False
         )
         p.transfer_action.setText("Enqueue >>" if self._shell.is_batch_mode() else "Create")
         p.reset_manifest_action.setEnabled(
@@ -361,8 +483,13 @@ class DawTransferController(QObject):
             proc_idx = self.page.daw_combo.itemData(index)
             self._state.active_daw_processor = self._state.daw_processors[proc_idx]
         self.page.daw_check_label.setText("")
+        self.page.daw_check_label.setToolTip("")
+        self._last_leaf_shift_db = 0.0
+        self.page.clear_rollback_notice()
+        self.page.set_dawproject_donor_warning("")
         self.signal_flow_ctrl.on_daw_processor_changed()
         self.sync_protools_ui_mode()
+        self._refresh_offline_ptx_readiness()
         self.populate_folder_tree()
         self.setup_table_refresh_requested.emit()
         self.update_lifecycle_buttons()
@@ -371,7 +498,8 @@ class DawTransferController(QObject):
 
     def run_daw_check_then(self, processor: Any, on_success: Callable[[], None]) -> None:
         self.pending_after_check = on_success
-        self.page.daw_check_label.setText("Connecting\u2026")
+        label = "Checking offline template\u2026" if _is_offline_ptx_processor(processor) else "Connecting\u2026"
+        self.page.daw_check_label.setText(label)
         self.page.daw_check_label.setStyleSheet(f"color: {COLORS['dim']};")
         worker = DawCheckWorker(processor, parent=self)
         self.check_worker = worker
@@ -389,22 +517,34 @@ class DawTransferController(QObject):
         self.check_worker = None
         if self._shell.is_closing_after_daw():
             return
+        active = self._state.active_daw_processor
+        if active is not None and worker._processor.template_identity != active.template_identity:
+            self.pending_after_check = None
+            self.update_lifecycle_buttons()
+            return
         if ok:
-            self.page.daw_check_label.setText(message)
-            self.page.daw_check_label.setStyleSheet(f"color: {COLORS['clean']};")
+            if _is_offline_ptx_processor(worker._processor):
+                self._refresh_offline_ptx_readiness()
+            else:
+                self.page.daw_check_label.setText(message)
+                self.page.daw_check_label.setStyleSheet(f"color: {COLORS['clean']};")
             cb = self.pending_after_check
             self.pending_after_check = None
             if cb:
                 cb()
         else:
-            self.page.daw_check_label.setText("Connection failed")
-            self.page.daw_check_label.setStyleSheet(f"color: {COLORS['problems']};")
             self.pending_after_check = None
-            QMessageBox.warning(
-                self._shell.dialog_parent(),
-                "Connection Failed",
-                f"{worker._processor.name} connection could not be established.\n\n{message}",
-            )
+            if _is_offline_ptx_processor(worker._processor):
+                self._refresh_offline_ptx_readiness()
+                self._shell.show_status(f"Offline .ptx not ready: {message}")
+            else:
+                self.page.daw_check_label.setText("Connection failed")
+                self.page.daw_check_label.setStyleSheet(f"color: {COLORS['problems']};")
+                QMessageBox.warning(
+                    self._shell.dialog_parent(),
+                    "Connection Failed",
+                    f"{worker._processor.name} connection could not be established.\n\n{message}",
+                )
         self.update_lifecycle_buttons()
 
     @Slot()
@@ -481,18 +621,26 @@ class DawTransferController(QObject):
             if processor.id in session.daw_state:
                 self._state.session.daw_state[processor.id] = session.daw_state[processor.id]
             self.sync_protools_ui_mode()
+            self._refresh_offline_ptx_readiness()
             self.populate_folder_tree()
             self.page.right_stack.setCurrentIndex(_SETUP_RIGHT_TREE)
             self.setup_table_refresh_requested.emit()
             self._shell.progress_finish(message)
-            self._shell.show_status(message)
+            if _is_offline_ptx_processor(processor):
+                ptxt = processor.resolve_template_ptxt_path() if hasattr(processor, "resolve_template_ptxt_path") else None
+                tname = ptxt.name if ptxt is not None else processor.name
+                self._shell.show_status(f"Offline .ptx Writer \u00b7 {tname} (parsed offline)")
+            else:
+                self._shell.show_status(message)
         else:
+            self._refresh_offline_ptx_readiness()
             self._shell.progress_fail(message)
-            QMessageBox.critical(
-                self._shell.dialog_parent(),
-                "Fetch Failed",
-                f"Could not fetch folder structure from {processor.name}.\n\n{message}",
-            )
+            if not _is_offline_ptx_processor(processor):
+                QMessageBox.critical(
+                    self._shell.dialog_parent(),
+                    "Fetch Failed",
+                    f"Could not fetch folder structure from {processor.name}.\n\n{message}",
+                )
             self._shell.show_status(f"Fetch failed: {message}")
         self.update_lifecycle_buttons()
 
@@ -763,7 +911,8 @@ class DawTransferController(QObject):
             (item.flags() | Qt.ItemFlag.ItemIsDropEnabled) & ~Qt.ItemFlag.ItemIsDragEnabled
         )
         folder_member_fnames = folder_tracks.get(folder["id"], [])
-        self._decorate_folder_columns(item, folder, len(folder_member_fnames))
+        has_subtree = _has_subtree_tracks(folder["id"], children_map, folder_tracks)
+        self._decorate_folder_columns(item, folder, len(folder_member_fnames), has_subtree_tracks=has_subtree)
         for fname in folder_member_fnames:
             self._add_folder_track_node(item, folder, fname, track_map, entry_map, gcm)
         for child in children_map.get(folder["id"], []):
@@ -773,18 +922,60 @@ class DawTransferController(QObject):
             )
         item.setExpanded(True)
 
-    def _decorate_folder_columns(self, item: QTreeWidgetItem, folder: dict[str, Any], member_count: int) -> None:
+    def _decorate_dawproject_folder_columns(
+        self, item: QTreeWidgetItem, folder: dict[str, Any], member_count: int, *, has_subtree_tracks: bool,
+    ) -> None:
+        topo = self.signal_flow_ctrl.current_topology
+        meta = topo.lookup(str(folder.get("id", "")), str(folder.get("name", ""))) if topo else None
+        opts = self._dawproject_options()
+        donor = getattr(topo, "donor_plugin_name", None) if topo is not None else None
+        has_cal = bool(getattr(topo, "has_calibrated_donor", False))
+        is_routing = folder.get("folder_type") == "routing"
+        bus_name = getattr(meta, "bus_channel_name", None) if meta is not None else None
+        ch_txt = f"Ch: {bus_name}" if bus_name else ("None (Basic)" if not is_routing else "\u2014")
+        item.setText(1, ch_txt)
+        item.setForeground(1, QColor(COLORS["text"] if bus_name else COLORS["metadata"]))
+
+        if not opts["insert_track_trim"]:
+            trim_txt, trim_col = "Insert off", COLORS["dim"]
+        elif topo is None or member_count == 0:
+            trim_txt, trim_col = "\u2014", COLORS["dim"]
+        elif donor:
+            tag = "calibrated" if (opts["apply_trim_gain"] and has_cal) else "0.0 dB"
+            trim_txt, trim_col = f"Children: {donor} (VST3, {tag})", COLORS["clean"]
+        else:
+            trim_txt, trim_col = "No VST3 donor", COLORS["attention"]
+        item.setText(2, trim_txt)
+        item.setForeground(2, QColor(trim_col))
+
+        chain = getattr(meta, "output_chain", "") if meta is not None else ""
+        prefix = "Walks up \u2192 " if (not is_routing and chain) else ("\u2192 " if chain else "")
+        prune_note = ""
+        if not has_subtree_tracks:
+            prune_note = " (empty, pruned + orphan buses)" if (is_routing and opts["remove_unused_buses"]) else " (empty, pruned)"
+        item.setText(3, f"{prefix}{chain}{prune_note}" if (chain or prune_note) else "\u2014")
+        item.setForeground(3, QColor(COLORS["metadata"] if has_subtree_tracks else COLORS["dim"]))
+
+    def _decorate_folder_columns(
+        self, item: QTreeWidgetItem, folder: dict[str, Any], member_count: int, *, has_subtree_tracks: bool | None = None,
+    ) -> None:
         if self.page.folder_tree.columnCount() < 4:
+            return
+        populated = (member_count > 0) if has_subtree_tracks is None else has_subtree_tracks
+        if self.signal_flow_ctrl.active_daw_mode() == "dawproject":
+            self._decorate_dawproject_folder_columns(item, folder, member_count, has_subtree_tracks=populated)
             return
         topo = self.signal_flow_ctrl.current_topology
         meta = topo.lookup(str(folder.get("id", "")), str(folder.get("name", ""))) if topo else None
         opts = self._protools_ptx_options()
         is_routing = folder.get("folder_type") == "routing"
-        in_bus = f"Bus: {meta.input_bus}" if (meta and meta.input_bus) else ("None (Basic)" if not is_routing else "\u2014")
+        in_bus_val = getattr(meta, "input_bus", None) if meta is not None else None
+        in_bus = f"Bus: {in_bus_val}" if in_bus_val else ("None (Basic)" if not is_routing else "\u2014")
         item.setText(1, in_bus)
-        item.setForeground(1, QColor(COLORS["text"] if (meta and meta.input_bus) else COLORS["metadata"]))
+        item.setForeground(1, QColor(COLORS["text"] if in_bus_val else COLORS["metadata"]))
 
-        vca = meta.vca_track if (meta and opts["link_template_vcas"] and opts["group_type"].lower() != "edit") else None
+        vca_val = getattr(meta, "vca_track", None) if meta is not None else None
+        vca = vca_val if (vca_val and opts["link_template_vcas"] and opts["group_type"].lower() != "edit") else None
         if not opts["auto_group_folders"]:
             grp_txt, grp_col = "Auto-grouping off", COLORS["dim"]
         elif member_count > 0:
@@ -797,9 +988,47 @@ class DawTransferController(QObject):
         item.setText(2, grp_txt)
         item.setForeground(2, QColor(grp_col))
 
-        route_txt = meta.output_chain if meta else ""
+        route_txt = getattr(meta, "output_chain", "") if meta is not None else ""
         item.setText(3, route_txt)
-        item.setForeground(3, QColor(COLORS["metadata"] if member_count > 0 else COLORS["dim"]))
+        item.setForeground(3, QColor(COLORS["metadata"] if populated else COLORS["dim"]))
+
+    def _decorate_track_columns(self, track_item: QTreeWidgetItem, folder: dict[str, Any]) -> None:
+        topo = self.signal_flow_ctrl.current_topology
+        meta = topo.lookup(str(folder.get("id", "")), str(folder.get("name", ""))) if topo else None
+        track_item.setText(1, "\u2014")
+        track_item.setForeground(1, QColor(COLORS["metadata"]))
+        if self.signal_flow_ctrl.active_daw_mode() == "dawproject":
+            opts = self._dawproject_options()
+            donor = getattr(topo, "donor_plugin_name", None) if topo is not None else None
+            has_cal = bool(getattr(topo, "has_calibrated_donor", False))
+            if opts["insert_track_trim"] and donor:
+                tag = "calibrated" if (opts["apply_trim_gain"] and has_cal) else "0.0 dB"
+                track_item.setText(2, f"{donor} (VST3, {tag})")
+                track_item.setForeground(2, QColor(COLORS["metadata"]))
+            else:
+                track_item.setText(2, "\u2014")
+                track_item.setForeground(2, QColor(COLORS["dim"]))
+            rbus = (
+                getattr(meta, "resolved_routing_channel_name", None)
+                or getattr(meta, "bus_channel_name", None)
+            ) if meta is not None else None
+            track_item.setText(3, f"Route \u2192 Ch: {rbus}" if rbus else "\u2014")
+            track_item.setForeground(3, QColor(COLORS["text"] if rbus else COLORS["metadata"]))
+            return
+        opts = self._protools_ptx_options()
+        grp_lbl = f"member of {folder['name']}" if opts["auto_group_folders"] else "\u2014"
+        track_item.setText(2, grp_lbl)
+        track_item.setForeground(2, QColor(COLORS["metadata"] if opts["auto_group_folders"] else COLORS["dim"]))
+        rbus = getattr(meta, "resolved_routing_bus", None) if meta is not None else None
+        if opts["auto_route"] and rbus:
+            track_item.setText(3, f"Auto-route \u2192 Bus: {rbus}")
+            track_item.setForeground(3, QColor(COLORS["text"]))
+        elif not opts["auto_route"]:
+            track_item.setText(3, "Auto-route off")
+            track_item.setForeground(3, QColor(COLORS["dim"]))
+        else:
+            track_item.setText(3, "\u2014")
+            track_item.setForeground(3, QColor(COLORS["metadata"]))
 
     def _add_folder_track_node(
         self,
@@ -828,24 +1057,7 @@ class DawTransferController(QObject):
             (track_item.flags() | Qt.ItemFlag.ItemIsDragEnabled) & ~Qt.ItemFlag.ItemIsDropEnabled
         )
         if self.page.folder_tree.columnCount() >= 4:
-            topo = self.signal_flow_ctrl.current_topology
-            meta = topo.lookup(str(folder.get("id", "")), str(folder.get("name", ""))) if topo else None
-            opts = self._protools_ptx_options()
-            track_item.setText(1, "\u2014")
-            track_item.setForeground(1, QColor(COLORS["metadata"]))
-            grp_lbl = f"member of {folder['name']}" if opts["auto_group_folders"] else "\u2014"
-            track_item.setText(2, grp_lbl)
-            track_item.setForeground(2, QColor(COLORS["metadata"] if opts["auto_group_folders"] else COLORS["dim"]))
-            rbus = meta.resolved_routing_bus if meta else None
-            if opts["auto_route"] and rbus:
-                track_item.setText(3, f"Auto-route \u2192 Bus: {rbus}")
-                track_item.setForeground(3, QColor(COLORS["text"]))
-            elif not opts["auto_route"]:
-                track_item.setText(3, "Auto-route off")
-                track_item.setForeground(3, QColor(COLORS["dim"]))
-            else:
-                track_item.setText(3, "\u2014")
-                track_item.setForeground(3, QColor(COLORS["metadata"]))
+            self._decorate_track_columns(track_item, folder)
         out_fn = te.output_filename if te else fname
         tc = track_map.get(out_fn)
         if tc and tc.group:
@@ -1159,6 +1371,14 @@ class DawTransferController(QObject):
             )
 
 
+def _is_offline_ptx_processor(processor: Any) -> bool:
+    return (
+        processor is not None
+        and str(getattr(processor, "id", "")).startswith("protools")
+        and getattr(processor, "transfer_backend", "ptsl_hybrid") == "offline_ptx"
+    )
+
+
 def _folder_icon(color_hex: str) -> QIcon:
     sz = 14
     pix = QPixmap(sz, sz)
@@ -1179,6 +1399,19 @@ def _build_folder_children_map(folders: list[dict[str, Any]]) -> dict[str | None
     for children in children_map.values():
         children.sort(key=lambda f: f.get("index", 0))
     return children_map
+
+
+def _has_subtree_tracks(
+    folder_id: str,
+    children_map: dict[str | None, list[dict[str, Any]]],
+    folder_tracks: dict[str, list[str]],
+) -> bool:
+    if folder_tracks.get(folder_id):
+        return True
+    return any(
+        _has_subtree_tracks(child["id"], children_map, folder_tracks)
+        for child in children_map.get(folder_id, [])
+    )
 
 
 def _build_folder_tracks_map(

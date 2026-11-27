@@ -169,14 +169,8 @@ def test_fetch_retries_with_inherited_temporary_directory_correction(
     cache_file = tmp_path / "settings" / "pt_template_cache.json"
     cache_file.write_text(json.dumps({
         "SessionPrep/Template": {
-            "mtime": template.stat().st_mtime,
-            "folders": [{
-                "id": "drums",
-                "name": "Drums",
-                "folder_type": "routing",
-                "index": 1,
-                "parent_id": None,
-            }],
+            "mtime": 0.0,
+            "folders": [],
         },
     }), encoding="utf-8")
     monkeypatch.setattr(DawFetchWorker, "start", DawFetchWorker.run)
@@ -199,6 +193,17 @@ def test_fetch_retries_with_inherited_temporary_directory_correction(
         window, monkeypatch,
         lambda dialog: _field(dialog._cfg_widgets, "protools_temp_dir").set_value(str(corrected)),
     )
+    monkeypatch.setattr(
+        protools.ProToolsDawProcessor,
+        "_fetch_folders_live",
+        lambda _self, _cb=None: [{
+            "id": "drums",
+            "name": "Drums",
+            "folder_type": "routing",
+            "index": 1,
+            "parent_id": None,
+        }],
+    )
     window.daw_controller.page.fetch_action.click()
 
     assert len(messages) == 1
@@ -218,7 +223,7 @@ def test_reordered_templates_keep_selection_and_assignments_until_replacement(
         templates = dialog._cfg_daw_custom_widgets["protools"]
         add = next(
             button for button in templates.findChildren(QPushButton)
-            if button.text() == "Add"
+            if button.text() in ("Add", "+ Add Template")
         )
         add.click()
         templates._table.item(1, 0).setText("SessionPrep")

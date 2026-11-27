@@ -490,21 +490,41 @@ sessionpreplib/
         mono_downmix.py          # MonoDownmixProcessor (stub)
     daw_processors/
         __init__.py              # Exports all DAW processors; provides default_daw_processors()
-        protools.py              # ProToolsDawProcessor — Pro Tools integration via py-ptsl + .ptx orchestration
+        protools.py              # ProToolsDawProcessor — Pro Tools offline Fetch + PTSL/offline backend dispatch
         protools_ptx.py          # Pro Tools .ptx routing, cleanup (folders/VCAs/orphaned Auxes), & post-close patching
-        protools_ptx_preview.py  # Offline .ptxt template topology inspection & Signal Flow preview engine
+        protools_ptx_media.py    # Offline Pro Tools session folder & Audio Files/ WAV staging (copy, exact resample, rollback)
+        protools_ptx_plan.py     # Declarative backend-agnostic ProToolsCreationPlan builder (tracks, routing, colors, signal flow)
+        protools_ptx_preview.py  # Offline .ptxt template folder/topology inspection & Signal Flow preview engine
         ptsl_connection.py       # PTSL engine connection & host-readiness helpers
         ptsl_helpers.py          # PTSL command wrappers, signalpath calibration & track/batch utilities
-        dawproject.py            # DawProjectDawProcessor — self-contained .dawproject archive generation
+        dawproject.py            # DawProjectDawProcessor — self-contained .dawproject archive generation & staging
+        dawproject_vst3.py       # Pure-Python VST3 .vstpreset codec, donor selection & XSD Slot 1 Trim XML helper
+        dawproject_signal_flow.py # DAWproject XML->MixerSession adapter, offline preview, bus patching & submix pruning
+    signal_flow/
+        __init__.py              # Public DAW-agnostic signal-flow DAG, staging-math & Trim-codec exports
+        models.py                # HostGainLimits, MixerSession/Track/Insert/Send, TrimPluginInfo, SignalFlowGraph
+        trim_codecs.py           # Format-agnostic TrackControl DGCT JSON & Protility VC2! XML codecs + donor selection
+        math.py                  # Pan law, float64 buffer normalization/measurement, bus gain math & resolve_track_staging()
+        analysis.py              # Balance validation, pre-fader send caveats, path tracing & semantic-tier DAG layout
+        solver.py                # DAW-agnostic DAG reconstruction, float64 summing & recursive multi-stage bus staging
     ptx/
-        __init__.py              # Public .ptx parser, patcher, Slot A trim & signal-flow exports
-        codec.py                 # 4 KB rolling-XOR decrypt/encrypt, Z-chunk traversal, 0x0002 index shifting
-        models.py                # Dataclasses for PtxSession, tracks, signal paths, inserts, SlotATrimInfo, groups
-        parser.py                # Pure-Python stdlib .ptx/.ptxt binary parser
-        plugin_trim.py           # Validated Slot A trim reader, clean-donor selector & 0x2625->0x2616 auto-insert/patcher
+        __init__.py              # Public .ptx parser, 5-layer API, stock plugin decoders, patcher & signal-flow exports
+        codec.py                 # 4 KB rolling-XOR decrypt/encrypt, Z-chunk tree/traversal, 0x46 control curves, 0x0002 index shifting
+        models.py                # Dataclasses, automation/clip-gain evaluators, PtxTimeConverter/PtxSessionLike protocols & constants
+        timeline.py              # PtxTimeline & PtxBarBeat (samples/seconds/ticks/bars|beats/timecode, tempo/meter/marker queries)
+        arrangement.py           # ResolvedAudioEvent/MidiEvent/VideoEvent joiners (fades, compounds, loops, overlap trimming)
+        queries.py               # Track/folder/group/VCA/insert/audio-file queries, effective mix-state evaluation & PtxSessionAudit
+        plugin_controls.py       # Avid stock AAX parameter decoders (EQ3 7-Band/1-Band, Dyn3 Comp/De-Esser/ExpGate) & automation tapers
+        parser.py                # Unified PtxSession v10+ binary reader facade & high-level delegation methods
+        parser_mixer.py          # Mixer strips, automation lanes, 0x2015 metadata, AAX plugin states/automation & ARA2 parsers
+        parser_timeline.py       # Session start TC, tempo/meter/markers, audio trees, clips/warp/fades/compounds, MIDI & video parsers
+        plugin_trim.py           # Validated AAX Slot A trim reader/patcher & 0x2625->0x2616 auto-insert (delegates payload codecs to signal_flow)
         patcher.py               # Atomic .ptx patchers (No Input, 0x2637 Clip Gain, faders, groups/VCAs, Slot A trims)
-        signal_flow.py           # Signal-flow DAG reconstruction, float64 summing & recursive multi-stage bus staging
-        signal_flow_analysis.py  # Balance validation, pre-fader send caveats, path tracing & semantic-tier DAG layout
+        patch_builder.py         # Fluent transactional PtxPatchBuilder wrapping validated in-memory/file batch mutations
+        writer_primitives.py     # Low-level Z-chunk/control-curve serializers & byte-exact 0x0002 chunk-offset index codec/mutators
+        writer_chunks.py         # Verified Pro Tools chunk serializers (0x1028, 0x103a, 0x1001, 0x104f/1052, 0x1014, 0x2628) & palette mapper
+        signal_flow.py           # Thin Pro Tools adapter (ptx_to_mixer_session, build_annotated_signal_flow) over signal_flow
+        signal_flow_analysis.py  # Backward-compatible re-exports of signal_flow.analysis
 
 sessionprepgui/                  # GUI package (PySide6)
     __init__.py                  # Exports main()
@@ -545,7 +565,8 @@ sessionprepgui/                  # GUI package (PySide6)
                                  #   _build_widget, _build_param_page, tooltip builders, sanitize_output_folder
         preset_panel.py          # Portable NamedPresetPanel — reusable named-preset CRUD widget
         config_pages.py          # SessionPrep-specific: GroupsTableWidget, DawProjectTemplatesWidget,
-                                 #   build/load/read_config_pages
+                                 #   build/load/read_config_pages (re-exports ProToolsTemplatesWidget)
+        protools_prefs.py        # 3-column ProToolsTemplatesWidget (.ptxt path) & Transfer Mode PTSL wiring
         page_general.py          # GeneralPage — app settings (widget_hint drives PathPicker for dir field)
         page_colors.py           # ColorsPage — editable color palette table
         page_groups.py           # GroupsPage — named group presets via NamedPresetPanel

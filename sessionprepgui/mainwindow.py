@@ -537,6 +537,7 @@ class SessionPrepWindow(QMainWindow):
             on_create_group_combo=self._groups_ctrl.create_group_combo,
             on_is_analysis_running=lambda: self._analysis_ctrl.is_analysis_running(),
             on_is_repair_running=lambda: self._analysis_ctrl.is_repair_running(),
+            on_get_dawproject_topology=lambda: self._daw_ctrl.signal_flow_ctrl.current_topology,
             parent=self,
         )
         self._analysis_ctrl = AnalysisPrepareController(
@@ -683,7 +684,7 @@ class SessionPrepWindow(QMainWindow):
     def _wire_lifecycle_and_daw_signals(self) -> None:
         self._daw_ctrl.setup_table_refresh_requested.connect(self._table_ctrl.populate_setup_table)
         self._daw_ctrl.clear_workspace_requested.connect(self._persistence_ctrl.clear_workspace)
-        self._daw_ctrl.edit_protools_config_requested.connect(self._open_protools_session_config)
+        self._daw_ctrl.edit_daw_config_requested.connect(self._open_daw_session_config)
         self._daw_ctrl.open_log_viewer_requested.connect(self._on_open_log_viewer)
         self._batch_ctrl.batch_mode_changed.connect(lambda _c: self._daw_ctrl.update_lifecycle_buttons())
         self._batch_ctrl.batch_mode_changed.connect(
@@ -850,24 +851,36 @@ class SessionPrepWindow(QMainWindow):
         self._daw_ctrl.refresh_from_config()
         self._update_tools_menu()
 
-    @Slot()
-    def _open_protools_session_config(self) -> None:
-        """Jump from Phase 3's read-only summary bar to Phase 2 › Config › Pro Tools."""
+    @Slot(str)
+    def _open_daw_session_config(self, daw_name: str) -> None:
+        """Jump from Phase 3's summary/recovery bar to Phase 2 › Config › <DAW> (or Preferences)."""
         if self._state.session is None:
+            section = (
+                "daw_processors.dawproject"
+                if (daw_name or "").strip().lower() == "dawproject"
+                else "daw_processors.protools"
+            )
+            self._on_preferences(initial_preset_section=section)
             return
         self._phase_tabs.setCurrentIndex(_PHASE_ANALYSIS)
         self._phase2_page.detail_tabs.setCurrentIndex(_TAB_SESSION)
-        self._config_ctrl.select_daw_processor_page("Pro Tools")
+        self._config_ctrl.select_daw_processor_page(daw_name or "Pro Tools")
 
     @Slot()
-    def _on_preferences(self) -> None:
+    def _open_protools_session_config(self) -> None:
+        """Jump from Phase 3's read-only summary bar to Phase 2 › Config › Pro Tools."""
+        self._open_daw_session_config("Pro Tools")
+
+    @Slot()
+    def _on_preferences(self, initial_preset_section: Any = None) -> None:
         old_scale = self._state.config.get("app", {}).get("scale_factor", DEFAULT_SCALE_FACTOR)
         old_config = self._state.effective_session_config()
         old_group_preset = self._state.config.get("group_presets", {}).get(
             self._state.active_session_preset
         )
 
-        dlg = PreferencesDialog(self._state.config, parent=self)
+        section = initial_preset_section if isinstance(initial_preset_section, str) else None
+        dlg = PreferencesDialog(self._state.config, parent=self, initial_preset_section=section)
         dlg.exec()
         if not dlg.saved:
             return

@@ -84,8 +84,9 @@ class DawSetupPage(QWidget):
         self.setup_table = self._build_setup_table()
         self.left_pane = self._build_left_pane()
         self.right_stack = self._build_right_stack()
+        self.right_pane = self._build_right_pane()
         self.splitter.addWidget(self.left_pane)
-        self.splitter.addWidget(self.right_stack)
+        self.splitter.addWidget(self.right_pane)
         self.splitter.setStretchFactor(0, 1)
         self.splitter.setStretchFactor(1, 1)
         self.schedule_splitter_fit()
@@ -285,6 +286,46 @@ class DawSetupPage(QWidget):
         stack.setCurrentIndex(_SETUP_RIGHT_PLACEHOLDER)
         return stack
 
+    def _build_right_pane(self) -> QWidget:
+        pane = QWidget()
+        lay = QVBoxLayout(pane)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+        self.offline_not_ready_banner = self._build_offline_not_ready_banner()
+        lay.addWidget(self.offline_not_ready_banner)
+        lay.addWidget(self.right_stack, 1)
+        return pane
+
+    def _build_offline_not_ready_banner(self) -> QWidget:
+        wrapper = QWidget()
+        w_lay = QVBoxLayout(wrapper)
+        w_lay.setContentsMargins(CONTENT_INSET, CONTENT_INSET, CONTENT_INSET, 0)
+        w_lay.setSpacing(0)
+
+        banner = QWidget()
+        banner.setObjectName("offlineNotReadyBanner")
+        banner.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        banner.setStyleSheet(
+            "QWidget#offlineNotReadyBanner { background-color: #2a251b; "
+            "border: 1px solid #5c4a26; border-left: 3px solid #e6a23c; border-radius: 2px; }"
+        )
+        lay = QHBoxLayout(banner)
+        lay.setContentsMargins(10, 6, 10, 6)
+        lay.setSpacing(10)
+        self.offline_not_ready_label = QLabel("")
+        self.offline_not_ready_label.setWordWrap(True)
+        self.offline_not_ready_label.setStyleSheet("border: none; background: transparent; color: #eed9b8;")
+        lay.addWidget(self.offline_not_ready_label, 1)
+        self.open_pt_settings_btn = FormActionButton("Open Pro Tools Settings\u2026")
+        self.open_pt_settings_btn.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.open_pt_settings_btn.setStyleSheet(
+            f"QPushButton:focus {{ border: 2px solid {COLORS['information']}; }}"
+        )
+        lay.addWidget(self.open_pt_settings_btn)
+        w_lay.addWidget(banner)
+        wrapper.hide()
+        return wrapper
+
     def _build_rollback_banner(self) -> QWidget:
         banner = QWidget()
         banner.setObjectName("rollbackBanner")
@@ -344,6 +385,25 @@ class DawSetupPage(QWidget):
         self.ptx_summary_bar.hide()
         self._routing_tab_layout.addWidget(self.ptx_summary_bar)
 
+        self.no_donor_banner = QWidget()
+        self.no_donor_banner.setObjectName("dawNoDonorBanner")
+        self.no_donor_banner.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.no_donor_banner.setStyleSheet(
+            f"QWidget#dawNoDonorBanner {{ background-color: #2a251b; border: 1px solid #5c4a26; "
+            f"border-left: 3px solid {COLORS['attention']}; border-radius: 2px; }}"
+        )
+        nd_lay = QHBoxLayout(self.no_donor_banner)
+        nd_lay.setContentsMargins(8, 4, 8, 4)
+        nd_lay.setSpacing(6)
+        self.no_donor_label = QLabel("")
+        self.no_donor_label.setWordWrap(True)
+        self.no_donor_label.setStyleSheet(
+            f"border: none; background: transparent; color: {COLORS['attention']};"
+        )
+        nd_lay.addWidget(self.no_donor_label, 1)
+        self.no_donor_banner.hide()
+        self._routing_tab_layout.addWidget(self.no_donor_banner)
+
         self.folder_tree = _FolderDropTree()
         self.folder_tree.setHeaderLabels(["Folder / Track"])
         self.folder_tree.setSelectionMode(QTreeWidget.SelectionMode.ExtendedSelection)
@@ -355,17 +415,29 @@ class DawSetupPage(QWidget):
         self._routing_tab_layout.addWidget(self.folder_tree, 1)
         return tab
 
-    def set_protools_mode(self, enabled: bool) -> None:
-        """Toggle Pro Tools right-pane tabs, summary bar, and 4-column enriched folder tree."""
-        self.right_tabs.setTabEnabled(1, enabled)
-        self.right_tabs.tabBar().setVisible(enabled)
-        self.ptx_summary_bar.setVisible(enabled)
-        pane_border = f"1px solid {COLORS['border']}" if enabled else "none"
+    def set_daw_mode(self, mode: str) -> None:
+        """Toggle right-pane tabs, summary bar, setup Column 4 header, and enriched folder tree."""
+        enriched = mode in ("protools", "dawproject")
+        self.right_tabs.setTabEnabled(1, enriched)
+        self.right_tabs.tabBar().setVisible(enriched)
+        self.ptx_summary_bar.setVisible(enriched)
+        if mode != "dawproject":
+            self.no_donor_banner.hide()
+        if mode != "protools":
+            self.rollback_banner.hide()
+            self.offline_not_ready_banner.hide()
+        pane_border = f"1px solid {COLORS['border']}" if enriched else "none"
         self.right_tabs.setStyleSheet(
             f"QTabWidget::pane {{ border: none; border-top: {pane_border}; margin: 0; padding: 0; }}"
         )
-        self._routing_tab_layout.setContentsMargins(0, 6 if enabled else 0, 0, 0)
-        if not enabled:
+        self._routing_tab_layout.setContentsMargins(0, 6 if enriched else 0, 0, 0)
+
+        col4_label = "Slot 1 Trim" if mode == "dawproject" else "Clip Gain"
+        hdr_item = self.setup_table.horizontalHeaderItem(4)
+        if hdr_item is not None:
+            hdr_item.setText(col4_label)
+
+        if not enriched:
             self.right_tabs.setCurrentIndex(0)
             self.rollback_banner.hide()
             self.folder_tree.setColumnCount(1)
@@ -373,12 +445,31 @@ class DawSetupPage(QWidget):
             self.folder_tree.header().setStretchLastSection(True)
             return
         self.folder_tree.setColumnCount(4)
-        self.folder_tree.setHeaderLabels(["Folder / Track", "Input Bus", "Planned Group & VCA", "Output Routing"])
+        if mode == "dawproject":
+            labels = ["Folder / Track", "Bus Channel", "Slot 1 Trim (VST3)", "Output Routing"]
+            widths = (220, 115, 215, 220)
+        else:
+            labels = ["Folder / Track", "Input Bus", "Planned Group & VCA", "Output Routing"]
+            widths = (220, 115, 195, 210)
+        self.folder_tree.setHeaderLabels(labels)
         hdr = self.folder_tree.header()
-        for col, width in enumerate((220, 115, 195, 210)):
+        for col, width in enumerate(widths):
             hdr.setSectionResizeMode(col, QHeaderView.ResizeMode.Interactive)
             self.folder_tree.setColumnWidth(col, width)
         hdr.setStretchLastSection(True)
+
+    def set_protools_mode(self, enabled: bool) -> None:
+        """Backward-compatible wrapper for toggling Pro Tools enriched mode."""
+        self.set_daw_mode("protools" if enabled else "basic")
+
+    def set_dawproject_donor_warning(self, message: str) -> None:
+        """Show or hide the amber DAWproject no-VST3-donor inline notice."""
+        if message:
+            self.no_donor_label.setText(f"\u26a0  {message}")
+            self.no_donor_banner.show()
+        else:
+            self.no_donor_label.setText("")
+            self.no_donor_banner.hide()
 
     def show_rollback_notice(self, detail: str) -> None:
         self.rollback_label.setText(f"\u2715  {detail}")
@@ -386,6 +477,15 @@ class DawSetupPage(QWidget):
 
     def clear_rollback_notice(self) -> None:
         self.rollback_banner.hide()
+
+    def set_offline_not_ready_notice(self, message: str) -> None:
+        """Show or hide the amber Offline .ptx not-ready recovery banner."""
+        if message:
+            self.offline_not_ready_label.setText(message)
+            self.offline_not_ready_banner.show()
+        else:
+            self.offline_not_ready_label.setText("")
+            self.offline_not_ready_banner.hide()
 
     def apply_table_column_modes(self) -> None:
         """Restore the intended setup-table resize behavior after auto-fit."""

@@ -24,6 +24,7 @@ from .protools_ptx import (
     resolve_protools_track_staging,
     run_post_close_ptx_enhancement,
 )
+from .protools_ptx_preview import read_template_folders_from_ptxt
 from .ptsl_connection import (
     ProToolsConnectionSettings,
     check_connectivity as check_ptsl_connectivity,
@@ -40,6 +41,76 @@ _parse_argb = ptslh.parse_argb
 _srgb_to_linear = ptslh.srgb_to_linear
 _rgb_to_lab = ptslh.rgb_to_lab
 _closest_palette_index = ptslh.closest_palette_index
+
+
+def _ptsl_connection_params() -> list[ParamSpec]:
+    return [
+        ParamSpec(
+            key="protools_temp_dir",
+            type=str,
+            default="",
+            label="Temporary project directory",
+            description=(
+                "Directory for temporary Pro Tools sessions during Live PTSL inspection "
+                "(PTSL only; leave empty for system temp)."
+            ),
+            widget_hint="path_picker_folder",
+        ),
+        ParamSpec(
+            key="protools_company_name",
+            type=str,
+            default="github.com",
+            label="Company Name",
+            description="Company name sent during the PTSL handshake (PTSL only).",
+        ),
+        ParamSpec(
+            key="protools_application_name",
+            type=str,
+            default="sessionprep",
+            label="Application Name",
+            description="Application name sent during the PTSL handshake (PTSL only).",
+        ),
+        ParamSpec(
+            key="protools_host",
+            type=str,
+            default="localhost",
+            label="Host",
+            description="Hostname or IP address of the Pro Tools PTSL server (PTSL only).",
+        ),
+        ParamSpec(
+            key="protools_port",
+            type=int,
+            default=31416,
+            label="Port",
+            description="Port number of the Pro Tools PTSL server (PTSL only).",
+            min=1,
+            max=65535,
+        ),
+        ParamSpec(
+            key="protools_command_delay",
+            type=float,
+            default=0.5,
+            label="Command Delay (s)",
+            description=(
+                "Seconds to wait between Pro Tools commands "
+                "(folder select, import, etc.; PTSL only)."
+            ),
+            min=0.1,
+            max=5.0,
+        ),
+        ParamSpec(
+            key="protools_template_create_timeout",
+            type=float,
+            default=60.0,
+            label="Template Create Timeout (s)",
+            description=(
+                "Seconds to wait for Pro Tools to create and open a session "
+                "from a template (PTSL only)."
+            ),
+            min=5.0,
+            max=300.0,
+        ),
+    ]
 
 
 class ProToolsDawProcessor(DawProcessor):
@@ -59,16 +130,21 @@ class ProToolsDawProcessor(DawProcessor):
         instance_index: int | None = None,
         instance_group: str = "",
         instance_name: str = "",
+        instance_ptxt_path: str = "",
     ):
         self._instance_index = instance_index
         self._instance_group = instance_group
-        self._instance_name = instance_name
+        self._instance_ptxt_path = instance_ptxt_path.strip()
+        self._instance_name = (
+            instance_name.strip()
+            or (os.path.splitext(os.path.basename(self._instance_ptxt_path))[0] if self._instance_ptxt_path else "")
+        )
         if instance_index is not None:
             self.id = f"protools_{instance_index}"
             if instance_group:
-                self.name = f"Pro Tools \u2013 {instance_group} / {instance_name}"
+                self.name = f"Pro Tools \u2013 {instance_group} / {self._instance_name}"
             else:
-                self.name = f"Pro Tools \u2013 {instance_name}"
+                self.name = f"Pro Tools \u2013 {self._instance_name}"
 
     @classmethod
     def create_instances(
@@ -78,8 +154,8 @@ class ProToolsDawProcessor(DawProcessor):
         """Create one processor instance per configured template.
 
         Reads ``protools_templates`` from *flat_config*.  Each entry
-        is a dict with key ``name`` and ``group``. Returns an empty list when no templates
-        are configured.
+        may provide ``group`` + ``name`` and/or an explicit ``ptxt_path`` (``path``).
+        Returns an empty list when no templates are configured.
         """
         templates = flat_config.get("protools_templates", [])
         if not isinstance(templates, list):
@@ -88,88 +164,42 @@ class ProToolsDawProcessor(DawProcessor):
         for idx, tpl in enumerate(templates):
             if not isinstance(tpl, dict):
                 continue
-            group = tpl.get("group", "").strip()
-            name = tpl.get("name", "").strip()
-            if not name or not group:
+            group = str(tpl.get("group", "") or "").strip()
+            name = str(tpl.get("name", "") or "").strip()
+            ptxt_path = str(tpl.get("ptxt_path") or tpl.get("path") or "").strip()
+            if not name and ptxt_path:
+                name = os.path.splitext(os.path.basename(ptxt_path))[0]
+            if not name or (not group and not ptxt_path):
                 continue
             instances.append(
                 cls(
                     instance_index=idx,
                     instance_group=group,
                     instance_name=name,
+                    instance_ptxt_path=ptxt_path,
                 )
             )
         return instances
 
     @classmethod
     def config_params(cls) -> list[ParamSpec]:
-        return super().config_params() + [
-            ParamSpec(
-                key="protools_temp_dir",
-                type=str,
-                default="",
-                label="Temporary project directory",
-                description=(
-                    "Directory where temporary Pro Tools projects are created "
-                    "from the referenced templates. Leave empty to use the system temp directory."
-                ),
-                widget_hint="path_picker_folder",
+        base = super().config_params()
+        transfer_mode = ParamSpec(
+            key="protools_transfer_backend",
+            type=str,
+            default="ptsl_hybrid",
+            label="Transfer Mode",
+            description=(
+                "Write .ptx sessions and Audio Files/ directly offline (no Pro Tools required), "
+                "or control a running Pro Tools instance via PTSL + post-close .ptx patching."
             ),
-            ParamSpec(
-                key="protools_company_name",
-                type=str,
-                default="github.com",
-                label="Company Name",
-                description="Company name sent during the PTSL handshake.",
-            ),
-            ParamSpec(
-                key="protools_application_name",
-                type=str,
-                default="sessionprep",
-                label="Application Name",
-                description="Application name sent during the PTSL handshake.",
-            ),
-            ParamSpec(
-                key="protools_host",
-                type=str,
-                default="localhost",
-                label="Host",
-                description="Hostname or IP address of the Pro Tools PTSL server.",
-            ),
-            ParamSpec(
-                key="protools_port",
-                type=int,
-                default=31416,
-                label="Port",
-                description="Port number of the Pro Tools PTSL server.",
-                min=1,
-                max=65535,
-            ),
-            ParamSpec(
-                key="protools_command_delay",
-                type=float,
-                default=0.5,
-                label="Command Delay (s)",
-                description=(
-                    "Seconds to wait between Pro Tools commands "
-                    "(folder select, import, etc.)."
-                ),
-                min=0.1,
-                max=5.0,
-            ),
-            ParamSpec(
-                key="protools_template_create_timeout",
-                type=float,
-                default=60.0,
-                label="Template Create Timeout (s)",
-                description=(
-                    "Seconds to wait for Pro Tools to create and open a session "
-                    "from a template."
-                ),
-                min=5.0,
-                max=300.0,
-            ),
-        ] + ptx_config_params()
+            choices=["ptsl_hybrid", "offline_ptx"],
+            choice_labels={
+                "ptsl_hybrid": "Live PTSL + .ptx Hybrid",
+                "offline_ptx": "Offline .ptx Writer",
+            },
+        )
+        return [base[0], transfer_mode, *base[1:]] + _ptsl_connection_params() + ptx_config_params()
 
     def configure(self, config: dict[str, Any]) -> None:
         saved = config.get(f"{self.id}_enabled")
@@ -196,9 +226,24 @@ class ProToolsDawProcessor(DawProcessor):
         self._stage_bus_faders: bool = bool(config.get("protools_stage_bus_faders", True))
         self._pan_law_db: float = float(config.get("protools_pan_law_db", -3.0))
         self._remove_unused_aux_tracks: bool = bool(config.get("protools_remove_unused_aux_tracks", True))
+        raw_backend = config.get("protools_transfer_backend")
+        self._transfer_backend: str = (str(raw_backend).strip().lower() if raw_backend else "ptsl_hybrid")
         self._connection_settings = ProToolsConnectionSettings.from_config(config)
 
     def check_connectivity(self) -> tuple[bool, str]:
+        if self._transfer_backend == "offline_ptx":
+            template_file, _mtime = self._template_file_and_mtime()
+            if template_file is None or not is_valid_ptx_file(template_file):
+                self._connected = False
+                return False, f"Pro Tools template file not found or invalid: {template_file or self._instance_name}"
+            if not self._project_dir or not os.path.isdir(self._project_dir):
+                self._connected = False
+                return False, "Pro Tools 'Project directory' is not configured or does not exist."
+            self._connected = True
+            return True, f"Offline .ptx ready ({template_file.name})"
+        if self._transfer_backend != "ptsl_hybrid":
+            self._connected = False
+            return False, f"Unknown Pro Tools transfer backend: {self._transfer_backend!r}"
         ok, message = check_ptsl_connectivity(
             self._connection_settings,
             ready_timeout=25.0,
@@ -207,7 +252,14 @@ class ProToolsDawProcessor(DawProcessor):
         return ok, message
 
     @property
+    def transfer_backend(self) -> str:
+        """Return the configured Pro Tools transfer backend (``'ptsl_hybrid'`` or ``'offline_ptx'``)."""
+        return getattr(self, "_transfer_backend", "ptsl_hybrid")
+
+    @property
     def template_identity(self) -> tuple[str, ...]:
+        if self._instance_ptxt_path:
+            return ("protools", self._instance_group, self._instance_name, self._instance_ptxt_path)
         return ("protools", self._instance_group, self._instance_name)
 
     def _track_list_with_retry(self, engine, *, timeout: float, sleep_time: float):
@@ -252,13 +304,22 @@ class ProToolsDawProcessor(DawProcessor):
         import platform
         from pathlib import Path
 
+        if self._instance_ptxt_path:
+            explicit = Path(self._instance_ptxt_path).expanduser()
+            try:
+                return explicit, (explicit.stat().st_mtime if explicit.is_file() else None)
+            except OSError:
+                return explicit, None
         if platform.system() not in ("Windows", "Darwin"):
             return None, None
         template_file = (
             Path.home() / "Documents" / "Pro Tools" / "Session Templates"
             / self._instance_group / f"{self._instance_name}.ptxt"
         )
-        return template_file, (template_file.stat().st_mtime if template_file.is_file() else None)
+        try:
+            return template_file, (template_file.stat().st_mtime if template_file.is_file() else None)
+        except OSError:
+            return template_file, None
 
     def _load_template_cache(self):
         import json
@@ -421,20 +482,38 @@ class ProToolsDawProcessor(DawProcessor):
             log.debug(f"Failed to write template cache: {e}")
             dbg(f"Failed to write Pro Tools template cache: {e}")
 
+    def _try_fetch_folders_offline(self, template_file, progress_cb) -> list[dict[str, Any]] | None:
+        host_low = self._host.strip().lower()
+        local_allowed = (
+            self._transfer_backend == "offline_ptx"
+            or bool(self._instance_ptxt_path)
+            or host_low in ("", "localhost", "127.0.0.1", "::1")
+        )
+        if not local_allowed or template_file is None or not is_valid_ptx_file(template_file):
+            return None
+        try:
+            folders = read_template_folders_from_ptxt(template_file)
+            if progress_cb:
+                progress_cb(80, 100, f"Read template '{self._instance_name}' offline.")
+            dbg(f"Read Pro Tools template folders offline from {str(template_file)!r}: folders={len(folders)}")
+            return folders
+        except Exception as exc:
+            log.warning("Offline .ptxt template fetch failed for %s (%s); falling back to PTSL.", template_file, exc)
+            return None
+
     def fetch(
         self,
         session: SessionContext,
         progress_cb=None,
         ignore_cache: bool = False,
     ) -> SessionContext:
-        if not self._temp_dir:
-            raise RuntimeError("The 'Temporary project directory' is not configured in Preferences.")
-        if not os.path.isdir(self._temp_dir):
-            raise RuntimeError(f"The configured temporary project directory does not exist: {self._temp_dir}")
-
         template_file, current_mtime = self._template_file_and_mtime()
         cache_file, cache_data = self._load_template_cache()
-        cache_key = f"{self._instance_group}/{self._instance_name}"
+        if self._instance_ptxt_path:
+            norm_path = os.path.normcase(os.path.normpath(os.path.expanduser(self._instance_ptxt_path)))
+            cache_key = f"{self._instance_group}/{self._instance_name}|{norm_path}"
+        else:
+            cache_key = f"{self._instance_group}/{self._instance_name}"
         dbg(f"Pro Tools template fetch requested: key={cache_key} ignore_cache={ignore_cache}")
 
         if not ignore_cache and current_mtime is not None and cache_key in cache_data:
@@ -446,8 +525,23 @@ class ProToolsDawProcessor(DawProcessor):
                 self._apply_fetched_folders(session, entry.get("folders", []))
                 return session
 
-        dbg(f"Pro Tools template cache miss: key={cache_key!r} template_file={str(template_file) if template_file else None!r} mtime={current_mtime}")
-        folders = self._fetch_folders_live(progress_cb)
+        offline_folders = self._try_fetch_folders_offline(template_file, progress_cb) if current_mtime is not None else None
+        if offline_folders is not None:
+            folders = offline_folders
+        elif self._transfer_backend == "offline_ptx" or (self._instance_ptxt_path and not self._instance_group):
+            raise RuntimeError(
+                f"Pro Tools template file not found or invalid for offline fetch: {template_file or self._instance_name}"
+            )
+        else:
+            if not self._temp_dir:
+                raise RuntimeError("The 'Temporary project directory' is not configured in Preferences.")
+            if not os.path.isdir(self._temp_dir):
+                raise RuntimeError(f"The configured temporary project directory does not exist: {self._temp_dir}")
+            dbg(
+                f"Pro Tools template cache miss: key={cache_key!r} "
+                f"template_file={str(template_file) if template_file else None!r} mtime={current_mtime}"
+            )
+            folders = self._fetch_folders_live(progress_cb)
         self._apply_fetched_folders(session, folders)
         if current_mtime is not None:
             self._save_template_cache(cache_file, cache_data, cache_key, current_mtime, folders)
@@ -866,35 +960,15 @@ class ProToolsDawProcessor(DawProcessor):
                 except Exception as exc:
                     record("reopen_session", session.project_name, error=str(exc))
 
-    def transfer(
+    def _execute_transfer_ptsl_hybrid(
         self,
         session: SessionContext,
-        output_path: str,
-        progress_cb=None,
-        close_when_done: bool = True,
-    ) -> list[DawCommandResult]:
-        """Create a new Pro Tools session from a template, import audio, route, and stage gains."""
-        log.debug("transfer() called")
-        try:
-            from ptsl import PTSL_pb2 as pt  # noqa: F401 – validates install
-        except ImportError:
-            log.debug("py-ptsl not installed")
-            return [DawCommandResult(DawCommand("transfer", "", {}), False, "py-ptsl package not installed")]
-
-        pt_state = session.daw_state.get(self.id, {})
-        if not pt_state.get("assignments"):
-            log.debug("No assignments, returning early")
-            return []
-
-        results: list[DawCommandResult] = []
-
-        def record(operation: str, target: str = "", *, error: str | None = None, **params: Any) -> None:
-            results.append(DawCommandResult(DawCommand(operation, target, params), error is None, error))
-
-        folder_map, valid_work = self._ordered_transfer_work(session, pt_state, record)
-        if not valid_work:
-            return results
-
+        folder_map: dict[str, Any],
+        valid_work: list[tuple[str, ProToolsTrackStaging, str, TrackContext]],
+        progress_cb,
+        close_when_done: bool,
+        record,
+    ) -> None:
         engine = None
         batch_job_id: str | None = None
         created_session_path: str | None = None
@@ -916,7 +990,7 @@ class ProToolsDawProcessor(DawProcessor):
 
             clip_id_map, import_failures = self._import_transfer_audio(engine, valid_work, batch_job_id, record)
             if clip_id_map is None:
-                return results
+                return
             color_groups, created_tracks = self._spot_transfer_tracks(
                 engine, valid_work, folder_map, clip_id_map, import_failures,
                 group_palette_idx, batch_job_id, progress_cb, record,
@@ -941,6 +1015,64 @@ class ProToolsDawProcessor(DawProcessor):
                         engine, session, created_session_path, created_tracks, close_when_done, progress_cb, record,
                     )
                 engine.close()
+
+    def _execute_transfer_offline_ptx(
+        self,
+        session: SessionContext,
+        folder_map: dict[str, Any],
+        valid_work: list[tuple[str, ProToolsTrackStaging, str, TrackContext]],
+        progress_cb,
+        record,
+    ) -> None:
+        del folder_map, valid_work, progress_cb
+        record(
+            "create_session",
+            session.project_name,
+            error="The offline .ptx writer backend is not yet available.",
+        )
+
+    def transfer(
+        self,
+        session: SessionContext,
+        output_path: str,
+        progress_cb=None,
+        close_when_done: bool = True,
+    ) -> list[DawCommandResult]:
+        """Create a new Pro Tools session from a template, import audio, route, and stage gains."""
+        log.debug("transfer() called (backend=%s)", self._transfer_backend)
+        if self._transfer_backend not in ("ptsl_hybrid", "offline_ptx"):
+            return [
+                DawCommandResult(
+                    DawCommand("transfer", session.project_name, {}),
+                    False,
+                    f"Unknown Pro Tools transfer backend: {self._transfer_backend!r}",
+                )
+            ]
+        if self._transfer_backend != "offline_ptx":
+            try:
+                from ptsl import PTSL_pb2 as pt  # noqa: F401 – validates install
+            except ImportError:
+                log.debug("py-ptsl not installed")
+                return [DawCommandResult(DawCommand("transfer", "", {}), False, "py-ptsl package not installed")]
+
+        pt_state = session.daw_state.get(self.id, {})
+        if not pt_state.get("assignments"):
+            log.debug("No assignments, returning early")
+            return []
+
+        results: list[DawCommandResult] = []
+
+        def record(operation: str, target: str = "", *, error: str | None = None, **params: Any) -> None:
+            results.append(DawCommandResult(DawCommand(operation, target, params), error is None, error))
+
+        folder_map, valid_work = self._ordered_transfer_work(session, pt_state, record)
+        if not valid_work:
+            return results
+
+        if self._transfer_backend == "offline_ptx":
+            self._execute_transfer_offline_ptx(session, folder_map, valid_work, progress_cb, record)
+        else:
+            self._execute_transfer_ptsl_hybrid(session, folder_map, valid_work, progress_cb, close_when_done, record)
 
         if progress_cb and all(result.success for result in results):
             progress_cb(100, 100, "Project creation complete")
