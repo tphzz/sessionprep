@@ -228,6 +228,83 @@ def parse_chunk_tree(buf: bytes, start: int = 0x1F) -> list[PtxChunk]:
     return nodes
 
 
+def normalize_ptx_uuid16(value: str | bytes) -> bytes:
+    """Normalize raw 16-byte, hex, hyphenated, or PTSL braced UUID into 16 raw bytes."""
+    if isinstance(value, (bytes, bytearray)):
+        if len(value) != 16:
+            raise ValueError(f"UUID bytes must be 16 bytes, got {len(value)}")
+        return bytes(value)
+    cleaned = str(value).strip().strip("{}").replace("-", "")
+    if len(cleaned) != 32:
+        raise ValueError(f"Invalid PTX UUID string: {value!r}")
+    try:
+        return bytes.fromhex(cleaned)
+    except ValueError as exc:
+        raise ValueError(f"Invalid PTX UUID string: {value!r}") from exc
+
+
+def find_zchunk_offset(
+    buf: bytearray | bytes,
+    tag: int,
+    start: int = 0,
+    end: int | None = None,
+) -> int:
+    """Return the first valid Z-chunk offset matching *tag* within ``buf[start:end]``, or ``-1``."""
+    limit = len(buf) if end is None else min(len(buf), end)
+    needle = struct.pack("<H", tag)
+    pos = max(0, start) + 7
+    while pos < limit:
+        hit = buf.find(needle, pos, limit)
+        if hit == -1:
+            return -1
+        off = hit - 7
+        if off >= start and buf[off] == 0x5A:
+            ver = struct.unpack_from("<H", buf, off + 1)[0]
+            sz = struct.unpack_from("<I", buf, off + 3)[0]
+            if ver < 0x1000 and 2 <= sz and off + 7 + sz <= limit:
+                return off
+        pos = hit + 1
+    return -1
+
+
+def read_zchunk_at(
+    raw: bytes | bytearray,
+    pos: int,
+    *,
+    expected_tag: int | None = None,
+    limit: int | None = None,
+) -> tuple[int, bytes, int]:
+    """Read one validated Z-chunk at *pos* and return ``(tag, chunk_bytes, next_pos)``."""
+    end_lim = len(raw) if limit is None else min(len(raw), limit)
+    if pos < 0 or pos + 9 > end_lim or raw[pos] != 0x5A:
+        raise RuntimeError(f"Expected Z-chunk header at offset 0x{pos:x}")
+    sz = struct.unpack_from("<I", raw, pos + 3)[0]
+    tag = struct.unpack_from("<H", raw, pos + 7)[0]
+    end = pos + 7 + sz
+    if sz < 2 or end > end_lim:
+        raise RuntimeError(f"Truncated Z-chunk 0x{tag:04x} at offset 0x{pos:x}")
+    if expected_tag is not None and tag != expected_tag:
+        raise RuntimeError(f"Expected Z-chunk 0x{expected_tag:04x} at 0x{pos:x}, found 0x{tag:04x}")
+    return tag, bytes(raw[pos:end]), end
+
+
+def walk_sequential_zchunks(
+    raw: bytes | bytearray,
+    start: int,
+    count: int,
+    *,
+    expected_tag: int | None = None,
+    limit: int | None = None,
+) -> tuple[list[bytes], int]:
+    """Deterministically walk *count* contiguous Z-chunks from *start*."""
+    items: list[bytes] = []
+    pos = start
+    for _ in range(count):
+        _tag, chunk_raw, pos = read_zchunk_at(raw, pos, expected_tag=expected_tag, limit=limit)
+        items.append(chunk_raw)
+    return items, pos
+
+
 def find_subchunks(buf: bytes, tag16: int, start: int = 9) -> list[bytes]:
     """Return all valid Z-subchunks with ``tag16`` inside *buf* starting at *start*."""
     results: list[bytes] = []
@@ -430,7 +507,7 @@ def atomic_write_bytes(target_path: str | Path, payload: bytes) -> None:
         handle.close()
         handle = None
         os.replace(tmp_name, target)
-    except Exception:
+    except BaseException:
         if handle is not None:
             handle.close()
         elif fd_owned:

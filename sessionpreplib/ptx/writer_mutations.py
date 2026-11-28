@@ -7,9 +7,10 @@ from dataclasses import dataclass
 from pathlib import Path
 import struct
 
+from .codec import find_zchunk_offset, read_zchunk_at, walk_sequential_zchunks
 from .parser import split_202b
 from .writer_blueprints import (
-    _find_zchunk_offset,
+    OutputBusSpec,
     build_audio_file_entry_1003,
     build_audio_mixer_strip_261c,
     build_audio_ui_entry_2589,
@@ -27,6 +28,9 @@ from .writer_chunks import (
 )
 from .writer_primitives import build_zchunk, serialize_folder_tree_210c
 
+_read_zchunk_at = read_zchunk_at
+_walk_sequential_zchunks = walk_sequential_zchunks
+
 
 @dataclass(frozen=True)
 class NewAudioTrackSpec:
@@ -36,12 +40,24 @@ class NewAudioTrackSpec:
     track_uuid16: bytes
     playlist_uuid16: bytes
     channels: int
-    parent_folder_uuid16: bytes
-    output_bus: tuple[int, bytes, str] | None  # (ptsl_index, bus_uuid16, bus_name)
+    parent_folder_uuid16: bytes | None
+    output_bus: OutputBusSpec | tuple[int, bytes, str] | None
     color_index: int
-    clip_indices: tuple[int, ...]  # 1 index (Mono) or 2 indices (Stereo L, R) in 0x262A
-    lane_indices: tuple[int, ...]  # 1 index (Mono) or 2 indices (Stereo L, R) in 0x1054
+    clip_indices: tuple[int, ...]  # () for empty track, 1 (Mono) or 2 (Stereo L, R) in 0x262A
+    lane_indices: tuple[int, ...]  # 1 (Mono) or 2 (Stereo L, R) in 0x1054
     playlist_index: int = 0  # 0-based index into 0x1015 Audio Playlists
+    start_sample: int = 0
+
+
+@dataclass(frozen=True)
+class MediaSurvivalPlan:
+    """Compacted existing playlists, lanes, and playlist-index mapping for surviving template audio."""
+
+    playlists: tuple[bytes, ...]
+    lanes: tuple[bytes, ...]
+    old_playlist_to_new: Mapping[int, int]
+    c4829_trailer: bytes
+    c4828_trailer: bytes
 
 
 @dataclass(frozen=True)
@@ -82,34 +98,6 @@ class ClipWriteSpec:
     pt_uuid16: bytes
 
 
-def _read_zchunk_at(raw: bytes, pos: int, *, expected_tag: int | None = None) -> tuple[int, bytes, int]:
-    if pos < 0 or pos + 9 > len(raw) or raw[pos] != 0x5A:
-        raise RuntimeError(f"Expected Z-chunk header at offset 0x{pos:x}")
-    sz = struct.unpack_from("<I", raw, pos + 3)[0]
-    tag = struct.unpack_from("<H", raw, pos + 7)[0]
-    end = pos + 7 + sz
-    if sz < 2 or end > len(raw):
-        raise RuntimeError(f"Truncated Z-chunk 0x{tag:04x} at offset 0x{pos:x}")
-    if expected_tag is not None and tag != expected_tag:
-        raise RuntimeError(f"Expected Z-chunk 0x{expected_tag:04x} at 0x{pos:x}, found 0x{tag:04x}")
-    return tag, raw[pos:end], end
-
-
-def _walk_sequential_zchunks(
-    raw: bytes,
-    start: int,
-    count: int,
-    *,
-    expected_tag: int | None = None,
-) -> tuple[list[bytes], int]:
-    items: list[bytes] = []
-    pos = start
-    for _ in range(count):
-        _tag, chunk_raw, pos = _read_zchunk_at(raw, pos, expected_tag=expected_tag)
-        items.append(chunk_raw)
-    return items, pos
-
-
 def _parse_2519_sections(raw: bytes) -> tuple[bytes, list[bytes], list[bytes], list[bytes], bytes]:
     """Deterministically parse ``0x2519`` into ``(clean_prefix, rows, pass1, pass2, tail)``."""
     if len(raw) < 27 or raw[0] != 0x5A:
@@ -122,6 +110,7 @@ def _parse_2519_sections(raw: bytes) -> tuple[bytes, list[bytes], list[bytes], l
     if cnt_a > (len(raw) - pos) // 2:
         raise RuntimeError(f"0x2519 header cnt_a ({cnt_a}) exceeds chunk bounds")
     pos += cnt_a * 2
+    # Clear pre-existing track-selection indices so Pro Tools does not reference shifted/deleted track slots.
     clean_prefix = hdr10 + b"\x00\x00\x00\x00"
     if pos + 4 > len(raw):
         raise RuntimeError("Truncated 0x2519 Table 1 track count")
@@ -139,24 +128,28 @@ def _parse_2519_sections(raw: bytes) -> tuple[bytes, list[bytes], list[bytes], l
             raise RuntimeError("Truncated 0x2519 Table 1 track name/UUID")
         pos += nlen + 21
         rows.append(raw[row_start:pos])
-    pass1, pos = _walk_sequential_zchunks(raw, pos, tcnt, expected_tag=0x251A)
+    pass1, pos = walk_sequential_zchunks(raw, pos, tcnt, expected_tag=0x251A)
     if pos + 4 > len(raw):
         raise RuntimeError("Truncated 0x2519 Pass 2 track count")
     tcnt2 = struct.unpack_from("<I", raw, pos)[0]
     if tcnt2 != tcnt:
         raise RuntimeError(f"0x2519 Pass 2 count {tcnt2} != Pass 1 count {tcnt}")
     pos += 4
-    pass2, pos = _walk_sequential_zchunks(raw, pos, tcnt2, expected_tag=0x251A)
+    pass2, pos = walk_sequential_zchunks(raw, pos, tcnt2, expected_tag=0x251A)
     return clean_prefix, rows, pass1, pass2, raw[pos:]
 
 
 def _patch_2519_summary_order(row: bytes, visible_order: int) -> bytes:
+    if not (0 <= visible_order <= 0xFFFF):
+        raise OverflowError(f"0x2519 visible_order exceeds u16 range: {visible_order}")
     buf = bytearray(row)
     struct.pack_into("<H", buf, len(buf) - 3, visible_order)
     return bytes(buf)
 
 
 def _patch_251a_order(raw_251a: bytes, visible_order: int) -> bytes:
+    if not (0 <= visible_order <= 0xFFFF):
+        raise OverflowError(f"0x251A visible_order exceeds u16 range: {visible_order}")
     buf = bytearray(raw_251a)
     if len(buf) < 15:
         raise RuntimeError("Truncated 0x251A track entry")
@@ -174,7 +167,7 @@ def mutate_2519_tracks(
     *,
     expected_old_count: int | None = None,
 ) -> bytes:
-    """Rebuild ``0x2519`` (Table 1 + Pass 1 & Pass 2 ``0x251A``) for *layout*."""
+    """Rebuild ``0x2519`` (Table 1 + Pass 1 & Pass 2 ``0x251A``), preserving hidden tracks' ``visible_order == 0``."""
     version = struct.unpack_from("<H", c2519_raw, 1)[0]
     prefix, old_rows, old_p1, old_p2, tail_raw = _parse_2519_sections(c2519_raw)
     if expected_old_count is not None and len(old_rows) != expected_old_count:
@@ -183,16 +176,27 @@ def mutate_2519_tracks(
     new_rows: list[bytes] = []
     new_p1: list[bytes] = []
     new_p2: list[bytes] = []
-    for visible_ord, slot in enumerate(layout, start=1):
+    next_visible_ord = 1
+    for slot in layout:
         if slot.old_index is not None:
-            new_rows.append(_patch_2519_summary_order(old_rows[slot.old_index], visible_ord))
-            new_p1.append(_patch_251a_order(old_p1[slot.old_index], visible_ord))
-            new_p2.append(_patch_251a_order(old_p2[slot.old_index], visible_ord))
+            old_row = old_rows[slot.old_index]
+            old_p1_item = old_p1[slot.old_index]
+            old_vis = struct.unpack_from("<H", old_row, len(old_row) - 3)[0]
+            p1_ver = struct.unpack_from("<H", old_p1_item, 1)[0]
+            is_hidden = (old_vis == 0) or (p1_ver >= 8 and len(old_p1_item) >= 40 and not bool(old_p1_item[-7]))
+            vis_ord = 0 if is_hidden else next_visible_ord
+            if vis_ord > 0:
+                next_visible_ord += 1
+            new_rows.append(_patch_2519_summary_order(old_row, vis_ord))
+            new_p1.append(_patch_251a_order(old_p1_item, vis_ord))
+            new_p2.append(_patch_251a_order(old_p2[slot.old_index], vis_ord))
         elif slot.new_track is not None:
             nt = slot.new_track
-            new_rows.append(build_track_summary_2519(nt.track_name, nt.track_uuid16, nt.channels, visible_ord))
+            vis_ord = next_visible_ord
+            next_visible_ord += 1
+            new_rows.append(build_track_summary_2519(nt.track_name, nt.track_uuid16, nt.channels, vis_ord))
             entry = build_track_entry_251a(
-                nt.track_name, nt.track_uuid16, nt.channels, visible_ord,
+                nt.track_name, nt.track_uuid16, nt.channels, vis_ord,
                 color_index=nt.color_index, has_clips=bool(nt.clip_indices),
             )
             new_p1.append(entry)
@@ -277,18 +281,24 @@ def mutate_2587_ui_state(
     expected_old_count: int | None = None,
 ) -> bytes:
     """Update ``0x2587 -> 0x2551 -> 0x258b -> 0x258a`` per-track ``0x2589`` entries deterministically."""
-    c2551_off = _find_zchunk_offset(c2587_raw, 0x2551, 9)
-    c258b_off = _find_zchunk_offset(c2587_raw, 0x258B, c2551_off + 9) if c2551_off >= 0 else -1
-    c258a_off = _find_zchunk_offset(c2587_raw, 0x258A, c258b_off + 9) if c258b_off >= 0 else -1
-    if min(c2551_off, c258b_off, c258a_off) < 0:
+    c2551_off = find_zchunk_offset(c2587_raw, 0x2551, 9)
+    if c2551_off < 0:
+        return c2587_raw
+    c2551_end = c2551_off + 7 + struct.unpack_from("<I", c2587_raw, c2551_off + 3)[0]
+    c258b_off = find_zchunk_offset(c2587_raw, 0x258B, c2551_off + 9, c2551_end)
+    if c258b_off < 0:
+        return c2587_raw
+    c258b_end = c258b_off + 7 + struct.unpack_from("<I", c2587_raw, c258b_off + 3)[0]
+    c258a_off = find_zchunk_offset(c2587_raw, 0x258A, c258b_off + 9, c258b_end)
+    if c258a_off < 0:
         return c2587_raw
 
-    _tag81, _raw81, after_81 = _read_zchunk_at(c2587_raw, c258a_off + 9, expected_tag=0x2581)
+    _tag81, _raw81, after_81 = read_zchunk_at(c2587_raw, c258a_off + 9, expected_tag=0x2581)
     if after_81 + 4 > len(c2587_raw):
         raise RuntimeError("Truncated 0x258A track UI entry count")
     old_count = struct.unpack_from("<I", c2587_raw, after_81)[0]
     first_off = after_81 + 4
-    old_2589, last_end = _walk_sequential_zchunks(c2587_raw, first_off, old_count, expected_tag=0x2589)
+    old_2589, last_end = walk_sequential_zchunks(c2587_raw, first_off, old_count, expected_tag=0x2589)
     if expected_old_count is not None and len(old_2589) != expected_old_count:
         raise RuntimeError(f"0x258A UI track count {len(old_2589)} != expected {expected_old_count}")
 
@@ -314,12 +324,21 @@ def mutate_2587_ui_state(
 def _max_2624_control_id(strips: Sequence[bytes]) -> int:
     max_id = 10000
     for strip in strips:
-        p485a = _find_zchunk_offset(strip, 0x485A, 9)
-        if p485a < 0:
+        last_485a_end = -1
+        scan = 9
+        while True:
+            hit = find_zchunk_offset(strip, 0x485A, scan)
+            if hit < 0:
+                break
+            last_485a_end = hit + 7 + struct.unpack_from("<I", strip, hit + 3)[0]
+            scan = last_485a_end
+        if last_485a_end < 0 or last_485a_end + 53 > len(strip):
             continue
-        p10 = strip.find(b"\x01\x01\x0a\x00", p485a)
-        if p10 >= 0 and p10 + 44 <= len(strip):
-            for val in struct.unpack_from("<10I", strip, p10 + 4):
+        if (
+            strip[last_485a_end : last_485a_end + 4] == b"\x01\x01\x0a\x00"
+            and strip[last_485a_end + 44 : last_485a_end + 53] == b"\x00\x00\x00\x00\x08\x00\x00\x00\x00"
+        ):
+            for val in struct.unpack_from("<10I", strip, last_485a_end + 4):
                 if val < 0xFFFF_FF00 and val > max_id:
                     max_id = val
     return max_id + 16
@@ -330,11 +349,11 @@ def _parse_261c_mid_gap(strip: bytes) -> tuple[int, int, int, int, int, int]:
 
     Returns ``(mid_off, active_pl, pl_cnt, entry_stride, p200b, tail_off)``.
     """
-    _tag_b, _raw_b, mid_off = _read_zchunk_at(strip, 9, expected_tag=0x261B)
-    p200b = _find_zchunk_offset(strip, 0x200B, mid_off)
+    _tag_b, _raw_b, mid_off = read_zchunk_at(strip, 9, expected_tag=0x261B)
+    p200b = find_zchunk_offset(strip, 0x200B, mid_off)
     if p200b < mid_off + 6:
         raise RuntimeError("Missing or malformed 0x200B after 0x261B inside 0x261C")
-    _tag_200b, _raw_200b, tail_off = _read_zchunk_at(strip, p200b, expected_tag=0x200B)
+    _tag_200b, _raw_200b, tail_off = read_zchunk_at(strip, p200b, expected_tag=0x200B)
     active_pl, pl_cnt = struct.unpack_from("<IH", strip, mid_off)
     mid_len = p200b - mid_off
     trailer_ok = mid_len >= 8 and struct.unpack_from("<H", strip, p200b - 2)[0] == 0xFFFF
@@ -355,14 +374,34 @@ def _extract_261c_playlist_indices(strip: bytes) -> set[int]:
     return {active_pl, *entries}
 
 
+def _patch_200b_view_ordinal(buf: bytearray, p200b: int, tail_off: int, track_ordinal_1based: int) -> None:
+    p2434 = find_zchunk_offset(buf, 0x2434, p200b + 9, tail_off)
+    if 0 <= p2434 < tail_off:
+        after_2434 = p2434 + 7 + struct.unpack_from("<I", buf, p2434 + 3)[0]
+        if after_2434 + 4 <= tail_off:
+            struct.pack_into("<I", buf, after_2434, track_ordinal_1based)
+
+
 def _remap_261c_strip_indices(
     strip: bytes,
     old_pl_to_new: Mapping[int, int] | None,
-    visible_ord_1based: int,
+    track_ordinal_1based: int,
 ) -> bytes:
-    """Remap ``0x1015`` playlist indices and ``0x2015`` track ordinal inside a surviving ``0x261C`` strip."""
-    if len(strip) < 25 or strip[0] != 0x5A or struct.unpack_from("<H", strip, 7)[0] != 0x261C:
+    """Remap ``0x2015`` track ordinals on surviving strips and ``0x1015`` playlist indices on ``0x261C`` strips."""
+    if len(strip) < 25 or strip[0] != 0x5A:
         return strip
+    tag = struct.unpack_from("<H", strip, 7)[0]
+    if tag != 0x261C:
+        search_start = 9
+        if strip[9] == 0x5A and struct.unpack_from("<H", strip, 16)[0] == 0x261B:
+            _t, _r, search_start = read_zchunk_at(strip, 9, expected_tag=0x261B)
+        p200b = find_zchunk_offset(strip, 0x200B, search_start)
+        if p200b < 0:
+            return strip
+        _t, _r, tail_off = read_zchunk_at(strip, p200b, expected_tag=0x200B)
+        buf = bytearray(strip)
+        _patch_200b_view_ordinal(buf, p200b, tail_off, track_ordinal_1based)
+        return bytes(buf)
     mid_off, active_pl, pl_cnt, stride, p200b, tail_off = _parse_261c_mid_gap(strip)
     buf = bytearray(strip)
     if old_pl_to_new is not None:
@@ -383,11 +422,7 @@ def _remap_261c_strip_indices(
             struct.pack_into(entry_fmt, buf, off_k, new_i)
         if tail_off + 21 <= len(buf):
             struct.pack_into("<I", buf, tail_off + 17, new_active)
-    p2434 = _find_zchunk_offset(buf, 0x2434, p200b + 9)
-    if 0 <= p2434 < tail_off:
-        after_2434 = p2434 + 7 + struct.unpack_from("<I", buf, p2434 + 3)[0]
-        if after_2434 + 4 <= tail_off:
-            struct.pack_into("<I", buf, after_2434, visible_ord_1based)
+    _patch_200b_view_ordinal(buf, p200b, tail_off, track_ordinal_1based)
     return bytes(buf)
 
 
@@ -484,14 +519,22 @@ def mutate_202b_groups_for_track_map(
 
 
 def _split_session_dir_parts(session_dir: Path) -> tuple[str, list[str]]:
-    resolved = session_dir.resolve()
-    parts = list(resolved.parts)
+    raw_str = str(session_dir.resolve())
+    if raw_str.startswith("\\\\?\\UNC\\"):
+        raw_str = "\\\\" + raw_str[8:]
+    elif raw_str.startswith("\\\\?\\"):
+        raw_str = raw_str[4:]
+    parts = list(Path(raw_str).parts)
     if not parts:
         return "/", []
     root = parts[0]
+    rest = parts[1:]
     if len(root) >= 2 and root[1] == ":":
         root = root[0].lower() + ":\\"
-    return root, parts[1:]
+    elif root == "/" and len(rest) >= 2 and rest[0] == "Volumes":
+        root = rest[1]
+        rest = rest[2:]
+    return root, rest
 
 
 def _parse_103a_entries(c103a_raw: bytes) -> list[PtxDirTreeEntry]:
@@ -524,6 +567,13 @@ def _append_session_tree_nodes(
     volume_serial_u32: int,
 ) -> list[int]:
     """Append volume, directory chain, ``Audio Files``, and file nodes; return new file node indices."""
+    seen_staged: set[str] = set()
+    for sf_item in staged_files:
+        low_fn = sf_item.filename.lower()
+        if low_fn in seen_staged:
+            raise ValueError(f"Duplicate audio filename {sf_item.filename!r} in staged audio files")
+        seen_staged.add(low_fn)
+
     vol_tag4 = struct.pack("<I", volume_serial_u32 & 0xFFFF_FFFF)
     if not entries:
         vol_idx = 1 + len(staged_files)
@@ -745,7 +795,7 @@ def plan_existing_media_survival(
     *,
     c2624_raw: bytes | None = None,
     deleted_old_indices: Sequence[int] = (),
-) -> tuple[list[bytes], list[bytes], dict[int, int], bytes, bytes]:
+) -> MediaSurvivalPlan:
     """Compact existing ``0x1014`` playlists & ``0x1052`` lanes for any deleted template audio tracks."""
     default_4829 = build_zchunk(0x4829, b"\x00\x00\x00\x00", version=2)
     default_4828 = build_zchunk(0x4828, b"\x00\x00\x00\x00", version=2)
@@ -783,8 +833,14 @@ def plan_existing_media_survival(
             continue
         old_lane_to_new[old_idx] = len(surviving_lanes)
         surviving_lanes.append(lane_raw)
-    remapped_playlists = [_remap_playlist_1014_lanes(pl, old_lane_to_new) for pl in kept_pl_raw]
-    return remapped_playlists, surviving_lanes, old_pl_to_new, c4829, c4828
+    remapped_playlists = tuple(_remap_playlist_1014_lanes(pl, old_lane_to_new) for pl in kept_pl_raw)
+    return MediaSurvivalPlan(
+        playlists=remapped_playlists,
+        lanes=tuple(surviving_lanes),
+        old_playlist_to_new=old_pl_to_new,
+        c4829_trailer=c4829,
+        c4828_trailer=c4828,
+    )
 
 
 def mutate_1015_and_1054_media(
@@ -792,10 +848,7 @@ def mutate_1015_and_1054_media(
     c1054_raw: bytes,
     new_tracks: Sequence[NewAudioTrackSpec],
     *,
-    surviving_playlists: Sequence[bytes],
-    surviving_lanes: Sequence[bytes],
-    c4829_trailer: bytes,
-    c4828_trailer: bytes,
+    survival: MediaSurvivalPlan,
 ) -> tuple[bytes, bytes]:
     """Rebuild ``0x1015`` playlists & ``0x1054`` lanes by appending *new_tracks* after surviving entries."""
     ver_1015 = struct.unpack_from("<H", c1015_raw, 1)[0]
@@ -806,17 +859,34 @@ def mutate_1015_and_1054_media(
         )
         for nt in new_tracks
     ]
-    added_lanes = [
-        serialize_lane_1052(
-            nt.track_name,
-            [(clip_idx, 0, 3, 0xFFFE)],
-            wrap_1050=True, wrap_version=3, lane_version=3,
-        )
-        for nt in new_tracks
-        for clip_idx in nt.clip_indices
-    ]
-    all_playlists = [*surviving_playlists, *added_playlists]
-    all_lanes = [*surviving_lanes, *added_lanes]
-    out_1015 = build_zchunk(0x1015, struct.pack("<I", len(all_playlists)) + b"".join(all_playlists) + c4829_trailer, version=ver_1015)
-    out_1054 = build_zchunk(0x1054, struct.pack("<I", len(all_lanes)) + b"".join(all_lanes) + c4828_trailer, version=ver_1054)
+    added_lanes: list[bytes] = []
+    for nt in new_tracks:
+        if nt.clip_indices and len(nt.clip_indices) != len(nt.lane_indices):
+            raise ValueError(
+                f"Track {nt.track_name!r} clip_indices count ({len(nt.clip_indices)}) != lane_indices count ({len(nt.lane_indices)})"
+            )
+        if nt.clip_indices:
+            for clip_idx in nt.clip_indices:
+                added_lanes.append(
+                    serialize_lane_1052(
+                        nt.track_name,
+                        [(clip_idx, nt.start_sample, 3, 0xFFFE)],
+                        wrap_1050=True, wrap_version=3, lane_version=3,
+                    )
+                )
+        else:
+            for _ in nt.lane_indices:
+                added_lanes.append(
+                    serialize_lane_1052(
+                        nt.track_name, (), wrap_1050=True, wrap_version=3, lane_version=3,
+                    )
+                )
+    all_playlists = [*survival.playlists, *added_playlists]
+    all_lanes = [*survival.lanes, *added_lanes]
+    out_1015 = build_zchunk(
+        0x1015, struct.pack("<I", len(all_playlists)) + b"".join(all_playlists) + survival.c4829_trailer, version=ver_1015,
+    )
+    out_1054 = build_zchunk(
+        0x1054, struct.pack("<I", len(all_lanes)) + b"".join(all_lanes) + survival.c4828_trailer, version=ver_1054,
+    )
     return out_1015, out_1054

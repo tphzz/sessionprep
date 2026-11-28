@@ -10,6 +10,24 @@ from typing import Protocol
 PTX_MAGIC = b"\x030010111100101011"
 UUID_PREFIX = b"\x00\x00\x00\x00\x2a\x00\x00\x00"
 MAX_GROUP_ID = 104  # 4 Pro Tools group banks * 26 letters (a..z, 2a..2z, 3a..3z, 4a..4z)
+VALID_PROTOOLS_SAMPLE_RATES = frozenset({44100, 48000, 88200, 96000, 176400, 192000})
+VALID_PROTOOLS_BIT_DEPTHS = frozenset({16, 24, 32})
+
+
+class PtxError(Exception):
+    """Base exception for Pro Tools ``.ptx`` reader and writer errors."""
+
+
+class PtxValidationError(PtxError, ValueError):
+    """Raised when caller inputs violate Pro Tools ``.ptx`` constraints."""
+
+
+class PtxUnsupportedTemplateError(PtxError, ValueError):
+    """Raised when a ``.ptx``/``.ptxt`` template uses an unsupported format or schema version."""
+
+
+class PtxCorruptFileError(PtxError, RuntimeError):
+    """Raised when a ``.ptx`` binary container is truncated or structurally malformed."""
 
 ZERO_TICKS = 1_000_000_000_000  # 0xE8D4A51000 timeline tick origin
 TICKS_PER_QUARTER = 960_000

@@ -30,13 +30,27 @@ from .protools_ptx import (
 )
 from .protools_ptx_media import TargetAudioSpec, resolve_target_audio_spec
 from .protools_ptx_preview import (
-    _apply_virtual_folder_groups,
-    _find_folder_track,
-    _load_preview_leaf,
-    _prune_preview_empty_branches,
-    _resolve_ancestor_routing_bus,
-    _unique_virtual_name,
+    apply_virtual_folder_groups,
+    find_folder_track,
+    load_preview_leaf,
+    prune_preview_empty_branches,
+    resolve_ancestor_routing_bus,
+    unique_virtual_name,
 )
+
+_KNOWN_AUDIO_EXTENSIONS = frozenset({
+    ".wav", ".aif", ".aiff", ".flac", ".mp3", ".m4a", ".ogg", ".w64", ".rf64", ".caf", ".sd2", ".mxf",
+})
+
+
+@dataclass(frozen=True)
+class _PlannedTracksBundle:
+    planned: list[PlannedAudioTrack]
+    leaf_entries: dict[str, tuple[TrackContext, ProToolsTrackStaging]]
+    leaf_gains: dict[str, tuple[float, float, float]]
+    chosen_tracks: list[TrackContext]
+    excluded: dict[str, str]
+    warnings: list[str]
 
 
 @dataclass(frozen=True)
@@ -117,6 +131,13 @@ def _ordered_entry_pairs(
     return work
 
 
+def _strip_known_audio_ext(name: str) -> str:
+    stem, ext = os.path.splitext(name)
+    if ext.lower() in _KNOWN_AUDIO_EXTENSIONS and stem.strip():
+        return stem.strip()
+    return name
+
+
 def _build_planned_track(
     ptx: PtxSession,
     session: SessionContext,
@@ -130,10 +151,10 @@ def _build_planned_track(
     auto_route: bool,
     warnings: list[str],
 ) -> PlannedAudioTrack:
-    raw_bus = _resolve_ancestor_routing_bus(ptx, folder_trk) if auto_route else None
+    raw_bus = resolve_ancestor_routing_bus(ptx, folder_trk) if auto_route else None
     sp = ptx.signal_path_by_name(raw_bus) if raw_bus else None
-    target_bus = raw_bus if (raw_bus and sp is not None) else None
-    if auto_route and raw_bus and sp is None:
+    target_bus = raw_bus if (raw_bus and sp is not None and sp.uuid_hex) else None
+    if auto_route and raw_bus and target_bus is None:
         warnings.append(
             f"Folder {folder_trk.name!r} input {raw_bus!r} is not an internal Pro Tools bus; {entry.daw_track_name!r} left unrouted."
         )
@@ -142,8 +163,8 @@ def _build_planned_track(
             f"Folder {folder_trk.name!r} has no ancestor Routing Folder bus; {entry.daw_track_name!r} left unrouted."
         )
     raw_name = (entry.daw_track_name or "").strip() or (track.filename or "").strip() or "Track"
-    base_name = os.path.splitext(raw_name)[0].strip() or raw_name
-    tname = _unique_virtual_name(base_name, used_names)
+    base_name = _strip_known_audio_ext(raw_name)
+    tname = unique_virtual_name(base_name, used_names)
     fmt = "Stereo" if track.channels >= 2 else "Mono"
     main_out = PtxSignalPathRef(target_bus, "bus", sp.uuid_hex) if (target_bus and sp is not None) else None
     group_label = entry.group or track.group or ""
@@ -173,14 +194,7 @@ def _plan_audio_tracks(
     *,
     auto_route: bool,
     gain_mode: str,
-) -> tuple[
-    list[PlannedAudioTrack],
-    dict[str, tuple[TrackContext, ProToolsTrackStaging]],
-    dict[str, tuple[float, float, float]],
-    list[TrackContext],
-    dict[str, str],
-    list[str],
-]:
+) -> _PlannedTracksBundle:
     if session.config.get("_use_processed") is True and session.prepare_state != "ready":
         raise ValueError("Prepared audio is out of date. Run Prepare again (or uncheck Use Processed).")
     manifest_map = {e.entry_id: e for e in session.transfer_manifest}
@@ -198,7 +212,7 @@ def _plan_audio_tracks(
     for eid, fid in _ordered_entry_pairs(assignments, track_order):
         entry = manifest_map.get(eid)
         track = out_map.get(entry.output_filename) if entry else None
-        folder_trk = _find_folder_track(ptx, fid, folder_lookup)
+        folder_trk = find_folder_track(ptx, fid, folder_lookup)
         if (
             entry is None
             or track is None
@@ -223,7 +237,7 @@ def _plan_audio_tracks(
         leaf_entries[item.track_name.lower()] = (track, staging)
         leaf_gains[item.track_name] = (staging.clip_gain_db, staging.fader_db, staging.baked_gain_db)
         chosen_tracks.append(track)
-    return planned, leaf_entries, leaf_gains, chosen_tracks, excluded, warnings
+    return _PlannedTracksBundle(planned, leaf_entries, leaf_gains, chosen_tracks, excluded, warnings)
 
 
 def _collect_fader_targets(
@@ -267,7 +281,7 @@ def _compute_plan_signal_flow(
         attenuate_only=(gain_mode != GAIN_MODE_CLIP_UNITY),
         strict_slot_a=True,
         allow_leaf_convergence=(gain_mode == GAIN_MODE_CLIP_AND_FADER and stage_bus_faders),
-        leaf_loader=lambda name: _load_preview_leaf(name, leaf_entries, excluded),
+        leaf_loader=lambda name: load_preview_leaf(name, leaf_entries, excluded),
         leaf_gains=leaf_gains,
         bus_fader_overrides=bus_fader_overrides,
         progress_cb=progress_cb,
@@ -291,11 +305,11 @@ def _plan_groups_and_cleanup(
         group_actions = plan_folder_groups_and_vcas(
             ptx, created_names, link_vcas=link_template_vcas, group_type=group_type,
         )
-        _apply_virtual_folder_groups(
+        apply_virtual_folder_groups(
             ptx, created_names, link_template_vcas=link_template_vcas, group_type=group_type,
         )
     cleanup_plan = plan_empty_folders_and_vcas(ptx, remove_unused_aux_tracks=remove_unused_aux_tracks)
-    _prune_preview_empty_branches(ptx, remove_unused_aux_tracks=remove_unused_aux_tracks)
+    prune_preview_empty_branches(ptx, remove_unused_aux_tracks=remove_unused_aux_tracks)
     return group_actions, cleanup_plan
 
 
@@ -324,33 +338,34 @@ def build_protools_creation_plan(
     if 0x2519 not in ptx.chunk_map:
         raise ValueError(f"Pro Tools template lacks 0x2519 track metadata: {ptxt_path}")
     audit = ptx.audit()
-    planned, leaf_entries, leaf_gains, chosen_tracks, excluded, warnings = _plan_audio_tracks(
+    bundle = _plan_audio_tracks(
         ptx, session, assignments, folders, track_order, auto_route=auto_route, gain_mode=gain_mode,
     )
     audio_spec = resolve_target_audio_spec(
-        chosen_tracks, template_sample_rate=ptx.info.sample_rate, template_bit_depth=ptx.info.bit_depth,
+        bundle.chosen_tracks, template_sample_rate=ptx.info.sample_rate, template_bit_depth=ptx.info.bit_depth,
     )
     group_actions, cleanup_plan = _plan_groups_and_cleanup(
-        ptx, [pt.track_name for pt in planned],
+        ptx, [pt.track_name for pt in bundle.planned],
         auto_group_folders=auto_group_folders, link_template_vcas=link_template_vcas,
         group_type=group_type, remove_unused_aux_tracks=remove_unused_aux_tracks,
     )
     graph = (
         _compute_plan_signal_flow(
-            ptx, session, leaf_entries, leaf_gains, excluded,
+            ptx, session, bundle.leaf_entries, bundle.leaf_gains, bundle.excluded,
             gain_mode=gain_mode, stage_bus_faders=stage_bus_faders, pan_law_db=pan_law_db,
             bus_fader_overrides=bus_fader_overrides, progress_cb=progress_cb, cancel_cb=cancel_cb,
         )
-        if compute_signal_flow and leaf_entries
+        if compute_signal_flow and bundle.leaf_entries
         else None
     )
-    faders, trims = _collect_fader_targets(planned, graph)
+    faders, trims = _collect_fader_targets(bundle.planned, graph)
     return ProToolsCreationPlan(
         ptxt_path=str(ptxt_path),
         session_name=(session.project_name or "").strip() or "Session",
         audio_spec=audio_spec,
-        tracks=tuple(planned), source_audio_paths=tuple(dict.fromkeys(pt.source_filepath for pt in planned)),
+        tracks=tuple(bundle.planned),
+        source_audio_paths=tuple(dict.fromkeys(pt.source_filepath for pt in bundle.planned)),
         group_actions=tuple(group_actions), cleanup_plan=cleanup_plan, template_audit=audit,
         signal_flow=graph, recommended_faders_db=faders, recommended_slot_a_trims_db=trims,
-        excluded_tracks=excluded, warnings=tuple(warnings),
+        excluded_tracks=bundle.excluded, warnings=tuple(bundle.warnings),
     )

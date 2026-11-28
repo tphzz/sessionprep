@@ -60,7 +60,7 @@ class TemplateTopologySummary:
         return self.by_id.get(folder_id) or self.by_name.get(folder_name.lower())
 
 
-def _resolve_ancestor_routing_bus(ptx: PtxSession, folder: PtxTrack) -> str | None:
+def resolve_ancestor_routing_bus(ptx: PtxSession, folder: PtxTrack) -> str | None:
     cur: PtxTrack | None = folder
     seen: set[str] = set()
     while cur is not None and cur.name.lower() not in seen:
@@ -69,6 +69,9 @@ def _resolve_ancestor_routing_bus(ptx: PtxSession, folder: PtxTrack) -> str | No
             return cur.input_path.name if cur.input_path else None
         cur = ptx.track_by_name(cur.parent_folder_name) if cur.parent_folder_name else None
     return None
+
+
+_resolve_ancestor_routing_bus = resolve_ancestor_routing_bus
 
 
 def _trace_output_chain(ptx: PtxSession, start: PtxTrack, max_hops: int = 4) -> str:
@@ -153,7 +156,7 @@ def read_template_folders_from_ptxt(ptxt_path: str | Path) -> list[dict[str, Any
     return folders
 
 
-def _find_folder_track(ptx: PtxSession, folder_id: str, folder_lookup: dict[str, dict[str, Any]]) -> PtxTrack | None:
+def find_folder_track(ptx: PtxSession, folder_id: str, folder_lookup: dict[str, dict[str, Any]]) -> PtxTrack | None:
     by_uuid = {t.uuid_braced.lower(): t for t in ptx.tracks if t.uuid_braced}
     trk = by_uuid.get(folder_id.lower())
     if trk is not None:
@@ -164,7 +167,10 @@ def _find_folder_track(ptx: PtxSession, folder_id: str, folder_lookup: dict[str,
     return None
 
 
-def _apply_virtual_folder_groups(
+_find_folder_track = find_folder_track
+
+
+def apply_virtual_folder_groups(
     ptx: PtxSession,
     virtual_names: list[str],
     *,
@@ -204,6 +210,9 @@ def _apply_virtual_folder_groups(
             trk = by_name.get(member.lower())
             if trk is not None and act.group_name not in trk.groups:
                 trk.groups.append(act.group_name)
+
+
+_apply_virtual_folder_groups = apply_virtual_folder_groups
 
 
 def _inject_virtual_leaves(
@@ -263,7 +272,7 @@ def _inject_virtual_leaves(
     return leaf_entries, leaf_gains
 
 
-def _unique_virtual_name(base_name: str, used_names: set[str]) -> str:
+def unique_virtual_name(base_name: str, used_names: set[str]) -> str:
     vname = base_name
     suffix = 2
     while vname.lower() in used_names:
@@ -273,7 +282,10 @@ def _unique_virtual_name(base_name: str, used_names: set[str]) -> str:
     return vname
 
 
-def _load_preview_leaf(
+_unique_virtual_name = unique_virtual_name
+
+
+def load_preview_leaf(
     track_name: str,
     leaf_entries: dict[str, tuple[TrackContext, ProToolsTrackStaging]],
     excluded: dict[str, str],
@@ -304,7 +316,10 @@ def _load_preview_leaf(
         return None
 
 
-def _prune_preview_empty_branches(ptx: PtxSession, *, remove_unused_aux_tracks: bool) -> None:
+_load_preview_leaf = load_preview_leaf
+
+
+def prune_preview_empty_branches(ptx: PtxSession, *, remove_unused_aux_tracks: bool) -> None:
     """Mirror Create's empty-folder/VCA/orphaned-Aux cleanup on the in-memory preview session."""
     plan = plan_empty_folders_and_vcas(ptx, remove_unused_aux_tracks=remove_unused_aux_tracks)
     removed = {
@@ -313,6 +328,9 @@ def _prune_preview_empty_branches(ptx: PtxSession, *, remove_unused_aux_tracks: 
     }
     if removed:
         ptx.tracks = [t for t in ptx.tracks if t.name.lower() not in removed]
+
+
+_prune_preview_empty_branches = prune_preview_empty_branches
 
 
 def preview_protools_signal_flow(

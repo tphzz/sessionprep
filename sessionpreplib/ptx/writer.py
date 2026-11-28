@@ -6,18 +6,36 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 import struct
+from types import MappingProxyType
 from typing import Any
 import uuid
 
-from .codec import atomic_write_bytes, decrypt_ptx, encrypt_ptx, iter_top_chunks, validate_index_0002
-from .models import PtxChunk
+from .codec import (
+    atomic_write_bytes,
+    decrypt_ptx,
+    encrypt_ptx,
+    iter_top_chunks,
+    normalize_ptx_uuid16,
+    validate_index_0002,
+    walk_sequential_zchunks,
+)
+from .models import (
+    VALID_PROTOOLS_BIT_DEPTHS,
+    VALID_PROTOOLS_SAMPLE_RATES,
+    PtxChunk,
+    PtxCorruptFileError,
+    PtxUnsupportedTemplateError,
+    PtxValidationError,
+)
 from .parser import PtxSession
 from .patch_builder import PtxPatchBuilder
-from .writer_chunks import patch_session_audio_format_1028
+from .writer_blueprints import OutputBusSpec
+from .writer_chunks import patch_session_audio_format_1028_decrypted, serialize_directory_tree_103a
 from .writer_index import apply_rebuilt_index_0002
 from .writer_mutations import (
     AudioFileWriteSpec,
     ClipWriteSpec,
+    MediaSurvivalPlan,
     NewAudioTrackSpec,
     TrackSlotOp,
     mutate_0f3d_volumes,
@@ -32,23 +50,31 @@ from .writer_mutations import (
     mutate_262a_clips,
     plan_existing_media_survival,
 )
-from .writer_primitives import generate_ptx_uuid, parse_index_0002
+from .writer_primitives import (
+    build_zchunk,
+    generate_ptx_uuid,
+    parse_index_0002,
+    serialize_folder_tree_210c,
+)
 
 _VALID_GROUP_ACTIONS = frozenset({"create", "add_members", "link_vca"})
+_EMPTY_MAP: Mapping[str, float] = MappingProxyType({})
+_FOLDER_TRACK_TYPES = frozenset({"RoutingFolder", "BasicFolder"})
 
 
 @dataclass(frozen=True)
 class OfflineAudioTrackRequest:
-    """One Audio track to synthesize inside a Pro Tools template."""
+    """One Audio track to synthesize inside a Pro Tools template (in a folder or at top level)."""
 
     track_name: str
     channels: int
-    parent_folder_uuid_hex: str
-    output_bus_name: str | None
-    audio_file_index: int
-    length_samples: int
-    clip_base_name: str
+    parent_folder_uuid_hex: str | None = None
+    output_bus_name: str | None = None
+    audio_file_index: int | None = None
+    length_samples: int = 0
+    clip_base_name: str = ""
     color_index: int = 0xFFFE
+    start_sample: int = 0
 
 
 @dataclass(frozen=True)
@@ -74,12 +100,16 @@ class OfflinePtxWriteRequest:
     audio_files: tuple[AudioFileWriteSpec, ...]
     tracks: tuple[OfflineAudioTrackRequest, ...]
     delete_track_names: tuple[str, ...] = ()
-    clip_gains_db: Mapping[str, float] = field(default_factory=dict)
-    slot_a_trims_db: Mapping[str, float] = field(default_factory=dict)
-    track_volumes_db: Mapping[str, float] = field(default_factory=dict)
+    clip_gains_db: Mapping[str, float] = field(default_factory=lambda: _EMPTY_MAP)
+    slot_a_trims_db: Mapping[str, float] = field(default_factory=lambda: _EMPTY_MAP)
+    track_volumes_db: Mapping[str, float] = field(default_factory=lambda: _EMPTY_MAP)
     group_requests: tuple[OfflineGroupRequest, ...] = ()
     volume_serial_u32: int = 0x53505250
     volume_label: str = "SessionPrep"
+
+    @property
+    def template_path(self) -> Path:
+        return self.ptxt_path
 
 
 @dataclass(frozen=True)
@@ -92,62 +122,152 @@ class OfflinePtxWriteResult:
     patch_summary: dict[str, Any]
 
 
-def _validate_template_supported(top_chunks: Sequence[PtxChunk]) -> None:
-    tags = {c.tag for c in top_chunks}
-    missing = [hex(t) for t in (0x1004, 0x1015, 0x1054, 0x202B, 0x2107, 0x210C, 0x2519, 0x2624, 0x262A) if t not in tags]
-    if missing:
-        raise ValueError(f"Pro Tools template is missing required chunks: {', '.join(missing)}")
+@dataclass(frozen=True)
+class _StructuralMutationPlan:
+    old_track_count: int
+    request: OfflinePtxWriteRequest
+    new_specs: tuple[NewAudioTrackSpec, ...]
+    clips: tuple[ClipWriteSpec, ...]
+    layout: tuple[TrackSlotOp, ...]
+    old_to_new: Mapping[int, int]
+    folder_insertions: Mapping[bytes, Sequence[bytes]]
+    deleted_uuids: frozenset[bytes]
+    survival: MediaSurvivalPlan
 
 
 def _chunk_u32_count(chunk_raw: bytes, label: str) -> int:
     if len(chunk_raw) < 13:
-        raise RuntimeError(f"Truncated {label} container chunk")
+        raise PtxCorruptFileError(f"Truncated {label} container chunk")
     return int(struct.unpack_from("<I", chunk_raw, 9)[0])
+
+
+def _empty_optional_chunk(tag: int) -> bytes:
+    if tag == 0x0F3D:
+        return build_zchunk(0x0F3D, struct.pack("<I", 0), version=1)
+    if tag == 0x1004:
+        empty_103a = serialize_directory_tree_103a([], version=1)
+        return build_zchunk(0x1004, struct.pack("<I", 0) + empty_103a + struct.pack("<I", 0) + empty_103a, version=3)
+    if tag == 0x2637:
+        return build_zchunk(0x2637, struct.pack("<I", 0), version=1)
+    if tag == 0x262A:
+        return build_zchunk(0x262A, struct.pack("<I", 0), version=1)
+    if tag == 0x1054:
+        return build_zchunk(0x1054, struct.pack("<I", 0) + build_zchunk(0x4828, b"\x00\x00\x00\x00", version=2), version=2)
+    if tag == 0x1015:
+        return build_zchunk(0x1015, struct.pack("<I", 0) + build_zchunk(0x4829, b"\x00\x00\x00\x00", version=2), version=2)
+    if tag == 0x210C:
+        return serialize_folder_tree_210c([], version=1)
+    raise ValueError(f"Unsupported synthesized chunk tag 0x{tag:04x}")
+
+
+def _validate_template_supported(top_chunks: Sequence[PtxChunk]) -> None:
+    by_tag = {c.tag: c for c in top_chunks}
+    missing = [hex(t) for t in (0x1028, 0x2519, 0x2107, 0x2624, 0x202B) if t not in by_tag]
+    if missing:
+        raise PtxUnsupportedTemplateError(f"Pro Tools template is missing required chunks: {', '.join(missing)}")
+    if by_tag[0x2519].version < 8:
+        raise PtxUnsupportedTemplateError(
+            f"Unsupported legacy Pro Tools template 0x2519 version {by_tag[0x2519].version} (expected >= 8)"
+        )
+    c2624_raw = by_tag[0x2624].raw
+    if len(c2624_raw) >= 13:
+        strips, _ = walk_sequential_zchunks(c2624_raw, 13, struct.unpack_from("<I", c2624_raw, 9)[0])
+        for st in strips:
+            if struct.unpack_from("<H", st, 7)[0] == 0x261C and struct.unpack_from("<H", st, 1)[0] < 6:
+                ver = struct.unpack_from("<H", st, 1)[0]
+                raise PtxUnsupportedTemplateError(f"Unsupported legacy Pro Tools template 0x261C version {ver} (expected >= 6)")
+
+
+def _resolve_output_bus(session: PtxSession, bus_name: str) -> OutputBusSpec:
+    sp = session.signal_path_by_name(bus_name)
+    if sp is None:
+        low = bus_name.lower()
+        sp = next((p for p in session.signal_paths if p.name.lower() == low and p.uuid_hex), None)
+    if sp is None or not sp.uuid_hex:
+        raise PtxValidationError(f"Output bus {bus_name!r} not found or lacks a valid UUID in template")
+    return OutputBusSpec(
+        ptsl_index=sp.index,
+        uuid16=bytes.fromhex(sp.uuid_hex),
+        name=sp.name,
+        channel_count=max(1, int(sp.channel_count or 2)),
+    )
+
+
+def _validate_track_request(
+    session: PtxSession,
+    request: OfflinePtxWriteRequest,
+    req: OfflineAudioTrackRequest,
+    folder_uuids_alive: set[bytes],
+    used_names_lc: set[str],
+) -> None:
+    if not req.track_name or not req.track_name.strip():
+        raise PtxValidationError("Track name must not be empty")
+    low_name = req.track_name.lower()
+    if low_name in used_names_lc:
+        raise PtxValidationError(f"Duplicate or colliding track name {req.track_name!r}")
+    used_names_lc.add(low_name)
+    if req.channels not in (1, 2):
+        raise PtxValidationError(f"Unsupported channel count {req.channels!r} for track {req.track_name!r} (expected 1 or 2)")
+    if isinstance(req.start_sample, bool) or not (0 <= req.start_sample <= 0x00FF_FFFF_FFFF_FFFF):
+        raise PtxValidationError(f"Track {req.track_name!r} start_sample out of range: {req.start_sample!r}")
+    if isinstance(req.color_index, bool) or not (0 <= req.color_index <= 0xFFFF):
+        raise PtxValidationError(f"Track {req.track_name!r} color_index out of range: {req.color_index!r}")
+    if req.audio_file_index is not None:
+        if not (0 <= req.audio_file_index < len(request.audio_files)):
+            raise PtxValidationError(
+                f"Track {req.track_name!r} audio_file_index {req.audio_file_index} out of range (0..{len(request.audio_files) - 1})"
+            )
+        af = request.audio_files[req.audio_file_index]
+        if req.channels > af.channels:
+            raise PtxValidationError(
+                f"Track {req.track_name!r} requires {req.channels} channels but audio file {req.audio_file_index} has {af.channels}"
+            )
+        if req.length_samples < 0 or req.length_samples > af.length_samples:
+            raise PtxValidationError(
+                f"Track {req.track_name!r} length_samples {req.length_samples} out of range (0..{af.length_samples})"
+            )
+        if not req.clip_base_name or not req.clip_base_name.strip():
+            raise PtxValidationError(f"Track {req.track_name!r} clip_base_name must not be empty")
+    if req.parent_folder_uuid_hex is not None:
+        try:
+            parent_uid = normalize_ptx_uuid16(req.parent_folder_uuid_hex)
+        except ValueError as exc:
+            raise PtxValidationError(f"Track {req.track_name!r} has invalid parent_folder_uuid_hex") from exc
+        if parent_uid not in folder_uuids_alive:
+            raise PtxValidationError(
+                f"Track {req.track_name!r} targets missing, non-folder, or deleted parent folder UUID {req.parent_folder_uuid_hex!r}"
+            )
+    if req.output_bus_name:
+        _resolve_output_bus(session, req.output_bus_name)
 
 
 def _validate_write_request(session: PtxSession, request: OfflinePtxWriteRequest) -> None:
     delete_lc = {n.lower() for n in request.delete_track_names}
+    deleted_uuids = {bytes.fromhex(t.uuid_hex) for t in session.tracks if t.uuid_hex and t.name.lower() in delete_lc}
     folder_uuids_alive: set[bytes] = set()
-    surviving_names_lc: set[str] = set()
+    used_names_lc: set[str] = set()
     for trk in session.tracks:
         if trk.name.lower() not in delete_lc:
-            surviving_names_lc.add(trk.name.lower())
-            if trk.uuid_hex:
+            used_names_lc.add(trk.name.lower())
+            if trk.uuid_hex and trk.track_type in _FOLDER_TRACK_TYPES:
                 folder_uuids_alive.add(bytes.fromhex(trk.uuid_hex))
-        if trk.parent_folder_name and trk.parent_folder_name.lower() in delete_lc and trk.name.lower() not in delete_lc:
-            raise ValueError(
-                f"Cannot delete folder {trk.parent_folder_name!r} while surviving child track {trk.name!r} remains"
-            )
-    seen_new_lc: set[str] = set()
+            parent_deleted = bool(trk.parent_folder_name and trk.parent_folder_name.lower() in delete_lc)
+            if not parent_deleted and trk.parent_folder_uuid:
+                try:
+                    parent_deleted = normalize_ptx_uuid16(trk.parent_folder_uuid) in deleted_uuids
+                except ValueError:
+                    parent_deleted = False
+            if parent_deleted:
+                raise PtxValidationError(
+                    f"Cannot delete folder {trk.parent_folder_name!r} while surviving child track {trk.name!r} remains"
+                )
     for req in request.tracks:
-        low_name = req.track_name.lower()
-        if low_name in surviving_names_lc or low_name in seen_new_lc:
-            raise ValueError(f"Duplicate or colliding track name {req.track_name!r}")
-        seen_new_lc.add(low_name)
-        if req.channels not in (1, 2):
-            raise ValueError(f"Unsupported channel count {req.channels!r} for track {req.track_name!r} (expected 1 or 2)")
-        if not (0 <= req.audio_file_index < len(request.audio_files)):
-            raise ValueError(
-                f"Track {req.track_name!r} audio_file_index {req.audio_file_index} out of range (0..{len(request.audio_files) - 1})"
-            )
-        if req.channels > request.audio_files[req.audio_file_index].channels:
-            raise ValueError(
-                f"Track {req.track_name!r} requires {req.channels} channels but audio file {req.audio_file_index} has "
-                f"{request.audio_files[req.audio_file_index].channels}"
-            )
-        if req.length_samples < 0:
-            raise ValueError(f"Track {req.track_name!r} length_samples must be non-negative: {req.length_samples}")
-        try:
-            parent_uid = bytes.fromhex(req.parent_folder_uuid_hex)
-        except ValueError as exc:
-            raise ValueError(f"Track {req.track_name!r} has invalid parent_folder_uuid_hex") from exc
-        if len(parent_uid) != 16 or parent_uid not in folder_uuids_alive:
-            raise ValueError(
-                f"Track {req.track_name!r} targets missing or deleted parent folder UUID {req.parent_folder_uuid_hex!r}"
-            )
+        _validate_track_request(session, request, req, folder_uuids_alive, used_names_lc)
     for grp in request.group_requests:
         if grp.action not in _VALID_GROUP_ACTIONS:
-            raise ValueError(f"Unsupported offline group action {grp.action!r} for group {grp.name!r}")
+            raise PtxValidationError(f"Unsupported offline group action {grp.action!r} for group {grp.name!r}")
+        if grp.action == "link_vca" and (not grp.vca_track or not grp.vca_track.strip()):
+            raise PtxValidationError(f"Group {grp.name!r} with action='link_vca' requires a non-empty vca_track")
 
 
 def _make_clip_spec(name: str, length_samples: int, audio_file_index: int, channel_index: int) -> ClipWriteSpec:
@@ -166,58 +286,65 @@ def _prepare_clips_and_specs(
     base_clip_index: int = 0,
     base_lane_index: int = 0,
     base_playlist_index: int = 0,
-) -> tuple[list[NewAudioTrackSpec], list[ClipWriteSpec]]:
+) -> tuple[tuple[NewAudioTrackSpec, ...], tuple[ClipWriteSpec, ...]]:
     clips: list[ClipWriteSpec] = []
     specs: list[NewAudioTrackSpec] = []
     next_lane = base_lane_index
     for req_offset, req in enumerate(requests):
-        out_bus: tuple[int, bytes, str] | None = None
-        if req.output_bus_name:
-            sp = session.signal_path_by_name(req.output_bus_name)
-            if sp is not None and sp.uuid_hex:
-                out_bus = (sp.index, bytes.fromhex(sp.uuid_hex), sp.name)
-
-        target_af_idx = base_audio_file_index + req.audio_file_index
+        out_bus = _resolve_output_bus(session, req.output_bus_name) if req.output_bus_name else None
         if req.channels == 2:
+            lane_indices: tuple[int, ...] = (next_lane, next_lane + 1)
+            next_lane += 2
+        else:
+            lane_indices = (next_lane,)
+            next_lane += 1
+
+        if req.audio_file_index is None:
+            clip_indices: tuple[int, ...] = ()
+        elif req.channels == 2:
+            target_af_idx = base_audio_file_index + req.audio_file_index
             c_idx_l = base_clip_index + len(clips)
             clips.append(_make_clip_spec(f"{req.clip_base_name}.L", req.length_samples, target_af_idx, 0))
             c_idx_r = base_clip_index + len(clips)
             clips.append(_make_clip_spec(f"{req.clip_base_name}.R", req.length_samples, target_af_idx, 1))
-            clip_indices: tuple[int, ...] = (c_idx_l, c_idx_r)
-            lane_indices: tuple[int, ...] = (next_lane, next_lane + 1)
-            next_lane += 2
+            clip_indices = (c_idx_l, c_idx_r)
         else:
+            target_af_idx = base_audio_file_index + req.audio_file_index
             c_idx = base_clip_index + len(clips)
             clips.append(_make_clip_spec(req.clip_base_name, req.length_samples, target_af_idx, 0))
             clip_indices = (c_idx,)
-            lane_indices = (next_lane,)
-            next_lane += 1
 
+        parent_uid = normalize_ptx_uuid16(req.parent_folder_uuid_hex) if req.parent_folder_uuid_hex is not None else None
         specs.append(NewAudioTrackSpec(
             track_name=req.track_name,
             track_uuid16=generate_ptx_uuid(),
             playlist_uuid16=generate_ptx_uuid(),
             channels=req.channels,
-            parent_folder_uuid16=bytes.fromhex(req.parent_folder_uuid_hex),
+            parent_folder_uuid16=parent_uid,
             output_bus=out_bus,
             color_index=req.color_index,
             clip_indices=clip_indices,
             lane_indices=lane_indices,
             playlist_index=base_playlist_index + req_offset,
+            start_sample=req.start_sample,
         ))
-    return specs, clips
+    return tuple(specs), tuple(clips)
 
 
 def _compute_unified_layout(
     session: PtxSession,
     new_specs: Sequence[NewAudioTrackSpec],
     delete_names: Sequence[str],
-) -> tuple[list[TrackSlotOp], dict[int, int], dict[bytes, list[bytes]], set[bytes], list[str]]:
+) -> tuple[tuple[TrackSlotOp, ...], dict[int, int], dict[bytes, list[bytes]], frozenset[bytes], tuple[str, ...]]:
     """Build final ordered track slots, old->new index map, folder insertions, and deleted UUIDs."""
     delete_lc = {n.lower() for n in delete_names}
     by_folder: dict[bytes, list[NewAudioTrackSpec]] = {}
+    top_level_new: list[NewAudioTrackSpec] = []
     for spec in new_specs:
-        by_folder.setdefault(spec.parent_folder_uuid16, []).append(spec)
+        if spec.parent_folder_uuid16 is None:
+            top_level_new.append(spec)
+        else:
+            by_folder.setdefault(spec.parent_folder_uuid16, []).append(spec)
 
     layout: list[TrackSlotOp] = []
     old_to_new: dict[int, int] = {}
@@ -241,69 +368,112 @@ def _compute_unified_layout(
             for child in children:
                 layout.append(TrackSlotOp(new_track=child))
                 placed_count += 1
+    for spec in top_level_new:
+        layout.append(TrackSlotOp(new_track=spec))
+        placed_count += 1
     if placed_count != len(new_specs):
-        raise ValueError(f"Placed {placed_count}/{len(new_specs)} requested tracks; check parent folder UUIDs")
-    return layout, old_to_new, folder_insertions, deleted_uuids, deleted_actual
+        raise PtxValidationError(f"Placed {placed_count}/{len(new_specs)} requested tracks; check parent folder UUIDs")
+    return tuple(layout), old_to_new, folder_insertions, frozenset(deleted_uuids), tuple(deleted_actual)
+
+
+def _assemble_chunks_with_insertions(
+    dec_header: bytes,
+    top_chunks: Sequence[PtxChunk],
+    replacements: Mapping[int, bytes],
+) -> bytearray:
+    """Emit top-level chunks replacing last occurrence of mutated tags and inserting synthesized chunks."""
+    last_idx_by_tag: dict[int, int] = {chunk.tag: idx for idx, chunk in enumerate(top_chunks)}
+    insertions_after: dict[int, list[bytes]] = {}
+    insertions_before: dict[int, list[bytes]] = {}
+
+    def _schedule_missing(tag: int, *, after: Sequence[int] = (), before: Sequence[int] = ()) -> None:
+        if tag in last_idx_by_tag or tag not in replacements:
+            return
+        for anchor in after:
+            if anchor in last_idx_by_tag:
+                insertions_after.setdefault(last_idx_by_tag[anchor], []).append(replacements[tag])
+                return
+        for anchor in before:
+            if anchor in last_idx_by_tag:
+                insertions_before.setdefault(last_idx_by_tag[anchor], []).append(replacements[tag])
+                return
+        idx_0002 = last_idx_by_tag.get(0x0002, len(top_chunks))
+        insertions_before.setdefault(idx_0002, []).append(replacements[tag])
+
+    _schedule_missing(0x0F3D, after=(0x2032, 0x1028), before=(0x1004, 0x2027))
+    _schedule_missing(0x1004, after=(0x0F3D, 0x2032, 0x1028), before=(0x2027, 0x2096))
+    _schedule_missing(0x2637, after=(0x204D,), before=(0x262C, 0x262A, 0x2721, 0x1054, 0x1015, 0x1055, 0x210C, 0x2107, 0x2624))
+    _schedule_missing(0x262A, after=(0x2637, 0x2632, 0x204D), before=(0x2721, 0x1054, 0x1015, 0x1055, 0x210C, 0x2107, 0x2624))
+    _schedule_missing(0x1054, after=(0x2437, 0x2029), before=(0x1015, 0x1055, 0x210C, 0x2107))
+    _schedule_missing(0x1015, after=(0x1054, 0x2437), before=(0x1055, 0x210C, 0x2107))
+    _schedule_missing(0x210C, before=(0x2107, 0x2624))
+
+    out = bytearray(dec_header)
+    for idx, chunk in enumerate(top_chunks):
+        for raw_ins in insertions_before.get(idx, ()):
+            out.extend(raw_ins)
+        if chunk.tag in replacements and last_idx_by_tag[chunk.tag] == idx:
+            out.extend(replacements[chunk.tag])
+        else:
+            out.extend(chunk.raw)
+        for raw_ins in insertions_after.get(idx, ()):
+            out.extend(raw_ins)
+    for raw_ins in insertions_before.get(len(top_chunks), ()):
+        out.extend(raw_ins)
+    return out
 
 
 def _apply_structural_mutations(
     dec_base: bytes,
     top_chunks: Sequence[PtxChunk],
-    old_track_count: int,
-    request: OfflinePtxWriteRequest,
-    new_specs: Sequence[NewAudioTrackSpec],
-    clips: Sequence[ClipWriteSpec],
-    layout: Sequence[TrackSlotOp],
-    old_to_new: Mapping[int, int],
-    folder_insertions: Mapping[bytes, Sequence[bytes]],
-    deleted_uuids: set[bytes],
-    surviving_playlists: Sequence[bytes],
-    surviving_lanes: Sequence[bytes],
-    old_playlist_to_new: Mapping[int, int],
-    c4829_trailer: bytes,
-    c4828_trailer: bytes,
+    plan: _StructuralMutationPlan,
 ) -> bytes:
     template_index = parse_index_0002(dec_base)
     if template_index is None:
-        raise RuntimeError("Template .ptx lacks trailing 0x0002 chunk-offset index")
+        raise PtxCorruptFileError("Template .ptx lacks trailing 0x0002 chunk-offset index")
 
-    by_tag = {c.tag: c.raw for c in reversed(top_chunks)}
+    by_tag = {c.tag: c.raw for c in top_chunks}  # last-wins, matching parser.py & writer_index.py
+    req = plan.request
     new_1004, root_path = mutate_1004_audio_files(
-        by_tag[0x1004], request.audio_files, session_dir=request.session_dir, volume_serial_u32=request.volume_serial_u32,
+        by_tag.get(0x1004) or _empty_optional_chunk(0x1004),
+        req.audio_files, session_dir=req.session_dir, volume_serial_u32=req.volume_serial_u32,
     )
     new_1015, new_1054 = mutate_1015_and_1054_media(
-        by_tag[0x1015], by_tag[0x1054], new_specs,
-        surviving_playlists=surviving_playlists, surviving_lanes=surviving_lanes,
-        c4829_trailer=c4829_trailer, c4828_trailer=c4828_trailer,
+        by_tag.get(0x1015) or _empty_optional_chunk(0x1015),
+        by_tag.get(0x1054) or _empty_optional_chunk(0x1054),
+        plan.new_specs, survival=plan.survival,
     )
     replacements: dict[int, bytes] = {
-        0x1004: new_1004,
         0x1015: new_1015,
         0x1054: new_1054,
-        0x202B: mutate_202b_groups_for_track_map(by_tag[0x202B], old_to_new, len(layout)),
-        0x2107: mutate_2107_tracks(by_tag[0x2107], layout, expected_old_count=old_track_count),
-        0x210C: mutate_210c_folders(by_tag[0x210C], folder_insertions, deleted_uuids),
-        0x2519: mutate_2519_tracks(by_tag[0x2519], layout, expected_old_count=old_track_count),
+        0x202B: mutate_202b_groups_for_track_map(by_tag[0x202B], plan.old_to_new, len(plan.layout)),
+        0x2107: mutate_2107_tracks(by_tag[0x2107], plan.layout, expected_old_count=plan.old_track_count),
+        0x2519: mutate_2519_tracks(by_tag[0x2519], plan.layout, expected_old_count=plan.old_track_count),
         0x2624: mutate_2624_mixer(
-            by_tag[0x2624], layout, expected_old_count=old_track_count, old_playlist_to_new=old_playlist_to_new,
+            by_tag[0x2624], plan.layout,
+            expected_old_count=plan.old_track_count,
+            old_playlist_to_new=plan.survival.old_playlist_to_new,
         ),
-        0x262A: mutate_262a_clips(by_tag[0x262A], clips),
     }
+    if 0x1004 in by_tag or req.audio_files:
+        replacements[0x1004] = new_1004
+    if 0x262A in by_tag or plan.clips:
+        replacements[0x262A] = mutate_262a_clips(by_tag.get(0x262A) or _empty_optional_chunk(0x262A), plan.clips)
+    if 0x210C in by_tag or plan.folder_insertions:
+        replacements[0x210C] = mutate_210c_folders(
+            by_tag.get(0x210C) or _empty_optional_chunk(0x210C), plan.folder_insertions, set(plan.deleted_uuids),
+        )
+    if 0x2637 not in by_tag and req.clip_gains_db:
+        replacements[0x2637] = _empty_optional_chunk(0x2637)
     if 0x2587 in by_tag:
-        replacements[0x2587] = mutate_2587_ui_state(by_tag[0x2587], layout, expected_old_count=old_track_count)
-    if request.audio_files and 0x0F3D in by_tag:
+        replacements[0x2587] = mutate_2587_ui_state(by_tag[0x2587], plan.layout, expected_old_count=plan.old_track_count)
+    if req.audio_files:
         replacements[0x0F3D] = mutate_0f3d_volumes(
-            by_tag[0x0F3D], request.volume_serial_u32, request.volume_label, root_path,
+            by_tag.get(0x0F3D) or _empty_optional_chunk(0x0F3D),
+            req.volume_serial_u32, req.volume_label, root_path,
         )
 
-    out = bytearray(dec_base[:0x1F])
-    replaced_tags: set[int] = set()
-    for chunk in top_chunks:
-        if chunk.tag in replacements and chunk.tag not in replaced_tags:
-            out.extend(replacements[chunk.tag])
-            replaced_tags.add(chunk.tag)
-        else:
-            out.extend(chunk.raw)
+    out = _assemble_chunks_with_insertions(dec_base[:0x1F], top_chunks, replacements)
     apply_rebuilt_index_0002(out, template_index, dec_base)
     return bytes(out)
 
@@ -312,6 +482,8 @@ def _apply_signal_flow_and_groups(
     ptx_encrypted: bytes,
     request: OfflinePtxWriteRequest,
 ) -> tuple[bytes, dict[str, Any]]:
+    if not (request.clip_gains_db or request.slot_a_trims_db or request.track_volumes_db or request.group_requests):
+        return ptx_encrypted, {"cleared_inputs": {}, "clip_gains": {}, "slot_a_trims": {}, "volumes": {}, "groups": []}
     builder = PtxPatchBuilder.from_bytes(ptx_encrypted)
     if request.clip_gains_db:
         builder.set_clip_gains(request.clip_gains_db)
@@ -342,70 +514,93 @@ def _verify_written_ptx(
     expected_audio_file_count: int,
     expected_clip_count: int,
     expected_playlist_count: int,
+    *,
+    baseline_warnings: Sequence[str] = (),
 ) -> None:
     dec, delta = decrypt_ptx(ptx_encrypted)
-    if not validate_index_0002(dec):
-        raise RuntimeError("Offline .ptx verification failed: trailing 0x0002 index missing or invalid")
-    by_tag = {c.tag: c.raw for c in reversed(iter_top_chunks(dec, strict=True))}
+    try:
+        idx_ok = validate_index_0002(dec)
+    except RuntimeError as exc:
+        raise PtxCorruptFileError(f"Offline .ptx verification failed: {exc}") from exc
+    if not idx_ok:
+        raise PtxCorruptFileError("Offline .ptx verification failed: trailing 0x0002 index missing or invalid")
+    by_tag = {c.tag: c.raw for c in iter_top_chunks(dec, strict=True)}
     session = PtxSession(dec, xor_delta=delta)
-    if session.warnings:
-        raise RuntimeError(f"Offline .ptx verification produced parser warnings: {session.warnings}")
+    baseline_set = set(baseline_warnings)
+    new_warnings = [w for w in session.warnings if w not in baseline_set]
+    if new_warnings:
+        raise PtxCorruptFileError(f"Offline .ptx verification produced new parser warnings: {new_warnings}")
     if len(session.tracks) != expected_track_count:
-        raise RuntimeError(
+        raise PtxCorruptFileError(
             f"Offline .ptx verification failed: expected {expected_track_count} tracks, parsed {len(session.tracks)}"
         )
     parsed_names = {t.name for t in session.tracks}
     missing = [n for n in created_names if n not in parsed_names]
     if missing:
-        raise RuntimeError(f"Offline .ptx verification failed: missing created tracks {missing}")
-    af_hdr = _chunk_u32_count(by_tag[0x1004], "0x1004")
+        raise PtxCorruptFileError(f"Offline .ptx verification failed: missing created tracks {missing}")
+    af_hdr = _chunk_u32_count(by_tag[0x1004], "0x1004") if 0x1004 in by_tag else 0
     if af_hdr != expected_audio_file_count:
-        raise RuntimeError(f"Offline .ptx verification failed: expected {expected_audio_file_count} 0x1004 files, got {af_hdr}")
-    clip_hdr = _chunk_u32_count(by_tag[0x262A], "0x262A")
+        raise PtxCorruptFileError(f"Offline .ptx verification failed: expected {expected_audio_file_count} 0x1004 files, got {af_hdr}")
+    clip_hdr = _chunk_u32_count(by_tag[0x262A], "0x262A") if 0x262A in by_tag else 0
     if clip_hdr != expected_clip_count:
-        raise RuntimeError(f"Offline .ptx verification failed: expected {expected_clip_count} 0x262A clips, got {clip_hdr}")
-    pl_hdr = _chunk_u32_count(by_tag[0x1015], "0x1015")
+        raise PtxCorruptFileError(f"Offline .ptx verification failed: expected {expected_clip_count} 0x262A clips, got {clip_hdr}")
+    pl_hdr = _chunk_u32_count(by_tag[0x1015], "0x1015") if 0x1015 in by_tag else 0
     if pl_hdr != expected_playlist_count or len(session.playlists) != expected_playlist_count:
-        raise RuntimeError(
+        raise PtxCorruptFileError(
             f"Offline .ptx verification failed: expected {expected_playlist_count} playlists, got header={pl_hdr} parsed={len(session.playlists)}"
         )
 
 
+def _prepare_validated_base(request: OfflinePtxWriteRequest) -> tuple[bytes, int, int, list[PtxChunk]]:
+    """Decrypt, validate template schema and format parameters, and patch ``0x1028`` in place."""
+    if isinstance(request.sample_rate, bool) or request.sample_rate not in VALID_PROTOOLS_SAMPLE_RATES:
+        raise PtxValidationError(f"Unsupported Pro Tools sample rate: {request.sample_rate!r}")
+    if isinstance(request.bit_depth, bool) or request.bit_depth not in VALID_PROTOOLS_BIT_DEPTHS:
+        raise PtxValidationError(f"Unsupported Pro Tools bit depth: {request.bit_depth!r}")
+    tpl_raw = request.ptxt_path.read_bytes()
+    dec_raw, delta = decrypt_ptx(tpl_raw)
+    k0 = tpl_raw[0x14] ^ 0x5A
+    _validate_template_supported(iter_top_chunks(dec_raw, strict=True))
+    dec_buf = bytearray(dec_raw)
+    patch_session_audio_format_1028_decrypted(
+        dec_buf, sample_rate=request.sample_rate, bit_depth=request.bit_depth, audio_format_code=0x03,
+    )
+    dec_base = bytes(dec_buf)
+    return dec_base, delta, k0, iter_top_chunks(dec_base, strict=True)
+
+
 def write_offline_ptx_session(request: OfflinePtxWriteRequest) -> OfflinePtxWriteResult:
     """Create a complete Pro Tools ``.ptx`` session directly from a ``.ptxt``/``.ptx`` template offline."""
-    tpl_raw = request.ptxt_path.read_bytes()
-    tpl_raw = patch_session_audio_format_1028(
-        tpl_raw, sample_rate=request.sample_rate, bit_depth=request.bit_depth, audio_format_code=0x03,
-    )
-    dec_base, delta = decrypt_ptx(tpl_raw)
-    k0 = tpl_raw[0x14] ^ 0x5A
-    top_chunks = iter_top_chunks(dec_base, strict=True)
-    _validate_template_supported(top_chunks)
+    dec_base, delta, k0, top_chunks = _prepare_validated_base(request)
     session = PtxSession(dec_base, xor_delta=delta)
+    baseline_warnings = tuple(session.warnings)
     _validate_write_request(session, request)
 
-    by_tag = {c.tag: c.raw for c in reversed(top_chunks)}
+    by_tag = {c.tag: c.raw for c in top_chunks}
     delete_lc = {n.lower() for n in request.delete_track_names}
     deleted_old_indices = [i for i, trk in enumerate(session.tracks) if trk.name.lower() in delete_lc]
-    surviving_pl, surviving_lanes, old_pl_to_new, c4829, c4828 = plan_existing_media_survival(
-        by_tag[0x1015], by_tag[0x1054], request.delete_track_names,
+    survival = plan_existing_media_survival(
+        by_tag.get(0x1015) or _empty_optional_chunk(0x1015),
+        by_tag.get(0x1054) or _empty_optional_chunk(0x1054),
+        request.delete_track_names,
         c2624_raw=by_tag[0x2624], deleted_old_indices=deleted_old_indices,
     )
-    base_af_count = _chunk_u32_count(by_tag[0x1004], "0x1004")
-    base_clip_count = _chunk_u32_count(by_tag[0x262A], "0x262A")
+    base_af_count = _chunk_u32_count(by_tag[0x1004], "0x1004") if 0x1004 in by_tag else 0
+    base_clip_count = _chunk_u32_count(by_tag[0x262A], "0x262A") if 0x262A in by_tag else 0
     new_specs, clips = _prepare_clips_and_specs(
         session, request.tracks,
         base_audio_file_index=base_af_count, base_clip_index=base_clip_count,
-        base_lane_index=len(surviving_lanes), base_playlist_index=len(surviving_pl),
+        base_lane_index=len(survival.lanes), base_playlist_index=len(survival.playlists),
     )
     layout, old_to_new, folder_insertions, deleted_uuids, deleted_actual = _compute_unified_layout(
         session, new_specs, request.delete_track_names,
     )
-    mutated_dec = _apply_structural_mutations(
-        dec_base, top_chunks, len(session.tracks), request, new_specs, clips,
-        layout, old_to_new, folder_insertions, deleted_uuids,
-        surviving_pl, surviving_lanes, old_pl_to_new, c4829, c4828,
+    mut_plan = _StructuralMutationPlan(
+        old_track_count=len(session.tracks), request=request, new_specs=new_specs, clips=clips,
+        layout=layout, old_to_new=old_to_new, folder_insertions=folder_insertions,
+        deleted_uuids=deleted_uuids, survival=survival,
     )
+    mutated_dec = _apply_structural_mutations(dec_base, top_chunks, mut_plan)
     mutated_enc = encrypt_ptx(mutated_dec, delta, k0=k0)
     final_enc, summary = _apply_signal_flow_and_groups(mutated_enc, request)
 
@@ -414,12 +609,13 @@ def write_offline_ptx_session(request: OfflinePtxWriteRequest) -> OfflinePtxWrit
         final_enc, len(layout), created_names,
         base_af_count + len(request.audio_files),
         base_clip_count + len(clips),
-        len(surviving_pl) + len(created_names),
+        len(survival.playlists) + len(created_names),
+        baseline_warnings=baseline_warnings,
     )
     atomic_write_bytes(request.output_ptx_path, final_enc)
     return OfflinePtxWriteResult(
         ptx_path=request.output_ptx_path,
         created_tracks=created_names,
-        deleted_tracks=tuple(deleted_actual),
+        deleted_tracks=deleted_actual,
         patch_summary=summary,
     )

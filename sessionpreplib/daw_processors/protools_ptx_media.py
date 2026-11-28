@@ -24,10 +24,16 @@ from scipy.signal import resample_poly
 import soundfile as sf
 
 from ..models import TrackContext
+from ..ptx.models import VALID_PROTOOLS_SAMPLE_RATES
 
 log = logging.getLogger(__name__)
 
-_VALID_PROTOOLS_RATES = frozenset({44100, 48000, 88200, 96000, 176400, 192000})
+_VALID_PROTOOLS_RATES = VALID_PROTOOLS_SAMPLE_RATES
+_MAX_SAFE_NAME_LEN = 120
+_STREAM_BLOCK_FRAMES = 65536
+_SRC_STREAM_THRESHOLD = 4_000_000
+_SRC_BLOCK_FRAMES = 524288
+_SRC_OVERLAP_FRAMES = 4096
 
 _BIT_DEPTH_TO_SUBTYPE: dict[int, str] = {
     16: "PCM_16",
@@ -60,9 +66,9 @@ class TargetAudioSpec:
     bit_depth: int  # 16, 24, or 32 (float)
 
     def __post_init__(self) -> None:
-        if self.sample_rate <= 0:
-            raise ValueError(f"Sample rate must be positive, got {self.sample_rate}")
-        if self.bit_depth not in _BIT_DEPTH_TO_SUBTYPE:
+        if isinstance(self.sample_rate, bool) or self.sample_rate not in _VALID_PROTOOLS_RATES:
+            raise ValueError(f"Unsupported Pro Tools sample rate: {self.sample_rate}")
+        if isinstance(self.bit_depth, bool) or self.bit_depth not in _BIT_DEPTH_TO_SUBTYPE:
             raise ValueError(f"Unsupported Pro Tools bit depth {self.bit_depth} (expected 16, 24, or 32)")
 
     @property
@@ -121,22 +127,30 @@ def resolve_target_audio_spec(
             depths.append(24)
         elif "16" in bd:
             depths.append(16)
-    fallback_sr = template_sample_rate if (template_sample_rate in _VALID_PROTOOLS_RATES) else 48000
+    preferred_sr = template_sample_rate if (template_sample_rate in _VALID_PROTOOLS_RATES) else None
+    fallback_sr = preferred_sr if preferred_sr is not None else 48000
     fallback_depth = template_bit_depth if (template_bit_depth in _BIT_DEPTH_TO_SUBTYPE) else 24
-    sr = Counter(rates).most_common(1)[0][0] if rates else fallback_sr
-    depth = Counter(depths).most_common(1)[0][0] if depths else fallback_depth
+    if rates:
+        counts = Counter(rates)
+        sr = max(counts, key=lambda r: (counts[r], r == preferred_sr, r))
+    else:
+        sr = fallback_sr
+    depth = max(depths) if depths else fallback_depth
     return TargetAudioSpec(sample_rate=sr, bit_depth=depth)
 
 
 def _is_windows_reserved_name(name: str) -> bool:
-    return name.split(".", 1)[0].upper() in _WIN_RESERVED_NAMES
+    return name.split(".", 1)[0].rstrip(" ").upper() in _WIN_RESERVED_NAMES
 
 
 def _sanitize_wav_stem(source_path: Path) -> str:
-    stem = _SAFE_NAME_RE.sub("_", source_path.stem).strip(" .")
+    stem = _SAFE_NAME_RE.sub("_", source_path.stem).strip(" .")[:_MAX_SAFE_NAME_LEN].strip(" .")
     if not stem:
         return "Audio"
     if _is_windows_reserved_name(stem):
+        if "." in stem:
+            head, rest = stem.split(".", 1)
+            return f"{head}_.{rest}"
         return f"{stem}_"
     return stem
 
@@ -145,6 +159,7 @@ def _validate_session_name(session_name: str) -> str:
     clean = session_name.strip()
     if (
         not clean
+        or len(clean) > _MAX_SAFE_NAME_LEN
         or clean != clean.strip(" .")
         or clean.endswith(".")
         or clean in (".", "..")
@@ -186,14 +201,96 @@ def _verify_float_wav_finite(src: Path) -> None:
                 raise ValueError(f"Non-finite audio samples in {src.name}")
 
 
+def _stream_convert_same_rate(src: Path, dst: Path, spec: TargetAudioSpec, channels: int) -> tuple[int, int]:
+    total_frames = 0
+    clipped_peak = 0.0
+    with (
+        sf.SoundFile(src, "r") as reader,
+        sf.SoundFile(dst, "w", samplerate=spec.sample_rate, channels=channels, format="WAV", subtype=spec.wav_subtype) as writer,
+    ):
+        while True:
+            block = reader.read(_STREAM_BLOCK_FRAMES, dtype="float64", always_2d=True)
+            if block.size == 0:
+                break
+            if not np.all(np.isfinite(block)):
+                raise ValueError(f"Non-finite audio samples in {src.name}")
+            if spec.bit_depth in (16, 24):
+                peak = float(np.max(np.abs(block)))
+                if peak > 1.0:
+                    clipped_peak = max(clipped_peak, peak)
+                    block = np.clip(block, -1.0, 1.0)
+            writer.write(block[:, 0] if channels == 1 else block)
+            total_frames += int(block.shape[0])
+    if clipped_peak > 1.0:
+        log.warning("Converted audio %s exceeded 0 dBFS (peak=%.4f); clipped to full scale.", src.name, clipped_peak)
+    return channels, total_frames
+
+
+def _stream_resample_wav(src: Path, dst: Path, spec: TargetAudioSpec, src_sr: int, channels: int) -> tuple[int, int]:
+    """Single-pass seek-free polyphase-aligned overlap-save resampler."""
+    divisor = math.gcd(spec.sample_rate, src_sr)
+    up, down = spec.sample_rate // divisor, src_sr // divisor
+    step = max(down, (_SRC_BLOCK_FRAMES // down) * down)
+    overlap = ((_SRC_OVERLAP_FRAMES + down - 1) // down) * down
+    total_out = 0
+    clipped_peak = 0.0
+    with (
+        sf.SoundFile(src, "r") as reader,
+        sf.SoundFile(dst, "w", samplerate=spec.sample_rate, channels=channels, format="WAV", subtype=spec.wav_subtype) as writer,
+    ):
+        buf = np.empty((0, channels), dtype=np.float64)
+        buf_start = 0
+        pos = 0
+        eof = False
+        while True:
+            need = pos + step + overlap - (buf_start + int(buf.shape[0]))
+            if need > 0 and not eof:
+                raw = np.asarray(reader.read(need, dtype="float64", always_2d=True), dtype=np.float64)
+                if raw.shape[0] < need:
+                    eof = True
+                if raw.size:
+                    if not np.all(np.isfinite(raw)):
+                        raise ValueError(f"Non-finite audio samples in {src.name}")
+                    buf = raw if buf.shape[0] == 0 else np.concatenate((buf, raw), axis=0)
+            avail_end = buf_start + int(buf.shape[0])
+            if pos >= avail_end:
+                break
+            core_end = min(avail_end, pos + step)
+            win_end = min(avail_end, core_end + overlap)
+            resamp = resample_poly(buf[: win_end - buf_start], up, down, axis=0)
+            out_s = ((pos - buf_start) // down) * up
+            out_e = ((core_end - buf_start) * up + down - 1) // down
+            chunk = resamp[out_s:out_e]
+            if spec.bit_depth in (16, 24) and chunk.size:
+                peak = float(np.max(np.abs(chunk)))
+                if peak > 1.0:
+                    clipped_peak = max(clipped_peak, peak)
+                    chunk = np.clip(chunk, -1.0, 1.0)
+            writer.write(chunk[:, 0] if channels == 1 else chunk)
+            total_out += int(chunk.shape[0])
+            pos = core_end
+            drop = max(0, pos - overlap - buf_start)
+            if drop > 0:
+                buf = buf[drop:]
+                buf_start += drop
+    if clipped_peak > 1.0:
+        log.warning("Resampled audio %s exceeded 0 dBFS (peak=%.4f); clipped to full scale.", src.name, clipped_peak)
+    return channels, total_out
+
+
 def _convert_and_write_wav(src: Path, dst: Path, spec: TargetAudioSpec) -> tuple[int, int]:
-    samples, src_sr = sf.read(src, dtype="float64", always_2d=True)
+    info = sf.info(src)
+    src_sr, channels = int(info.samplerate), int(info.channels)
+    if src_sr == spec.sample_rate:
+        return _stream_convert_same_rate(src, dst, spec, channels)
+    if int(info.frames) > _SRC_STREAM_THRESHOLD:
+        return _stream_resample_wav(src, dst, spec, src_sr, channels)
+    samples, _sr = sf.read(src, dtype="float64", always_2d=True)
     arr = np.asarray(samples, dtype=np.float64)
     if not np.all(np.isfinite(arr)):
         raise ValueError(f"Non-finite audio samples in {src.name}")
-    if int(src_sr) != spec.sample_rate:
-        divisor = math.gcd(spec.sample_rate, int(src_sr))
-        arr = resample_poly(arr, spec.sample_rate // divisor, int(src_sr) // divisor, axis=0)
+    divisor = math.gcd(spec.sample_rate, src_sr)
+    arr = resample_poly(arr, spec.sample_rate // divisor, src_sr // divisor, axis=0)
     if spec.bit_depth in (16, 24):
         peak = float(np.max(np.abs(arr))) if arr.size else 0.0
         if peak > 1.0:
@@ -279,14 +376,16 @@ def _scan_wav_riff_chunks(wav_path: Path) -> tuple[list[tuple[bytes, int, int]],
             csz = struct.unpack_from("<I", ch_hdr, 4)[0]
             total = 8 + csz + (csz & 1)
             if pos + 8 + csz > limit:
-                needs_rewrite = True
-                break
+                raise ValueError(f"Truncated RIFF chunk {cid!r} in {wav_path.name}")
             if cid in _STRIP_RIFF_CHUNKS:
                 needs_rewrite = True
             chunks.append((cid, pos, min(total, limit - pos)))
             pos += total
         if pos != limit:
             needs_rewrite = True
+    chunk_ids = {cid for cid, _off, _tot in chunks}
+    if b"fmt " not in chunk_ids or b"data" not in chunk_ids:
+        raise ValueError(f"WAV file {wav_path.name} is missing required fmt/data RIFF chunks")
     return chunks, needs_rewrite
 
 
@@ -407,10 +506,13 @@ def _on_rmtree_exc(func, path: str, _exc: BaseException) -> None:
 
 
 def cleanup_staged_session_dir(session_dir: Path) -> None:
-    """Remove a newly staged session directory on failure (never follows symlinks/junctions)."""
+    """Remove a newly staged session directory on failure (never follows symlinks/junctions or masks errors)."""
     is_link = session_dir.is_symlink() or (hasattr(session_dir, "is_junction") and session_dir.is_junction())
     if session_dir.exists() and not is_link:
-        shutil.rmtree(session_dir, onexc=_on_rmtree_exc)
+        try:
+            shutil.rmtree(session_dir, onexc=_on_rmtree_exc)
+        except OSError as exc:
+            log.warning("Failed to clean up staged session directory %s: %s", session_dir, exc)
 
 
 def stage_session_audio_files(

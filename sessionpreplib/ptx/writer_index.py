@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import struct
 
-from .codec import iter_top_chunks
+from .codec import find_zchunk_offset, iter_top_chunks
 from .models import PtxChunk
 from .writer_primitives import (
     PtxIndex0002,
@@ -269,20 +269,56 @@ def _find_entry_delta(
     return None
 
 
+def _compute_2587_internal_shift(
+    old_chunks: list[PtxChunk],
+    new_chunks: list[PtxChunk],
+) -> tuple[int, int] | None:
+    """Return ``(old_258a_end_abs, inner_delta)`` when the last ``0x2587`` resized its ``0x258A`` track list."""
+    old_ch = next((c for c in reversed(old_chunks) if c.tag == 0x2587), None)
+    new_ch = next((c for c in reversed(new_chunks) if c.tag == 0x2587), None)
+    if old_ch is None or new_ch is None:
+        return None
+    inner_delta = len(new_ch.raw) - len(old_ch.raw)
+    if inner_delta == 0:
+        return None
+    p2551 = find_zchunk_offset(old_ch.raw, 0x2551, 9)
+    if p2551 < 0:
+        return None
+    p2551_end = p2551 + 7 + struct.unpack_from("<I", old_ch.raw, p2551 + 3)[0]
+    p258b = find_zchunk_offset(old_ch.raw, 0x258B, p2551 + 9, p2551_end)
+    if p258b < 0:
+        return None
+    p258b_end = p258b + 7 + struct.unpack_from("<I", old_ch.raw, p258b + 3)[0]
+    p258a = find_zchunk_offset(old_ch.raw, 0x258A, p258b + 9, p258b_end)
+    if p258a < 0:
+        return None
+    old_258a_end_rel = p258a + 7 + struct.unpack_from("<I", old_ch.raw, p258a + 3)[0]
+    return old_ch.offset + old_258a_end_rel, inner_delta
+
+
 def _shift_static_entry(
     entry: PtxIndexEntry,
     old_by_key: dict[tuple[int, int], PtxChunk],
     new_by_key: dict[tuple[int, int], PtxChunk],
+    shift_2587: tuple[int, int] | None = None,
 ) -> PtxIndexEntry:
     delta = _find_entry_delta(entry, old_by_key, new_by_key)
-    if delta is None or delta == 0:
+    if delta is None:
         return entry
+    is_2587 = bool(entry.path and entry.path[0].tag == 0x2587 and shift_2587 is not None)
+    if delta == 0 and not is_2587:
+        return entry
+    thresh_258a, inner_delta = shift_2587 if (is_2587 and shift_2587 is not None) else (0, 0)
+
+    def _adj(off: int) -> int:
+        return off + delta + (inner_delta if (is_2587 and off >= thresh_258a) else 0)
+
     new_path = [
-        PtxIndexPathStep(s.tag, (-1 if s.offset == -1 else s.offset + delta), s.meta)
+        PtxIndexPathStep(s.tag, (-1 if s.offset == -1 else _adj(s.offset)), s.meta)
         for s in entry.path
     ]
     new_occs = [
-        PtxIndexOccurrence(o.flag, tuple(x + delta for x in o.offsets), o.tail)
+        PtxIndexOccurrence(o.flag, tuple(_adj(x) for x in o.offsets), o.tail)
         for o in entry.occurrences
     ]
     return PtxIndexEntry(path=new_path, occurrences=new_occs)
@@ -386,6 +422,48 @@ def _rebuild_dynamic_entry(entry: PtxIndexEntry, ctx: _RebuildContext) -> list[P
     return None
 
 
+def _append_synthesized_chunk_entries(
+    out_entries: list[PtxIndexEntry],
+    old_tags: set[int],
+    new_chunks: list[PtxChunk],
+    ctx: _RebuildContext,
+) -> None:
+    """Append canonical ``0x0002`` entries only for chunks newly synthesized onto virgin templates."""
+    present_paths = {tuple(s.tag for s in e.path) for e in out_entries if e.path}
+    by_tag = {c.tag: c for c in new_chunks}
+    m0 = _meta_ord(0)
+    if 0x0F3D not in old_tags and (0x0F3D,) not in present_paths and ctx.c0f3d_off is not None:
+        out_entries.append(PtxIndexEntry(
+            [PtxIndexPathStep(0x0F3D, -1, m0)],
+            [_occ(ctx.c0f3d_off), *(_occ(o) for o in ctx.c0f3d_subs)],
+        ))
+    for tag in (0x1004, 0x2637, 0x262A, 0x210C):
+        if tag not in old_tags and (tag,) not in present_paths and tag in by_tag:
+            out_entries.append(PtxIndexEntry([PtxIndexPathStep(tag, -1, _ZERO5)], [_occ(by_tag[tag].offset)]))
+    if 0x1054 not in old_tags and ctx.c1054_off is not None:
+        if (0x1054,) not in present_paths:
+            out_entries.append(PtxIndexEntry(
+                [PtxIndexPathStep(0x1054, -1, m0)],
+                [_occ(ctx.c1054_off), *(_occ(o) for o in ctx.c1054_subs)],
+            ))
+        if (0x1054, 0x4828) not in present_paths and ctx.c4828_off is not None:
+            out_entries.append(PtxIndexEntry(
+                [PtxIndexPathStep(0x1054, -1, m0), PtxIndexPathStep(0x4828, ctx.c1054_off, m0)],
+                [_occ(ctx.c4828_off)],
+            ))
+    if 0x1015 not in old_tags and ctx.c1015_off is not None:
+        if (0x1015,) not in present_paths:
+            out_entries.append(PtxIndexEntry(
+                [PtxIndexPathStep(0x1015, -1, m0)],
+                [_occ(ctx.c1015_off), *(_occ(o) for o in ctx.c1015_subs)],
+            ))
+        if (0x1015, 0x4829) not in present_paths and ctx.c4829_off is not None:
+            out_entries.append(PtxIndexEntry(
+                [PtxIndexPathStep(0x1015, -1, m0), PtxIndexPathStep(0x4829, ctx.c1015_off, m0)],
+                [_occ(ctx.c4829_off)],
+            ))
+
+
 def rebuild_index_0002(
     template_index: PtxIndex0002,
     old_buf: bytes,
@@ -396,6 +474,7 @@ def rebuild_index_0002(
     new_chunks = iter_top_chunks(new_buf, strict=True)
     old_by_key = _index_top_chunks_by_key(old_chunks)
     new_by_key = _index_top_chunks_by_key(new_chunks)
+    shift_2587 = _compute_2587_internal_shift(old_chunks, new_chunks)
     ctx = _prepare_rebuild_context(new_buf, new_chunks, template_index)
 
     out_entries: list[PtxIndexEntry] = []
@@ -404,7 +483,8 @@ def rebuild_index_0002(
         if dynamic is not None:
             out_entries.extend(dynamic)
         else:
-            out_entries.append(_shift_static_entry(entry, old_by_key, new_by_key))
+            out_entries.append(_shift_static_entry(entry, old_by_key, new_by_key, shift_2587))
+    _append_synthesized_chunk_entries(out_entries, {c.tag for c in old_chunks}, new_chunks, ctx)
     return PtxIndex0002(version=template_index.version, entries=out_entries)
 
 

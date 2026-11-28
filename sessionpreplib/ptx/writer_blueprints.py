@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 import struct
 import uuid
 
 from .writer_chunks import (
     serialize_audio_desc_1001,
     serialize_clip_core_2628_dims,
+    serialize_playlist_1014,
 )
 from .writer_primitives import build_zchunk, encode_lp_str
 
@@ -22,7 +24,17 @@ _AUTO_PAN_BANK_STEREO_R: tuple[int, ...] = (100, 100, 100, 100, 100, 100, 100, 1
 
 _DEFAULT_TRACK_HEIGHT_PX = 0x61  # Pro Tools Medium track height (97 px)
 _DEFAULT_COLOR_SENTINEL = bytes.fromhex("efffdfbf")
-_DEFAULT_VOLUME_CURVE_RAW = 0x0000FA60  # Unity / default initial automation curve value
+_DEFAULT_LFE_CURVE_RAW = 0x0000FA60  # -1440 (-144.0 dB / -inf) default LFE automation curve value
+
+
+@dataclass(frozen=True)
+class OutputBusSpec:
+    """Resolved Main Output bus specification for an Audio mixer strip."""
+
+    ptsl_index: int
+    uuid16: bytes
+    name: str
+    channel_count: int = 2
 
 
 def _check_bytes_len(data: bytes, expected: int, name: str) -> None:
@@ -33,23 +45,6 @@ def _check_bytes_len(data: bytes, expected: int, name: str) -> None:
 def _check_uint(value: int, max_val: int, name: str) -> None:
     if isinstance(value, bool) or not (0 <= value <= max_val):
         raise ValueError(f"{name} out of range 0..{max_val}: {value!r}")
-
-
-def _find_zchunk_offset(buf: bytearray | bytes, tag: int, start: int = 0) -> int:
-    needle = struct.pack("<H", tag)
-    pos = start + 7
-    while pos < len(buf):
-        hit = buf.find(needle, pos)
-        if hit == -1:
-            return -1
-        off = hit - 7
-        if off >= start and buf[off] == 0x5A:
-            ver = struct.unpack_from("<H", buf, off + 1)[0]
-            sz = struct.unpack_from("<I", buf, off + 3)[0]
-            if ver < 0x1000 and 2 <= sz and off + 7 + sz <= len(buf):
-                return off
-        pos = hit + 1
-    return -1
 
 
 # ── Small UI state Z-chunks (used by 0x2589 and 0x200B) ──────────────
@@ -127,17 +122,17 @@ def _build_pan_bank_260c(values: Sequence[int]) -> bytes:
 
 
 def _build_mixer_dsp_1029(*, is_stereo: bool, is_send: bool, is_muted: bool = False) -> bytes:
-    """Serialize ``0x1029`` (v14) mixer DSP initial + live state (volume, pan array, mute, divergence)."""
+    """Serialize ``0x1029`` (v14) mixer DSP initial + live state (volume, LFE, pan array, mute, divergence)."""
     mute_b = 1 if is_muted else 0
     pans = _PAN_MONO if not is_stereo else (_PAN_STEREO_SEND if is_send else _PAN_STEREO_MAIN)
-    vol_and_pans = struct.pack("<i16i", -1440, *pans)  # 68 B: default vol + 16 surround/stereo pan slots
+    lfe_and_pans = struct.pack("<i16i", -1440, *pans)  # 68 B: default LFE (-144 dB) + 16 pan slots
     body = (
         bytes([1, 0, 0, 0, 0, mute_b, 0, 0, 0])
-        + vol_and_pans
+        + lfe_and_pans
         + b"\x00\x00"
         + struct.pack("<ii", 100, 100)
         + bytes([0, 0, 0, 0, mute_b, 0, 0, 0])
-        + vol_and_pans
+        + lfe_and_pans
         + (b"\x00" * 8)
         + struct.pack("<II", 1, 1) + (b"\x00" * 40)
         + struct.pack("<II", 1, 1) + (b"\x00" * 32)
@@ -151,9 +146,9 @@ def _build_main_channel_260d(*, is_stereo: bool, output_bus_260e: bytes | None) 
     c1029 = _build_mixer_dsp_1029(is_stereo=is_stereo, is_send=False)
     out_block = (struct.pack("<H", 1) + output_bus_260e) if output_bus_260e else struct.pack("<H", 0)
     scalars = (
-        b"\x01" + _build_auto_curve_260a(0)  # bypass/solo
-        + b"\x01" + _build_auto_curve_260a(0)  # mute
-        + b"\x01" + _build_auto_curve_260a(_DEFAULT_VOLUME_CURVE_RAW)  # volume
+        b"\x01" + _build_auto_curve_260a(0)  # main volume (0.0 dB)
+        + b"\x01" + _build_auto_curve_260a(0)  # mute (off)
+        + b"\x01" + _build_auto_curve_260a(_DEFAULT_LFE_CURVE_RAW)  # LFE (-144.0 dB)
     )
     pan_l = _build_pan_bank_260c(_AUTO_PAN_BANK_STEREO_L if is_stereo else _AUTO_PAN_BANK_MONO)
     pan_r = _build_pan_bank_260c(_AUTO_PAN_BANK_STEREO_R if is_stereo else _AUTO_PAN_BANK_MONO)
@@ -190,12 +185,13 @@ def _build_empty_inserts_2627(slot_count: int = 11) -> bytes:
     return build_zchunk(0x2627, struct.pack("<H", slot_count) + empty_slot * slot_count, version=1)
 
 
-def _build_output_mirror_4856(output_bus_260e: bytes | None) -> bytes:
+def _build_output_mirror_4856(output_bus_260e: bytes | None, *, bus_channels: int = 2) -> bytes:
+    del bus_channels  # Pro Tools always writes (2, 2) in 0x4856/0x485E even for mono busses (live-verified).
     prefix = (b"\x00" * 8) + struct.pack("<I", 1) + (b"\x00" * 8) + struct.pack("<Ii", 1, -1)
     if output_bus_260e is None:
         mid = struct.pack("<I", 1) + (b"\x00" * 5) + struct.pack("<IiI", 1, -1, 0)
         return build_zchunk(0x4856, prefix + struct.pack("<I", 0) + mid + b"\x01", version=4)
-    c485e = build_zchunk(0x485E, b"\x02\x00\x02\x00\x00\x00\x00", version=2)
+    c485e = build_zchunk(0x485E, struct.pack("<HH", 2, 2) + b"\x00\x00\x00", version=2)
     mid = struct.pack("<HHI", 2, 2, 1) + (b"\x00" * 5) + struct.pack("<IiI", 1, -1, 1)
     return build_zchunk(0x4856, prefix + struct.pack("<I", 1) + output_bus_260e + mid + c485e + b"\x01", version=4)
 
@@ -243,11 +239,21 @@ def _build_track_view_200b(
     return build_zchunk(0x200B, build_zchunk(0x200A, b200a, version=10) + (b"\x00" * 25), version=10)
 
 
+def _resolve_output_bus_260e(
+    output_bus: OutputBusSpec | tuple[int, bytes, str] | None,
+) -> tuple[bytes | None, int]:
+    if isinstance(output_bus, OutputBusSpec):
+        return build_output_bus_260e(output_bus.ptsl_index, output_bus.uuid16, output_bus.name), output_bus.channel_count
+    if output_bus is not None:
+        return build_output_bus_260e(*output_bus), 2
+    return None, 2
+
+
 def build_audio_mixer_strip_261c(
     track_name: str,
     track_uuid16: bytes,
     channels: int,
-    output_bus: tuple[int, bytes, str] | None,
+    output_bus: OutputBusSpec | tuple[int, bytes, str] | None,
     *,
     track_ordinal_1based: int,
     id_base: int,
@@ -265,7 +271,7 @@ def build_audio_mixer_strip_261c(
     _check_uint(color_index, 0xFFFF, "color_index")
 
     is_stereo = channels == 2
-    out_260e = build_output_bus_260e(*output_bus) if output_bus is not None else None
+    out_260e, bus_ch = _resolve_output_bus_260e(output_bus)
     send_ids = tuple(send_uuids16) if send_uuids16 is not None else tuple(uuid.uuid4().bytes_le for _ in range(10))
     if len(send_ids) != 10 or any(len(u) != 16 for u in send_ids):
         raise ValueError("send_uuids16 must contain ten 16-byte UUIDs")
@@ -292,7 +298,7 @@ def build_audio_mixer_strip_261c(
         + _build_main_channel_260d(is_stereo=is_stereo, output_bus_260e=out_260e)
         + bytes(sends_blob)
         + ctrl_and_sends
-        + _build_output_mirror_4856(out_260e)
+        + _build_output_mirror_4856(out_260e, bus_channels=bus_ch)
     )
     c261b = build_zchunk(0x261B, b261b, version=15)
     c200b = _build_track_view_200b(
@@ -377,26 +383,14 @@ def build_playlist_1014_v9(
     is_stereo: bool,
 ) -> bytes:
     """Build a Pro Tools v12+ ``0x1014`` (v9) playlist entry with ``<H`` + ``<I`` lane references."""
-    _check_bytes_len(playlist_uuid16, 16, "playlist_uuid16")
     expected_lanes = 2 if is_stereo else 1
     if len(lane_indices) != expected_lanes:
-        raise ValueError(f"Expected {expected_lanes} lane index(es) for {'stereo' if is_stereo else 'mono'} playlist, got {len(lane_indices)}")
-    for li in lane_indices:
-        _check_uint(li, 0xFFFF, "lane_index")
-    body = bytearray(encode_lp_str(playlist_name))
-    body.append(1 if is_stereo else 0)
-    body.extend(struct.pack("<I", len(lane_indices)))
-    body.extend(struct.pack(f"<{len(lane_indices)}H", *lane_indices))
-    body.extend(playlist_uuid16)
-    if is_stereo:
-        body.extend(struct.pack("<HH", 1, 1) + (b"\x00" * 3))
-        body.extend(struct.pack("<II", lane_indices[0], lane_indices[1]))
-        body.extend(struct.pack("<IH", 1, 0))
-    else:
-        body.extend(b"\x00" * 7)
-        body.extend(struct.pack("<I", lane_indices[0]))
-        body.extend(struct.pack("<IH", 0, 0))
-    return build_zchunk(0x1014, bytes(body), version=9)
+        raise ValueError(
+            f"Expected {expected_lanes} lane index(es) for {'stereo' if is_stereo else 'mono'} playlist, got {len(lane_indices)}"
+        )
+    return serialize_playlist_1014(
+        playlist_name, lane_indices, playlist_uuid16, is_stereo=is_stereo, version=9,
+    )
 
 
 def build_audio_file_entry_1003(

@@ -208,3 +208,15 @@ def test_explicit_ptxt_path_cross_platform_offline_connectivity_and_fetch(tmp_pa
     proc_a.configure({"protools_transfer_backend": "bogus_mode", "protools_project_dir": str(proj_dir)})
     ok_bad, msg_bad = proc_a.check_connectivity()
     assert ok_bad is False and "Unknown Pro Tools transfer backend" in msg_bad
+
+
+def test_strip_known_audio_ext_preserves_dots_in_track_names():
+    from sessionpreplib.daw_processors.protools_ptx_plan import _strip_known_audio_ext
+
+    assert _strip_known_audio_ext("Kick.wav") == "Kick"
+    assert _strip_known_audio_ext("Snare.AIFF") == "Snare"
+    assert _strip_known_audio_ext("Vox.flac") == "Vox"
+    assert _strip_known_audio_ext("Dr. Kick") == "Dr. Kick"
+    assert _strip_known_audio_ext("Gtr v1.2") == "Gtr v1.2"
+    assert _strip_known_audio_ext("Synth.L") == "Synth.L"
+    assert _strip_known_audio_ext("Dr. Kick.wav") == "Dr. Kick"

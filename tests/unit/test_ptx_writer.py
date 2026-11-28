@@ -460,7 +460,7 @@ def test_template_variants_validation_guards_and_rollback(tmp_path: Path):
     assert res.ptx_path.is_file()
 
     # Reject inserting into missing or deleted folder, deleting folder with surviving child, or bad group action
-    with pytest.raises(ValueError, match="missing or deleted parent folder"):
+    with pytest.raises(ValueError, match="missing, non-folder, or deleted parent folder"):
         write_offline_ptx_session(OfflinePtxWriteRequest(
             ptxt_path=ptxt_min, output_ptx_path=tmp_path / "x.ptx", session_dir=tmp_path,
             sample_rate=48000, bit_depth=24, audio_files=(af,),
@@ -514,7 +514,7 @@ def test_template_variants_validation_guards_and_rollback(tmp_path: Path):
     # Point plan at a missing parent UUID so writer fails after media staging
     from dataclasses import replace as dc_replace
     bad_plan = dc_replace(plan_rb, tracks=(dc_replace(plan_rb.tracks[0], parent_folder_uuid="{00000000-0000-0000-0000-000000000000}"),))
-    with pytest.raises(ValueError, match="missing or deleted parent folder"):
+    with pytest.raises(ValueError, match="missing, non-folder, or deleted parent folder"):
         execute_offline_ptx_creation(bad_plan, proj_root)
     assert not (proj_root / "RollbackSong").exists()
 
@@ -672,18 +672,18 @@ def test_template_with_preexisting_audio_append_and_delete(tmp_path: Path):
     dec_del, _ = decrypt_ptx(res_del.ptx_path.read_bytes())
     assert validate_index_0002(dec_del) is True
     c2624_del = next(c.raw for c in iter_top_chunks(dec_del, strict=True) if c.tag == 0x2624)
-    from sessionpreplib.ptx.writer_blueprints import _find_zchunk_offset
-    from sessionpreplib.ptx.writer_mutations import _extract_261c_playlist_indices, _read_zchunk_at, _walk_sequential_zchunks
-    strips_del, _ = _walk_sequential_zchunks(c2624_del, 13, struct.unpack_from("<I", c2624_del, 9)[0])
+    from sessionpreplib.ptx.codec import find_zchunk_offset, read_zchunk_at, walk_sequential_zchunks
+    from sessionpreplib.ptx.writer_mutations import _extract_261c_playlist_indices
+    strips_del, _ = walk_sequential_zchunks(c2624_del, 13, struct.unpack_from("<I", c2624_del, 9)[0])
     audio_pl_indices = []
     audio_view_ordinals = []
     for ord_1, st_raw in enumerate(strips_del, start=1):
         if struct.unpack_from("<H", st_raw, 7)[0] == 0x261C:
             audio_pl_indices.append(sorted(_extract_261c_playlist_indices(st_raw)))
-            _, _, mid_off = _read_zchunk_at(st_raw, 9, expected_tag=0x261B)
-            _, _, tail_off = _read_zchunk_at(st_raw, mid_off + 12, expected_tag=0x200B)
+            _, _, mid_off = read_zchunk_at(st_raw, 9, expected_tag=0x261B)
+            _, _, tail_off = read_zchunk_at(st_raw, mid_off + 12, expected_tag=0x200B)
             assert struct.unpack_from("<I", st_raw, mid_off)[0] == struct.unpack_from("<I", st_raw, tail_off + 17)[0]
-            p2434 = _find_zchunk_offset(st_raw, 0x2434, mid_off + 21)
+            p2434 = find_zchunk_offset(st_raw, 0x2434, mid_off + 21)
             after_2434 = p2434 + 7 + struct.unpack_from("<I", st_raw, p2434 + 3)[0]
             audio_view_ordinals.append((ord_1, struct.unpack_from("<I", st_raw, after_2434)[0]))
     assert audio_pl_indices == [[1], [2], [0]]  # track order: NewSt(pl 1), NewMn(pl 2) under KIK, OldVox(pl 0) under VOX
@@ -717,12 +717,12 @@ def test_review_edge_cases_playlist_ownership_fades_strides_and_guards(tmp_path:
     st_keep2 = build_audio_mixer_strip_261c("Keep2", _uuid(4), 2, None, track_ordinal_1based=4, id_base=120, playlist_index=2)
     c2624 = build_zchunk(0x2624, struct.pack("<I", 4) + st_folder + st_keep0 + st_del1 + st_keep2, version=1)
 
-    kept_pl, kept_lanes, pl_map, _c4829, _c4828 = plan_existing_media_survival(
+    surv = plan_existing_media_survival(
         c1015, c1054, ("VOX", "DelMid"), c2624_raw=c2624, deleted_old_indices=(0, 2),
     )
-    assert [_parse_playlist_1014_meta(p)[0] for p in kept_pl] == ["VOX", "SharedEnd"]
-    assert pl_map == {0: 0, 2: 1}
-    assert len(kept_lanes) == 3  # lane 1 survived because SharedEnd still references it!
+    assert [_parse_playlist_1014_meta(p)[0] for p in surv.playlists] == ["VOX", "SharedEnd"]
+    assert surv.old_playlist_to_new == {0: 0, 2: 1}
+    assert len(surv.lanes) == 3  # lane 1 survived because SharedEnd still references it!
 
     # 2. Alternate playlists (pl_cnt == 2) for both 2-byte (<H) and 4-byte (<I) mid_gap strides + error on malformed gap
     from sessionpreplib.ptx.writer_mutations import _read_zchunk_at
@@ -823,3 +823,243 @@ def test_review_edge_cases_playlist_ownership_fades_strides_and_guards(tmp_path:
     parsed_2519 = _parse_2519_offsets(fake_2519, PtxChunk(offset=0, version=9, size=len(fake_2519) - 7, tag=0x2519, raw=fake_2519))
     assert parsed_2519.c2716_offset == 9 + 22
     assert parsed_2519.c251b_offset == 9 + 22 + len(c2716) + 4
+
+
+def test_virgin_template_2587_siblings_hidden_tracks_top_level_and_guards(tmp_path: Path, monkeypatch):
+    """Verify virgin-template synthesis, canonical ordering, 0x2587 sibling shifts, hidden tracks, top-level/empty tracks, and guards."""
+    from sessionpreplib.ptx import (
+        OutputBusSpec,
+        PtxUnsupportedTemplateError,
+        PtxValidationError,
+        normalize_ptx_uuid16,
+    )
+    from sessionpreplib.ptx.writer_mutations import mutate_2519_tracks
+
+    # 1. Virgin template missing 0x0F3D, 0x1004, 0x2637, 0x262A, 0x1054, 0x1015, 0x210C PLUS 0x2587 sibling after 0x258A!
+    raw_base = _build_clean_template_ptxt(include_0f3d=False, include_2587=True)
+    dec_base, delta = decrypt_ptx(raw_base)
+    top = iter_top_chunks(dec_base, strict=True)
+    # Remove optional virgin-omitted chunks and append a sibling 0x2586 inside 0x2587->0x2551 AFTER 0x258B/0x258A!
+    omit_tags = {0x0F3D, 0x1004, 0x2637, 0x262A, 0x1054, 0x1015, 0x210C}
+    old_2587 = next(c for c in top if c.tag == 0x2587)
+    sib_2056 = build_zchunk(0x2056, b"\x01\x02\x03\x04", version=6)
+    sib_2586 = build_zchunk(0x2586, sib_2056, version=1)
+    # Rebuild 0x2587 -> 0x2551 -> (0x258B, 0x2586)
+    old_258b = old_2587.raw[18:]  # inside 0x2587(9) + 0x2551(9)
+    new_2587 = build_zchunk(0x2587, build_zchunk(0x2551, old_258b + sib_2586, version=3), version=1)
+
+    out_tpl = bytearray(dec_base[:0x1F])
+    kept_top = []
+    for ch in top:
+        if ch.tag in omit_tags or ch.tag == 0x0002:
+            continue
+        off = len(out_tpl)
+        blob = new_2587 if ch.tag == 0x2587 else ch.raw
+        out_tpl.extend(blob)
+        kept_top.append((ch.tag, off, blob))
+    o2587 = next(off for t, off, _ in kept_top if t == 0x2587)
+    o2551 = o2587 + 9
+    o2586 = o2551 + 9 + len(old_258b)
+    o2056 = o2586 + 9
+    old_idx = parse_index_0002(dec_base)
+    assert old_idx is not None
+    virgin_entries = [
+        e for e in old_idx.entries
+        if e.path and e.path[0].tag not in omit_tags and e.path[0].tag != 0x2587
+    ]
+    # Add 0x2587 + post-0x258A sibling 0x2586->0x2056 entries!
+    virgin_entries.append(PtxIndexEntry([PtxIndexPathStep(0x2587, -1)], [PtxIndexOccurrence(1, (o2587,))]))
+    virgin_entries.append(PtxIndexEntry(
+        [PtxIndexPathStep(0x2587, -1), PtxIndexPathStep(0x2551, o2587), PtxIndexPathStep(0x2586, o2551), PtxIndexPathStep(0x2056, o2586)],
+        [PtxIndexOccurrence(1, (o2056,))],
+    ))
+    # Recompute static offsets via apply_rebuilt_index_0002
+    o0002 = len(out_tpl)
+    struct.pack_into("<I", out_tpl, 0x1B, o0002)
+    out_tpl.extend(serialize_index_0002(PtxIndex0002(version=2, entries=virgin_entries)))
+    # Fix shifted pre-existing entries once so virgin_ptxt is valid before writing
+    virgin_dec = bytearray(out_tpl)
+    rebuilt_v = rebuild_index_0002(PtxIndex0002(version=2, entries=virgin_entries), dec_base, bytes(virgin_dec))
+    # Restore exact 0x2587 sibling offsets (since dec_base had smaller 0x2587)
+    rebuilt_v.entries[-2] = PtxIndexEntry([PtxIndexPathStep(0x2587, -1)], [PtxIndexOccurrence(1, (o2587,))])
+    rebuilt_v.entries[-1] = PtxIndexEntry(
+        [PtxIndexPathStep(0x2587, -1), PtxIndexPathStep(0x2551, o2587), PtxIndexPathStep(0x2586, o2551), PtxIndexPathStep(0x2056, o2586)],
+        [PtxIndexOccurrence(1, (o2056,))],
+    )
+    from sessionpreplib.ptx.writer_primitives import replace_index_0002_chunk
+    replace_index_0002_chunk(virgin_dec, rebuilt_v)
+    assert validate_index_0002(bytes(virgin_dec)) is True
+
+    virgin_ptxt = tmp_path / "Virgin.ptxt"
+    virgin_ptxt.write_bytes(encrypt_ptx(bytes(virgin_dec), delta))
+    wav = _write_wav(tmp_path / "Lead.wav", 48000, 1, frames=4800)
+    proj_root = tmp_path / "out"
+    proj_root.mkdir()
+    staged = stage_session_audio_files(proj_root, "VirginRun", [wav], TargetAudioSpec(48000, 24))
+    af = AudioFileWriteSpec(
+        staged.staged_files[0].filename, 48000, 1, 24, 4800,
+        staged.staged_files[0].file_id8, staged.staged_files[0].smpte_umid32, staged.staged_files[0].filetime_u64,
+    )
+    kik_trk = PtxSession.from_file(virgin_ptxt).track_by_name("KIK")
+    assert kik_trk is not None
+    # Create: 1 foldered track (using braced UUID!), 1 top-level track with start_sample=480, 1 empty Audio track, + clip gain!
+    res = write_offline_ptx_session(OfflinePtxWriteRequest(
+        ptxt_path=virgin_ptxt,
+        output_ptx_path=staged.ptx_path,
+        session_dir=staged.session_dir,
+        sample_rate=48000,
+        bit_depth=24,
+        audio_files=(af,),
+        tracks=(
+            OfflineAudioTrackRequest("FolderLead", 1, kik_trk.uuid_braced, "KIK", 0, 4800, "Lead"),
+            OfflineAudioTrackRequest("TopLevel", 1, None, None, 0, 4800, "LeadTop", start_sample=480),
+            OfflineAudioTrackRequest("EmptyAudio", 2, None, None, None),
+        ),
+        clip_gains_db={"FolderLead": -2.5},
+    ))
+    dec_out, _ = decrypt_ptx(res.ptx_path.read_bytes())
+    assert validate_index_0002(dec_out) is True  # proves 0x2587 sibling 0x2586->0x2056 shifted accurately AND synthesized chunks indexed!
+    sess_out = PtxSession.from_file(res.ptx_path)
+    assert [t.name for t in sess_out.tracks] == ["KIK", "FolderLead", "KIK-VCA", "VOX", "VOX-VCA", "TopLevel", "EmptyAudio"]
+    assert sess_out.track_by_name("TopLevel").parent_folder_name == ""
+    assert sess_out.track_by_name("TopLevel").clips[0].start_sample == 480
+    assert sess_out.track_by_name("EmptyAudio").clips == []
+    out_tags = [c.tag for c in iter_top_chunks(dec_out, strict=True)]
+    assert 0x0F3D in out_tags and 0x2637 in out_tags and 0x262A in out_tags
+    # Canonical ordering: 0x2637 and 0x262A must appear BEFORE 0x1054, 0x1015, 0x210C, 0x2107, 0x2624
+    assert out_tags.index(0x2637) < out_tags.index(0x1054)
+    assert out_tags.index(0x262A) < out_tags.index(0x1054)
+    assert out_tags.index(0x210C) < out_tags.index(0x2107)
+
+    # Idempotency: rebuild_index_0002(idx, dec, dec) must NOT fabricate entries for unindexed pre-existing chunks
+    raw_idx_base = parse_index_0002(dec_base)
+    assert raw_idx_base is not None
+    stripped_entries = [e for e in raw_idx_base.entries if not (e.path and e.path[0].tag == 0x210C)]
+    stripped_idx = PtxIndex0002(version=raw_idx_base.version, entries=stripped_entries)
+    idem_idx = rebuild_index_0002(stripped_idx, dec_base, dec_base)
+    assert not any(e.path and e.path[0].tag == 0x210C for e in idem_idx.entries)
+
+    # 2. Hidden track preservation in mutate_2519_tracks (visible_order == 0 stays 0!)
+    u1, u2, u3 = generate_ptx_uuid(), generate_ptx_uuid(), generate_ptx_uuid()
+    r1 = build_track_summary_2519("Vis1", u1, 1, 1)
+    r2 = build_track_summary_2519("Hid2", u2, 1, 0)  # hidden!
+    r3 = build_track_summary_2519("Vis3", u3, 1, 2)
+    e1 = build_track_entry_251a("Vis1", u1, 1, 1)
+    e2 = build_track_entry_251a("Hid2", u2, 1, 0)
+    e3 = build_track_entry_251a("Vis3", u3, 1, 2)
+    c2519_hid = build_zchunk(
+        0x2519,
+        (b"\x00" * 10) + struct.pack("<II", 0, 3) + r1 + r2 + r3 + e1 + e2 + e3 + struct.pack("<I", 3) + e1 + e2 + e3,
+        version=9,
+    )
+    mut_hid = mutate_2519_tracks(c2519_hid, [TrackSlotOp(old_index=0), TrackSlotOp(old_index=1), TrackSlotOp(old_index=2)])
+    from sessionpreplib.ptx.writer_mutations import _parse_2519_sections
+    _, rows_h, p1_h, _, _ = _parse_2519_sections(mut_hid)
+    vis_orders = [struct.unpack_from("<H", r, len(r) - 3)[0] for r in rows_h]
+    assert vis_orders == [1, 0, 2]
+
+    # 3. Mono OutputBusSpec resolves cleanly and emits Pro Tools' canonical (2, 2) 0x4856/0x485E mirror
+    mono_strip = build_audio_mixer_strip_261c(
+        "MonoOut", generate_ptx_uuid(), 1, OutputBusSpec(4, generate_ptx_uuid(), "Bus 1", channel_count=1),
+        track_ordinal_1based=1, id_base=100,
+    )
+    from sessionpreplib.ptx.codec import find_subchunks
+    s485e = find_subchunks(mono_strip, 0x485E)[0]
+    assert s485e[9:13] == b"\x02\x00\x02\x00"
+
+    # 4. Strict validation guards: non-folder parent, unresolved output_bus_name, empty track_name, link_vca without vca, legacy 0x2519
+    vca_trk = PtxSession.from_file(virgin_ptxt).track_by_name("KIK-VCA")
+    assert vca_trk is not None
+    with pytest.raises(PtxValidationError, match="non-folder"):
+        write_offline_ptx_session(OfflinePtxWriteRequest(
+            ptxt_path=virgin_ptxt, output_ptx_path=tmp_path / "x.ptx", session_dir=staged.session_dir,
+            sample_rate=48000, bit_depth=24, audio_files=(af,),
+            tracks=(OfflineAudioTrackRequest("BadParent", 1, vca_trk.uuid_hex, None, 0, 4800, "Lead"),),
+        ))
+    with pytest.raises(PtxValidationError, match="Output bus 'NoSuchBus' not found"):
+        write_offline_ptx_session(OfflinePtxWriteRequest(
+            ptxt_path=virgin_ptxt, output_ptx_path=tmp_path / "x.ptx", session_dir=staged.session_dir,
+            sample_rate=48000, bit_depth=24, audio_files=(af,),
+            tracks=(OfflineAudioTrackRequest("BadBus", 1, None, "NoSuchBus", 0, 4800, "Lead"),),
+        ))
+    with pytest.raises(PtxValidationError, match="requires a non-empty vca_track"):
+        write_offline_ptx_session(OfflinePtxWriteRequest(
+            ptxt_path=virgin_ptxt, output_ptx_path=tmp_path / "x.ptx", session_dir=staged.session_dir,
+            sample_rate=48000, bit_depth=24, audio_files=(), tracks=(),
+            group_requests=(OfflineGroupRequest("G", "link_vca", (), vca_track=None),),
+        ))
+    # Legacy 0x2519 v7 and missing 0x1028 rejected cleanly with PtxUnsupportedTemplateError
+    legacy_dec = bytearray(dec_base)
+    c2519_ch = next(c for c in top if c.tag == 0x2519)
+    struct.pack_into("<H", legacy_dec, c2519_ch.offset + 1, 7)
+    legacy_ptxt = tmp_path / "Legacy.ptxt"
+    legacy_ptxt.write_bytes(encrypt_ptx(bytes(legacy_dec), delta))
+    with pytest.raises(PtxUnsupportedTemplateError, match="0x2519 version 7"):
+        write_offline_ptx_session(OfflinePtxWriteRequest(
+            ptxt_path=legacy_ptxt, output_ptx_path=tmp_path / "x.ptx", session_dir=staged.session_dir,
+            sample_rate=48000, bit_depth=24, audio_files=(), tracks=(),
+        ))
+    no1028_dec = bytearray(dec_base[:0x1F])
+    for ch in top:
+        if ch.tag != 0x1028:
+            no1028_dec.extend(ch.raw)
+    no1028_ptxt = tmp_path / "No1028.ptxt"
+    no1028_ptxt.write_bytes(encrypt_ptx(bytes(no1028_dec), delta))
+    with pytest.raises(PtxUnsupportedTemplateError, match="0x1028"):
+        write_offline_ptx_session(OfflinePtxWriteRequest(
+            ptxt_path=no1028_ptxt, output_ptx_path=tmp_path / "x.ptx", session_dir=staged.session_dir,
+            sample_rate=48000, bit_depth=24, audio_files=(), tracks=(),
+        ))
+    with pytest.raises(PtxValidationError, match="sample rate"):
+        write_offline_ptx_session(OfflinePtxWriteRequest(
+            ptxt_path=virgin_ptxt, output_ptx_path=tmp_path / "x.ptx", session_dir=staged.session_dir,
+            sample_rate=22050, bit_depth=24, audio_files=(), tracks=(),
+        ))
+    with pytest.raises(PtxValidationError, match="color_index"):
+        write_offline_ptx_session(OfflinePtxWriteRequest(
+            ptxt_path=virgin_ptxt, output_ptx_path=tmp_path / "x.ptx", session_dir=staged.session_dir,
+            sample_rate=48000, bit_depth=24, audio_files=(),
+            tracks=(OfflineAudioTrackRequest("BadColor", 1, None, None, None, color_index=70000),),
+        ))
+
+    # 5. _verify_written_ptx ignores pre-existing baseline warnings but fails on newly introduced parser warnings
+    from sessionpreplib.ptx import PtxCorruptFileError
+    from sessionpreplib.ptx import writer as writer_mod
+    from sessionpreplib.ptx.writer import _verify_written_ptx
+    sess_ok = PtxSession.from_file(res.ptx_path)
+    raw_ok = res.ptx_path.read_bytes()
+    dec_ok, delta_ok = decrypt_ptx(raw_ok)
+
+    orig_session_cls = writer_mod.PtxSession
+
+    class _WarnSession(orig_session_cls):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.warnings.append("Pre-existing tempo warning")
+
+    monkeypatch.setattr(writer_mod, "PtxSession", _WarnSession)
+    _verify_written_ptx(
+        raw_ok,
+        expected_track_count=len(sess_ok.tracks), created_names=[t.name for t in sess_ok.tracks],
+        expected_audio_file_count=1, expected_clip_count=2, expected_playlist_count=len(sess_ok.playlists),
+        baseline_warnings=("Pre-existing tempo warning",),
+    )
+    with pytest.raises(PtxCorruptFileError, match="Pre-existing tempo warning"):
+        _verify_written_ptx(
+            raw_ok,
+            expected_track_count=len(sess_ok.tracks), created_names=[t.name for t in sess_ok.tracks],
+            expected_audio_file_count=1, expected_clip_count=2, expected_playlist_count=len(sess_ok.playlists),
+            baseline_warnings=(),
+        )
+    monkeypatch.setattr(writer_mod, "PtxSession", orig_session_cls)
+
+    # Corrupting 0x0002 raises PtxCorruptFileError
+    bad_idx_dec = bytearray(dec_ok)
+    struct.pack_into("<I", bad_idx_dec, 0x1B, 0x1F)
+    with pytest.raises(PtxCorruptFileError, match="0x0002"):
+        _verify_written_ptx(
+            encrypt_ptx(bytes(bad_idx_dec), delta_ok),
+            expected_track_count=len(sess_ok.tracks), created_names=[],
+            expected_audio_file_count=1, expected_clip_count=2, expected_playlist_count=len(sess_ok.playlists),
+        )
+    assert len(normalize_ptx_uuid16(kik_trk.uuid_braced)) == 16

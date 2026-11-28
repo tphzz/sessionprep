@@ -32,10 +32,6 @@ class OfflineProToolsSessionOutput:
     write_result: OfflinePtxWriteResult
 
 
-def _strip_braced_uuid(uuid_str: str) -> str:
-    return uuid_str.strip().strip("{}").replace("-", "").lower()
-
-
 def _build_track_and_clip_gain_requests(
     plan: ProToolsCreationPlan,
     staged: StagedSessionDir,
@@ -43,19 +39,29 @@ def _build_track_and_clip_gain_requests(
     file_index_by_dest = {sf.dest_path: idx for idx, sf in enumerate(staged.staged_files)}
     track_reqs: list[OfflineAudioTrackRequest] = []
     clip_gains: dict[str, float] = {}
+    used_clip_names: set[str] = set()
     for pt in plan.tracks:
         sf = staged.lookup(pt.source_filepath)
         if sf is None:
             raise RuntimeError(f"Staged audio file missing for {pt.track_name!r}: {pt.source_filepath}")
+        base_clip = Path(sf.filename).stem
+        if base_clip.lower() in used_clip_names:
+            base_clip = pt.track_name
+        suffix = 2
+        clip_name = base_clip
+        while clip_name.lower() in used_clip_names:
+            clip_name = f"{base_clip}_{suffix}"
+            suffix += 1
+        used_clip_names.add(clip_name.lower())
         track_reqs.append(
             OfflineAudioTrackRequest(
                 track_name=pt.track_name,
                 channels=pt.channels,
-                parent_folder_uuid_hex=_strip_braced_uuid(pt.parent_folder_uuid),
+                parent_folder_uuid_hex=pt.parent_folder_uuid or None,
                 output_bus_name=pt.output_bus_name,
                 audio_file_index=file_index_by_dest[sf.dest_path],
                 length_samples=sf.length_samples,
-                clip_base_name=Path(sf.filename).stem,
+                clip_base_name=clip_name,
                 color_index=pt.color_index,
             )
         )
