@@ -525,9 +525,9 @@ sessionpreplib/
         writer_primitives.py     # Low-level Z-chunk/control-curve serializers & byte-exact 0x0002 chunk-offset index codec/mutators
         writer_chunks.py         # Verified Pro Tools chunk serializers (0x1028, 0x103a, 0x1001, 0x104f/1052, 0x1014, 0x2628) & palette mapper
         writer_index.py          # Deterministic 0x0002 chunk-offset index structural rebuilder
-        writer_blueprints.py     # Neutralized canonical Mono/Stereo 0x261C Audio strip & 0x2589 UI blueprints + chunk serializers
-        writer_mutations.py      # Per-chunk binary mutators (0x2519, 0x2107, 0x210C, 0x2587, 0x2624, 0x202B, 0x1004, 0x262A, 0x1015, 0x1054)
-        writer.py                # Pure offline Pro Tools .ptx session writer (write_offline_ptx_session) from clean .ptxt templates
+        writer_blueprints.py     # Blob-free structured Z-chunk builders for Mono/Stereo 0x261C Audio strips, 0x2589 UI & media chunks
+        writer_mutations.py      # Per-chunk binary mutators (0x2519, 0x2107, 0x210C, 0x2587, 0x2624, 0x202B, 0x1004, 0x0F3D, 0x262A, 0x1015, 0x1054)
+        writer.py                # Pure offline Pro Tools .ptx session writer (write_offline_ptx_session) for clean & pre-populated templates
         signal_flow.py           # Thin Pro Tools adapter (ptx_to_mixer_session, build_annotated_signal_flow) over signal_flow
         signal_flow_analysis.py  # Backward-compatible re-exports of signal_flow.analysis
 

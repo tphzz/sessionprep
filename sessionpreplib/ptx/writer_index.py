@@ -117,7 +117,7 @@ def _parse_2519_offsets(buf: bytes, chunk: PtxChunk) -> _Parsed2519Offsets:
                     sub_cnt = struct.unpack_from("<I", buf, scan + 9)[0]
                     subs, _ = _walk_counted_children(buf, scan + 13, nxt, sub_cnt)
                     c251c_offs = [off for t, off, _ in subs if t == 0x251C]
-            scan = nxt
+            scan = buf.find(b"\x5A", nxt, end)
         else:
             scan = buf.find(b"\x5A", scan + 1, end)
     return _Parsed2519Offsets(

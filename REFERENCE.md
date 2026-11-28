@@ -688,7 +688,8 @@ post-close pass with automatic rollback if Pro Tools fails to reopen the session
   disables PTSL connection controls in Preferences, validates local template/project
   readiness offline in Phase 3 without PTSL prompts, stages BWF/UMID-linked WAVs into
   `<project_dir>/<session_name>/Audio Files/` (resampling/converting if needed), and
-  writes complete Pro Tools `.ptx` sessions directly from clean `.ptxt` templates —
+  writes complete Pro Tools `.ptx` sessions directly from `.ptxt`/`.ptx` templates
+  (including templates with pre-existing audio tracks, clips, and playlists) —
   including folder placement, `No Input`, Routing Folder bus output assignment, track
   colors, whole-file clips spotted at sample 0, Clip Gain, Slot A Trim, Track/Bus
   Faders, VCA-linked Folder Groups, and empty folder/VCA/orphaned Aux cleanup — with

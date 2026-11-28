@@ -44,11 +44,9 @@ from sessionpreplib.ptx import (
 )
 from sessionpreplib.ptx.models import PTX_MAGIC
 from sessionpreplib.ptx.writer_blueprints import (
-    _MONO_261C_RAW,
-    _STEREO_261C_RAW,
-    AUDIO_UI_2589_RAW,
     build_audio_file_entry_1003,
     build_audio_mixer_strip_261c,
+    build_audio_ui_entry_2589,
     build_output_bus_260e,
     build_playlist_1014_v9,
     build_track_entry_251a,
@@ -169,7 +167,7 @@ def _build_clean_template_ptxt(
     )
     # Note: EmptyBasic is intentionally omitted from 0x210C (as Pro Tools does for empty folders).
     c210c = serialize_folder_tree_210c([(kik_uid, [kik_vca_uid]), (vox_uid, [vox_vca_uid])])
-    c258a = build_zchunk(0x258A, build_zchunk(0x2581, b"\x00" * 8, version=3) + cnt_le + AUDIO_UI_2589_RAW * len(tracks), version=2)
+    c258a = build_zchunk(0x258A, build_zchunk(0x2581, b"\x00" * 8, version=3) + cnt_le + build_audio_ui_entry_2589() * len(tracks), version=2)
     c2587 = build_zchunk(0x2587, build_zchunk(0x2551, build_zchunk(0x258B, c258a, version=1), version=3), version=1)
     strips = [
         _mixer_track_261e(kik_uid, bus_kik, bus_out, 0.0),
@@ -241,30 +239,44 @@ def _build_clean_template_ptxt(
     return encrypt_ptx(bytes(out), 0x40)
 
 
-def test_blueprints_are_clean_of_private_paths_and_validate_inputs():
-    for blob in (_STEREO_261C_RAW, _MONO_261C_RAW, AUDIO_UI_2589_RAW):
-        low = blob.lower()
-        for forbidden in (b"develop", b"sessionprep_private", b"scratch", b"probe", b"e:\\", b"c:\\", b"users", b"\xb0\xcf\xee\x62"):
-            assert forbidden not in low
+def test_structured_builders_are_blob_free_and_validate_inputs():
+    import inspect
+    from sessionpreplib.ptx import writer_blueprints as wb
+
+    src = inspect.getsource(wb)
+    assert "b64decode" not in src and "zlib.decompress" not in src
 
     uid, bus_uid = generate_ptx_uuid(), generate_ptx_uuid()
+    ui_raw = build_audio_ui_entry_2589()
     st_routed = build_audio_mixer_strip_261c("Synth", uid, 2, (118, bus_uid, "KIK"), track_ordinal_1based=2, id_base=8000, color_index=29)
+    st_routed_2 = build_audio_mixer_strip_261c("Synth", uid, 2, (118, bus_uid, "KIK"), track_ordinal_1based=2, id_base=8000, color_index=29)
     mo_unrouted = build_audio_mixer_strip_261c("Kick", uid, 1, None, track_ordinal_1based=3, id_base=8010, color_index=25)
+    assert len(ui_raw) == 283
+    assert st_routed != st_routed_2  # fresh unique send-slot UUIDv4s per synthesized strip
+    for chunk in (ui_raw, st_routed, mo_unrouted):
+        low = chunk.lower()
+        for forbidden in (b"c:\\", b"e:\\", b"/users/", b"\\users\\", b".wav", b"audio files"):
+            assert forbidden not in low
     assert st_routed[:1] == b"Z" and b"Synth" in st_routed and b"KIK" in st_routed and st_routed.count(uid) == 3
     assert mo_unrouted[:1] == b"Z" and b"Kick" in mo_unrouted and b"BUS" not in mo_unrouted and mo_unrouted.count(uid) == 3
+    # No-output 0x4856 must omit 0x260E and 0x485E (63 bytes exact, prevents Pro Tools GlobalRenderer assertion)
+    p4856 = mo_unrouted.find(b"\x56\x48") - 7
+    assert struct.unpack_from("<I", mo_unrouted, p4856 + 3)[0] + 7 == 63
     assert build_output_bus_260e(118, bus_uid, "KIK")[:1] == b"Z"
     assert build_track_summary_2519("Kick", uid, 1, 2).endswith(b"\x02\x00\x00")
     assert build_track_entry_251a("Kick", uid, 1, 2, color_index=25)[:1] == b"Z"
     assert build_track_uuid_entry_210b("Kick", uid)[:1] == b"Z"
-    assert build_playlist_1014_v9("Synth", [0, 1], uid, is_stereo=True, playlist_ordinal_1based=1)[:1] == b"Z"
-    assert build_playlist_1014_v9("Kick", [2], uid, is_stereo=False, playlist_ordinal_1based=2)[:1] == b"Z"
+    pl_st = build_playlist_1014_v9("Synth", (3, 4), uid, is_stereo=True)
+    pl_mn = build_playlist_1014_v9("Kick", (5,), uid, is_stereo=False)
+    assert pl_st[:1] == b"Z" and struct.unpack_from("<II", pl_st, len(pl_st) - 14) == (3, 4)
+    assert pl_mn[:1] == b"Z" and struct.unpack_from("<I", pl_mn, len(pl_mn) - 10)[0] == 5
     c1003 = build_audio_file_entry_1003(
-        96000, 2, 24, 96000, file_id8=b"\x01" * 8, smpte_umid32=b"\x02" * 32, filetime_u64=123456, file_index=0,
+        96000, 2, 24, 96000, file_id8=b"\x01" * 8, smpte_umid32=b"\x02" * 32, filetime_u64=123456, tree_node_index=1,
     )
     assert c1003[:1] == b"Z" and len(c1003) == 319 and struct.unpack_from("<I", c1003, 9)[0] == 1
     assert struct.unpack_from("<I", build_audio_file_entry_1003(
-        96000, 1, 24, 96000, file_id8=b"\x01" * 8, smpte_umid32=b"\x02" * 32, filetime_u64=123456, file_index=2,
-    ), 9)[0] == 3
+        96000, 1, 24, 96000, file_id8=b"\x01" * 8, smpte_umid32=b"\x02" * 32, filetime_u64=123456, tree_node_index=14,
+    ), 9)[0] == 14
     assert build_whole_file_clip_2629("Kick", 96000, audio_file_index=0, channel_index=0, clip_guid16=b"\x03" * 16, pt_uuid16=uid)[:1] == b"Z"
     assert build_volume_table_0f3d(0x12345678, "Data", "e:\\")[:1] == b"Z"
 
@@ -488,17 +500,22 @@ def test_template_variants_validation_guards_and_rollback(tmp_path: Path):
         execute_offline_ptx_creation(plan_existing, proj_root)
     assert sentinel.is_file()
 
-    # Non-clean template (already has audio files) fails writer -> staged dir rolled back cleanly!
+    # Writer failure (corrupt/truncated template missing required chunks) rolls back staged dir cleanly!
+    bad_tpl = tmp_path / "Broken.ptxt"
+    bad_tpl.write_bytes(res.ptx_path.read_bytes())
     sess_rb = SessionContext(
         tracks=[tc], output_tracks=[tc], config={}, project_name="RollbackSong",
         transfer_manifest=[TransferEntry("Kick.wav", "Kick.wav", "Kick")],
     )
     plan_rb = build_protools_creation_plan(
-        res.ptx_path, sess_rb, {"Kick.wav": kik.uuid_braced}, [{"id": kik.uuid_braced, "name": "KIK"}],
+        ptxt_min, sess_rb, {"Kick.wav": kik.uuid_braced}, [{"id": kik.uuid_braced, "name": "KIK"}],
         compute_signal_flow=False,
     )
-    with pytest.raises(ValueError, match="clean session template"):
-        execute_offline_ptx_creation(plan_rb, proj_root)
+    # Point plan at a missing parent UUID so writer fails after media staging
+    from dataclasses import replace as dc_replace
+    bad_plan = dc_replace(plan_rb, tracks=(dc_replace(plan_rb.tracks[0], parent_folder_uuid="{00000000-0000-0000-0000-000000000000}"),))
+    with pytest.raises(ValueError, match="missing or deleted parent folder"):
+        execute_offline_ptx_creation(bad_plan, proj_root)
     assert not (proj_root / "RollbackSong").exists()
 
 
@@ -556,12 +573,12 @@ def test_rebuild_index_0002_idempotent_on_template():
 
 
 def test_audio_file_entry_1003_encodes_tree_node_index_and_channel_layout_flags():
-    for file_index, channels, expected_flag in ((0, 2, 1), (1, 1, 0), (2, 1, 0), (3, 2, 1)):
+    for node_index, channels, expected_flag in ((1, 2, 1), (2, 1, 0), (12, 1, 0), (14, 2, 1)):
         c1003 = build_audio_file_entry_1003(
             48000, channels, 24, 4800,
-            file_id8=b"\x11" * 8, smpte_umid32=b"\x22" * 32, filetime_u64=123456789, file_index=file_index,
+            file_id8=b"\x11" * 8, smpte_umid32=b"\x22" * 32, filetime_u64=123456789, tree_node_index=node_index,
         )
-        assert struct.unpack_from("<I", c1003, 9)[0] == file_index + 1
+        assert struct.unpack_from("<I", c1003, 9)[0] == node_index
         sz1001 = struct.unpack_from("<I", c1003, 13 + 3)[0]
         p1033 = 13 + 7 + sz1001
         sz1033 = struct.unpack_from("<I", c1003, p1033 + 3)[0]
@@ -571,3 +588,238 @@ def test_audio_file_entry_1003_encodes_tree_node_index_and_channel_layout_flags(
         assert body2106[-48] == expected_flag
         assert body2106[-47:-15] == b"\x22" * 32
         assert struct.unpack_from("<I", body2106, len(body2106) - 8)[0] == expected_flag
+
+
+def test_template_with_preexisting_audio_append_and_delete(tmp_path: Path):
+    """Appending new tracks onto a template with existing audio preserves existing media & compacts deleted lanes."""
+    base_ptxt = tmp_path / "Clean.ptxt"
+    base_ptxt.write_bytes(_build_clean_template_ptxt())
+    w_ref = _write_wav(tmp_path / "RefLoop.wav", 48000, 2, frames=4800)
+    w_old = _write_wav(tmp_path / "OldVox.wav", 48000, 1, frames=4800)
+    w_new_st = _write_wav(tmp_path / "NewSt.wav", 48000, 2, frames=4800)
+    w_new_mn = _write_wav(tmp_path / "NewMn.wav", 48000, 1, frames=4800)
+
+    root = tmp_path / "sessions"
+    root.mkdir()
+    base_sess = PtxSession.from_file(base_ptxt)
+    kik_uid = base_sess.track_by_name("KIK").uuid_hex
+    vox_uid = base_sess.track_by_name("VOX").uuid_hex
+    assert kik_uid and vox_uid
+
+    # Step 1: Produce a template session that ALREADY contains 2 audio files, 3 clips, 2 playlists, 3 lanes.
+    st1 = stage_session_audio_files(root, "TplWithAudio", [w_ref, w_old], TargetAudioSpec(48000, 24))
+    af1 = tuple(
+        AudioFileWriteSpec(sf.filename, sf.sample_rate, sf.channels, sf.bit_depth, sf.length_samples, sf.file_id8, sf.smpte_umid32, sf.filetime_u64)
+        for sf in st1.staged_files
+    )
+    tpl_res = write_offline_ptx_session(OfflinePtxWriteRequest(
+        ptxt_path=base_ptxt, output_ptx_path=st1.ptx_path, session_dir=st1.session_dir,
+        sample_rate=48000, bit_depth=24, audio_files=af1,
+        tracks=(
+            OfflineAudioTrackRequest("RefTrack", 2, kik_uid, "KIK", 0, 4800, "RefLoop"),
+            OfflineAudioTrackRequest("OldVox", 1, vox_uid, "VOX", 1, 4800, "OldVox"),
+        ),
+        volume_serial_u32=0x11112222, volume_label="TplVol",
+    ))
+
+    # Step 2: Append 2 new tracks (1 Stereo + 1 Mono) onto TplWithAudio while KEEPING all existing tracks.
+    st2 = stage_session_audio_files(root, "AppendedKeep", [w_new_st, w_new_mn], TargetAudioSpec(48000, 24))
+    af2 = tuple(
+        AudioFileWriteSpec(sf.filename, sf.sample_rate, sf.channels, sf.bit_depth, sf.length_samples, sf.file_id8, sf.smpte_umid32, sf.filetime_u64)
+        for sf in st2.staged_files
+    )
+    res_keep = write_offline_ptx_session(OfflinePtxWriteRequest(
+        ptxt_path=tpl_res.ptx_path, output_ptx_path=st2.ptx_path, session_dir=st2.session_dir,
+        sample_rate=48000, bit_depth=24, audio_files=af2,
+        tracks=(
+            OfflineAudioTrackRequest("NewSt", 2, kik_uid, "KIK", 0, 4800, "NewSt"),
+            OfflineAudioTrackRequest("NewMn", 1, kik_uid, "KIK", 1, 4800, "NewMn"),
+        ),
+        volume_serial_u32=0x33334444, volume_label="OutVol",
+    ))
+    s_keep = PtxSession.from_file(res_keep.ptx_path)
+    assert not s_keep.warnings
+    assert [a.filename for a in s_keep.audio_files] == ["RefLoop.wav", "OldVox.wav", "NewSt.wav", "NewMn.wav"]
+    assert len(s_keep.clips) == 6
+    assert [(p.name, p.lane_indices) for p in s_keep.playlists] == [
+        ("RefTrack", [0, 1]), ("OldVox", [2]), ("NewSt", [3, 4]), ("NewMn", [5]),
+    ]
+
+    # Step 3: Append new tracks onto TplWithAudio while DELETING existing audio track RefTrack (playlist 0)
+    # so surviving OldVox shifts from playlist 1 -> 0 and lane 2 -> 0, and new tracks take playlists 1 & 2!
+    st3 = stage_session_audio_files(root, "AppendedDelete", [w_new_st, w_new_mn], TargetAudioSpec(48000, 24))
+    af3 = tuple(
+        AudioFileWriteSpec(sf.filename, sf.sample_rate, sf.channels, sf.bit_depth, sf.length_samples, sf.file_id8, sf.smpte_umid32, sf.filetime_u64)
+        for sf in st3.staged_files
+    )
+    res_del = write_offline_ptx_session(OfflinePtxWriteRequest(
+        ptxt_path=tpl_res.ptx_path, output_ptx_path=st3.ptx_path, session_dir=st3.session_dir,
+        sample_rate=48000, bit_depth=24, audio_files=af3,
+        tracks=(
+            OfflineAudioTrackRequest("NewSt", 2, kik_uid, "KIK", 0, 4800, "NewSt"),
+            OfflineAudioTrackRequest("NewMn", 1, kik_uid, "KIK", 1, 4800, "NewMn"),
+        ),
+        delete_track_names=("RefTrack",),
+        volume_serial_u32=0x11112222, volume_label="TplVol",  # same serial -> deduplicated in 0x0F3D
+    ))
+    s_del = PtxSession.from_file(res_del.ptx_path)
+    assert not s_del.warnings
+    assert len(s_del.audio_files) == 4 and len(s_del.clips) == 6  # Clip list preserved like PT
+    assert [(p.name, p.lane_indices) for p in s_del.playlists] == [
+        ("OldVox", [0]), ("NewSt", [1, 2]), ("NewMn", [3]),
+    ]
+    # Verify every Audio track's 0x261C mid_gap, tail, and 0x2015 track ordinal match compacted layout!
+    dec_del, _ = decrypt_ptx(res_del.ptx_path.read_bytes())
+    assert validate_index_0002(dec_del) is True
+    c2624_del = next(c.raw for c in iter_top_chunks(dec_del, strict=True) if c.tag == 0x2624)
+    from sessionpreplib.ptx.writer_blueprints import _find_zchunk_offset
+    from sessionpreplib.ptx.writer_mutations import _extract_261c_playlist_indices, _read_zchunk_at, _walk_sequential_zchunks
+    strips_del, _ = _walk_sequential_zchunks(c2624_del, 13, struct.unpack_from("<I", c2624_del, 9)[0])
+    audio_pl_indices = []
+    audio_view_ordinals = []
+    for ord_1, st_raw in enumerate(strips_del, start=1):
+        if struct.unpack_from("<H", st_raw, 7)[0] == 0x261C:
+            audio_pl_indices.append(sorted(_extract_261c_playlist_indices(st_raw)))
+            _, _, mid_off = _read_zchunk_at(st_raw, 9, expected_tag=0x261B)
+            _, _, tail_off = _read_zchunk_at(st_raw, mid_off + 12, expected_tag=0x200B)
+            assert struct.unpack_from("<I", st_raw, mid_off)[0] == struct.unpack_from("<I", st_raw, tail_off + 17)[0]
+            p2434 = _find_zchunk_offset(st_raw, 0x2434, mid_off + 21)
+            after_2434 = p2434 + 7 + struct.unpack_from("<I", st_raw, p2434 + 3)[0]
+            audio_view_ordinals.append((ord_1, struct.unpack_from("<I", st_raw, after_2434)[0]))
+    assert audio_pl_indices == [[1], [2], [0]]  # track order: NewSt(pl 1), NewMn(pl 2) under KIK, OldVox(pl 0) under VOX
+    assert all(expected == actual for expected, actual in audio_view_ordinals)
+
+
+def test_review_edge_cases_playlist_ownership_fades_strides_and_guards(tmp_path: Path):
+    """Lock down edge cases: non-Audio name collisions, renamed playlists, fade tails, alternate playlists, guards."""
+    from sessionpreplib.ptx.codec import splice_top_chunk
+    from sessionpreplib.ptx.writer_chunks import serialize_lane_1052
+    from sessionpreplib.ptx.writer_mutations import (
+        _extract_261c_playlist_indices,
+        _parse_playlist_1014_meta,
+        _remap_261c_strip_indices,
+        _remap_playlist_1014_lanes,
+        mutate_0f3d_volumes,
+        plan_existing_media_survival,
+    )
+
+    # 1. Deleting a non-Audio track named 'VOX' must NOT delete a surviving Audio track's playlist named 'VOX',
+    #    while deleting an Audio track whose playlist is renamed 'AltLead' MUST delete 'AltLead' via 0x261C ownership.
+    pl0 = build_playlist_1014_v9("VOX", (0,), generate_ptx_uuid(), is_stereo=False)
+    pl1 = build_playlist_1014_v9("AltLead", (1,), generate_ptx_uuid(), is_stereo=False)
+    pl2 = build_playlist_1014_v9("SharedEnd", (1, 2), generate_ptx_uuid(), is_stereo=True)  # shares lane 1 with pl1!
+    c1015 = build_zchunk(0x1015, struct.pack("<I", 3) + pl0 + pl1 + pl2 + build_zchunk(0x4829, b"\x00" * 4, version=2), version=2)
+    lanes = [serialize_lane_1052(f"L{i}", [(i, 0, 3, 0xFFFE)], wrap_1050=True, wrap_version=3, lane_version=3) for i in range(3)]
+    c1054 = build_zchunk(0x1054, struct.pack("<I", 3) + b"".join(lanes) + build_zchunk(0x4828, b"\x00" * 4, version=2), version=2)
+    st_folder = _mixer_track_261e(_uuid(1), None, _uuid(99), 0.0)
+    st_keep0 = build_audio_mixer_strip_261c("Keep0", _uuid(2), 1, None, track_ordinal_1based=2, id_base=100, playlist_index=0)
+    st_del1 = build_audio_mixer_strip_261c("DelMid", _uuid(3), 1, None, track_ordinal_1based=3, id_base=110, playlist_index=1)
+    st_keep2 = build_audio_mixer_strip_261c("Keep2", _uuid(4), 2, None, track_ordinal_1based=4, id_base=120, playlist_index=2)
+    c2624 = build_zchunk(0x2624, struct.pack("<I", 4) + st_folder + st_keep0 + st_del1 + st_keep2, version=1)
+
+    kept_pl, kept_lanes, pl_map, _c4829, _c4828 = plan_existing_media_survival(
+        c1015, c1054, ("VOX", "DelMid"), c2624_raw=c2624, deleted_old_indices=(0, 2),
+    )
+    assert [_parse_playlist_1014_meta(p)[0] for p in kept_pl] == ["VOX", "SharedEnd"]
+    assert pl_map == {0: 0, 2: 1}
+    assert len(kept_lanes) == 3  # lane 1 survived because SharedEnd still references it!
+
+    # 2. Alternate playlists (pl_cnt == 2) for both 2-byte (<H) and 4-byte (<I) mid_gap strides + error on malformed gap
+    from sessionpreplib.ptx.writer_mutations import _read_zchunk_at
+    _, _, mid_off = _read_zchunk_at(st_keep2, 9, expected_tag=0x261B)
+    _, raw_200b, tail_off = _read_zchunk_at(st_keep2, mid_off + 12, expected_tag=0x200B)
+    st_alt_u16 = build_zchunk(
+        0x261C, st_keep2[9:mid_off] + struct.pack("<IHHHHH", 2, 2, 2, 3, 0, 0xFFFF) + raw_200b + st_keep2[tail_off:], version=6,
+    )
+    assert _extract_261c_playlist_indices(st_alt_u16) == {2, 3}
+    remapped_u16 = _remap_261c_strip_indices(st_alt_u16, {2: 0, 3: 1}, 5)
+    assert _extract_261c_playlist_indices(remapped_u16) == {0, 1}
+    st_alt_u32 = build_zchunk(
+        0x261C, st_keep2[9:mid_off] + struct.pack("<IHIIH", 2, 2, 2, 3, 0xFFFF) + raw_200b + st_keep2[tail_off:], version=6,
+    )
+    assert _extract_261c_playlist_indices(st_alt_u32) == {2, 3}
+    remapped_u32 = _remap_261c_strip_indices(st_alt_u32, {2: 0, 3: 1}, 5)
+    assert _extract_261c_playlist_indices(remapped_u32) == {0, 1}
+    with pytest.raises(RuntimeError, match="missing playlist index"):
+        _remap_261c_strip_indices(st_alt_u16, {2: 0}, 5)
+    st_bad_gap = build_zchunk(0x261C, st_keep2[9:mid_off] + b"\x00" * 11 + raw_200b + st_keep2[tail_off:], version=6)
+    with pytest.raises(RuntimeError, match="Unrecognized 0x261C mid_gap"):
+        _extract_261c_playlist_indices(st_bad_gap)
+
+    # 3. Template with fade-file 0x1003 in 0x1004 trailing_tail + delete-only (0 new tracks) + shared audio_file_index
+    ptxt = tmp_path / "FadeTpl.ptxt"
+    raw_tpl = _build_clean_template_ptxt()
+    dec_tpl, delta = decrypt_ptx(raw_tpl)
+    buf_tpl = bytearray(dec_tpl)
+    c1004_orig = next(c.raw for c in iter_top_chunks(dec_tpl, strict=True) if c.tag == 0x1004)
+    fade_1003 = build_audio_file_entry_1003(48000, 1, 24, 128, file_id8=b"\x99" * 8, smpte_umid32=b"\x88" * 32, filetime_u64=1, tree_node_index=0)
+    # Inject a fade-file 0x1003 in trailing_tail while main header count stays 0!
+    c1004_with_fade = build_zchunk(0x1004, c1004_orig[9:-17] + struct.pack("<I", 1) + fade_1003 + c1004_orig[-13:], version=3)
+    splice_top_chunk(buf_tpl, 0x1004, c1004_with_fade)
+    ptxt.write_bytes(encrypt_ptx(bytes(buf_tpl), delta))
+
+    wav_st = _write_wav(tmp_path / "SharedSt.wav", 48000, 2, frames=4800)
+    wav_mn = _write_wav(tmp_path / "MonoOne.wav", 48000, 1, frames=4800)
+    root = tmp_path / "out"
+    root.mkdir()
+    st_run = stage_session_audio_files(root, "FadeAndShare", [wav_st, wav_mn], TargetAudioSpec(48000, 24))
+    afs = tuple(AudioFileWriteSpec(s.filename, s.sample_rate, s.channels, s.bit_depth, s.length_samples, s.file_id8, s.smpte_umid32, s.filetime_u64) for s in st_run.staged_files)
+    kik_uid = PtxSession.from_file(ptxt).track_by_name("KIK").uuid_hex
+    assert kik_uid
+    res_shared = write_offline_ptx_session(OfflinePtxWriteRequest(
+        ptxt_path=ptxt, output_ptx_path=st_run.ptx_path, session_dir=st_run.session_dir,
+        sample_rate=48000, bit_depth=24, audio_files=afs,
+        tracks=(
+            OfflineAudioTrackRequest("TrkA", 2, kik_uid, "KIK", 0, 4800, "SharedA"),
+            OfflineAudioTrackRequest("TrkB", 2, kik_uid, "KIK", 0, 4800, "SharedB"),  # shares audio_file_index=0
+        ),
+    ))
+    parsed_sh = PtxSession.from_file(res_shared.ptx_path)
+    assert [c.audio_file_index for c in parsed_sh.clips] == [0, 0, 0, 0]  # NOT shifted by fade 0x1003!
+
+    # Delete-only (0 new tracks, 0 staged files) on populated session
+    res_del_only = write_offline_ptx_session(OfflinePtxWriteRequest(
+        ptxt_path=res_shared.ptx_path, output_ptx_path=tmp_path / "DelOnly.ptx", session_dir=st_run.session_dir,
+        sample_rate=48000, bit_depth=24, audio_files=(), tracks=(), delete_track_names=("TrkB",),
+    ))
+    assert [p.name for p in PtxSession.from_file(res_del_only.ptx_path).playlists] == ["TrkA"]
+
+    # 4. Validation & malformed-chunk guards + writer_index 0x2519 non-0x5A gap bytes
+    with pytest.raises(ValueError, match="requires 2 channels"):
+        write_offline_ptx_session(OfflinePtxWriteRequest(
+            ptxt_path=ptxt, output_ptx_path=tmp_path / "BadCh.ptx", session_dir=st_run.session_dir,
+            sample_rate=48000, bit_depth=24, audio_files=afs,
+            tracks=(OfflineAudioTrackRequest("BadSt", 2, kik_uid, "KIK", 1, 4800, "MonoOne"),),
+        ))
+    with pytest.raises(ValueError, match="Duplicate or colliding track name"):
+        write_offline_ptx_session(OfflinePtxWriteRequest(
+            ptxt_path=ptxt, output_ptx_path=tmp_path / "DupTrk.ptx", session_dir=st_run.session_dir,
+            sample_rate=48000, bit_depth=24, audio_files=afs,
+            tracks=(OfflineAudioTrackRequest("KIK", 1, kik_uid, "KIK", 1, 4800, "MonoOne"),),
+        ))
+    with pytest.raises(ValueError, match="Duplicate audio filename"):
+        write_offline_ptx_session(OfflinePtxWriteRequest(
+            ptxt_path=res_shared.ptx_path, output_ptx_path=tmp_path / "DupWav.ptx", session_dir=st_run.session_dir,
+            sample_rate=48000, bit_depth=24, audio_files=(afs[0],),
+            tracks=(OfflineAudioTrackRequest("TrkC", 2, kik_uid, "KIK", 0, 4800, "SharedC"),),
+        ))
+    with pytest.raises(ValueError, match="exactly one of old_index or new_track"):
+        TrackSlotOp()
+    with pytest.raises(RuntimeError, match="Truncated 0x1014"):
+        _parse_playlist_1014_meta(build_zchunk(0x1014, struct.pack("<I", 50) + b"abc", version=9))
+    with pytest.raises(RuntimeError, match="missing lane"):
+        _remap_playlist_1014_lanes(pl0, {99: 0})
+    bad_0f3c = build_zchunk(0x0F3C, struct.pack("<I", 0) + struct.pack("<II", 1, 999), version=1)
+    with pytest.raises(RuntimeError, match="Truncated 0x0F3C"):
+        mutate_0f3d_volumes(build_zchunk(0x0F3D, struct.pack("<I", 1) + bad_0f3c, version=1), 2, "V", "d:\\")
+
+    # writer_index.py:120 non-0x5A gap bytes between 0x2716 and 0x251B inside 0x2519
+    from sessionpreplib.ptx.models import PtxChunk
+    from sessionpreplib.ptx.writer_index import _parse_2519_offsets
+    c2716 = build_zchunk(0x2716, b"\x00\x00\x00\x00", version=1)
+    c251b = build_zchunk(0x251B, b"\x00\x00\x00\x00", version=1)
+    # 0x2519 body: 10B hdr + cnt_a=0 + tcnt=0 + tcnt2=0 + c2716 + 4B non-0x5A gap + c251b
+    fake_2519 = build_zchunk(0x2519, (b"\x00" * 10) + struct.pack("<III", 0, 0, 0) + c2716 + b"\xaa\xbb\xcc\xdd" + c251b, version=9)
+    parsed_2519 = _parse_2519_offsets(fake_2519, PtxChunk(offset=0, version=9, size=len(fake_2519) - 7, tag=0x2519, raw=fake_2519))
+    assert parsed_2519.c2716_offset == 9 + 22
+    assert parsed_2519.c251b_offset == 9 + 22 + len(c2716) + 4
