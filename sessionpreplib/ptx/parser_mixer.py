@@ -13,6 +13,7 @@ from .codec import find_subchunks, format_rfc_uuid, lookup_pt_color_rgb, parse_c
 from .models import (
     AUTOMATION_MODE_MAP,
     SEND_SLOTS,
+    TRACK_HEIGHT_MAP,
     UUID_PREFIX,
     PtxAraBinding,
     PtxAraPlugin,
@@ -280,33 +281,48 @@ def extract_260d_params(chunk_260d: bytes) -> OutputSlotParams:
     return res
 
 
-def parse_2015_metadata(blk: bytes, *, start: int = 9) -> tuple[str, int | None, bool, bytes | None]:
-    """Extract ``(comment, color_index, is_solo_safe, first_2038)`` from a track's ``0x2015`` block."""
+def parse_2015_metadata(blk: bytes, *, start: int = 9) -> tuple[str, int | None, bool, bytes | None, int | None]:
+    """Extract ``(comment, color_index, is_solo_safe, first_2038, height_px)`` from a track's ``0x2015`` block."""
     s15 = find_subchunks(blk, 0x2015, start=start)
     if not s15:
-        return "", None, False, None
+        return "", None, False, None, None
     b15 = s15[-1]
     p15 = blk.rfind(b15)
     is_solo_safe = p15 != -1 and p15 + len(b15) < len(blk) and blk[p15 + len(b15)] == 1
-    s38 = find_subchunks(b15, 0x2038)
-    if not s38:
-        return "", None, is_solo_safe, None
-    p38 = b15.find(s38[0], 9)
-    if p38 == -1:
-        return "", None, is_solo_safe, s38[0]
-    fend = p38 + len(s38[0])
+    first_2038: bytes | None = None
+    if len(b15) >= 18 and b15[9] == 0x5A:
+        f_sz = struct.unpack_from("<I", b15, 12)[0]
+        f_tag = struct.unpack_from("<H", b15, 16)[0]
+        fend = 9 + 7 + f_sz
+        if f_tag in (0x2038, 0x203A, 0x203B) and f_sz >= 2 and fend <= len(b15):
+            if f_tag == 0x2038:
+                first_2038 = b15[9:fend]
+        else:
+            fend = -1
+    else:
+        fend = -1
+    if fend < 0:
+        s38 = find_subchunks(b15, 0x2038)
+        if not s38:
+            return "", None, is_solo_safe, None, None
+        first_2038 = s38[0]
+        p38 = b15.find(first_2038, 9)
+        if p38 == -1:
+            return "", None, is_solo_safe, first_2038, None
+        fend = p38 + len(first_2038)
     comment = ""
     clen = 0
     if fend + 12 > len(b15):
-        return "", None, is_solo_safe, s38[0]
+        return "", None, is_solo_safe, first_2038, None
     cand_len = struct.unpack_from("<I", b15, fend + 8)[0]
     if cand_len > 0:
         if cand_len >= 4096 or fend + 12 + cand_len > len(b15):
-            return "", None, is_solo_safe, s38[0]
+            return "", None, is_solo_safe, first_2038, None
         clen = cand_len
         comment = b15[fend + 12 : fend + 12 + clen].decode("utf-8", errors="replace")
     q = fend + 21 + clen
     color_idx: int | None = None
+    height_px: int | None = None
     if q < len(b15):
         if b15[q] == 1 and q + 8 <= len(b15) and b15[q + 1] == 0x5A:
             sub_sz = struct.unpack_from("<I", b15, q + 4)[0]
@@ -317,30 +333,47 @@ def parse_2015_metadata(blk: bytes, *, start: int = 9) -> tuple[str, int | None,
             col = struct.unpack_from("<h", b15, q2 + 1)[0]
             if col >= 0:
                 color_idx = int(col)
-    return comment, color_idx, is_solo_safe, s38[0]
+        if q2 + 14 <= len(b15):
+            cand_h = struct.unpack_from("<I", b15, q2 + 10)[0]
+            if 8 <= cand_h <= 2000:
+                height_px = int(cand_h)
+    return comment, color_idx, is_solo_safe, first_2038, height_px
+
+
+def _parse_midi_strip_timebase(track: PtxTrack, blk: bytes, strip_tag: int) -> None:
+    if track.track_type == "Midi" or strip_tag == 0x2620:
+        s2611 = find_subchunks(blk, 0x2611)
+        if s2611:
+            c260a = find_subchunks(s2611[0], 0x260A)
+            if c260a:
+                parsed_tb = parse_control_curve(c260a[0], 9)
+                if parsed_tb is not None:
+                    track.timebase = parsed_tb[0]
 
 
 def parse_track_flags(track: PtxTrack, blk: bytes, ara_plugins: list[PtxAraPlugin]) -> None:
     """Populate track solo, solo-safe, automation mode, record, monitor, comment, color, and ARA2 state."""
-    s2619 = find_subchunks(blk[:512], 0x2619)
-    if s2619:
-        p19 = blk.find(s2619[0], 9)
-        if p19 != -1 and p19 + len(s2619[0]) + 2 <= len(blk):
-            e19 = p19 + len(s2619[0])
-            track.is_soloed = bool(blk[e19])
-            am_code = blk[e19 + 1]
-            track.automation_mode_code = am_code
-            track.automation_mode = AUTOMATION_MODE_MAP.get(am_code, f"Mode_{am_code}")
-    else:
-        s4301 = find_subchunks(blk[:512], 0x4301)
-        if s4301:
-            h4301 = blk.find(s4301[0], 9)
-            if h4301 != -1 and h4301 + 61 <= len(blk):
-                track.is_soloed = bool(blk[h4301 + 59])
-                am_code = blk[h4301 + 60]
+    strip_tag = struct.unpack_from("<H", blk, 7)[0] if len(blk) >= 9 else 0
+    if track.track_type != "BasicFolder" and strip_tag != 0x263B:
+        s2619 = find_subchunks(blk[:512], 0x2619)
+        if s2619:
+            p19 = blk.find(s2619[0], 9)
+            if p19 != -1 and p19 + len(s2619[0]) + 2 <= len(blk):
+                e19 = p19 + len(s2619[0])
+                track.is_soloed = bool(blk[e19])
+                am_code = blk[e19 + 1]
                 track.automation_mode_code = am_code
                 track.automation_mode = AUTOMATION_MODE_MAP.get(am_code, f"Mode_{am_code}")
-    comment, col_2015, solo_safe, b2038 = parse_2015_metadata(blk, start=9)
+        else:
+            s4301 = find_subchunks(blk[:512], 0x4301)
+            if s4301:
+                h4301 = blk.find(s4301[0], 9)
+                if h4301 != -1 and h4301 + 61 <= len(blk):
+                    track.is_soloed = bool(blk[h4301 + 59])
+                    am_code = blk[h4301 + 60]
+                    track.automation_mode_code = am_code
+                    track.automation_mode = AUTOMATION_MODE_MAP.get(am_code, f"Mode_{am_code}")
+    comment, col_2015, solo_safe, b2038, height_px = parse_2015_metadata(blk, start=9)
     if b2038 is None:
         tail_blk = blk[max(0, len(blk) - 900) :]
         s2038 = find_subchunks(tail_blk, 0x2038, start=0)
@@ -351,11 +384,15 @@ def parse_track_flags(track: PtxTrack, blk: bytes, ara_plugins: list[PtxAraPlugi
     if comment:
         track.comment = comment
     track.is_solo_safe = solo_safe
+    if height_px is not None:
+        track.track_height_px = height_px
+        track.track_height_name = TRACK_HEIGHT_MAP.get(height_px, f"{height_px}px")
     if track.color_index == 0xFFFE and col_2015 is not None:
         track.color_index = col_2015
     track.color_rgb = lookup_pt_color_rgb(track.color_index)
     if track.track_type == "Audio" and len(blk) > 33:
         track.is_input_monitor = bool(blk[-33])
+    _parse_midi_strip_timebase(track, blk, strip_tag)
     tail_ara = blk[max(0, len(blk) - 900) :]
     s4807 = find_subchunks(tail_ara, 0x4807, start=0)
     if s4807:
@@ -448,17 +485,19 @@ def parse_track_outputs_and_sends(
     """Decode Main Output and Sends A..J (``0x260d`` blocks) including automation lanes."""
     for di, d_chunk in enumerate(find_subchunks(blk, 0x260D)):
         e_list = find_subchunks(d_chunk, 0x260E)
-        if not e_list:
-            continue
-        dest, is_active = _extract_260e_ref_and_active(e_list[0], resolve_uuid)
-        if dest is None:
+        dest: PtxSignalPathRef | None = None
+        is_active = True
+        if e_list:
+            dest, is_active = _extract_260e_ref_and_active(e_list[0], resolve_uuid)
+        if di > 0 and dest is None:
             continue
         p = extract_260d_params(d_chunk)
         if di == 0:
-            track.main_output = dest
-            track.is_output_active = is_active
-            if derive_inactive_from_output and not is_active:
-                track.is_inactive = True
+            if dest is not None:
+                track.main_output = dest
+                track.is_output_active = is_active
+                if derive_inactive_from_output and not is_active:
+                    track.is_inactive = True
             track.volume_db = p.volume_db
             track.is_muted = p.is_muted
             track.lfe_db = p.lfe_db
@@ -470,7 +509,7 @@ def parse_track_outputs_and_sends(
             track.lfe_or_trim_automation = p.lfe_or_trim_automation
             track.pan_left_automation = p.pan_left_automation
             track.pan_right_automation = p.pan_right_automation
-        else:
+        elif dest is not None:
             slot_idx = di - 1
             slot = SEND_SLOTS[slot_idx] if slot_idx < len(SEND_SLOTS) else str(slot_idx)
             s1029 = find_subchunks(d_chunk, 0x1029)

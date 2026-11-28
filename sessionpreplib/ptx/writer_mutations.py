@@ -10,14 +10,22 @@ import struct
 from .codec import find_zchunk_offset, read_zchunk_at, walk_sequential_zchunks
 from .parser import split_202b
 from .writer_blueprints import (
+    TRACK_TYPE_TO_251A,
     OutputBusSpec,
     build_audio_file_entry_1003,
     build_audio_mixer_strip_261c,
     build_audio_ui_entry_2589,
+    build_aux_or_rf_mixer_strip_261e,
+    build_basic_folder_mixer_strip_263b,
+    build_instrument_mixer_strip_2621,
+    build_master_mixer_strip_261d,
+    build_midi_mixer_strip_2620,
+    build_midi_track_1057,
     build_playlist_1014_v9,
     build_track_entry_251a,
     build_track_summary_2519,
     build_track_uuid_entry_210b,
+    build_vca_mixer_strip_261f,
     build_volume_entry_0f3c,
     build_whole_file_clip_2629,
 )
@@ -34,7 +42,7 @@ _walk_sequential_zchunks = walk_sequential_zchunks
 
 @dataclass(frozen=True)
 class NewAudioTrackSpec:
-    """Internal spec for one newly synthesized Audio track during ``.ptx`` writing."""
+    """Internal spec for one newly synthesized track (Audio, Aux, RoutingFolder, Master, Vca, BasicFolder, Midi, Instrument)."""
 
     track_name: str
     track_uuid16: bytes
@@ -43,10 +51,19 @@ class NewAudioTrackSpec:
     parent_folder_uuid16: bytes | None
     output_bus: OutputBusSpec | tuple[int, bytes, str] | None
     color_index: int
-    clip_indices: tuple[int, ...]  # () for empty track, 1 (Mono) or 2 (Stereo L, R) in 0x262A
-    lane_indices: tuple[int, ...]  # 1 (Mono) or 2 (Stereo L, R) in 0x1054
+    clip_indices: tuple[int, ...]  # () for empty/non-Audio track, 1..12 in 0x262A
+    lane_indices: tuple[int, ...]  # 1..12 in 0x1054 for Audio; () for non-Audio
     playlist_index: int = 0  # 0-based index into 0x1015 Audio Playlists
     start_sample: int = 0
+    track_type: str = "Audio"
+    is_folder_open: bool = True
+    track_format: str | None = None
+    midi_index: int | None = None
+    midi_uuid16: bytes = b"\x00" * 16
+    clip_muted: bool = False
+    clip_time_locked: bool = False
+    clip_edit_locked: bool = False
+    clip_color_index: int = 0xFFFE
 
 
 @dataclass(frozen=True)
@@ -88,7 +105,7 @@ class AudioFileWriteSpec:
 
 @dataclass(frozen=True)
 class ClipWriteSpec:
-    """Whole-file clip info needed to populate ``0x262A``."""
+    """Whole-file or sub-clip info needed to populate ``0x262A``."""
 
     clip_name: str
     length_samples: int
@@ -96,6 +113,10 @@ class ClipWriteSpec:
     channel_index: int
     clip_guid16: bytes
     pt_uuid16: bytes
+    start_sample: int = 0
+    sync_point_samples: int = 0
+    orig_timestamp: int = 0
+    user_timestamp: int = 0
 
 
 def _parse_2519_sections(raw: bytes) -> tuple[bytes, list[bytes], list[bytes], list[bytes], bytes]:
@@ -194,10 +215,16 @@ def mutate_2519_tracks(
             nt = slot.new_track
             vis_ord = next_visible_ord
             next_visible_ord += 1
-            new_rows.append(build_track_summary_2519(nt.track_name, nt.track_uuid16, nt.channels, vis_ord))
+            new_rows.append(
+                build_track_summary_2519(
+                    nt.track_name, nt.track_uuid16, nt.channels, vis_ord,
+                    track_type=nt.track_type, track_format=nt.track_format,
+                )
+            )
             entry = build_track_entry_251a(
                 nt.track_name, nt.track_uuid16, nt.channels, vis_ord,
                 color_index=nt.color_index, has_clips=bool(nt.clip_indices),
+                track_type=nt.track_type, track_format=nt.track_format,
             )
             new_p1.append(entry)
             new_p2.append(entry)
@@ -227,7 +254,10 @@ def mutate_2107_tracks(
         if slot.old_index is not None:
             new_items.append(old_items[slot.old_index])
         elif slot.new_track is not None:
-            new_items.append(build_track_uuid_entry_210b(slot.new_track.track_name, slot.new_track.track_uuid16))
+            tcode = TRACK_TYPE_TO_251A.get(slot.new_track.track_type, (0, False))[0]
+            new_items.append(
+                build_track_uuid_entry_210b(slot.new_track.track_name, slot.new_track.track_uuid16, type_code=tcode)
+            )
     body = hdr_prefix + struct.pack("<I", len(new_items)) + b"".join(new_items) + c2107_raw[end_pos:]
     return build_zchunk(0x2107, body, version=version)
 
@@ -302,11 +332,26 @@ def mutate_2587_ui_state(
     if expected_old_count is not None and len(old_2589) != expected_old_count:
         raise RuntimeError(f"0x258A UI track count {len(old_2589)} != expected {expected_old_count}")
 
-    default_audio_ui = build_audio_ui_entry_2589()
-    new_items = [
-        old_2589[slot.old_index] if slot.old_index is not None else default_audio_ui
-        for slot in layout
-    ]
+    old_by_idx: dict[int, bytes] = {}
+    for pos_i, entry in enumerate(old_2589):
+        if len(entry) >= 11:
+            tidx = struct.unpack_from("<H", entry, 9)[0]
+            if tidx < len(old_2589) and tidx not in old_by_idx:
+                old_by_idx[tidx] = entry
+            elif pos_i not in old_by_idx:
+                old_by_idx[pos_i] = entry
+
+    new_items: list[bytes] = []
+    for new_idx, slot in enumerate(layout):
+        if slot.old_index is not None:
+            surv = bytearray(old_by_idx.get(slot.old_index, old_2589[slot.old_index]))
+            if len(surv) >= 11:
+                struct.pack_into("<H", surv, 9, new_idx)
+            new_items.append(bytes(surv))
+        elif slot.new_track is not None:
+            new_items.append(
+                build_audio_ui_entry_2589(track_index=new_idx, is_folder_open=slot.new_track.is_folder_open)
+            )
     new_blob = b"".join(new_items)
     buf = bytearray(c2587_raw)
     struct.pack_into("<I", buf, after_81, len(new_items))
@@ -336,7 +381,10 @@ def _max_2624_control_id(strips: Sequence[bytes]) -> int:
             continue
         if (
             strip[last_485a_end : last_485a_end + 4] == b"\x01\x01\x0a\x00"
-            and strip[last_485a_end + 44 : last_485a_end + 53] == b"\x00\x00\x00\x00\x08\x00\x00\x00\x00"
+            and (
+                strip[last_485a_end + 44 : last_485a_end + 53] == b"\x00\x00\x00\x00\x08\x00\x00\x00\x00"
+                or strip[last_485a_end + 44 : last_485a_end + 52] == b"\x00" * 8
+            )
         ):
             for val in struct.unpack_from("<10I", strip, last_485a_end + 4):
                 if val < 0xFFFF_FF00 and val > max_id:
@@ -382,12 +430,71 @@ def _patch_200b_view_ordinal(buf: bytearray, p200b: int, tail_off: int, track_or
             struct.pack_into("<I", buf, after_2434, track_ordinal_1based)
 
 
+@dataclass(frozen=True)
+class MidiSurvivalPlan:
+    """Compacted existing ``0x1057`` MIDI entries and old->new index mapping for surviving MIDI/Instrument tracks."""
+
+    entries: tuple[bytes, ...]
+    old_midi_to_new: Mapping[int, int]
+    trailer: bytes = b""
+
+
+def _find_midi_strip_index_offset(strip: bytes) -> int | None:
+    if len(strip) < 25 or strip[0] != 0x5A:
+        return None
+    tag = struct.unpack_from("<H", strip, 7)[0]
+    if tag == 0x2620:
+        _t, _r, gap_off = read_zchunk_at(strip, 9, expected_tag=0x102D)
+        if gap_off + 12 <= len(strip) and struct.unpack_from("<I", strip, gap_off + 4)[0] == 1:
+            return gap_off
+        return None
+    if tag == 0x2621:
+        last_485a_end = -1
+        scan = 9
+        while True:
+            hit = find_zchunk_offset(strip, 0x485A, scan)
+            if hit < 0:
+                break
+            last_485a_end = hit + 7 + struct.unpack_from("<I", strip, hit + 3)[0]
+            scan = last_485a_end
+        off = last_485a_end + 52
+        if last_485a_end >= 0 and off + 8 <= len(strip) and struct.unpack_from("<H", strip, off + 4)[0] == 1:
+            return off
+    return None
+
+
+def _remap_midi_strip_index(buf: bytearray, old_midi_to_new: Mapping[int, int] | None) -> None:
+    if old_midi_to_new is None:
+        return
+    off = _find_midi_strip_index_offset(bytes(buf))
+    if off is None:
+        return
+    tag = struct.unpack_from("<H", buf, 7)[0]
+    old_idx = struct.unpack_from("<I", buf, off)[0]
+    if old_idx not in old_midi_to_new:
+        raise RuntimeError(f"Surviving MIDI/Instrument strip references deleted/missing 0x1058 index {old_idx}")
+    new_idx = old_midi_to_new[old_idx]
+    if not (0 <= new_idx <= 0xFFFF):
+        raise OverflowError(f"Remapped MIDI strip index out of u16 range: {new_idx}")
+    if tag == 0x2620:
+        struct.pack_into("<III", buf, off, new_idx, 1, new_idx)
+        p206f = find_zchunk_offset(bytes(buf), 0x206F, off + 13)
+        if p206f >= 0:
+            t_off = p206f + 7 + struct.unpack_from("<I", buf, p206f + 3)[0]
+            if t_off + 6 <= len(buf):
+                struct.pack_into("<I", buf, t_off + 1, new_idx)
+    else:
+        struct.pack_into("<IHH", buf, off, new_idx, 1, new_idx)
+
+
 def _remap_261c_strip_indices(
     strip: bytes,
     old_pl_to_new: Mapping[int, int] | None,
     track_ordinal_1based: int,
+    *,
+    old_midi_to_new: Mapping[int, int] | None = None,
 ) -> bytes:
-    """Remap ``0x2015`` track ordinals on surviving strips and ``0x1015`` playlist indices on ``0x261C`` strips."""
+    """Remap ``0x2015`` track ordinals, ``0x1015`` playlist indices, and ``0x1058`` MIDI indices on surviving strips."""
     if len(strip) < 25 or strip[0] != 0x5A:
         return strip
     tag = struct.unpack_from("<H", strip, 7)[0]
@@ -395,12 +502,17 @@ def _remap_261c_strip_indices(
         search_start = 9
         if strip[9] == 0x5A and struct.unpack_from("<H", strip, 16)[0] == 0x261B:
             _t, _r, search_start = read_zchunk_at(strip, 9, expected_tag=0x261B)
-        p200b = find_zchunk_offset(strip, 0x200B, search_start)
-        if p200b < 0:
-            return strip
-        _t, _r, tail_off = read_zchunk_at(strip, p200b, expected_tag=0x200B)
+        p_view = -1
+        for view_tag in (0x200B, 0x200D, 0x200C, 0x2515, 0x4701, 0x2010):
+            p_view = find_zchunk_offset(strip, view_tag, search_start)
+            if p_view >= 0:
+                break
         buf = bytearray(strip)
-        _patch_200b_view_ordinal(buf, p200b, tail_off, track_ordinal_1based)
+        if tag in (0x2620, 0x2621):
+            _remap_midi_strip_index(buf, old_midi_to_new)
+        if p_view >= 0:
+            _t, _r, tail_off = read_zchunk_at(strip, p_view)
+            _patch_200b_view_ordinal(buf, p_view, tail_off, track_ordinal_1based)
         return bytes(buf)
     mid_off, active_pl, pl_cnt, stride, p200b, tail_off = _parse_261c_mid_gap(strip)
     buf = bytearray(strip)
@@ -426,12 +538,78 @@ def _remap_261c_strip_indices(
     return bytes(buf)
 
 
+def _require_control_ids(next_id: int) -> None:
+    if next_id + 10 > 0xFFFF_FFFE:
+        raise OverflowError(f"0x2624 control ID counter overflow: {next_id}")
+
+
+def _build_new_mixer_strip(nt: NewAudioTrackSpec, ord_1based: int, next_id: int) -> tuple[bytes, int]:
+    tt = nt.track_type
+    if tt == "Audio":
+        _require_control_ids(next_id)
+        return (
+            build_audio_mixer_strip_261c(
+                nt.track_name, nt.track_uuid16, nt.channels, nt.output_bus,
+                track_ordinal_1based=ord_1based, id_base=next_id,
+                playlist_index=nt.playlist_index, color_index=nt.color_index,
+                track_format=nt.track_format,
+            ),
+            next_id + 10,
+        )
+    if tt in ("Aux", "RoutingFolder"):
+        _require_control_ids(next_id)
+        return (
+            build_aux_or_rf_mixer_strip_261e(
+                nt.track_name, nt.track_uuid16, nt.channels, nt.output_bus,
+                is_routing_folder=(tt == "RoutingFolder"),
+                track_ordinal_1based=ord_1based, id_base=next_id,
+                color_index=nt.color_index, track_format=nt.track_format,
+            ),
+            next_id + 10,
+        )
+    if tt == "Master":
+        _require_control_ids(next_id)
+        return (
+            build_master_mixer_strip_261d(
+                nt.track_name, nt.track_uuid16, nt.channels, nt.output_bus,
+                track_ordinal_1based=ord_1based, id_base=next_id,
+                color_index=nt.color_index, track_format=nt.track_format,
+            ),
+            next_id + 10,
+        )
+    if tt == "Instrument":
+        _require_control_ids(next_id)
+        if nt.midi_index is None:
+            raise ValueError(f"Instrument track {nt.track_name!r} requires midi_index")
+        return (
+            build_instrument_mixer_strip_2621(
+                nt.track_name, nt.track_uuid16, nt.channels, nt.output_bus,
+                track_ordinal_1based=ord_1based, id_base=next_id,
+                midi_index=nt.midi_index, color_index=nt.color_index,
+            ),
+            next_id + 10,
+        )
+    if tt == "Midi":
+        if nt.midi_index is None:
+            raise ValueError(f"Midi track {nt.track_name!r} requires midi_index")
+        return build_midi_mixer_strip_2620(
+            nt.track_name, nt.track_uuid16,
+            track_ordinal_1based=ord_1based, midi_index=nt.midi_index, color_index=nt.color_index,
+        ), next_id
+    if tt == "Vca":
+        return build_vca_mixer_strip_261f(nt.track_name, nt.track_uuid16, track_ordinal_1based=ord_1based, color_index=nt.color_index), next_id
+    if tt == "BasicFolder":
+        return build_basic_folder_mixer_strip_263b(nt.track_name, nt.track_uuid16, track_ordinal_1based=ord_1based, color_index=nt.color_index), next_id
+    raise ValueError(f"Unsupported track_type for 0x2624 mixer strip synthesis: {tt!r}")
+
+
 def mutate_2624_mixer(
     c2624_raw: bytes,
     layout: Sequence[TrackSlotOp],
     *,
     expected_old_count: int | None = None,
     old_playlist_to_new: Mapping[int, int] | None = None,
+    old_midi_to_new: Mapping[int, int] | None = None,
 ) -> bytes:
     """Rebuild ``0x2624`` mixer strip container deterministically for *layout*."""
     if len(c2624_raw) < 13:
@@ -446,19 +624,14 @@ def mutate_2624_mixer(
     new_strips: list[bytes] = []
     for ord_1based, slot in enumerate(layout, start=1):
         if slot.old_index is not None:
-            new_strips.append(_remap_261c_strip_indices(old_strips[slot.old_index], old_playlist_to_new, ord_1based))
-        elif slot.new_track is not None:
-            nt = slot.new_track
-            if next_id + 10 > 0xFFFF_FFFE:
-                raise OverflowError(f"0x2624 control ID counter overflow: {next_id}")
             new_strips.append(
-                build_audio_mixer_strip_261c(
-                    nt.track_name, nt.track_uuid16, nt.channels, nt.output_bus,
-                    track_ordinal_1based=ord_1based, id_base=next_id,
-                    playlist_index=nt.playlist_index, color_index=nt.color_index,
+                _remap_261c_strip_indices(
+                    old_strips[slot.old_index], old_playlist_to_new, ord_1based, old_midi_to_new=old_midi_to_new,
                 )
             )
-            next_id += 10
+        elif slot.new_track is not None:
+            strip_bytes, next_id = _build_new_mixer_strip(slot.new_track, ord_1based, next_id)
+            new_strips.append(strip_bytes)
     body = struct.pack("<I", len(new_strips)) + b"".join(new_strips) + c2624_raw[end_pos:]
     return build_zchunk(0x2624, body, version=version)
 
@@ -516,6 +689,35 @@ def mutate_202b_groups_for_track_map(
         + trailer
     )
     return build_zchunk(0x202B, body, version=version)
+
+
+def mutate_2030_markers_for_track_map(
+    c2030_raw: bytes,
+    old_to_new: Mapping[int, int],
+) -> bytes:
+    """Remap Track marker ``track_index`` fields in ``0x2030`` and drop markers on deleted tracks."""
+    if len(c2030_raw) < 13:
+        return c2030_raw
+    ver = struct.unpack_from("<H", c2030_raw, 1)[0]
+    cnt = struct.unpack_from("<I", c2030_raw, 9)[0]
+    if cnt == 0:
+        return c2030_raw
+    items, end_pos = walk_sequential_zchunks(c2030_raw, 13, cnt, expected_tag=0x2077)
+    kept: list[bytes] = []
+    for item in items:
+        p4826 = find_zchunk_offset(item, 0x4826, 9)
+        if p4826 >= 35:
+            old_tidx = struct.unpack_from("<i", item, p4826 - 4)[0]
+            if old_tidx >= 0:
+                if old_tidx not in old_to_new:
+                    continue
+                new_tidx = old_to_new[old_tidx]
+                if new_tidx != old_tidx:
+                    mbuf = bytearray(item)
+                    struct.pack_into("<i", mbuf, p4826 - 4, new_tidx)
+                    item = bytes(mbuf)
+        kept.append(item)
+    return build_zchunk(0x2030, struct.pack("<I", len(kept)) + b"".join(kept) + c2030_raw[end_pos:], version=ver)
 
 
 def _split_session_dir_parts(session_dir: Path) -> tuple[str, list[str]]:
@@ -703,6 +905,8 @@ def mutate_262a_clips(c262a_raw: bytes, new_clips: Sequence[ClipWriteSpec]) -> b
             c.clip_name, c.length_samples,
             audio_file_index=c.audio_file_index, channel_index=c.channel_index,
             clip_guid16=c.clip_guid16, pt_uuid16=c.pt_uuid16,
+            start_sample=c.start_sample, sync_point_samples=c.sync_point_samples,
+            orig_timestamp=c.orig_timestamp, user_timestamp=c.user_timestamp,
         )
         for c in new_clips
     ]
@@ -729,9 +933,10 @@ def _extract_counted_items_and_trailer(
 
 
 def _parse_playlist_1014_meta(raw_1014: bytes) -> tuple[str, int, tuple[int, ...], int]:
-    """Return ``(name, is_stereo_byte, lane_indices, lane_array_offset)`` for a ``0x1014`` chunk."""
+    """Return ``(name, is_stereo_byte, all_lane_indices, lane_array_offset)`` for a ``0x1014`` chunk (incl. 7.1.2/7.1.4)."""
     if len(raw_1014) < 18 or raw_1014[0] != 0x5A:
         raise RuntimeError("Truncated 0x1014 playlist chunk")
+    ver = struct.unpack_from("<H", raw_1014, 1)[0]
     nlen = struct.unpack_from("<I", raw_1014, 9)[0]
     st_off = 13 + nlen
     if st_off + 5 > len(raw_1014):
@@ -742,12 +947,24 @@ def _parse_playlist_1014_meta(raw_1014: bytes) -> tuple[str, int, tuple[int, ...
     arr_off = st_off + 5
     if lcnt > (len(raw_1014) - arr_off) // 2:
         raise RuntimeError(f"Truncated 0x1014 lane array for playlist {name!r}")
-    lanes = struct.unpack_from(f"<{lcnt}H", raw_1014, arr_off) if lcnt else ()
-    return name, is_st, lanes, arr_off
+    lanes = list(struct.unpack_from(f"<{lcnt}H", raw_1014, arr_off)) if lcnt else []
+    ext_hdr_off = arr_off + lcnt * 2 + 16
+    if ver >= 9 and ext_hdr_off + 7 <= len(raw_1014):
+        ext_a, ext_b, extra_cnt = struct.unpack_from("<HBI", raw_1014, ext_hdr_off)
+        p_ext = ext_hdr_off + 7
+        if ext_b == 0x11 and 0 < extra_cnt <= 32 and p_ext + extra_cnt * 2 <= len(raw_1014):
+            lanes.extend(struct.unpack_from(f"<{extra_cnt}H", raw_1014, p_ext))
+        elif ext_a == 0x0A and ext_b == 0x0E and extra_cnt == 0:
+            p_hi = p_ext + lcnt * 4
+            if p_hi + 5 <= len(raw_1014) and raw_1014[p_hi] == 0x1E:
+                h_cnt = struct.unpack_from("<I", raw_1014, p_hi + 1)[0]
+                if 0 < h_cnt <= 32 and p_hi + 5 + h_cnt * 4 <= len(raw_1014):
+                    lanes.extend(struct.unpack_from(f"<{h_cnt}I", raw_1014, p_hi + 5))
+    return name, is_st, tuple(lanes), arr_off
 
 
 def _remap_playlist_1014_lanes(raw_1014: bytes, old_lane_to_new: Mapping[int, int]) -> bytes:
-    """Remap both ``<H`` and v9 trailing ``<I`` lane indices in a surviving ``0x1014`` playlist."""
+    """Remap all ``<H`` and v9 trailing ``<I`` lane indices (including 7.1.2 / 7.1.4 height lanes)."""
     name, _is_st, old_lanes, arr_off = _parse_playlist_1014_meta(raw_1014)
     missing = [li for li in old_lanes if li not in old_lane_to_new]
     if missing:
@@ -758,12 +975,28 @@ def _remap_playlist_1014_lanes(raw_1014: bytes, old_lane_to_new: Mapping[int, in
     if any(not (0 <= li <= 0xFFFF) for li in new_lanes):
         raise OverflowError(f"Remapped 0x1014 lane index out of u16 range for playlist {name!r}")
     buf = bytearray(raw_1014)
-    struct.pack_into(f"<{len(new_lanes)}H", buf, arr_off, *new_lanes)
+    lcnt = struct.unpack_from("<I", buf, arr_off - 4)[0]
+    struct.pack_into(f"<{lcnt}H", buf, arr_off, *new_lanes[:lcnt])
     ver = struct.unpack_from("<H", buf, 1)[0]
-    tail_off = arr_off + len(old_lanes) * 2 + 16 + 7  # after <H array + 16B UUID + 7B header
-    if ver >= 9 and old_lanes and tail_off + len(old_lanes) * 4 <= len(buf):
-        if struct.unpack_from(f"<{len(old_lanes)}I", buf, tail_off) == old_lanes:
-            struct.pack_into(f"<{len(new_lanes)}I", buf, tail_off, *new_lanes)
+    ext_hdr_off = arr_off + lcnt * 2 + 16
+    if ver >= 9 and old_lanes and ext_hdr_off + 7 <= len(buf):
+        ext_a, ext_b, extra_cnt = struct.unpack_from("<HBI", buf, ext_hdr_off)
+        p_ext = ext_hdr_off + 7
+        if ext_b == 0x11 and extra_cnt == len(old_lanes) - lcnt:
+            struct.pack_into(f"<{extra_cnt}H", buf, p_ext, *new_lanes[lcnt:])
+            p_i = p_ext + extra_cnt * 2
+            if p_i + len(old_lanes) * 4 <= len(buf) and struct.unpack_from(f"<{len(old_lanes)}I", buf, p_i) == old_lanes:
+                struct.pack_into(f"<{len(new_lanes)}I", buf, p_i, *new_lanes)
+        elif ext_a == 0x0A and ext_b == 0x0E and extra_cnt == 0 and len(old_lanes) > lcnt:
+            if p_ext + lcnt * 4 <= len(buf) and struct.unpack_from(f"<{lcnt}I", buf, p_ext) == old_lanes[:lcnt]:
+                struct.pack_into(f"<{lcnt}I", buf, p_ext, *new_lanes[:lcnt])
+            p_hi = p_ext + lcnt * 4
+            if p_hi + 5 <= len(buf) and buf[p_hi] == 0x1E:
+                h_cnt = struct.unpack_from("<I", buf, p_hi + 1)[0]
+                if h_cnt == len(old_lanes) - lcnt and p_hi + 5 + h_cnt * 4 <= len(buf):
+                    struct.pack_into(f"<{h_cnt}I", buf, p_hi + 5, *new_lanes[lcnt:])
+        elif p_ext + len(old_lanes) * 4 <= len(buf) and struct.unpack_from(f"<{len(old_lanes)}I", buf, p_ext) == old_lanes:
+            struct.pack_into(f"<{len(new_lanes)}I", buf, p_ext, *new_lanes)
     return bytes(buf)
 
 
@@ -853,14 +1086,16 @@ def mutate_1015_and_1054_media(
     """Rebuild ``0x1015`` playlists & ``0x1054`` lanes by appending *new_tracks* after surviving entries."""
     ver_1015 = struct.unpack_from("<H", c1015_raw, 1)[0]
     ver_1054 = struct.unpack_from("<H", c1054_raw, 1)[0]
+    audio_tracks = [nt for nt in new_tracks if nt.track_type == "Audio"]
     added_playlists = [
         build_playlist_1014_v9(
-            nt.track_name, nt.lane_indices, nt.playlist_uuid16, is_stereo=(nt.channels >= 2),
+            nt.track_name, nt.lane_indices, nt.playlist_uuid16,
+            is_stereo=(nt.channels >= 2), track_format=nt.track_format,
         )
-        for nt in new_tracks
+        for nt in audio_tracks
     ]
     added_lanes: list[bytes] = []
-    for nt in new_tracks:
+    for nt in audio_tracks:
         if nt.clip_indices and len(nt.clip_indices) != len(nt.lane_indices):
             raise ValueError(
                 f"Track {nt.track_name!r} clip_indices count ({len(nt.clip_indices)}) != lane_indices count ({len(nt.lane_indices)})"
@@ -870,7 +1105,7 @@ def mutate_1015_and_1054_media(
                 added_lanes.append(
                     serialize_lane_1052(
                         nt.track_name,
-                        [(clip_idx, nt.start_sample, 3, 0xFFFE)],
+                        [(clip_idx, nt.start_sample, 3, nt.clip_color_index, nt.clip_muted, nt.clip_time_locked, nt.clip_edit_locked)],
                         wrap_1050=True, wrap_version=3, lane_version=3,
                     )
                 )
@@ -890,3 +1125,65 @@ def mutate_1015_and_1054_media(
         0x1054, struct.pack("<I", len(all_lanes)) + b"".join(all_lanes) + survival.c4828_trailer, version=ver_1054,
     )
     return out_1015, out_1054
+
+
+def plan_existing_midi_survival(
+    c1058_raw: bytes,
+    c2624_raw: bytes,
+    deleted_old_indices: Sequence[int],
+) -> MidiSurvivalPlan:
+    """Compact existing ``0x1057`` MIDI entries for any deleted template MIDI/Instrument tracks."""
+    if len(c1058_raw) < 13:
+        return MidiSurvivalPlan(entries=(), old_midi_to_new={}, trailer=b"")
+    old_cnt = struct.unpack_from("<I", c1058_raw, 9)[0]
+    old_entries, end_pos = _walk_sequential_zchunks(c1058_raw, 13, old_cnt, expected_tag=0x1057)
+    trailer = c1058_raw[end_pos:]
+    if not old_entries or not deleted_old_indices or len(c2624_raw) < 13:
+        return MidiSurvivalPlan(
+            entries=tuple(old_entries),
+            old_midi_to_new={i: i for i in range(len(old_entries))},
+            trailer=trailer,
+        )
+    s_cnt = struct.unpack_from("<I", c2624_raw, 9)[0]
+    old_strips, _ = _walk_sequential_zchunks(c2624_raw, 13, s_cnt)
+    del_set = set(deleted_old_indices)
+    dropped: set[int] = set()
+    surviving: set[int] = set()
+    for idx, strip in enumerate(old_strips):
+        off = _find_midi_strip_index_offset(strip)
+        if off is not None:
+            midx = struct.unpack_from("<I", strip, off)[0]
+            (dropped if idx in del_set else surviving).add(midx)
+    removable = dropped - surviving
+    kept: list[bytes] = []
+    old_to_new: dict[int, int] = {}
+    for i, entry in enumerate(old_entries):
+        if i in removable:
+            continue
+        old_to_new[i] = len(kept)
+        kept.append(entry)
+    return MidiSurvivalPlan(entries=tuple(kept), old_midi_to_new=old_to_new, trailer=trailer)
+
+
+def mutate_1058_midi_tracks(
+    c1058_raw: bytes,
+    new_tracks: Sequence[NewAudioTrackSpec],
+    *,
+    midi_survival: MidiSurvivalPlan | None = None,
+) -> bytes:
+    """Rebuild ``0x1058`` with surviving and newly synthesized MIDI/Instrument ``0x1057`` entries."""
+    if len(c1058_raw) < 13:
+        raise RuntimeError("Truncated 0x1058 MIDI playlist container chunk")
+    version = struct.unpack_from("<H", c1058_raw, 1)[0]
+    if midi_survival is not None:
+        base_entries = list(midi_survival.entries)
+        trailer = midi_survival.trailer
+    else:
+        old_count = struct.unpack_from("<I", c1058_raw, 9)[0]
+        base_entries, end_pos = _walk_sequential_zchunks(c1058_raw, 13, old_count, expected_tag=0x1057)
+        trailer = c1058_raw[end_pos:]
+    midi_tracks = [nt for nt in new_tracks if nt.track_type in ("Midi", "Instrument")]
+    added = [build_midi_track_1057(nt.track_name, nt.midi_uuid16) for nt in midi_tracks]
+    all_entries = [*base_entries, *added]
+    body = struct.pack("<I", len(all_entries)) + b"".join(all_entries) + trailer
+    return build_zchunk(0x1058, body, version=version)

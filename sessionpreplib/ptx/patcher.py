@@ -780,8 +780,10 @@ def _validate_patched_ptx(original_bytes: bytes, patched_bytes: bytes) -> None:
     new_chunks = iter_top_chunks(new_dec, strict=True)
     orig_tags = {c.tag for c in orig_chunks}
     new_tags = {c.tag for c in new_chunks}
-    if orig_tags != new_tags:
-        raise RuntimeError(f"Patched .ptx top-level chunk tags changed: missing={orig_tags - new_tags}")
+    missing_tags = orig_tags - new_tags
+    extra_tags = new_tags - orig_tags - {0x2630}
+    if missing_tags or extra_tags:
+        raise RuntimeError(f"Patched .ptx top-level chunk tags changed: missing={missing_tags}, extra={extra_tags}")
     orig_has_idx = any(c.tag == 0x0002 for c in orig_chunks)
     if orig_has_idx and not validate_index_0002(new_dec):
         raise RuntimeError("Patched .ptx lost valid 0x0002 chunk offset index")

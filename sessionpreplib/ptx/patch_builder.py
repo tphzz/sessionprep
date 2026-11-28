@@ -19,6 +19,16 @@ from .patcher import (
     patch_slot_a_trim_gains,
     patch_track_volumes,
 )
+from .patcher_extended import (
+    patch_add_fade,
+    patch_add_marker,
+    patch_clip_attributes,
+    patch_delete_marker,
+    patch_rename_clips,
+    patch_rename_tracks,
+    patch_session_settings,
+    patch_track_states,
+)
 
 _UNSET: Any = object()
 _StepFn = Callable[[bytes, dict[str, Any]], bytes]
@@ -31,6 +41,13 @@ def _empty_summary() -> dict[str, Any]:
         "slot_a_trims": {},
         "volumes": {},
         "groups": [],
+        "session_settings": {},
+        "track_states": {},
+        "renamed_tracks": {},
+        "renamed_clips": {},
+        "clip_attributes": [],
+        "fades": [],
+        "markers": [],
     }
 
 
@@ -216,6 +233,181 @@ class PtxPatchBuilder:
         def _step(cur: bytes, summary: dict[str, Any]) -> bytes:
             nxt, info = patch_delete_group(cur, name)
             summary["groups"].append(info)
+            return nxt
+
+        self._steps.append(_step)
+        return self
+
+    def set_session_settings(
+        self,
+        *,
+        sample_rate: int | None = None,
+        bit_depth: int | None = None,
+        audio_format: str | None = None,
+        is_interleaved: bool | None = None,
+        audio_pull_rate: str | None = None,
+        video_pull_rate: str | None = None,
+        fps_code: int | None = None,
+        start_frames: int | None = None,
+        feet_frames_rate: str | None = None,
+        session_length: str | None = None,
+        main_counter_format: str | None = None,
+        sub_counter_format: str | None = None,
+        edit_mode: str | None = None,
+        grid_relative: bool | None = None,
+        edit_tool: str | None = None,
+        smart_tool_enabled: bool | None = None,
+        pre_roll_enabled: bool | None = None,
+        pre_roll_samples: int | None = None,
+        post_roll_enabled: bool | None = None,
+        post_roll_samples: int | None = None,
+        timeline_in_sample: int | None = None,
+        timeline_out_sample: int | None = None,
+    ) -> PtxPatchBuilder:
+        def _step(cur: bytes, summary: dict[str, Any]) -> bytes:
+            nxt, res = patch_session_settings(
+                cur,
+                sample_rate=sample_rate, bit_depth=bit_depth, audio_format=audio_format,
+                is_interleaved=is_interleaved, audio_pull_rate=audio_pull_rate,
+                video_pull_rate=video_pull_rate, fps_code=fps_code, start_frames=start_frames,
+                feet_frames_rate=feet_frames_rate, session_length=session_length,
+                main_counter_format=main_counter_format, sub_counter_format=sub_counter_format,
+                edit_mode=edit_mode, grid_relative=grid_relative, edit_tool=edit_tool,
+                smart_tool_enabled=smart_tool_enabled, pre_roll_enabled=pre_roll_enabled,
+                pre_roll_samples=pre_roll_samples, post_roll_enabled=post_roll_enabled,
+                post_roll_samples=post_roll_samples, timeline_in_sample=timeline_in_sample,
+                timeline_out_sample=timeline_out_sample,
+            )
+            summary["session_settings"].update(res)
+            return nxt
+
+        self._steps.append(_step)
+        return self
+
+    def set_track_states(self, track_states: Mapping[str, Mapping[str, Any]]) -> PtxPatchBuilder:
+        copied = {k: dict(v) for k, v in track_states.items()}
+        if not copied:
+            return self
+
+        def _step(cur: bytes, summary: dict[str, Any]) -> bytes:
+            nxt, res = patch_track_states(cur, copied)
+            for k, v in res.items():
+                summary["track_states"].setdefault(k, {}).update(v)
+            return nxt
+
+        self._steps.append(_step)
+        return self
+
+    def rename_tracks(self, renames: Mapping[str, str]) -> PtxPatchBuilder:
+        copied = dict(renames)
+        if not copied:
+            return self
+
+        def _step(cur: bytes, summary: dict[str, Any]) -> bytes:
+            nxt, res = patch_rename_tracks(cur, copied)
+            summary["renamed_tracks"].update(res)
+            return nxt
+
+        self._steps.append(_step)
+        return self
+
+    def rename_clips(self, renames: Mapping[str, str]) -> PtxPatchBuilder:
+        copied = dict(renames)
+        if not copied:
+            return self
+
+        def _step(cur: bytes, summary: dict[str, Any]) -> bytes:
+            nxt, res = patch_rename_clips(cur, copied)
+            summary["renamed_clips"].update(res)
+            return nxt
+
+        self._steps.append(_step)
+        return self
+
+    def set_clip_attributes(
+        self,
+        track_name: str,
+        start_sample: int,
+        *,
+        is_muted: bool | None = None,
+        is_time_locked: bool | None = None,
+        is_edit_locked: bool | None = None,
+        color_index: int | None = None,
+    ) -> PtxPatchBuilder:
+        def _step(cur: bytes, summary: dict[str, Any]) -> bytes:
+            nxt, info = patch_clip_attributes(
+                cur, track_name, start_sample,
+                is_muted=is_muted, is_time_locked=is_time_locked,
+                is_edit_locked=is_edit_locked, color_index=color_index,
+            )
+            summary["clip_attributes"].append(info)
+            return nxt
+
+        self._steps.append(_step)
+        return self
+
+    def add_fade(
+        self,
+        track_name: str,
+        fade_type: str,
+        start_sample: int,
+        total_samples: int,
+        *,
+        pre_samples: int | None = None,
+        shape: str = "standard",
+        crossfade_link: str = "equal_power",
+    ) -> PtxPatchBuilder:
+        def _step(cur: bytes, summary: dict[str, Any]) -> bytes:
+            nxt, info = patch_add_fade(
+                cur, track_name, fade_type, start_sample, total_samples,
+                pre_samples=pre_samples, shape=shape, crossfade_link=crossfade_link,
+            )
+            summary["fades"].append(info)
+            return nxt
+
+        self._steps.append(_step)
+        return self
+
+    def add_marker(
+        self,
+        name: str,
+        start_pos: int,
+        *,
+        number: int | None = None,
+        end_pos: int | None = None,
+        reference: str = "Absolute",
+        time_properties: str = "Marker",
+        comments: str = "",
+        color_index: int = 0,
+        color_rgb: tuple[int, int, int] | None = None,
+        track: str | int | None = None,
+        zoom_settings: bool = False,
+        pre_post_roll_times: bool = False,
+        track_visibility: bool = False,
+        track_heights: bool = False,
+        group_enables: bool = False,
+        window_configuration: bool = False,
+    ) -> PtxPatchBuilder:
+        def _step(cur: bytes, summary: dict[str, Any]) -> bytes:
+            nxt, info = patch_add_marker(
+                cur, name, start_pos,
+                number=number, end_pos=end_pos, reference=reference,
+                time_properties=time_properties, comments=comments,
+                color_index=color_index, color_rgb=color_rgb, track=track,
+                zoom_settings=zoom_settings, pre_post_roll_times=pre_post_roll_times,
+                track_visibility=track_visibility, track_heights=track_heights,
+                group_enables=group_enables, window_configuration=window_configuration,
+            )
+            summary["markers"].append(info)
+            return nxt
+
+        self._steps.append(_step)
+        return self
+
+    def delete_marker(self, number: int) -> PtxPatchBuilder:
+        def _step(cur: bytes, summary: dict[str, Any]) -> bytes:
+            nxt, info = patch_delete_marker(cur, number)
+            summary["markers"].append(info)
             return nxt
 
         self._steps.append(_step)

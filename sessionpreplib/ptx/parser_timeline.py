@@ -17,10 +17,16 @@ from .codec import (
     read_lp_str,
 )
 from .models import (
+    COUNTER_FORMAT_MAP,
     CROSSFADE_LINK_MAP,
+    EDIT_MODE_MAP,
+    EDIT_TOOL_MAP,
     FADE_SHAPE_MAP,
     FADE_TYPE_MAP,
+    FEET_FRAMES_RATE_MAP,
     FPS_CODE_MAP,
+    MARKER_GENERAL_PROP_BITS,
+    MARKER_REFERENCE_MAP,
     MARKER_TIME_PROPS,
     MIDI_CONTROL_LANE_TYPE_MAP,
     TICK_MASK_56,
@@ -87,6 +93,52 @@ def parse_session_start_204d(raw: bytes, info: PtxSessionInfo) -> None:
         info.is_drop_frame = is_drop
         info.start_seconds = round(start_frames / real_fps, 6)
         info.start_timecode = format_timecode(start_frames, fps_code)
+    if len(body) > 17:
+        info.feet_frames_rate = FEET_FRAMES_RATE_MAP.get(body[17], "")
+    if len(body) >= 40 and struct.unpack_from("<I", body, 25)[0] == 11:
+        raw_len = body[29:40].decode("ascii", errors="replace")
+        if re.match(r"^\d{2}:\d{2}:\d{2}[:;]\d{2}$", raw_len):
+            info.session_length_timecode = raw_len
+
+
+def parse_session_ui_state(chunk_map: dict[int, PtxChunk], info: PtxSessionInfo) -> None:
+    """Populate counters, edit mode/tool, pre/post roll, and timeline selection from UI chunks."""
+    c2024 = chunk_map.get(0x2024)
+    if c2024 and len(c2024.body) >= 2:
+        info.edit_mode = EDIT_MODE_MAP.get(c2024.body[0], info.edit_mode)
+        info.main_counter_format = COUNTER_FORMAT_MAP.get(c2024.body[1], info.main_counter_format)
+    c2056 = chunk_map.get(0x2056)
+    if c2056 and len(c2056.body) >= 22:
+        info.smart_tool_enabled = bool(c2056.body[0])
+        info.edit_tool = EDIT_TOOL_MAP.get(c2056.body[13], info.edit_tool)
+        if not info.edit_mode:
+            info.edit_mode = EDIT_MODE_MAP.get(c2056.body[17], info.edit_mode)
+        if not info.main_counter_format:
+            info.main_counter_format = COUNTER_FORMAT_MAP.get(c2056.body[21], info.main_counter_format)
+    c201f = chunk_map.get(0x201F)
+    if c201f and len(c201f.body) > 32:
+        info.sub_counter_format = COUNTER_FORMAT_MAP.get(c201f.body[32], info.sub_counter_format)
+    c2025 = chunk_map.get(0x2025)
+    if c2025 and len(c2025.body) >= 18:
+        b25 = c2025.body
+        info.pre_roll_enabled = bool(b25[0])
+        info.pre_roll_samples = struct.unpack_from("<Q", b25, 1)[0] & TICK_MASK_56
+        info.post_roll_enabled = bool(b25[9])
+        info.post_roll_samples = struct.unpack_from("<Q", b25, 10)[0] & TICK_MASK_56
+    c2016 = chunk_map.get(0x2016)
+    if c2016 and len(c2016.body) >= 126:
+        b16 = c2016.body
+        if not info.sub_counter_format:
+            info.sub_counter_format = COUNTER_FORMAT_MAP.get(b16[125], info.sub_counter_format)
+        raw_in, raw_out = struct.unpack_from("<QQ", b16, 80)
+        if (raw_in >> 56) != 0x40 and (raw_out >> 56) != 0x40:
+            info.timeline_in_sample = raw_in
+            info.timeline_out_sample = raw_out
+        if len(b16) >= 1774:
+            info.grid_relative = bool(b16[len(b16) - 45])
+    c2066 = chunk_map.get(0x2066)
+    if c2066 and len(c2066.body) > 266 and not info.grid_relative:
+        info.grid_relative = bool(c2066.body[266])
 
 
 def parse_tempo_2028(raw: bytes) -> tuple[list[PtxTempoEvent], int, float | None]:
@@ -164,7 +216,12 @@ def parse_meter_2029(raw: bytes) -> list[PtxMeterEvent]:
     return meters
 
 
-def parse_markers_2030(chunks: list[PtxChunk], sample_rate: int) -> list[PtxMarker]:
+def parse_markers_2030(
+    chunks: list[PtxChunk],
+    sample_rate: int,
+    *,
+    tracks: list[PtxTrack] | None = None,
+) -> list[PtxMarker]:
     """Decode Memory Locations / Markers from ``0x2030`` -> ``0x2077`` chunks."""
     markers: list[PtxMarker] = []
     seen: set[tuple[int, str, int, int]] = set()
@@ -172,7 +229,7 @@ def parse_markers_2030(chunks: list[PtxChunk], sample_rate: int) -> list[PtxMark
         targets = [ch.raw] if ch.tag == 0x2030 else find_subchunks(ch.raw, 0x2030)
         for m_raw in targets:
             for sub in find_subchunks(m_raw, 0x2077):
-                marker = _decode_marker_2077(sub, sample_rate)
+                marker = _decode_marker_2077(sub, sample_rate, tracks=tracks)
                 if marker is None:
                     continue
                 key = (marker.number, marker.name, marker.start_sample, marker.end_sample)
@@ -183,32 +240,70 @@ def parse_markers_2030(chunks: list[PtxChunk], sample_rate: int) -> list[PtxMark
     return markers
 
 
-def _decode_marker_2077(sub: bytes, sample_rate: int) -> PtxMarker | None:
-    if len(sub) < 35:
-        return None
-    num = struct.unpack_from("<H", sub, 9)[0]
-    tprop = MARKER_TIME_PROPS.get(sub[11], f"Prop_{sub[11]}")
-    ref = "Absolute" if sub[12] == 1 else "BarBeat"
-    mname, off = read_lp_str(sub, 15, max_len=256)
-    if off + 16 > len(sub):
-        return None
-    start_smp, end_smp = struct.unpack_from("<QQ", sub, off)
+def _decode_marker_extras(
+    sub: bytes,
+    off: int,
+) -> tuple[str, int | None, tuple[int, int, int] | None, int | None]:
     comments = ""
+    color_idx: int | None = None
+    color_rgb: tuple[int, int, int] | None = None
+    track_idx: int | None = None
     s2506 = find_subchunks(sub, 0x2506)
     if s2506:
+        first_p = sub.find(s2506[0], off + 16)
+        if first_p >= off + 22:
+            color_idx = struct.unpack_from("<H", sub, first_p - 6)[0]
         last_end = sub.rfind(s2506[-1]) + len(s2506[-1])
         if last_end + 8 <= len(sub):
             comments, _ = read_lp_str(sub, last_end + 4, max_len=1024)
+    s4826 = find_subchunks(sub, 0x4826)
+    if s4826:
+        p4826 = sub.find(s4826[0], off + 16)
+        if p4826 >= off + 20:
+            cand_trk = struct.unpack_from("<i", sub, p4826 - 4)[0]
+            if cand_trk >= 0:
+                track_idx = cand_trk
+        b4826 = s4826[0]
+        if len(b4826) >= 16 and b4826[9] == 1:
+            color_rgb = (b4826[11], b4826[13], b4826[15])
+    return comments, color_idx, color_rgb, track_idx
+
+
+def _decode_marker_2077(
+    sub: bytes,
+    sample_rate: int,
+    *,
+    tracks: list[PtxTrack] | None = None,
+) -> PtxMarker | None:
+    if len(sub) < 35:
+        return None
+    num = struct.unpack_from("<H", sub, 9)[0]
+    ref_bits = sub[11]
+    ref = MARKER_REFERENCE_MAP.get(ref_bits & 0x03, f"Ref_{ref_bits & 0x03}")
+    tprop = MARKER_TIME_PROPS.get(sub[12], f"Prop_{sub[12]}")
+    mname, off = read_lp_str(sub, 15, max_len=256)
+    if off + 16 > len(sub):
+        return None
+    raw_start, raw_end = struct.unpack_from("<QQ", sub, off)
+    is_tick = (raw_start >> 56) == 0x40
+    start_pos = (raw_start & TICK_MASK_56) if is_tick else raw_start
+    end_pos = (raw_end & TICK_MASK_56) if (raw_end >> 56) == 0x40 else raw_end
+    comments, color_idx, color_rgb, track_idx = _decode_marker_extras(sub, off)
+    track_name = tracks[track_idx].name if (track_idx is not None and tracks and track_idx < len(tracks)) else ""
+    location = "Track" if track_idx is not None else "MainRuler"
+    start_sec = round(start_pos / sample_rate, 4) if (sample_rate > 0 and not is_tick) else None
+    end_sec = round(end_pos / sample_rate, 4) if (sample_rate > 0 and end_pos > 0 and not is_tick) else None
     return PtxMarker(
-        number=num,
-        name=mname,
-        start_sample=start_smp,
-        end_sample=end_smp,
-        time_properties=tprop,
-        reference=ref,
-        comments=comments,
-        start_seconds=round(start_smp / sample_rate, 4) if sample_rate > 0 else None,
-        end_seconds=round(end_smp / sample_rate, 4) if (sample_rate > 0 and end_smp > 0) else None,
+        number=num, name=mname, start_sample=start_pos, end_sample=end_pos,
+        time_properties=tprop, reference=ref, comments=comments,
+        start_seconds=start_sec, end_seconds=end_sec, color_index=color_idx,
+        color_rgb=color_rgb, location=location, track_index=track_idx, track_name=track_name,
+        zoom_settings=bool(ref_bits & MARKER_GENERAL_PROP_BITS["zoom_settings"]),
+        pre_post_roll_times=bool(ref_bits & MARKER_GENERAL_PROP_BITS["pre_post_roll_times"]),
+        track_visibility=bool(ref_bits & MARKER_GENERAL_PROP_BITS["track_visibility"]),
+        track_heights=bool(ref_bits & MARKER_GENERAL_PROP_BITS["track_heights"]),
+        group_enables=bool(ref_bits & MARKER_GENERAL_PROP_BITS["group_enables"]),
+        window_configuration=bool(ref_bits & MARKER_GENERAL_PROP_BITS["window_configuration"]),
     )
 
 
@@ -674,14 +769,19 @@ def _decode_lane_event(
         cname = clip_obj.name if clip_obj else f"clip_{idx}"
         afname = clip_obj.audio_file_name if clip_obj else ""
         clen = (clip_obj.timeline_length_samples or clip_obj.length_samples) if clip_obj else 0
+    is_edit_locked = bool(s4f[10])
+    is_time_locked = (len(s4f) > 39 and bool(s4f[39])) or is_edit_locked
+    is_muted = bool(s4f[9]) or (flags != 0 and (flags & 2) == 0)
     lane_clips.append(
         PtxClipPlacement(
             0, idx, cname, afname, start_smp, clen, start_smp + clen, color_idx,
             start_seconds=round(start_smp / sample_rate, 4) if sample_rate > 0 else None,
             duration_seconds=round(clen / sample_rate, 4) if (sample_rate > 0 and clen > 0) else None,
             flags=flags,
-            is_muted=(flags != 0 and (flags & 2) == 0),
+            is_muted=is_muted,
             is_covered=(flags != 0 and (flags & 1) == 0),
+            is_time_locked=is_time_locked,
+            is_edit_locked=is_edit_locked,
             is_compound=is_comp,
             loop_count=loop_count,
             has_clip_gain_automation=clip_obj.has_clip_gain_automation if clip_obj else False,
@@ -722,6 +822,29 @@ def parse_playlists_1015(
     return playlists
 
 
+def _extract_playlist_1014_lanes(s14: bytes, off: int) -> tuple[list[int], int, str]:
+    ch_count = struct.unpack_from("<I", s14, off + 1)[0]
+    lp = off + 5
+    lane_idxs = list(struct.unpack_from(f"<{ch_count}H", s14, lp)) if (0 < ch_count <= 64 and lp + 2 * ch_count <= len(s14)) else []
+    uoff = s14.find(UUID_PREFIX, lp + 2 * len(lane_idxs))
+    pl_uuid = format_ptsl_uuid(s14[uoff : uoff + 16]) if (uoff != -1 and uoff + 16 <= len(s14)) else ""
+    ver = struct.unpack_from("<H", s14, 1)[0] if len(s14) >= 3 else 0
+    if ver >= 9 and uoff != -1 and uoff + 23 <= len(s14):
+        ext_a, ext_b, extra_cnt = struct.unpack_from("<HBI", s14, uoff + 16)
+        p_ext = uoff + 23
+        if ext_b == 0x11 and 0 < extra_cnt <= 32 and p_ext + 2 * extra_cnt <= len(s14):
+            lane_idxs.extend(struct.unpack_from(f"<{extra_cnt}H", s14, p_ext))
+            ch_count = len(lane_idxs)
+        elif ext_a == 0x0A and ext_b == 0x0E and extra_cnt == 0:
+            p_hi = p_ext + 4 * len(lane_idxs)
+            if p_hi + 5 <= len(s14) and s14[p_hi] == 0x1E:
+                h_cnt = struct.unpack_from("<I", s14, p_hi + 1)[0]
+                if 0 < h_cnt <= 32 and p_hi + 5 + 4 * h_cnt <= len(s14):
+                    lane_idxs.extend(struct.unpack_from(f"<{h_cnt}I", s14, p_hi + 5))
+                    ch_count = len(lane_idxs)
+    return lane_idxs, (ch_count if ch_count <= 64 else len(lane_idxs)), pl_uuid
+
+
 def _decode_playlist_1014(
     index: int,
     s14: bytes,
@@ -730,11 +853,7 @@ def _decode_playlist_1014(
     pname, off = read_lp_str(s14, 9, max_len=256)
     if not pname or off + 5 > len(s14):
         return None
-    ch_count = struct.unpack_from("<I", s14, off + 1)[0]
-    lp = off + 5
-    lane_idxs = list(struct.unpack_from(f"<{ch_count}H", s14, lp)) if (0 < ch_count <= 64 and lp + 2 * ch_count <= len(s14)) else []
-    uoff = s14.find(UUID_PREFIX, lp)
-    pl_uuid = format_ptsl_uuid(s14[uoff : uoff + 16]) if (uoff != -1 and uoff + 16 <= len(s14)) else ""
+    lane_idxs, ch_count, pl_uuid = _extract_playlist_1014_lanes(s14, off)
     placements: list[PtxClipPlacement] = []
     fade_placements: list[PtxFadePlacement] = []
     for ch_i, lidx in enumerate(lane_idxs):
@@ -742,12 +861,27 @@ def _decode_playlist_1014(
             for plc in lanes[lidx][1]:
                 placements.append(
                     PtxClipPlacement(
-                        ch_i, plc.clip_index, plc.clip_name, plc.audio_file_name,
-                        plc.start_sample, plc.length_samples, plc.end_sample, plc.color_index,
-                        plc.start_seconds, plc.duration_seconds, plc.flags,
-                        plc.is_muted, plc.is_covered, plc.is_compound, plc.loop_count,
-                        plc.has_clip_gain_automation, list(plc.clip_gain_breakpoints),
-                        plc.ara_plugin_name, plc.ara_modification_uuid,
+                        channel=ch_i,
+                        clip_index=plc.clip_index,
+                        clip_name=plc.clip_name,
+                        audio_file_name=plc.audio_file_name,
+                        start_sample=plc.start_sample,
+                        length_samples=plc.length_samples,
+                        end_sample=plc.end_sample,
+                        color_index=plc.color_index,
+                        start_seconds=plc.start_seconds,
+                        duration_seconds=plc.duration_seconds,
+                        flags=plc.flags,
+                        is_muted=plc.is_muted,
+                        is_covered=plc.is_covered,
+                        is_time_locked=plc.is_time_locked,
+                        is_edit_locked=plc.is_edit_locked,
+                        is_compound=plc.is_compound,
+                        loop_count=plc.loop_count,
+                        has_clip_gain_automation=plc.has_clip_gain_automation,
+                        clip_gain_breakpoints=list(plc.clip_gain_breakpoints),
+                        ara_plugin_name=plc.ara_plugin_name,
+                        ara_modification_uuid=plc.ara_modification_uuid,
                     )
                 )
             for fpl in lanes[lidx][2]:
@@ -758,7 +892,7 @@ def _decode_playlist_1014(
                     )
                 )
     return PtxPlaylist(
-        index, pname, pl_uuid, ch_count if ch_count <= 64 else len(lane_idxs),
+        index, pname, pl_uuid, ch_count,
         lane_idxs, placements, fade_placements=fade_placements,
     )
 

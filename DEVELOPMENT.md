@@ -521,13 +521,14 @@ sessionpreplib/
         parser_timeline.py       # Session start TC, tempo/meter/markers, audio trees, clips/warp/fades/compounds, MIDI & video parsers
         plugin_trim.py           # Validated AAX Slot A trim reader/patcher & 0x2625->0x2616 auto-insert (delegates payload codecs to signal_flow)
         patcher.py               # Atomic .ptx patchers (No Input, 0x2637 Clip Gain, faders, groups/VCAs, Slot A trims)
+        patcher_extended.py      # Extended .ptx patchers (session settings/UI state, markers, track states/timebase, track & clip renames, clip attributes, fades)
         patch_builder.py         # Fluent transactional PtxPatchBuilder wrapping validated in-memory/file batch mutations
         writer_primitives.py     # Low-level Z-chunk/control-curve serializers & byte-exact 0x0002 chunk-offset index codec/mutators
-        writer_chunks.py         # Verified Pro Tools chunk serializers (0x1028, 0x103a, 0x1001, 0x104f/1052, 0x1014, 0x2628) & palette mapper
-        writer_index.py          # Deterministic 0x0002 chunk-offset index structural rebuilder (0x2587 sibling shifts & virgin-chunk entries)
-        writer_blueprints.py     # Blob-free structured Z-chunk builders for Mono/Stereo 0x261C Audio strips, 0x2589 UI & media chunks
-        writer_mutations.py      # Per-chunk binary mutators (0x2519, 0x2107, 0x210C, 0x2587, 0x2624, 0x202B, 0x1004, 0x0F3D, 0x262A, 0x1015, 0x1054)
-        writer.py                # Pure offline Pro Tools .ptx session writer (write_offline_ptx_session) for virgin, clean & pre-populated templates
+        writer_chunks.py         # Verified Pro Tools chunk serializers (0x1028, 0x204D, session UI state, 0x2077, 0x103a, 0x1001, 0x104f/1052, 0x1014, 0x2628, 0x262f) & palette mapper
+        writer_index.py          # Deterministic 0x0002 chunk-offset index structural rebuilder (0x2587 sibling shifts, 3/4-step 0x2624 racks, 0x1058 MIDI tracks & synthesized chunks)
+        writer_blueprints.py     # Blob-free structured Z-chunk builders for all 8 track types (Audio/Aux/RoutingFolder/Master/Vca/BasicFolder/Midi/Instrument, Mono–7.1.4), 0x2589 UI & media chunks
+        writer_mutations.py      # Per-chunk binary mutators (0x2519, 0x2107, 0x210C, 0x2587, 0x2624, 0x202B, 0x2030, 0x1004, 0x0F3D, 0x262A, 0x1015, 0x1054, 0x1058)
+        writer.py                # Pure offline Pro Tools .ptx session writer (write_offline_ptx_session) for virgin, clean & pre-populated templates (surround, MIDI/Instrument, sub-clips, fades, UI state)
         signal_flow.py           # Thin Pro Tools adapter (ptx_to_mixer_session, build_annotated_signal_flow) over signal_flow
         signal_flow_analysis.py  # Backward-compatible re-exports of signal_flow.analysis
 

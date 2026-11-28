@@ -30,10 +30,13 @@ from .codec import (
     read_lp_str,
 )
 from .models import (
+    AUDIO_FORMAT_MAP,
     GROUP_TYPE_MAP,
     IO_KIND_MAP,
+    TRACK_FORMAT_MAP,
     TRACK_TYPE_MAP,
     UUID_PREFIX,
+    format_pull_rate,
     PtxAraBinding,
     PtxAraPlugin,
     PtxAudioFile,
@@ -79,6 +82,7 @@ from .parser_timeline import (
     parse_midi_data,
     parse_playlists_1015,
     parse_session_start_204d,
+    parse_session_ui_state,
     parse_tempo_2028,
     parse_timeline_lanes_1054,
     parse_video_data,
@@ -613,6 +617,7 @@ class PtxSession:
             ("tracks", self._parse_tracks_2519),
             ("folders", self._parse_folder_tree_210c),
             ("mixer", self._parse_mixer_2624),
+            ("track UI", self._parse_track_ui_2587),
             ("group globals", self._parse_group_globals_and_presets),
             ("groups", self._parse_groups_202b),
             ("audio files", self._parse_audio_files),
@@ -642,9 +647,22 @@ class PtxSession:
                 self.info.os_name = strs[4]
         c1028 = self.chunk_map.get(0x1028)
         if c1028 and len(c1028.raw) >= 15:
-            self.info.audio_format_code = c1028.raw[9]
-            self.info.bit_depth = c1028.raw[10]
-            self.info.sample_rate = struct.unpack_from("<I", c1028.raw, 11)[0]
+            raw28 = c1028.raw
+            self.info.audio_format_code = raw28[9]
+            self.info.audio_format_name = AUDIO_FORMAT_MAP.get(raw28[9], f"Format_{raw28[9]}")
+            self.info.bit_depth = raw28[10]
+            self.info.sample_rate = struct.unpack_from("<I", raw28, 11)[0]
+            pull_01 = raw28[15] if len(raw28) > 15 else 0
+            if len(raw28) >= 31:
+                pull_4 = raw28[-15]
+                vpull_01 = raw28[-14]
+                self.info.audio_pull_rate = format_pull_rate(pull_4, pull_01)
+                self.info.video_pull_rate = format_pull_rate(0, vpull_01)
+                self.info.is_interleaved = bool(raw28[-7])
+                if raw28[-6] in (16, 24, 32):
+                    self.info.bit_depth = raw28[-6]
+            else:
+                self.info.audio_pull_rate = format_pull_rate(0, pull_01)
         c2067 = self.chunk_map.get(0x2067)
         if c2067:
             sid, paths = _parse_ptx_paths_2067(c2067.raw)
@@ -658,6 +676,7 @@ class PtxSession:
         c204d = self.chunk_map.get(0x204D)
         if c204d:
             parse_session_start_204d(c204d.raw, self.info)
+        parse_session_ui_state(self.chunk_map, self.info)
 
     def _parse_tempo(self) -> None:
         c = self.chunk_map.get(0x2028)
@@ -805,10 +824,15 @@ class PtxSession:
             color_idx = 0xFFFE
             self._tracks_missing_tail_active.add(raw_uuid.hex())
         ttype = "RoutingFolder" if (type_code == 2 and is_folder) else TRACK_TYPE_MAP.get(type_code, f"Type_{type_code}")
-        fmt_str = "None" if ttype in ("Vca", "BasicFolder", "Midi", "Video") else ("Stereo" if fmt_byte == 1 else "Mono")
+        if ttype in ("Vca", "BasicFolder", "Midi", "Video"):
+            fmt_str, ch_count = "None", 0
+        else:
+            ext_code = sub[-9] if (has_v8_tail and sub[-9] != 0 and sub[-9] in TRACK_FORMAT_MAP) else fmt_byte
+            fmt_entry = TRACK_FORMAT_MAP.get(ext_code) or TRACK_FORMAT_MAP.get(fmt_byte)
+            fmt_str, ch_count = fmt_entry if fmt_entry is not None else (f"Format_{ext_code}", 1)
         return PtxTrack(
             index=len(self.tracks), name=name, uuid_hex=raw_uuid.hex(), uuid_braced=format_ptsl_uuid(raw_uuid),
-            track_type=ttype, format=fmt_str, is_folder=is_folder, is_elastic_or_ara=is_elastic,
+            track_type=ttype, format=fmt_str, channel_count=ch_count, is_folder=is_folder, is_elastic_or_ara=is_elastic,
             color_index=color_idx, is_hidden=is_hidden, is_inactive=is_inactive,
             color_rgb=lookup_pt_color_rgb(color_idx),
         )
@@ -1049,5 +1073,20 @@ class PtxSession:
             if trk.track_type == "Video" and trk.name in self.video_playlists:
                 trk.video_clips = list(self.video_playlists[trk.name])
 
+    def _parse_track_ui_2587(self) -> None:
+        c2587 = self.chunk_map.get(0x2587)
+        if not c2587:
+            return
+        entries = find_subchunks(c2587.raw, 0x2589)
+        for entry in entries:
+            if len(entry) < 20:
+                continue
+            tidx = struct.unpack_from("<H", entry, 9)[0]
+            if tidx >= len(self.tracks):
+                continue
+            trk = self.tracks[tidx]
+            if trk.is_folder or trk.track_type in ("BasicFolder", "RoutingFolder"):
+                trk.is_folder_open = not bool(entry[-7])
+
     def _parse_markers(self) -> None:
-        self.markers = parse_markers_2030(self.chunks, self.info.sample_rate)
+        self.markers = parse_markers_2030(self.chunks, self.info.sample_rate, tracks=self.tracks)

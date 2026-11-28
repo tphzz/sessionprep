@@ -34,7 +34,7 @@ class _Parsed2624StripRack:
     ordinal_1based: int
     strip_tag: int
     strip_offset: int
-    c261b_offset: int
+    c261b_offset: int | None
     c2627_offset: int
 
 
@@ -130,6 +130,24 @@ def _parse_2519_offsets(buf: bytes, chunk: PtxChunk) -> _Parsed2519Offsets:
     )
 
 
+def _find_2627_after_head(buf: bytes, start: int, end: int) -> int | None:
+    pos = start
+    if pos + 9 <= end and buf[pos] == 0x5A:
+        sz0 = struct.unpack_from("<I", buf, pos + 3)[0]
+        t0 = struct.unpack_from("<H", buf, pos + 7)[0]
+        if sz0 >= 2 and pos + 7 + sz0 <= end:
+            if t0 == 0x2627:
+                return pos
+            pos = pos + 7 + sz0
+    for cand in (pos, pos + 4):
+        if cand + 9 <= end and buf[cand] == 0x5A:
+            c_sz = struct.unpack_from("<I", buf, cand + 3)[0]
+            c_tag = struct.unpack_from("<H", buf, cand + 7)[0]
+            if c_tag == 0x2627 and c_sz >= 2 and cand + 7 + c_sz <= end:
+                return cand
+    return None
+
+
 def _scan_2624_offsets(buf: bytes, chunk: PtxChunk) -> tuple[list[int], list[_Parsed2624StripRack]]:
     end = chunk.offset + 7 + chunk.size
     count = struct.unpack_from("<I", buf, chunk.offset + 9)[0]
@@ -137,31 +155,20 @@ def _scan_2624_offsets(buf: bytes, chunk: PtxChunk) -> tuple[list[int], list[_Pa
     strip_offsets = [off for _, off, _ in strips]
     racks: list[_Parsed2624StripRack] = []
     for ordinal, (strip_tag, strip_off, strip_end) in enumerate(strips, start=1):
-        # First child of 0x261C/0x261D/0x261E is 0x261B; walk its direct children sequentially.
         if strip_off + 18 > strip_end or buf[strip_off + 9] != 0x5A:
             continue
         b_sz = struct.unpack_from("<I", buf, strip_off + 12)[0]
         b_tag = struct.unpack_from("<H", buf, strip_off + 16)[0]
         b_end = strip_off + 9 + 7 + b_sz
-        if b_tag != 0x261B or b_sz < 2 or b_end > strip_end:
-            continue
-        pos = strip_off + 18
-        if pos + 9 <= b_end and buf[pos] == 0x5A:
-            sz0 = struct.unpack_from("<I", buf, pos + 3)[0]
-            t0 = struct.unpack_from("<H", buf, pos + 7)[0]
-            if sz0 >= 2 and pos + 7 + sz0 <= b_end:
-                if t0 == 0x2627:
-                    racks.append(_Parsed2624StripRack(ordinal, strip_tag, strip_off, strip_off + 9, pos))
-                    continue
-                pos = pos + 7 + sz0
-        # After 0x102D, Pro Tools writes a 4-byte field before 0x2627 (check exact offsets +0 and +4).
-        for cand in (pos, pos + 4):
-            if cand + 9 <= b_end and buf[cand] == 0x5A:
-                c_sz = struct.unpack_from("<I", buf, cand + 3)[0]
-                c_tag = struct.unpack_from("<H", buf, cand + 7)[0]
-                if c_tag == 0x2627 and c_sz >= 2 and cand + 7 + c_sz <= b_end:
-                    racks.append(_Parsed2624StripRack(ordinal, strip_tag, strip_off, strip_off + 9, cand))
-                    break
+        if b_tag == 0x261B and b_sz >= 2 and b_end <= strip_end:
+            c27 = _find_2627_after_head(buf, strip_off + 18, b_end)
+            if c27 is not None:
+                racks.append(_Parsed2624StripRack(ordinal, strip_tag, strip_off, strip_off + 9, c27))
+        elif b_tag == 0x102D and b_sz >= 2 and b_end <= strip_end:
+            # Strips without 0x261B (e.g. Instrument 0x2621) place 0x102D + gap + 0x2627 directly inside strip.
+            c27 = _find_2627_after_head(buf, strip_off + 9, strip_end)
+            if c27 is not None:
+                racks.append(_Parsed2624StripRack(ordinal, strip_tag, strip_off, None, c27))
     return strip_offsets, racks
 
 
@@ -223,18 +230,23 @@ def _build_2519_tail_entry(entry: PtxIndexEntry, p2519: _Parsed2519Offsets) -> P
 
 
 def _build_2624_rack_entries(c2624_off: int, racks: list[_Parsed2624StripRack]) -> list[PtxIndexEntry]:
-    return [
-        PtxIndexEntry(
-            path=[
+    entries: list[PtxIndexEntry] = []
+    for r in racks:
+        if r.c261b_offset is not None:
+            path = [
                 PtxIndexPathStep(0x2624, -1, _meta_ord(r.ordinal_1based)),
                 PtxIndexPathStep(r.strip_tag, c2624_off, _ZERO5),
                 PtxIndexPathStep(0x261B, r.strip_offset, _ZERO5),
                 PtxIndexPathStep(0x2627, r.c261b_offset, _ZERO5),
-            ],
-            occurrences=[_occ(r.c2627_offset)],
-        )
-        for r in racks
-    ]
+            ]
+        else:
+            path = [
+                PtxIndexPathStep(0x2624, -1, _meta_ord(r.ordinal_1based)),
+                PtxIndexPathStep(r.strip_tag, c2624_off, _ZERO5),
+                PtxIndexPathStep(0x2627, r.strip_offset, _ZERO5),
+            ]
+        entries.append(PtxIndexEntry(path=path, occurrences=[_occ(r.c2627_offset)]))
+    return entries
 
 
 def _index_top_chunks_by_key(chunks: list[PtxChunk]) -> dict[tuple[int, int], PtxChunk]:
@@ -334,6 +346,8 @@ class _RebuildContext:
     c1054_off: int | None
     c1054_subs: list[int]
     c4828_off: int | None
+    c1058_off: int | None
+    c1058_subs: list[int]
     p2519: _Parsed2519Offsets | None
     c2624_off: int | None
     c2624_strips: list[int]
@@ -345,16 +359,20 @@ class _RebuildContext:
 
 def _prepare_rebuild_context(new_buf: bytes, new_chunks: list[PtxChunk], template_index: PtxIndex0002) -> _RebuildContext:
     by_tag = {c.tag: c for c in new_chunks}
-    c0f3d, c1015, c1054 = by_tag.get(0x0F3D), by_tag.get(0x1015), by_tag.get(0x1054)
+    c0f3d, c1015, c1054, c1058 = by_tag.get(0x0F3D), by_tag.get(0x1015), by_tag.get(0x1054), by_tag.get(0x1058)
     c2519, c2624 = by_tag.get(0x2519), by_tag.get(0x2624)
 
     f3d_items, _, _ = _scan_counted_container(new_buf, c0f3d) if c0f3d else ([], None, None)
     i15_items, t4829, o4829 = _scan_counted_container(new_buf, c1015) if c1015 else ([], None, None)
     i54_items, t4828, o4828 = _scan_counted_container(new_buf, c1054) if c1054 else ([], None, None)
+    i58_items, _, _ = _scan_counted_container(new_buf, c1058) if c1058 else ([], None, None)
     p2519 = _parse_2519_offsets(new_buf, c2519) if c2519 else None
     strips, racks = _scan_2624_offsets(new_buf, c2624) if c2624 else ([], [])
     has_rack = any(
-        len(e.path) == 4 and e.path[0].tag == 0x2624 and e.path[2].tag == 0x261B and e.path[3].tag == 0x2627
+        e.path and e.path[0].tag == 0x2624 and (
+            (len(e.path) == 4 and e.path[2].tag == 0x261B and e.path[3].tag == 0x2627)
+            or (len(e.path) == 3 and e.path[2].tag == 0x2627)
+        )
         for e in template_index.entries
     )
     return _RebuildContext(
@@ -366,6 +384,8 @@ def _prepare_rebuild_context(new_buf: bytes, new_chunks: list[PtxChunk], templat
         c1054_off=c1054.offset if c1054 else None,
         c1054_subs=[o for t, o, _ in i54_items if t == 0x1052],
         c4828_off=o4828 if t4828 == 0x4828 else None,
+        c1058_off=c1058.offset if c1058 else None,
+        c1058_subs=[o for t, o, _ in i58_items if t == 0x1057],
         p2519=p2519,
         c2624_off=c2624.offset if c2624 else None,
         c2624_strips=strips,
@@ -398,6 +418,8 @@ def _rebuild_dynamic_entry(entry: PtxIndexEntry, ctx: _RebuildContext) -> list[P
             PtxIndexPathStep(0x1054, -1, entry.path[0].meta),
             PtxIndexPathStep(0x4828, ctx.c1054_off, entry.path[1].meta),
         ], [_occ(ctx.c4828_off)])]
+    if tags == (0x1058,) and ctx.c1058_off is not None:
+        return [PtxIndexEntry(list(entry.path), [_occ(ctx.c1058_off), *(_occ(o) for o in ctx.c1058_subs)])]
     if tags[0] == 0x2519 and ctx.p2519 is not None:
         if tags == (0x2519,):
             return [PtxIndexEntry(list(entry.path), [_occ(ctx.p2519.chunk_offset), *(_occ(o) for o in ctx.p2519.pass2_offsets)])]
@@ -414,7 +436,11 @@ def _rebuild_dynamic_entry(entry: PtxIndexEntry, ctx: _RebuildContext) -> list[P
             ctx.done_2624 = True
             res.extend(_build_2624_rack_entries(ctx.c2624_off, ctx.c2624_racks))
         return res
-    if tags[0] == 0x2624 and len(tags) == 4 and tags[2:] == (0x261B, 0x2627) and ctx.c2624_off is not None:
+    if (
+        tags[0] == 0x2624
+        and ctx.c2624_off is not None
+        and ((len(tags) == 4 and tags[2:] == (0x261B, 0x2627)) or (len(tags) == 3 and tags[2] == 0x2627))
+    ):
         if ctx.done_2624:
             return []
         ctx.done_2624 = True
@@ -437,9 +463,14 @@ def _append_synthesized_chunk_entries(
             [PtxIndexPathStep(0x0F3D, -1, m0)],
             [_occ(ctx.c0f3d_off), *(_occ(o) for o in ctx.c0f3d_subs)],
         ))
-    for tag in (0x1004, 0x2637, 0x262A, 0x210C):
+    for tag in (0x1004, 0x2637, 0x262A, 0x2630, 0x210C):
         if tag not in old_tags and (tag,) not in present_paths and tag in by_tag:
             out_entries.append(PtxIndexEntry([PtxIndexPathStep(tag, -1, _ZERO5)], [_occ(by_tag[tag].offset)]))
+    if 0x1058 not in old_tags and (0x1058,) not in present_paths and ctx.c1058_off is not None:
+        out_entries.append(PtxIndexEntry(
+            [PtxIndexPathStep(0x1058, -1, m0)],
+            [_occ(ctx.c1058_off), *(_occ(o) for o in ctx.c1058_subs)],
+        ))
     if 0x1054 not in old_tags and ctx.c1054_off is not None:
         if (0x1054,) not in present_paths:
             out_entries.append(PtxIndexEntry(

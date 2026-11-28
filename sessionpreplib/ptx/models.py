@@ -66,11 +66,123 @@ AUTOMATION_MODE_MAP: dict[int, str] = {
     5: "Touch/Latch",
 }
 
-MARKER_TIME_PROPS: dict[int, str] = {
-    1: "Selection",
-    2: "None",
-    3: "Marker",
+AUDIO_FORMAT_MAP: dict[int, str] = {
+    3: "WAV",
+    4: "AIFF",
 }
+
+AUDIO_PULL_01_MAP: dict[int, str] = {
+    0: "",
+    1: "+0.1%",
+    2: "-0.1%",
+}
+
+AUDIO_PULL_4_MAP: dict[int, str] = {
+    0: "",
+    1: "+4%",
+    2: "-4%",
+}
+
+FEET_FRAMES_RATE_MAP: dict[int, str] = {
+    0: "23.976",
+    1: "24",
+    2: "25",
+}
+
+TRACK_HEIGHT_MAP: dict[int, str] = {
+    16: "Micro",
+    23: "Mini",
+    43: "Small",
+    97: "Medium",
+    192: "Large",
+    300: "Jumbo",
+    600: "Extreme",
+}
+
+TRACK_HEIGHT_PRESET_PX: dict[str, tuple[int, int]] = {
+    "Micro": (16, 19),
+    "Mini": (23, 19),
+    "Small": (43, 36),
+    "Medium": (97, 92),
+    "Large": (192, 192),
+    "Jumbo": (300, 300),
+    "Extreme": (600, 600),
+}
+
+MARKER_TIME_PROPS: dict[int, str] = {
+    1: "Marker",
+    2: "Selection",
+    3: "None",
+}
+
+MARKER_REFERENCE_MAP: dict[int, str] = {
+    1: "FollowTrackTimebase",
+    2: "BarBeat",
+    3: "Absolute",
+}
+
+MARKER_GENERAL_PROP_BITS: dict[str, int] = {
+    "track_visibility": 0x04,
+    "track_heights": 0x08,
+    "group_enables": 0x10,
+    "pre_post_roll_times": 0x20,
+    "zoom_settings": 0x40,
+    "window_configuration": 0x80,
+}
+
+# Verified Pro Tools 0x251A extended format code -> (canonical name, channel_count).
+TRACK_FORMAT_MAP: dict[int, tuple[str, int]] = {
+    0: ("Mono", 1),
+    1: ("Stereo", 2),
+    2: ("LCR", 3),
+    3: ("Quad", 4),
+    4: ("LCRS", 4),
+    5: ("5.0", 5),
+    6: ("5.1", 6),
+    13: ("7.0", 7),
+    14: ("7.1", 8),
+    17: ("7.1.2", 10),
+    30: ("7.1.4", 12),
+}
+
+TRACK_FORMAT_NAME_TO_CODE: dict[str, tuple[int, int]] = {
+    name.lower(): (code, ch) for code, (name, ch) in TRACK_FORMAT_MAP.items()
+}
+
+COUNTER_FORMAT_MAP: dict[int, str] = {
+    0: "BarsBeats",
+    1: "MinSecs",
+    2: "TimeCode",
+    3: "FeetFrames",
+    4: "Samples",
+}
+
+EDIT_MODE_MAP: dict[int, str] = {
+    0: "Shuffle",
+    1: "Slip",
+    2: "Spot",
+    3: "Grid",
+}
+
+EDIT_MODE_MASK_MAP: dict[int, int] = {
+    0: 2,
+    1: 8,
+    2: 4,
+    3: 1,
+}
+
+EDIT_TOOL_MAP: dict[int, str] = {
+    2: "Selector",
+    3: "Trim",
+    4: "Grabber",
+    8: "Pencil",
+}
+
+
+def format_pull_rate(pull_4: int, pull_01: int) -> str:
+    """Format Pro Tools ``0x1028`` 4% and 0.1% pull-rate codes into a human-readable label."""
+    parts = [p for p in (AUDIO_PULL_4_MAP.get(pull_4, ""), AUDIO_PULL_01_MAP.get(pull_01, "")) if p]
+    return " ".join(parts) if parts else "None"
 
 FADE_TYPE_MAP: dict[int, str] = {
     1: "crossfade",
@@ -163,6 +275,11 @@ class PtxSessionInfo:
     sample_rate: int = 0
     bit_depth: int = 0
     audio_format_code: int = 0
+    audio_format_name: str = ""
+    is_interleaved: bool | None = None
+    audio_pull_rate: str = "None"
+    video_pull_rate: str = "None"
+    feet_frames_rate: str = ""
     tempo_bpm: float | None = None
     session_id_code: str = ""
     saved_session_path: str = ""
@@ -176,6 +293,19 @@ class PtxSessionInfo:
     start_frames: int | None = None
     start_seconds: float | None = None
     start_timecode: str = ""
+    session_length_timecode: str = ""
+    main_counter_format: str = ""
+    sub_counter_format: str = ""
+    edit_mode: str = ""
+    grid_relative: bool = False
+    edit_tool: str = ""
+    smart_tool_enabled: bool = False
+    pre_roll_enabled: bool = False
+    pre_roll_samples: int = 0
+    post_roll_enabled: bool = False
+    post_roll_samples: int = 0
+    timeline_in_sample: int | None = None
+    timeline_out_sample: int | None = None
 
 
 @dataclass
@@ -211,6 +341,17 @@ class PtxMarker:
     comments: str = ""
     start_seconds: float | None = None
     end_seconds: float | None = None
+    color_index: int | None = None
+    color_rgb: tuple[int, int, int] | None = None
+    location: str = "MainRuler"
+    track_index: int | None = None
+    track_name: str = ""
+    zoom_settings: bool = False
+    pre_post_roll_times: bool = False
+    track_visibility: bool = False
+    track_heights: bool = False
+    group_enables: bool = False
+    window_configuration: bool = False
 
 
 @dataclass
@@ -687,6 +828,8 @@ class PtxClipPlacement:
     flags: int = 0
     is_muted: bool = False
     is_covered: bool = False
+    is_time_locked: bool = False
+    is_edit_locked: bool = False
     is_compound: bool = False
     loop_count: int | None = None
     has_clip_gain_automation: bool = False
@@ -802,6 +945,7 @@ class PtxTrack:
     uuid_braced: str
     track_type: str
     format: str
+    channel_count: int = 1
     is_folder: bool = False
     is_elastic_or_ara: bool = False
     color_index: int = 0xFFFE
@@ -832,6 +976,9 @@ class PtxTrack:
     vca_controlled_tracks: list[str] = field(default_factory=list)
     clips: list[PtxClipPlacement] = field(default_factory=list)
     is_solo_safe: bool = False
+    is_folder_open: bool = True
+    track_height_px: int | None = None
+    track_height_name: str = ""
     comment: str = ""
     color_rgb: tuple[int, int, int] | None = None
     is_output_active: bool = True
