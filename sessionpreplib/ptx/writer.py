@@ -192,6 +192,7 @@ def _resolve_output_bus(session: PtxSession, bus_name: str) -> OutputBusSpec:
         uuid16=bytes.fromhex(sp.uuid_hex),
         name=sp.name,
         channel_count=max(1, int(sp.channel_count or 2)),
+        parent_uuid16=(bytes.fromhex(sp.parent_uuid_hex) if sp.is_subpath and sp.parent_uuid_hex else None),
     )
 
 

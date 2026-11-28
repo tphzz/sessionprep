@@ -35,6 +35,7 @@ class OutputBusSpec:
     uuid16: bytes
     name: str
     channel_count: int = 2
+    parent_uuid16: bytes | None = None
 
 
 def _check_bytes_len(data: bytes, expected: int, name: str) -> None:
@@ -89,18 +90,32 @@ def build_audio_ui_entry_2589(*, is_visible: bool = True) -> bytes:
 # ── Output bus and mixer strip (0x261C) structured builders ───────────
 
 
-def build_output_bus_260e(bus_ptsl_index: int, bus_uuid16: bytes, bus_name: str) -> bytes:
+def build_output_bus_260e(
+    bus_ptsl_index: int,
+    bus_uuid16: bytes,
+    bus_name: str,
+    *,
+    parent_uuid16: bytes | None = None,
+) -> bytes:
     """Serialize a Pro Tools ``0x260E`` (v9) Main Output bus descriptor Z-chunk."""
     _check_bytes_len(bus_uuid16, 16, "bus_uuid16")
     _check_uint(bus_ptsl_index, 0xFFFE, "bus_ptsl_index")
+    is_subpath = parent_uuid16 is not None
+    if parent_uuid16 is not None:
+        _check_bytes_len(parent_uuid16, 16, "parent_uuid16")
+        if parent_uuid16 == b"\x00" * 16:
+            raise ValueError("parent_uuid16 must be non-zero for subpaths (use None for primary paths)")
     bus_id = bus_ptsl_index + 1
+    parent_bytes = parent_uuid16 if parent_uuid16 is not None else (b"\x00" * 16)
+    sub_flags = b"\x00\x00" if is_subpath else b"\x01\x01"
+    tail_flags = b"\x00\x0c\x00\x00" if is_subpath else b"\x00\x0c\x01\x00"
     body = (
         struct.pack("<H", bus_id)
         + b"\x01\x01"  # present=1, active=1
         + bus_uuid16
-        + (b"\x00" * 16)
+        + parent_bytes
         + encode_lp_str(bus_name)
-        + b"\x01\x01" + struct.pack("<q", -1) + b"\x00" + struct.pack("<i", -1) + b"\x00\x0c\x01\x00"
+        + sub_flags + struct.pack("<q", -1) + b"\x00" + struct.pack("<i", -1) + tail_flags
     )
     return build_zchunk(0x260E, body, version=9)
 
@@ -243,7 +258,15 @@ def _resolve_output_bus_260e(
     output_bus: OutputBusSpec | tuple[int, bytes, str] | None,
 ) -> tuple[bytes | None, int]:
     if isinstance(output_bus, OutputBusSpec):
-        return build_output_bus_260e(output_bus.ptsl_index, output_bus.uuid16, output_bus.name), output_bus.channel_count
+        return (
+            build_output_bus_260e(
+                output_bus.ptsl_index,
+                output_bus.uuid16,
+                output_bus.name,
+                parent_uuid16=output_bus.parent_uuid16,
+            ),
+            output_bus.channel_count,
+        )
     if output_bus is not None:
         return build_output_bus_260e(*output_bus), 2
     return None, 2

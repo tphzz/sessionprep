@@ -487,14 +487,33 @@ def test_pressed_save_marker_is_painted_white(qapp):
     button.show()
     set_button_marker(button, True, "Unsaved changes")
     qapp.processEvents()
-    centre = (MARKER_GAP + 3, 8)
     idle = slot.grab().toImage()
+    dpr = idle.devicePixelRatio() or 1.0
+    centre = (round((MARKER_GAP + MARKER_DOT / 2) * dpr), round((slot.height() / 2) * dpr))
     assert QColor(idle.pixelColor(*centre)).name() == COLORS["information"]
     button.setDown(True)
     pressed = slot.grab().toImage()
-    assert QColor(pressed.pixelColor(*centre)).name() == COLORS["heading"]
+    dpr_p = pressed.devicePixelRatio() or 1.0
+    centre_p = (round((MARKER_GAP + MARKER_DOT / 2) * dpr_p), round((slot.height() / 2) * dpr_p))
+    assert QColor(pressed.pixelColor(*centre_p)).name() == COLORS["heading"]
     button.setDown(False)
+    # Regression: event filter Python wrapper must survive GC while button is alive AND release button on destruction
+    import gc
+    import weakref
+    from sessionprepgui.change_marker import _BUTTON_MARKERS
+
+    old_x = slot.x()
+    gc.collect()
+    button.resize(button.width() + 12, button.height())
+    qapp.processEvents()
+    assert slot.x() == old_x + 12
+    btn_ref = weakref.ref(button)
     button.close()
+    del slot, button
+    qapp.processEvents()
+    gc.collect()
+    assert btn_ref() is None
+    assert all(k is not None for k in list(_BUTTON_MARKERS))
 
 
 @pytest.mark.parametrize("css", [None, ""])

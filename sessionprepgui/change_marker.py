@@ -9,6 +9,7 @@ only while the marker is shown.
 """
 from __future__ import annotations
 
+import weakref
 import shiboken6
 from PySide6.QtCore import QEvent, QObject, QRect, QRectF, QSize, Qt
 from PySide6.QtGui import QColor, QIcon, QIconEngine, QPainter, QPixmap
@@ -277,18 +278,40 @@ def is_tab_marked(tabs: QTabWidget, index: int) -> bool:
 class _ButtonMarkerFilter(QObject):
     def __init__(self, button: QPushButton, slot: ChangeMarkerSlot):
         super().__init__(button)
-        self._button = button
-        self._slot = slot
+        self._button_ref = weakref.ref(button)
+        self._slot_ref = weakref.ref(slot)
 
     def eventFilter(self, watched, event):
-        if watched is self._button and event.type() in (QEvent.Resize, QEvent.Show):
+        ref = getattr(self, "_button_ref", None)
+        btn = ref() if ref is not None else None
+        if (
+            btn is not None
+            and shiboken6.isValid(btn)
+            and watched is btn
+            and event.type() in (QEvent.Resize, QEvent.Show)
+        ):
             self.place()
         return False
 
     def place(self):
-        button = self._button
-        self._slot.move(button.width() - _BUTTON_PADDING - self._slot.width(),
-                        (button.height() - self._slot.height()) // 2)
+        bref = getattr(self, "_button_ref", None)
+        sref = getattr(self, "_slot_ref", None)
+        button = bref() if bref is not None else None
+        slot = sref() if sref is not None else None
+        if button is None or slot is None or not shiboken6.isValid(button) or not shiboken6.isValid(slot):
+            return
+        slot.move(button.width() - _BUTTON_PADDING - slot.width(),
+                  (button.height() - slot.height()) // 2)
+
+
+_BUTTON_MARKERS: weakref.WeakKeyDictionary[QPushButton, tuple[ChangeMarkerSlot, _ButtonMarkerFilter]] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _button_is_down(ref: weakref.ReferenceType[QPushButton]) -> bool:
+    btn = ref()
+    return bool(btn is not None and shiboken6.isValid(btn) and btn.isDown())
 
 
 def install_button_marker(button: QPushButton) -> ChangeMarkerSlot:
@@ -299,11 +322,14 @@ def install_button_marker(button: QPushButton) -> ChangeMarkerSlot:
     The button's own stylesheet is kept: marking appends the padding rule and
     unmarking removes exactly that rule from the button's current sheet.
     """
-    slot = ChangeMarkerSlot(button, on_selection=button.isDown)
+    button_ref = weakref.ref(button)
+    slot = ChangeMarkerSlot(button, on_selection=lambda ref=button_ref: _button_is_down(ref))
     slot.hide()
     button.pressed.connect(slot.update)
     button.released.connect(slot.update)
     placer = _ButtonMarkerFilter(button, slot)
+    # Keep strong Python refs keyed weakly by button so Shiboken cannot GC the event-filter wrapper.
+    _BUTTON_MARKERS[button] = (slot, placer)
     button.installEventFilter(placer)
     placer.place()
     return slot

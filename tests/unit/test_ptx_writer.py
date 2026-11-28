@@ -1098,3 +1098,60 @@ def test_virgin_template_2587_siblings_hidden_tracks_top_level_and_guards(tmp_pa
             expected_audio_file_count=1, expected_clip_count=2, expected_playlist_count=len(sess_ok.playlists),
         )
     assert len(normalize_ptx_uuid16(kik_trk.uuid_braced)) == 16
+
+
+def test_output_bus_260e_root_and_mono_subpath_resolution():
+    from types import SimpleNamespace
+
+    from sessionpreplib.ptx import OutputBusSpec
+    from sessionpreplib.ptx.codec import find_subchunks
+    from sessionpreplib.ptx.models import PtxSignalPath
+    from sessionpreplib.ptx.writer import _resolve_output_bus
+
+    bus_uid = generate_ptx_uuid()
+    parent_uid = generate_ptx_uuid()
+
+    # Primary/root bus encodes zero parent UUID and primary flags (01 01 / 00 0c 01 00)
+    root_260e = build_output_bus_260e(3, parent_uid, "Bus 1-2")
+    assert root_260e[13:29] == parent_uid
+    assert root_260e[29:45] == b"\x00" * 16
+    assert root_260e[56:58] == b"\x01\x01"
+    assert root_260e[-4:] == b"\x00\x0c\x01\x00"
+
+    # Mono subpath encodes parent_uuid16 and subpath flags (00 00 / 00 0c 00 00) in both 0x260D & 0x4856
+    mono_strip = build_audio_mixer_strip_261c(
+        "MonoOut", generate_ptx_uuid(), 1,
+        OutputBusSpec(4, bus_uid, "Bus 1", channel_count=1, parent_uuid16=parent_uid),
+        track_ordinal_1based=1, id_base=100,
+    )
+    subs_260e = find_subchunks(mono_strip, 0x260E)
+    assert len(subs_260e) == 2
+    for s260e in subs_260e:
+        assert s260e[13:29] == bus_uid
+        assert s260e[29:45] == parent_uid
+        assert s260e[54:56] == b"\x00\x00"
+        assert s260e[-4:] == b"\x00\x0c\x00\x00"
+
+    with pytest.raises(ValueError, match="parent_uuid16"):
+        build_output_bus_260e(4, bus_uid, "Bus 1", parent_uuid16=b"\x01\x02")
+    with pytest.raises(ValueError, match="non-zero"):
+        build_output_bus_260e(4, bus_uid, "Bus 1", parent_uuid16=b"\x00" * 16)
+
+    # _resolve_output_bus populates parent_uuid16 for subpaths and leaves it None for root paths
+    sp_root = PtxSignalPath(
+        index=3, name="Bus 1-2", kind="bus", is_stereo=True, channel_count=2,
+        uuid_hex=parent_uid.hex(), uuid_braced="", source_chunk="0x2603",
+    )
+    sp_sub = PtxSignalPath(
+        index=4, name="Bus 1", kind="bus", is_stereo=False, channel_count=1,
+        uuid_hex=bus_uid.hex(), uuid_braced="", source_chunk="0x2603",
+        is_subpath=True, parent_uuid_hex=parent_uid.hex(),
+    )
+    fake_sess = SimpleNamespace(
+        signal_paths=[sp_root, sp_sub],
+        signal_path_by_name=lambda n: next((p for p in (sp_root, sp_sub) if p.name == n), None),
+    )
+    spec_root = _resolve_output_bus(fake_sess, "Bus 1-2")  # type: ignore[arg-type]
+    spec_sub = _resolve_output_bus(fake_sess, "Bus 1")  # type: ignore[arg-type]
+    assert spec_root.parent_uuid16 is None and spec_root.channel_count == 2
+    assert spec_sub.parent_uuid16 == parent_uid and spec_sub.channel_count == 1
