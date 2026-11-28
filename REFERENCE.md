@@ -677,15 +677,15 @@ When creating a Pro Tools session from a template, SessionPrep combines PTSL
 commands with validated, atomic `.ptx` session-file updates (applied in a single
 post-close pass with automatic rollback if Pro Tools fails to reopen the session):
 
-- **Template Paths, Offline Fetch & Transfer Mode (`protools_transfer_backend`, default `ptsl_hybrid`):**
+- **Template Paths, Offline Fetch & Transfer Mode (`protools_transfer_backend`, default `offline_ptx`):**
   Each entry in **Pro Tools Templates** accepts a `Template Group` + `Template Name`
   (auto-resolving `~/Documents/Pro Tools/Session Templates/<group>/<name>.ptxt` on
   Windows and macOS) and an optional explicit `.ptxt` file path (working on Windows,
   macOS, Linux, and custom template folders). When a valid local `.ptxt` file is
   present, Phase 3 **Fetch** reads folder topology offline in milliseconds without
-  launching Pro Tools. **Transfer Mode** lets you switch between **Live PTSL + .ptx
-  Hybrid** (`ptsl_hybrid`, default) and **Offline .ptx Writer** (`offline_ptx`), which
-  disables PTSL connection controls in Preferences, validates local template/project
+  launching Pro Tools. **Transfer Mode** defaults to **Offline .ptx Writer**
+  (`offline_ptx`), with **Live PTSL + .ptx Hybrid** (`ptsl_hybrid`) available as an
+  option. Offline mode disables PTSL connection controls in Preferences, validates local template/project
   readiness offline in Phase 3 without PTSL prompts, stages BWF/UMID-linked WAVs into
   `<project_dir>/<session_name>/Audio Files/` (resampling/converting if needed), and
   writes complete Pro Tools `.ptx` sessions directly from `.ptxt`/`.ptx` templates

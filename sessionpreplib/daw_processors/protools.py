@@ -189,16 +189,16 @@ class ProToolsDawProcessor(DawProcessor):
         transfer_mode = ParamSpec(
             key="protools_transfer_backend",
             type=str,
-            default="ptsl_hybrid",
+            default="offline_ptx",
             label="Transfer Mode",
             description=(
                 "Write .ptx sessions and Audio Files/ directly offline (no Pro Tools required), "
                 "or control a running Pro Tools instance via PTSL + post-close .ptx patching."
             ),
-            choices=["ptsl_hybrid", "offline_ptx"],
+            choices=["offline_ptx", "ptsl_hybrid"],
             choice_labels={
-                "ptsl_hybrid": "Live PTSL + .ptx Hybrid",
                 "offline_ptx": "Offline .ptx Writer",
+                "ptsl_hybrid": "Live PTSL + .ptx Hybrid",
             },
         )
         return [base[0], transfer_mode, *base[1:]] + _ptsl_connection_params() + ptx_config_params()
@@ -229,7 +229,7 @@ class ProToolsDawProcessor(DawProcessor):
         self._pan_law_db: float = float(config.get("protools_pan_law_db", -3.0))
         self._remove_unused_aux_tracks: bool = bool(config.get("protools_remove_unused_aux_tracks", True))
         raw_backend = config.get("protools_transfer_backend")
-        self._transfer_backend: str = (str(raw_backend).strip().lower() if raw_backend else "ptsl_hybrid")
+        self._transfer_backend: str = (str(raw_backend).strip().lower() if raw_backend else "offline_ptx")
         self._connection_settings = ProToolsConnectionSettings.from_config(config)
 
     def check_connectivity(self) -> tuple[bool, str]:
@@ -255,8 +255,8 @@ class ProToolsDawProcessor(DawProcessor):
 
     @property
     def transfer_backend(self) -> str:
-        """Return the configured Pro Tools transfer backend (``'ptsl_hybrid'`` or ``'offline_ptx'``)."""
-        return getattr(self, "_transfer_backend", "ptsl_hybrid")
+        """Return the configured Pro Tools transfer backend (``'offline_ptx'`` or ``'ptsl_hybrid'``)."""
+        return getattr(self, "_transfer_backend", "offline_ptx")
 
     @property
     def template_identity(self) -> tuple[str, ...]:

@@ -1375,7 +1375,7 @@ def _is_offline_ptx_processor(processor: Any) -> bool:
     return (
         processor is not None
         and str(getattr(processor, "id", "")).startswith("protools")
-        and getattr(processor, "transfer_backend", "ptsl_hybrid") == "offline_ptx"
+        and getattr(processor, "transfer_backend", "offline_ptx") == "offline_ptx"
     )
 
 

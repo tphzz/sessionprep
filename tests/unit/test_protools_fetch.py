@@ -84,6 +84,7 @@ def _processor(tmp_path, timeout=60.0):
     )
     processor.configure(
         {
+            "protools_transfer_backend": "ptsl_hybrid",
             "protools_temp_dir": str(tmp_path),
             "protools_template_create_timeout": timeout,
             "protools_command_delay": 0.01,

@@ -101,7 +101,7 @@ def test_transfer_backend_config_impact_and_ptxt_path_validation():
     cfg_a = build_defaults()
     p_a = cfg_a["config_presets"]["Default"]
     p_b = deepcopy(p_a)
-    p_b["daw_processors"]["protools"]["protools_transfer_backend"] = "offline_ptx"
+    p_b["daw_processors"]["protools"]["protools_transfer_backend"] = "ptsl_hybrid"
     impact = classify_structured_config_change(p_a, p_b)
     assert impact.daw_only is True
     assert "daw_processors.protools.protools_transfer_backend" in impact.daw_keys
@@ -125,26 +125,26 @@ def test_protools_prefs_transfer_mode_disables_all_7_ptsl_params_and_dirty_track
         pt_fields = dict(widgets_dict["daw_processors.protools"])
         combo = pt_fields["protools_transfer_backend"]
         assert isinstance(combo, QComboBox)
-        assert combo.currentData() == "ptsl_hybrid" and combo.currentText() == "Live PTSL + .ptx Hybrid"
+        assert combo.currentData() == "offline_ptx" and combo.currentText() == "Offline .ptx Writer"
         reset_btn = combo._param_row_widgets[2]
-        assert "Live PTSL + .ptx Hybrid" in reset_btn.toolTip()
-        assert all(pt_fields[k].isEnabled() for k in PTSL_ONLY_PARAM_KEYS)
-
-        combo.setCurrentIndex(combo.findData("offline_ptx"))
-        assert combo.currentText() == "Offline .ptx Writer"
+        assert "Offline .ptx Writer" in reset_btn.toolTip()
         for key in PTSL_ONLY_PARAM_KEYS:
             w = pt_fields[key]
             assert not w.isEnabled()
             assert all(not c.isEnabled() for c in getattr(w, "_param_row_widgets", ()))
 
+        combo.setCurrentIndex(combo.findData("ptsl_hybrid"))
+        assert combo.currentText() == "Live PTSL + .ptx Hybrid"
+        assert all(pt_fields[k].isEnabled() for k in PTSL_ONLY_PARAM_KEYS)
+
         out = read_config_widgets(widgets_dict, daw_widgets)
-        assert out["daw_processors"]["protools"]["protools_transfer_backend"] == "offline_ptx"
+        assert out["daw_processors"]["protools"]["protools_transfer_backend"] == "ptsl_hybrid"
         load_config_widgets(widgets_dict, preset, daw_widgets)
-        assert combo.currentData() == "ptsl_hybrid" and all(pt_fields[k].isEnabled() for k in PTSL_ONLY_PARAM_KEYS)
+        assert combo.currentData() == "offline_ptx" and all(not pt_fields[k].isEnabled() for k in PTSL_ONLY_PARAM_KEYS)
         assert dlg._config_tree_dirty_keys() == set()
         dlg_pt = dict(dlg._cfg_widgets["daw_processors.protools"])
         dlg_combo = dlg_pt["protools_transfer_backend"]
-        dlg_combo.setCurrentIndex(dlg_combo.findData("offline_ptx"))
+        dlg_combo.setCurrentIndex(dlg_combo.findData("ptsl_hybrid"))
         assert "daw_processors.protools" in dlg._config_tree_dirty_keys()
 
         # Direct deep-link into Config Presets › Pro Tools (cold-start recovery jump)
@@ -258,8 +258,9 @@ def test_protools_config_params_order_and_choice_labels():
     keys = [p.key for p in ProToolsDawProcessor.config_params()]
     assert keys[:3] == ["protools_enabled", "protools_transfer_backend", "protools_project_dir"]
     spec = ProToolsDawProcessor.config_params()[1]
-    assert spec.choices == ["ptsl_hybrid", "offline_ptx"]
+    assert spec.default == "offline_ptx"
+    assert spec.choices == ["offline_ptx", "ptsl_hybrid"]
     assert spec.choice_labels == {
-        "ptsl_hybrid": "Live PTSL + .ptx Hybrid",
         "offline_ptx": "Offline .ptx Writer",
+        "ptsl_hybrid": "Live PTSL + .ptx Hybrid",
     }

@@ -84,7 +84,7 @@ def transfer(tmp_path, monkeypatch):
     monkeypatch.setattr(paths, "get_app_dir", lambda: str(tmp_path))
     host = Host()
     processor = ProToolsDawProcessor(instance_group="Example", instance_name="Nested")
-    processor.configure({"protools_project_dir": str(tmp_path), "protools_temp_dir": str(tmp_path), "protools_command_delay": 0})
+    processor.configure({"protools_transfer_backend": "ptsl_hybrid", "protools_project_dir": str(tmp_path), "protools_temp_dir": str(tmp_path), "protools_command_delay": 0})
     monkeypatch.setattr(processor, "_open_engine", lambda: host)
     tracks = []
     for title in ("A.wav", "B.wav"):

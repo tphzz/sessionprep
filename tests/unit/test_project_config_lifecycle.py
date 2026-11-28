@@ -34,6 +34,7 @@ def project(qapp, tmp_path, monkeypatch):
     config = settings.build_defaults()
     default = config["config_presets"]["Default"]
     default["daw_processors"]["protools"].update(
+        protools_transfer_backend="ptsl_hybrid",
         protools_project_dir="Default Projects",
         protools_temp_dir="Default Scratch",
         protools_templates=[{"group": "Mix", "name": "Stereo"}],

@@ -238,7 +238,7 @@ def _setup_real_ptx_transfer(tmp_path, monkeypatch, *, raw_ptx: bytes | None = N
     )
 
     processor = protools.ProToolsDawProcessor(instance_index=0, instance_group="Mix", instance_name="Studio")
-    processor.configure({"protools_project_dir": str(project_dir), "protools_command_delay": 0})
+    processor.configure({"protools_transfer_backend": "ptsl_hybrid", "protools_project_dir": str(project_dir), "protools_command_delay": 0})
     state = {"session_path": "", "open": False, "routed": [], "reopened": [], "closed": False}
 
     live_tracks = [
@@ -546,7 +546,7 @@ def test_protools_transfer_runs_empty_folder_cleanup_and_guards_session_switch(t
                 return [{"id": rf_kik.uuid_braced, "name": "KIK", "type": "TType_RoutingFolder"}]
 
         proc = ProToolsDawProcessor()
-        proc.configure({"protools_project_dir": str(tmp_path), "protools_auto_route_folders": False})
+        proc.configure({"protools_transfer_backend": "ptsl_hybrid", "protools_project_dir": str(tmp_path), "protools_auto_route_folders": False})
         monkeypatch.setattr(proc, "_open_engine", lambda: FakeEngine())
         monkeypatch.setattr(ptslh, "wait_for_host_ready", lambda *a, **kw: True)
         monkeypatch.setattr(proc, "_create_transfer_session", lambda *a, **kw: str(session_ptx))
@@ -628,7 +628,7 @@ def test_protools_transfer_records_set_slot_a_trim_result(tmp_path, monkeypatch)
     session_ptx.write_bytes(raw)
 
     proc = protools.ProToolsDawProcessor()
-    proc.configure({"protools_project_dir": str(tmp_path)})
+    proc.configure({"protools_transfer_backend": "ptsl_hybrid", "protools_project_dir": str(tmp_path)})
     monkeypatch.setattr(protools.ptslh, "close_session", lambda *_a, **_kw: None)
     monkeypatch.setattr(protools.ptslh, "is_session_open", lambda *_a, **_kw: False)
     monkeypatch.setattr(protools.ptslh, "open_session", lambda *_a, **_kw: None)

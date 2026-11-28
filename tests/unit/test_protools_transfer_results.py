@@ -15,7 +15,7 @@ def transfer(tmp_path, monkeypatch):
     processor = protools.ProToolsDawProcessor(
         instance_index=0, instance_group="Mix Templates", instance_name="Studio",
     )
-    processor.configure({"protools_project_dir": str(project_dir), "protools_command_delay": 0})
+    processor.configure({"protools_transfer_backend": "ptsl_hybrid", "protools_project_dir": str(project_dir), "protools_command_delay": 0})
     closes = []
     faders = []
     spotted = []

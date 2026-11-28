@@ -48,6 +48,7 @@ def app_config(monkeypatch, tmp_path):
     config = settings.build_defaults()
     preset = config["config_presets"]["Default"]
     preset["daw_processors"]["protools"].update(
+        protools_transfer_backend="ptsl_hybrid",
         protools_project_dir=str(tmp_path / "protools-default"),
         protools_temp_dir=str(tmp_path / "protools-temp-default"),
         protools_port=31416,

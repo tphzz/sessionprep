@@ -321,8 +321,8 @@ def install_protools_mode_wiring(
     ptsl_widgets = [by_key[k] for k in PTSL_ONLY_PARAM_KEYS if k in by_key]
 
     def apply_mode() -> None:
-        backend = mode_combo.currentData() if isinstance(mode_combo, QComboBox) else "ptsl_hybrid"
-        is_offline = str(backend or "ptsl_hybrid") == "offline_ptx"
+        backend = mode_combo.currentData() if isinstance(mode_combo, QComboBox) else "offline_ptx"
+        is_offline = str(backend or "offline_ptx") == "offline_ptx"
         for w in ptsl_widgets:
             _set_param_row_enabled(w, not is_offline)
         if is_offline:

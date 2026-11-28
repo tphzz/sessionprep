@@ -58,6 +58,7 @@ def phase3_project(qapp, messages, monkeypatch, tmp_path):
     app_config = settings.build_defaults()
     preset = app_config["config_presets"]["Default"]
     preset["daw_processors"]["protools"].update(
+        protools_transfer_backend="ptsl_hybrid",
         protools_project_dir=str(tmp_path / "projects"),
         protools_temp_dir=str(tmp_path / "temporary-projects"),
         protools_templates=[{"group": "SessionPrep", "name": "Template"}],
