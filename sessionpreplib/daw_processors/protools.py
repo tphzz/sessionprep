@@ -24,6 +24,8 @@ from .protools_ptx import (
     resolve_protools_track_staging,
     run_post_close_ptx_enhancement,
 )
+from .protools_ptx_offline import execute_offline_ptx_creation
+from .protools_ptx_plan import build_protools_creation_plan
 from .protools_ptx_preview import read_template_folders_from_ptxt
 from .ptsl_connection import (
     ProToolsConnectionSettings,
@@ -1016,6 +1018,35 @@ class ProToolsDawProcessor(DawProcessor):
                     )
                 engine.close()
 
+    def _record_offline_write_results(self, session: SessionContext, output, record) -> None:
+        plan, staged, res = output.plan, output.staged, output.write_result
+        record("create_session", plan.session_name, path=str(staged.ptx_path))
+        for sf in staged.staged_files:
+            record("stage_audio", sf.filename, converted=sf.converted, sample_rate=sf.sample_rate, bit_depth=sf.bit_depth)
+        for pt in plan.tracks:
+            record("create_track", pt.track_name, folder=pt.parent_folder_name, bus=pt.output_bus_name)
+        for ftrk in plan.cleanup_plan.empty_folders:
+            record("remove_empty_folder", ftrk.name)
+        for vtrk in plan.cleanup_plan.unused_vcas:
+            record("remove_unused_vca", vtrk.name)
+        for atrk in plan.cleanup_plan.orphaned_auxes:
+            record("remove_unused_aux", atrk.name)
+        meta = res.patch_summary
+        for tname, info in (meta.get("clip_gains") or {}).items():
+            record("set_clip_gain", tname, clip_gain_db=info["target_db"])
+        for tname, info in (meta.get("slot_a_trims") or {}).items():
+            record(
+                "set_slot_a_trim", tname, plugin=info.get("plugin"),
+                trim_db=info.get("target_db"), activated=info.get("activated"),
+                auto_inserted=info.get("auto_inserted", False),
+            )
+        for tname, info in (meta.get("volumes") or {}).items():
+            record("set_fader_ptx", tname, fader_db=info["target_db"])
+        for grp in meta.get("groups") or ():
+            record("set_group", grp["name"], vca_track=grp.get("vca_track"), members=grp.get("member_tracks", []))
+        if plan.signal_flow is not None:
+            session.daw_state.setdefault(self.id, {})["signal_flow"] = plan.signal_flow.to_dict()
+
     def _execute_transfer_offline_ptx(
         self,
         session: SessionContext,
@@ -1024,12 +1055,54 @@ class ProToolsDawProcessor(DawProcessor):
         progress_cb,
         record,
     ) -> None:
-        del folder_map, valid_work, progress_cb
-        record(
-            "create_session",
-            session.project_name,
-            error="The offline .ptx writer backend is not yet available.",
-        )
+        del folder_map, valid_work
+        template_file, _mtime = self._template_file_and_mtime()
+        if template_file is None or not is_valid_ptx_file(template_file):
+            record(
+                "create_session", session.project_name,
+                error=f"Pro Tools template file not found or invalid: {template_file or self._instance_name}",
+            )
+            return
+        if not self._project_dir or not os.path.isdir(self._project_dir):
+            record(
+                "create_session", session.project_name,
+                error="Pro Tools 'Project directory' is not configured or does not exist.",
+            )
+            return
+        pt_state = session.daw_state.get(self.id, {})
+        overrides = pt_state.get("bus_fader_overrides")
+        try:
+            if progress_cb:
+                progress_cb(5, 100, "Planning offline Pro Tools session...")
+            plan = build_protools_creation_plan(
+                template_file, session,
+                pt_state.get("assignments") or {},
+                list(pt_state.get("folders") or ()),
+                track_order=pt_state.get("track_order"),
+                auto_route=self._auto_route_folders,
+                gain_mode=self._gain_mode,
+                auto_group_folders=self._auto_group_folders,
+                link_template_vcas=self._link_template_vcas,
+                group_type=self._group_type,
+                stage_bus_faders=self._stage_bus_faders,
+                pan_law_db=self._pan_law_db,
+                remove_unused_aux_tracks=self._remove_unused_aux_tracks,
+                bus_fader_overrides=overrides if isinstance(overrides, dict) else None,
+            )
+            for fname, reason in plan.excluded_tracks.items():
+                record("plan_track", fname, error=reason)
+            for warn in plan.warnings:
+                log.warning("Offline Pro Tools planning: %s", warn)
+            if not plan.tracks:
+                record(
+                    "create_session", session.project_name,
+                    error="No valid audio tracks remained to create after offline Pro Tools planning.",
+                )
+                return
+            output = execute_offline_ptx_creation(plan, self._project_dir, progress_cb=progress_cb)
+            self._record_offline_write_results(session, output, record)
+        except Exception as exc:
+            record("create_session", session.project_name, error=str(exc))
 
     def transfer(
         self,

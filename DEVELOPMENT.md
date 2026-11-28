@@ -492,7 +492,8 @@ sessionpreplib/
         __init__.py              # Exports all DAW processors; provides default_daw_processors()
         protools.py              # ProToolsDawProcessor — Pro Tools offline Fetch + PTSL/offline backend dispatch
         protools_ptx.py          # Pro Tools .ptx routing, cleanup (folders/VCAs/orphaned Auxes), & post-close patching
-        protools_ptx_media.py    # Offline Pro Tools session folder & Audio Files/ WAV staging (copy, exact resample, rollback)
+        protools_ptx_media.py    # Offline Pro Tools session folder & Audio Files/ BWF/UMID WAV staging (copy, exact resample, rollback)
+        protools_ptx_offline.py  # Offline Pro Tools creation runner bridging ProToolsCreationPlan, media stager & .ptx writer
         protools_ptx_plan.py     # Declarative backend-agnostic ProToolsCreationPlan builder (tracks, routing, colors, signal flow)
         protools_ptx_preview.py  # Offline .ptxt template folder/topology inspection & Signal Flow preview engine
         ptsl_connection.py       # PTSL engine connection & host-readiness helpers
@@ -523,6 +524,10 @@ sessionpreplib/
         patch_builder.py         # Fluent transactional PtxPatchBuilder wrapping validated in-memory/file batch mutations
         writer_primitives.py     # Low-level Z-chunk/control-curve serializers & byte-exact 0x0002 chunk-offset index codec/mutators
         writer_chunks.py         # Verified Pro Tools chunk serializers (0x1028, 0x103a, 0x1001, 0x104f/1052, 0x1014, 0x2628) & palette mapper
+        writer_index.py          # Deterministic 0x0002 chunk-offset index structural rebuilder
+        writer_blueprints.py     # Neutralized canonical Mono/Stereo 0x261C Audio strip & 0x2589 UI blueprints + chunk serializers
+        writer_mutations.py      # Per-chunk binary mutators (0x2519, 0x2107, 0x210C, 0x2587, 0x2624, 0x202B, 0x1004, 0x262A, 0x1015, 0x1054)
+        writer.py                # Pure offline Pro Tools .ptx session writer (write_offline_ptx_session) from clean .ptxt templates
         signal_flow.py           # Thin Pro Tools adapter (ptx_to_mixer_session, build_annotated_signal_flow) over signal_flow
         signal_flow_analysis.py  # Backward-compatible re-exports of signal_flow.analysis
 

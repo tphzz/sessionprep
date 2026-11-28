@@ -2,16 +2,22 @@
 
 from __future__ import annotations
 
+import ctypes
 from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 import logging
 import math
 import os
 from pathlib import Path
 import re
+import secrets
 import shutil
 import stat
+import struct
+import tempfile
+import time
 
 import numpy as np
 from scipy.signal import resample_poly
@@ -77,6 +83,9 @@ class StagedAudioFile:
     channels: int
     length_samples: int
     converted: bool
+    file_id8: bytes = b"\x00" * 8
+    smpte_umid32: bytes = b"\x00" * 32
+    filetime_u64: int = 0
 
 
 @dataclass(frozen=True)
@@ -195,6 +204,163 @@ def _convert_and_write_wav(src: Path, dst: Path, spec: TargetAudioSpec) -> tuple
     return int(arr.shape[1]), int(arr.shape[0])
 
 
+_BWF_UMID_PREFIX = bytes.fromhex("060a2b340101010501010f1013000000")
+_WIN_FILETIME_EPOCH_DIFF = 116444736000000000  # 100ns intervals between 1601-01-01 and 1970-01-01
+
+
+def get_volume_info(path: str | Path) -> tuple[int, str]:
+    """Return ``(volume_serial_u32, volume_label)`` for *path* (Windows API with safe fallback)."""
+    resolved = Path(path).resolve()
+    if os.name == "nt":
+        try:
+            root = str(resolved.anchor or resolved)
+            vol_buf = ctypes.create_unicode_buffer(261)
+            fs_buf = ctypes.create_unicode_buffer(261)
+            serial = ctypes.c_ulong(0)
+            max_comp = ctypes.c_ulong(0)
+            flags = ctypes.c_ulong(0)
+            ok = ctypes.windll.kernel32.GetVolumeInformationW(
+                ctypes.c_wchar_p(root),
+                vol_buf, 261,
+                ctypes.byref(serial), ctypes.byref(max_comp), ctypes.byref(flags),
+                fs_buf, 261,
+            )
+            if ok:
+                return int(serial.value), (vol_buf.value or "Volume")
+        except Exception:
+            pass
+    return 0x53505250, "SessionPrep"
+
+
+def _build_bwf_bext_payload(smpte_umid32: bytes) -> bytes:
+    now = datetime.now(UTC)
+    orig = b"SessionPrep".ljust(32, b"\x00")[:32]
+    orig_ref = secrets.token_hex(16).encode("ascii")[:32]
+    orig_date = now.strftime("%Y-%m-%d").encode("ascii")[:10]
+    orig_time = now.strftime("%H:%M:%S").encode("ascii")[:8]
+    return (
+        (b"\x00" * 256)  # Description
+        + orig
+        + orig_ref
+        + orig_date
+        + orig_time
+        + struct.pack("<QH", 0, 1)  # TimeReference=0, Version=1
+        + smpte_umid32
+        + (b"\x00" * 32)  # Extended UMID bytes (unused)
+        + (b"\x00" * 190)  # Reserved
+    )
+
+
+_STRIP_RIFF_CHUNKS = frozenset({b"bext", b"umid", b"minf"})
+
+
+def _scan_wav_riff_chunks(wav_path: Path) -> tuple[list[tuple[bytes, int, int]], bool]:
+    """Scan RIFF/WAVE chunks and report ``(chunks[(id, offset, total_bytes)], needs_rewrite)``."""
+    file_len = wav_path.stat().st_size
+    with wav_path.open("rb") as handle:
+        header = handle.read(12)
+        if len(header) != 12 or header[8:12] != b"WAVE":
+            raise ValueError(f"Staged audio file is not a valid WAVE file: {wav_path.name}")
+        if header[:4] == b"RF64":
+            raise ValueError(f"RF64 (>4 GB) WAV files are not supported for offline .ptx UMID embedding: {wav_path.name}")
+        if header[:4] != b"RIFF":
+            raise ValueError(f"Unsupported WAVE container {header[:4]!r} in {wav_path.name}")
+        riff_end = 8 + struct.unpack_from("<I", header, 4)[0]
+        limit = min(file_len, riff_end)
+        chunks: list[tuple[bytes, int, int]] = []
+        needs_rewrite = file_len != riff_end
+        pos = 12
+        while pos + 8 <= limit:
+            handle.seek(pos)
+            ch_hdr = handle.read(8)
+            if len(ch_hdr) < 8:
+                break
+            cid = ch_hdr[:4]
+            csz = struct.unpack_from("<I", ch_hdr, 4)[0]
+            total = 8 + csz + (csz & 1)
+            if pos + 8 + csz > limit:
+                needs_rewrite = True
+                break
+            if cid in _STRIP_RIFF_CHUNKS:
+                needs_rewrite = True
+            chunks.append((cid, pos, min(total, limit - pos)))
+            pos += total
+        if pos != limit:
+            needs_rewrite = True
+    return chunks, needs_rewrite
+
+
+def _rewrite_wav_with_identity(
+    wav_path: Path,
+    chunks: list[tuple[bytes, int, int]],
+    extra_chunks: bytes,
+) -> None:
+    kept = [(cid, off, total) for cid, off, total in chunks if cid not in _STRIP_RIFF_CHUNKS]
+    kept_bytes = sum(total + (total & 1) for _, _, total in kept)
+    new_riff_size = 4 + kept_bytes + len(extra_chunks)
+    if new_riff_size > 0xFFFF_FFFF:
+        raise ValueError(f"Staged WAV exceeds 4 GB RIFF limit after BWF/UMID embedding: {wav_path.name}")
+
+    fd, tmp_name = tempfile.mkstemp(dir=str(wav_path.parent), prefix=".tmp_wav_", suffix=".wav")
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as dst, wav_path.open("rb") as src:
+            dst.write(b"RIFF" + struct.pack("<I", new_riff_size) + b"WAVE")
+            for _cid, off, total in kept:
+                src.seek(off)
+                remaining = total
+                while remaining > 0:
+                    buf = src.read(min(65536, remaining))
+                    if not buf:
+                        break
+                    dst.write(buf)
+                    remaining -= len(buf)
+                if total & 1:
+                    dst.write(b"\x00")
+            dst.write(extra_chunks)
+        os.replace(tmp_path, wav_path)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
+def _embed_protools_wav_identity(wav_path: Path) -> tuple[bytes, bytes, int]:
+    """Write fresh Pro Tools ``bext``, ``umid``, and ``minf`` RIFF chunks (stripping any stale copies)."""
+    file_id8 = secrets.token_bytes(8)
+    smpte_umid32 = _BWF_UMID_PREFIX + file_id8 + secrets.token_bytes(8)
+    filetime_u64 = int(time.time() * 10_000_000) + _WIN_FILETIME_EPOCH_DIFF
+
+    bext_body = _build_bwf_bext_payload(smpte_umid32)
+    umid_body = b"\x00\x00\x00\x00\x00\x00\x00\x2a" + file_id8 + (b"\x00" * 8)
+    minf_body = struct.pack("<QII", filetime_u64, 1, 0)
+    extra = bytearray()
+    for cid, body in ((b"bext", bext_body), (b"umid", umid_body), (b"minf", minf_body)):
+        extra.extend(cid)
+        extra.extend(struct.pack("<I", len(body)))
+        extra.extend(body)
+        if len(body) & 1:
+            extra.append(0)
+
+    chunks, needs_rewrite = _scan_wav_riff_chunks(wav_path)
+    if needs_rewrite:
+        _rewrite_wav_with_identity(wav_path, chunks, bytes(extra))
+        return file_id8, smpte_umid32, filetime_u64
+
+    file_len = wav_path.stat().st_size
+    pad = file_len & 1
+    new_total = file_len + pad + len(extra)
+    if new_total - 8 > 0xFFFF_FFFF:
+        raise ValueError(f"Staged WAV exceeds 4 GB RIFF limit after BWF/UMID embedding: {wav_path.name}")
+    with wav_path.open("r+b") as handle:
+        handle.seek(0, os.SEEK_END)
+        if pad:
+            handle.write(b"\x00")
+        handle.write(extra)
+        handle.seek(4)
+        handle.write(struct.pack("<I", new_total - 8))
+    return file_id8, smpte_umid32, filetime_u64
+
+
 def _stage_single_audio_file(
     src: Path, audio_dir: Path, spec: TargetAudioSpec, used_lower: set[str]
 ) -> StagedAudioFile:
@@ -215,6 +381,7 @@ def _stage_single_audio_file(
     else:
         channels, length_samples = _convert_and_write_wav(src, dst, spec)
         converted = True
+    file_id8, smpte_umid32, filetime_u64 = _embed_protools_wav_identity(dst)
     return StagedAudioFile(
         source_path=str(src),
         dest_path=str(dst),
@@ -225,6 +392,9 @@ def _stage_single_audio_file(
         channels=channels,
         length_samples=length_samples,
         converted=converted,
+        file_id8=file_id8,
+        smpte_umid32=smpte_umid32,
+        filetime_u64=filetime_u64,
     )
 
 

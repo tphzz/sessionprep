@@ -684,10 +684,15 @@ post-close pass with automatic rollback if Pro Tools fails to reopen the session
   macOS, Linux, and custom template folders). When a valid local `.ptxt` file is
   present, Phase 3 **Fetch** reads folder topology offline in milliseconds without
   launching Pro Tools. **Transfer Mode** lets you switch between **Live PTSL + .ptx
-  Hybrid** (`ptsl_hybrid`, active today for full session creation) and **Offline .ptx
-  Writer** (`offline_ptx`, which disables PTSL connection controls in Preferences,
-  validates local template/project readiness offline in Phase 3 without PTSL prompts,
-  and reserves direct PTSL-free `.ptx` session creation for an upcoming release).
+  Hybrid** (`ptsl_hybrid`, default) and **Offline .ptx Writer** (`offline_ptx`), which
+  disables PTSL connection controls in Preferences, validates local template/project
+  readiness offline in Phase 3 without PTSL prompts, stages BWF/UMID-linked WAVs into
+  `<project_dir>/<session_name>/Audio Files/` (resampling/converting if needed), and
+  writes complete Pro Tools `.ptx` sessions directly from clean `.ptxt` templates —
+  including folder placement, `No Input`, Routing Folder bus output assignment, track
+  colors, whole-file clips spotted at sample 0, Clip Gain, Slot A Trim, Track/Bus
+  Faders, VCA-linked Folder Groups, and empty folder/VCA/orphaned Aux cleanup — with
+  no running Pro Tools instance required.
 - **Automatic Folder Output Routing (`protools_auto_route_folders`, default `true`), Empty Folder/VCA & Orphaned Aux Cleanup (`protools_remove_unused_aux_tracks`, default `true`), and Audio Track `No Input` Clearing:**
   Routes each newly created audio track's Main Output to its parent Routing
   Folder's input bus (walking up through nested Basic Folders when necessary),

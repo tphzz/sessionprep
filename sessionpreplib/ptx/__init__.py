@@ -133,6 +133,13 @@ from .signal_flow_analysis import (
     validate_signal_flow_balance,
 )
 from .timeline import PtxBarBeat, PtxTimeline
+from .writer import (
+    OfflineAudioTrackRequest,
+    OfflineGroupRequest,
+    OfflinePtxWriteRequest,
+    OfflinePtxWriteResult,
+    write_offline_ptx_session,
+)
 from .writer_chunks import (
     PtxDirTreeEntry,
     closest_pt_color_index,
@@ -144,6 +151,8 @@ from .writer_chunks import (
     serialize_placement_104f,
     serialize_playlist_1014,
 )
+from .writer_index import apply_rebuilt_index_0002, rebuild_index_0002
+from .writer_mutations import AudioFileWriteSpec
 from .writer_primitives import (
     PtxIndex0002,
     PtxIndexEntry,
@@ -163,6 +172,7 @@ from .writer_primitives import (
 )
 
 __all__ = [
+    "AudioFileWriteSpec",
     "BalanceValidationReport",
     "DecodedPluginParameters",
     "FPS_CODE_MAP",
@@ -170,6 +180,10 @@ __all__ = [
     "GraphLayoutNode",
     "LeafAudioInput",
     "MAX_GROUP_ID",
+    "OfflineAudioTrackRequest",
+    "OfflineGroupRequest",
+    "OfflinePtxWriteRequest",
+    "OfflinePtxWriteResult",
     "PT12_COLOR_PALETTE",
     "PathTraceResult",
     "PreFaderSendCaveat",
@@ -236,6 +250,7 @@ __all__ = [
     "TICKS_PER_QUARTER",
     "ZERO_TICKS",
     "apply_atomic_ptx_patch",
+    "apply_rebuilt_index_0002",
     "atomic_write_bytes",
     "audit_session",
     "build_annotated_signal_flow",
@@ -280,6 +295,7 @@ __all__ = [
     "patch_slot_a_trim_gains",
     "patch_track_volumes",
     "read_lp_str",
+    "rebuild_index_0002",
     "replace_index_0002_chunk",
     "resolve_audio_events",
     "resolve_midi_events",
@@ -303,4 +319,5 @@ __all__ = [
     "validate_index_0002",
     "validate_signal_flow_balance",
     "vcas_for_track",
+    "write_offline_ptx_session",
 ]

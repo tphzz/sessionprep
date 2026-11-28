@@ -64,7 +64,7 @@ def test_protools_offline_backend_dispatch_does_not_require_ptsl(tmp_path: Path)
     )
     results = proc.transfer(sess, "")
     assert len(results) == 1 and results[0].success is False
-    assert "not yet available" in (results[0].error or "")
+    assert "template file not found or invalid" in (results[0].error or "").lower()
 
 
 def test_resolve_target_audio_spec_and_stage_copy_convert_dedup_collisions(tmp_path: Path):
