@@ -497,7 +497,7 @@ def _serialize_group_202a(
     body = b"".join([
         struct.pack("<I", len(name_b)),
         name_b,
-        struct.pack("<BiBBI", group_type_code, id_number, int(is_edit_active), int(is_mix_active), len(member_indices)),
+        struct.pack("<BiBBI", group_type_code, id_number, int(bool(is_edit_active)), int(bool(is_mix_active)), len(member_indices)),
         struct.pack(f"<{len(member_indices)}H", *member_indices) if member_indices else b"",
         struct.pack("<HH6sH", color_index & 0xFFFF, flags & 0xFFFF, b"\x00" * 6, vca_u16 & 0xFFFF),
         _serialize_group_attrs_258e(attrs),
@@ -678,6 +678,8 @@ def patch_modify_group(
     remove_tracks: list[Any] | None = None,
     vca_track: Any = _UNSET,
     group_type: str | None = None,
+    is_edit_active: bool | None = None,
+    is_mix_active: bool | None = None,
     follow_globals: bool | None = None,
     include_rulers: bool | None = None,
 ) -> tuple[bytes, dict[str, Any]]:
@@ -710,8 +712,18 @@ def patch_modify_group(
         attrs.follow_globals = follow_globals
     if include_rulers is not None:
         attrs.include_rulers = include_rulers
-    new_202a = _serialize_group_202a(
-        target_name, gtype_code, existing.id_number, existing.is_edit_active, existing.is_mix_active,
+    edit_ex = session.group_by_name(name, kind="edit") or existing
+    mix_ex = session.group_by_name(name, kind="mix") or existing
+    e_edit_act = edit_ex.is_edit_active if is_edit_active is None else bool(is_edit_active)
+    e_mix_act = edit_ex.is_mix_active if is_mix_active is None else bool(is_mix_active)
+    m_edit_act = mix_ex.is_edit_active if is_edit_active is None else bool(is_edit_active)
+    m_mix_act = mix_ex.is_mix_active if is_mix_active is None else bool(is_mix_active)
+    new_edit_202a = _serialize_group_202a(
+        target_name, gtype_code, existing.id_number, e_edit_act, e_mix_act,
+        member_indices, existing.color_index, 0x0001, vca_idx, attrs,
+    )
+    new_mix_202a = new_edit_202a if (m_edit_act, m_mix_act) == (e_edit_act, e_mix_act) else _serialize_group_202a(
+        target_name, gtype_code, existing.id_number, m_edit_act, m_mix_act,
         member_indices, existing.color_index, 0x0001, vca_idx, attrs,
     )
     c202b = session.chunk_map.get(0x202B)
@@ -719,8 +731,8 @@ def patch_modify_group(
         raise RuntimeError("Missing 0x202b groups chunk in .ptx")
     edit_list, mix_list, trailer = split_202b(c202b.raw)
     old_low = existing.name.lower()
-    new_edit = _replace_in_202a_list(edit_list, old_low, new_202a, gtype_code in (0, 2))
-    new_mix = _replace_in_202a_list(mix_list, old_low, new_202a, gtype_code in (1, 2))
+    new_edit = _replace_in_202a_list(edit_list, old_low, new_edit_202a, gtype_code in (0, 2))
+    new_mix = _replace_in_202a_list(mix_list, old_low, new_mix_202a, gtype_code in (1, 2))
     buf = bytearray(dec)
     splice_top_chunk(buf, 0x202B, _build_202b(new_edit, new_mix, trailer=trailer, version=c202b.version))
     _set_vca_track_group_names(buf, vca_updates)

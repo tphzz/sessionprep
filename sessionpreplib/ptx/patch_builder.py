@@ -182,6 +182,8 @@ class PtxPatchBuilder:
         remove_tracks: Sequence[Any] | None = None,
         vca_track: Any = _UNSET,
         group_type: str | None = None,
+        is_edit_active: bool | None = None,
+        is_mix_active: bool | None = None,
         follow_globals: bool | None = None,
         include_rulers: bool | None = None,
     ) -> PtxPatchBuilder:
@@ -194,13 +196,15 @@ class PtxPatchBuilder:
                 nxt, info = patch_modify_group(
                     cur, name, new_name=new_name, member_tracks=m_tracks,
                     add_tracks=a_tracks, remove_tracks=r_tracks, group_type=group_type,
+                    is_edit_active=is_edit_active, is_mix_active=is_mix_active,
                     follow_globals=follow_globals, include_rulers=include_rulers,
                 )
             else:
                 nxt, info = patch_modify_group(
                     cur, name, new_name=new_name, member_tracks=m_tracks,
                     add_tracks=a_tracks, remove_tracks=r_tracks, vca_track=vca_track,
-                    group_type=group_type, follow_globals=follow_globals, include_rulers=include_rulers,
+                    group_type=group_type, is_edit_active=is_edit_active, is_mix_active=is_mix_active,
+                    follow_globals=follow_globals, include_rulers=include_rulers,
                 )
             summary["groups"].append(info)
             return nxt

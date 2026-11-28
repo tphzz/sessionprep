@@ -185,13 +185,16 @@ def apply_virtual_folder_groups(
     is_mix = group_type.strip().lower() != "edit"
     for act in actions:
         if act.op == "modify":
-            grp = ptx.group_by_name(act.group_name)
-            if grp is not None:
+            for grp in ptx.groups:
+                if grp.name.lower() != act.group_name.lower():
+                    continue
                 for member in act.member_tracks:
                     if member not in grp.member_names:
                         grp.member_names.append(member)
                 if act.vca_track and not grp.vca_track_name:
                     grp.vca_track_name = act.vca_track
+                grp.is_edit_active = False
+                grp.is_mix_active = False
         else:
             ptx.groups.append(
                 PtxGroup(
@@ -201,7 +204,8 @@ def apply_virtual_folder_groups(
                     group_type=act.group_type,
                     id_number=len(ptx.groups) + 1,
                     id_letter="",
-                    is_mix_active=is_mix,
+                    is_edit_active=False,
+                    is_mix_active=False,
                     vca_track_name=act.vca_track,
                     member_names=list(act.member_tracks),
                 )

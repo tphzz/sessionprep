@@ -96,12 +96,20 @@ def _build_251a_template_track(
     return build_zchunk(0x251A, body, version=10)
 
 
-def _build_group_202a(name: str, members: list[int], id_num: int, *, vca_index: int = 0xFFFF) -> bytes:
+def _build_group_202a(
+    name: str,
+    members: list[int],
+    id_num: int,
+    *,
+    vca_index: int = 0xFFFF,
+    is_edit_active: bool = False,
+    is_mix_active: bool = False,
+) -> bytes:
     m_bytes = struct.pack(f"<{len(members)}H", *members) if members else b""
     tail = bytes.fromhex("feff1080010000000000") + struct.pack("<H", vca_index)
     body = (
         encode_lp_str(name)
-        + struct.pack("<BiH", 2, id_num, 0)
+        + struct.pack("<BiBB", 2, id_num, int(is_edit_active), int(is_mix_active))
         + struct.pack("<I", len(members))
         + m_bytes
         + tail
@@ -183,9 +191,18 @@ def _build_clean_template_ptxt(
         _build_group_202a("<ALL>", list(range(len(tracks))), -1),
         _build_group_202a("ALL-VCA", [1, 3], 1, vca_index=(3 if with_preexisting_vca_group else 0xFFFF)),
     ]
+    mix_groups: list[bytes] = []
     if with_preexisting_vca_group:
-        edit_groups.append(_build_group_202a("KIK-PRE", [0], 2, vca_index=1))
-    c202b = build_zchunk(0x202B, struct.pack("<I", len(edit_groups)) + b"".join(edit_groups) + struct.pack("<I", 0) + b"\x00\x00", version=4)
+        # Seed KIK-PRE as active in BOTH edit & mix lists so offline add_members proves deactivation!
+        kik_pre = _build_group_202a("KIK-PRE", [0], 2, vca_index=1, is_edit_active=True, is_mix_active=True)
+        edit_groups.append(kik_pre)
+        mix_groups.append(kik_pre)
+    c202b = build_zchunk(
+        0x202B,
+        struct.pack("<I", len(edit_groups)) + b"".join(edit_groups)
+        + struct.pack("<I", len(mix_groups)) + b"".join(mix_groups) + b"\x00\x00",
+        version=4,
+    )
     c1054 = build_zchunk(0x1054, struct.pack("<I", 0) + build_zchunk(0x4828, b"\x00\x00\x00\x00", version=2), version=2)
     c1015 = build_zchunk(0x1015, struct.pack("<I", 0) + build_zchunk(0x4829, b"\x00\x00\x00\x00", version=2), version=2)
     c262a = build_zchunk(0x262A, struct.pack("<I", 0), version=1)
@@ -414,6 +431,8 @@ def test_write_offline_ptx_end_to_end_empty_basic_folder_vca_remap_and_unicode(t
         track_volumes_db={"Kick Ω": 3.0},
         group_requests=(
             OfflineGroupRequest("KIK-PRE", "add_members", ("Kick Ω",), vca_track="KIK-VCA"),
+            OfflineGroupRequest("UNROUTED-GRP", "create", ("UnroutedMono",)),
+            OfflineGroupRequest("OPT-IN-ACTIVE", "create", ("UnroutedMono",), is_edit_active=True, is_mix_active=True),
         ),
     )
     res = write_offline_ptx_session(req)
@@ -430,11 +449,27 @@ def test_write_offline_ptx_end_to_end_empty_basic_folder_vca_remap_and_unicode(t
     assert idx is not None
     rack_entries = [e for e in idx.entries if len(e.path) == 4 and e.path[0].tag == 0x2624 and e.path[3].tag == 0x2627]
     assert len(rack_entries) == 2
-    # Pre-existing VCA-linked group KIK-PRE stayed linked to shifted KIK-VCA (index 2) and ALL-VCA cleared deleted VOX-VCA
-    g_pre = next(g for g in parsed.groups if g.name == "KIK-PRE")
+    # Pre-existing active VCA-linked group KIK-PRE stayed linked to shifted KIK-VCA (index 2) and was deactivated in BOTH edit & mix lists;
+    # newly created group defaults to deselected, while explicit opt-in active flags are honored
+    g_pre_list = [g for g in parsed.groups if g.name == "KIK-PRE"]
+    assert len(g_pre_list) == 2 and all(not g.is_edit_active and not g.is_mix_active for g in g_pre_list)
+    g_pre = g_pre_list[0]
     assert g_pre.vca_track_name == "KIK-VCA" and "Kick Ω" in [parsed.tracks[i].name for i in g_pre.member_indices]
+    g_new_list = [g for g in parsed.groups if g.name == "UNROUTED-GRP"]
+    assert len(g_new_list) == 2 and all(not g.is_edit_active and not g.is_mix_active for g in g_new_list)
+    g_opt_list = [g for g in parsed.groups if g.name == "OPT-IN-ACTIVE"]
+    assert len(g_opt_list) == 2 and all(g.is_edit_active and g.is_mix_active for g in g_opt_list)
     g_all_vca = next(g for g in parsed.groups if g.name == "ALL-VCA")
     assert g_all_vca.vca_track_name is None
+
+    # link_vca action also deactivates an active pre-existing group by default
+    link_res = write_offline_ptx_session(OfflinePtxWriteRequest(
+        ptxt_path=ptxt, output_ptx_path=tmp_path / "link_vca.ptx", session_dir=staged.session_dir,
+        sample_rate=48000, bit_depth=24, audio_files=(), tracks=(),
+        group_requests=(OfflineGroupRequest("KIK-PRE", "link_vca", (), vca_track="KIK-VCA"),),
+    ))
+    link_groups = [g for g in PtxSession.from_file(link_res.ptx_path).groups if g.name == "KIK-PRE"]
+    assert len(link_groups) == 2 and all(not g.is_edit_active and not g.is_mix_active for g in link_groups)
 
 
 def test_template_variants_validation_guards_and_rollback(tmp_path: Path):

@@ -699,11 +699,24 @@ def _queue_group_actions(builder: PtxPatchBuilder, group_actions: Sequence[Folde
                 list(act.member_tracks),
                 vca_track=act.vca_track,
                 group_type=act.group_type,
+                is_edit_active=False,
+                is_mix_active=False,
             )
         elif act.vca_track is not None:
-            builder.modify_group(act.group_name, add_tracks=list(act.member_tracks), vca_track=act.vca_track)
+            builder.modify_group(
+                act.group_name,
+                add_tracks=list(act.member_tracks),
+                vca_track=act.vca_track,
+                is_edit_active=False,
+                is_mix_active=False,
+            )
         else:
-            builder.modify_group(act.group_name, add_tracks=list(act.member_tracks))
+            builder.modify_group(
+                act.group_name,
+                add_tracks=list(act.member_tracks),
+                is_edit_active=False,
+                is_mix_active=False,
+            )
 
 
 def log_ptx_audit_caveats(audit: PtxSessionAudit, context_label: str) -> None:

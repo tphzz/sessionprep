@@ -170,13 +170,52 @@ def test_folder_groups_and_vca_planning_links_vca_and_avoids_cross_folder_collis
     assert by_folder["Alias"].vca_track == "KIK-VCA"
     assert by_folder["KIK"].vca_track is None
 
-    # In-memory group/VCA simulation exposes newly wired VCA offset to DAG evaluation
+    # In-memory group/VCA simulation exposes newly wired VCA offset to DAG evaluation,
+    # and newly created/modified groups are left deselected (inactive) so member faders stay independent.
     sim_raw, _ = patch_track_volumes(_build_synthetic_ptx(), {"KIK-VCA": -3.0})
     sim_ptx = PtxSession.from_bytes(sim_raw)
     sim_actions = protools_ptx.plan_folder_groups_and_vcas(sim_ptx, ["Kick"], link_vcas=True)
     updated_ptx = protools_ptx._apply_group_actions_in_memory(sim_raw, sim_actions)
+    for act in sim_actions:
+        matched = [g for g in updated_ptx.groups if g.name == act.group_name]
+        assert matched and all(not g.is_edit_active and not g.is_mix_active for g in matched)
     graph = build_annotated_signal_flow(updated_ptx, {}, stage_bus_faders=False)
     assert graph.nodes["Kick"].vca_offset_db == pytest.approx(-3.0, abs=0.1)
+
+    # Modifying an already-active group via _queue_group_actions also deselects it
+    from sessionpreplib.ptx import patch_add_group, patch_modify_group
+    act_raw, _ = patch_add_group(_build_synthetic_ptx(), "KIK", ["Snare"], is_edit_active=True, is_mix_active=True)
+    # Low-level patch_modify_group preserves active flags by default and preserves diverged Edit/Mix states on partial override
+    kept_raw, _ = patch_modify_group(act_raw, "KIK", add_tracks=["Kick"])
+    kept_groups = [g for g in PtxSession.from_bytes(kept_raw).groups if g.name == "KIK"]
+    assert len(kept_groups) == 2 and all(g.is_edit_active is True and g.is_mix_active is True for g in kept_groups)
+    # Build diverged Edit (edit_act=True, mix_act=False) vs Mix (edit_act=False, mix_act=True) entries and override only is_edit_active=False
+    from sessionpreplib.ptx import decrypt_ptx, encrypt_ptx, splice_top_chunk
+    from sessionpreplib.ptx.parser import split_202b
+    from sessionpreplib.ptx.patcher import _build_202b
+    dec_a, delta_a = decrypt_ptx(act_raw)
+    c202b_a = PtxSession(dec_a, xor_delta=delta_a).chunk_map[0x202B]
+    e_list, m_list, trl = split_202b(c202b_a.raw)
+    # Flip mix_act on edit entry -> False and edit_act on mix entry -> False
+    e_b, m_b = bytearray(e_list[-1]), bytearray(m_list[-1])
+    off_k = 9 + 4 + len(b"KIK")
+    e_b[off_k + 5], e_b[off_k + 6] = 1, 0
+    m_b[off_k + 5], m_b[off_k + 6] = 0, 1
+    e_list[-1], m_list[-1] = bytes(e_b), bytes(m_b)
+    div_buf = bytearray(dec_a)
+    splice_top_chunk(div_buf, 0x202B, _build_202b(e_list, m_list, trailer=trl, version=c202b_a.version))
+    div_raw = encrypt_ptx(bytes(div_buf), delta_a)
+    part_raw, _ = patch_modify_group(div_raw, "KIK", add_tracks=["Kick"], is_edit_active=False)
+    part_sess = PtxSession.from_bytes(part_raw)
+    e_part = part_sess.group_by_name("KIK", kind="edit")
+    m_part = part_sess.group_by_name("KIK", kind="mix")
+    assert e_part is not None and e_part.is_edit_active is False and e_part.is_mix_active is False
+    assert m_part is not None and m_part.is_edit_active is False and m_part.is_mix_active is True
+    mod_ptx = protools_ptx._apply_group_actions_in_memory(
+        act_raw, [protools_ptx.FolderGroupAction("modify", "KIK", "KIK", ("Kick",), "KIK-VCA", "Mix/Edit")],
+    )
+    mod_groups = [g for g in mod_ptx.groups if g.name == "KIK"]
+    assert mod_groups and all(not g.is_edit_active and not g.is_mix_active for g in mod_groups)
 
 
 def _setup_real_ptx_transfer(tmp_path, monkeypatch, *, raw_ptx: bytes | None = None):

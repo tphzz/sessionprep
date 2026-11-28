@@ -86,6 +86,8 @@ class OfflineGroupRequest:
     member_tracks: tuple[str, ...]
     vca_track: str | None = None
     group_type: str = "Mix/Edit"
+    is_edit_active: bool = False
+    is_mix_active: bool = False
 
 
 @dataclass(frozen=True)
@@ -495,15 +497,23 @@ def _apply_signal_flow_and_groups(
         if grp.action == "create":
             builder.add_group(
                 grp.name, grp.member_tracks, vca_track=grp.vca_track, group_type=grp.group_type,
+                is_edit_active=grp.is_edit_active, is_mix_active=grp.is_mix_active,
             )
         elif grp.action == "add_members":
-            kwargs: dict[str, Any] = {"add_tracks": grp.member_tracks}
+            kwargs: dict[str, Any] = {
+                "add_tracks": grp.member_tracks,
+                "is_edit_active": grp.is_edit_active,
+                "is_mix_active": grp.is_mix_active,
+            }
             if grp.vca_track:
                 kwargs["vca_track"] = grp.vca_track
                 kwargs["group_type"] = grp.group_type
             builder.modify_group(grp.name, **kwargs)
         elif grp.action == "link_vca" and grp.vca_track:
-            builder.modify_group(grp.name, vca_track=grp.vca_track, group_type=grp.group_type)
+            builder.modify_group(
+                grp.name, vca_track=grp.vca_track, group_type=grp.group_type,
+                is_edit_active=grp.is_edit_active, is_mix_active=grp.is_mix_active,
+            )
     return builder.build()
 
 
