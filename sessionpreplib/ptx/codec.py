@@ -16,7 +16,12 @@ from .models import (
     ZERO_TICKS,
     PtxAutomationPoint,
     PtxChunk,
+    PtxCorruptFileError,
+    PtxUnsupportedTemplateError,
+    PtxValidationError,
 )
+
+_XOR_TABLES: tuple[bytes, ...] = tuple(bytes(b ^ k for b in range(256)) for k in range(256))
 
 
 def format_ptsl_uuid(raw16: bytes) -> str:
@@ -110,17 +115,17 @@ def _estimate_mode_xor_delta(raw: bytes, nblocks: int) -> int:
 
 
 def _apply_block_xor(data: bytes, delta: int, k0: int) -> bytes:
-    out = bytearray(data)
-    nblocks = (len(out) + 0xFFF) // 0x1000
+    if len(data) <= 0x14:
+        return bytes(data)
+    parts: list[bytes] = [data[:0x14]]
+    nblocks = (len(data) + 0xFFF) // 0x1000
     for block_idx in range(nblocks):
         key = (k0 + block_idx * delta) & 0xFF
-        if key == 0:
-            continue
         start = 0x14 if block_idx == 0 else block_idx * 0x1000
-        end = min(len(out), (block_idx + 1) * 0x1000)
-        for i in range(start, end):
-            out[i] ^= key
-    return bytes(out)
+        end = min(len(data), (block_idx + 1) * 0x1000)
+        chunk = data[start:end]
+        parts.append(chunk if key == 0 else chunk.translate(_XOR_TABLES[key]))
+    return b"".join(parts)
 
 
 def _is_plausible_ptx_plaintext(buf: bytes) -> bool:
@@ -136,14 +141,14 @@ def _is_plausible_ptx_plaintext(buf: bytes) -> bool:
 def decrypt_ptx(raw: bytes) -> tuple[bytes, int]:
     """Decrypt a Pro Tools v10+ ``.ptx``/``.ptxt`` buffer and return ``(decrypted, xor_delta)``."""
     if len(raw) < 0x20:
-        raise ValueError(f"File too small to be a .ptx session ({len(raw)} bytes)")
+        raise PtxValidationError(f"File too small to be a .ptx session ({len(raw)} bytes)")
     if not raw.startswith(PTX_MAGIC):
-        raise ValueError(f"Unrecognized .ptx magic header: {raw[:20]!r}")
+        raise PtxValidationError(f"Unrecognized .ptx magic header: {raw[:20]!r}")
     if raw[0x11] != 0:
-        raise ValueError("Big-endian legacy Pro Tools sessions are not supported (.ptx v10+ only)")
+        raise PtxUnsupportedTemplateError("Big-endian legacy Pro Tools sessions are not supported (.ptx v10+ only)")
     xor_type = raw[0x12]
     if xor_type == 0x01:
-        raise ValueError("Legacy Pro Tools v5-v9 (.pts/.ptf) encryption is not supported (.ptx v10+ only)")
+        raise PtxUnsupportedTemplateError("Legacy Pro Tools v5-v9 (.pts/.ptf) encryption is not supported (.ptx v10+ only)")
 
     k0 = raw[0x14] ^ 0x5A
     nblocks = (len(raw) + 0xFFF) // 0x1000
@@ -173,7 +178,7 @@ def iter_top_chunks(buf: bytes, *, strict: bool = False) -> list[PtxChunk]:
     while pos < limit:
         if pos + 9 > limit or buf[pos] != 0x5A:
             if strict:
-                raise RuntimeError(f"Invalid top-level Z-chunk header at offset 0x{pos:x}")
+                raise PtxCorruptFileError(f"Invalid top-level Z-chunk header at offset 0x{pos:x}")
             break
         version = struct.unpack_from("<H", buf, pos + 1)[0]
         size = struct.unpack_from("<I", buf, pos + 3)[0]
@@ -181,7 +186,7 @@ def iter_top_chunks(buf: bytes, *, strict: bool = False) -> list[PtxChunk]:
         end = pos + 7 + size
         if size < 2 or end > limit:
             if strict:
-                raise RuntimeError(f"Truncated Z-chunk 0x{tag:04x} at 0x{pos:x} (size={size})")
+                raise PtxCorruptFileError(f"Truncated Z-chunk 0x{tag:04x} at 0x{pos:x} (size={size})")
             break
         chunks.append(PtxChunk(offset=pos, version=version, size=size, tag=tag, raw=buf[pos:end]))
         pos = end
@@ -232,15 +237,15 @@ def normalize_ptx_uuid16(value: str | bytes) -> bytes:
     """Normalize raw 16-byte, hex, hyphenated, or PTSL braced UUID into 16 raw bytes."""
     if isinstance(value, (bytes, bytearray)):
         if len(value) != 16:
-            raise ValueError(f"UUID bytes must be 16 bytes, got {len(value)}")
+            raise PtxValidationError(f"UUID bytes must be 16 bytes, got {len(value)}")
         return bytes(value)
     cleaned = str(value).strip().strip("{}").replace("-", "")
     if len(cleaned) != 32:
-        raise ValueError(f"Invalid PTX UUID string: {value!r}")
+        raise PtxValidationError(f"Invalid PTX UUID string: {value!r}")
     try:
         return bytes.fromhex(cleaned)
     except ValueError as exc:
-        raise ValueError(f"Invalid PTX UUID string: {value!r}") from exc
+        raise PtxValidationError(f"Invalid PTX UUID string: {value!r}") from exc
 
 
 def find_zchunk_offset(
@@ -277,14 +282,14 @@ def read_zchunk_at(
     """Read one validated Z-chunk at *pos* and return ``(tag, chunk_bytes, next_pos)``."""
     end_lim = len(raw) if limit is None else min(len(raw), limit)
     if pos < 0 or pos + 9 > end_lim or raw[pos] != 0x5A:
-        raise RuntimeError(f"Expected Z-chunk header at offset 0x{pos:x}")
+        raise PtxCorruptFileError(f"Expected Z-chunk header at offset 0x{pos:x}")
     sz = struct.unpack_from("<I", raw, pos + 3)[0]
     tag = struct.unpack_from("<H", raw, pos + 7)[0]
     end = pos + 7 + sz
     if sz < 2 or end > end_lim:
-        raise RuntimeError(f"Truncated Z-chunk 0x{tag:04x} at offset 0x{pos:x}")
+        raise PtxCorruptFileError(f"Truncated Z-chunk 0x{tag:04x} at offset 0x{pos:x}")
     if expected_tag is not None and tag != expected_tag:
-        raise RuntimeError(f"Expected Z-chunk 0x{expected_tag:04x} at 0x{pos:x}, found 0x{tag:04x}")
+        raise PtxCorruptFileError(f"Expected Z-chunk 0x{expected_tag:04x} at 0x{pos:x}, found 0x{tag:04x}")
     return tag, bytes(raw[pos:end]), end
 
 
@@ -305,15 +310,20 @@ def walk_sequential_zchunks(
     return items, pos
 
 
-def find_subchunks(buf: bytes, tag16: int, start: int = 9) -> list[bytes]:
-    """Return all valid Z-subchunks with ``tag16`` inside *buf* starting at *start*."""
-    results: list[bytes] = []
+def find_subchunk_spans(
+    buf: bytes | bytearray,
+    tag16: int,
+    start: int = 9,
+    end: int | None = None,
+) -> list[tuple[int, bytes]]:
+    """Return ``(offset, raw_bytes)`` for all valid Z-subchunks with *tag16* inside ``buf[start:end]``."""
+    results: list[tuple[int, bytes]] = []
     needle = struct.pack("<H", tag16)
     min_start = max(0, start)
     pos = min_start + 7
-    limit = len(buf)
+    limit = len(buf) if end is None else min(len(buf), end)
     while pos < limit:
-        hit = buf.find(needle, pos)
+        hit = buf.find(needle, pos, limit)
         if hit == -1:
             break
         cstart = hit - 7
@@ -321,11 +331,29 @@ def find_subchunks(buf: bytes, tag16: int, start: int = 9) -> list[bytes]:
             version = struct.unpack_from("<H", buf, cstart + 1)[0]
             size = struct.unpack_from("<I", buf, cstart + 3)[0]
             if 2 <= size <= limit - cstart - 7 and version < 0x1000:
-                results.append(buf[cstart : cstart + 7 + size])
+                results.append((cstart, bytes(buf[cstart : cstart + 7 + size])))
                 pos = cstart + 7 + size + 7
                 continue
         pos = hit + 1
     return results
+
+
+def find_subchunks(buf: bytes, tag16: int, start: int = 9) -> list[bytes]:
+    """Return all valid Z-subchunks with ``tag16`` inside *buf* starting at *start*."""
+    return [raw for _, raw in find_subchunk_spans(buf, tag16, start)]
+
+
+def resize_zchunk_ancestors(buf: bytearray, ancestor_offsets: list[int] | tuple[int, ...], delta: int) -> None:
+    """Adjust the ``<I`` size headers of enclosing Z-chunks at *ancestor_offsets* by *delta*."""
+    if delta == 0:
+        return
+    for off in ancestor_offsets:
+        if off < 0 or off + 7 > len(buf) or buf[off] != 0x5A:
+            raise PtxCorruptFileError(f"Invalid ancestor Z-chunk at offset 0x{off:x}")
+        new_sz = struct.unpack_from("<I", buf, off + 3)[0] + delta
+        if not (2 <= new_sz <= 0xFFFF_FFFF):
+            raise PtxCorruptFileError(f"Ancestor Z-chunk size out of u32 bounds at 0x{off:x}: {new_sz}")
+        struct.pack_into("<I", buf, off + 3, new_sz)
 
 
 def read_lp_str(buf: bytes, offset: int, max_len: int = 512) -> tuple[str, int]:
@@ -348,7 +376,7 @@ def _decode_control_value(buf: bytes, pos: int, vsize: int, *, signed_int32: boo
         return float(struct.unpack_from("<f", buf, pos)[0])
     if vsize == 8:
         return float(struct.unpack_from("<Q", buf, pos)[0])
-    raise ValueError(f"Unsupported control-curve value width {vsize}")
+    raise PtxCorruptFileError(f"Unsupported control-curve value width {vsize}")
 
 
 def parse_control_curve(
@@ -390,42 +418,75 @@ def parse_control_curve(
     return timebase, points, end
 
 
-def _shift_index_entry(buf: bytearray, pos: int, body_end: int, threshold: int, delta: int) -> int:
+def _validate_index_entry(buf: bytes, pos: int, body_end: int) -> int:
     if pos + 4 > body_end:
-        raise RuntimeError("Truncated 0x0002 chunk offset index")
+        raise PtxCorruptFileError("Truncated 0x0002 chunk offset index")
     depth = struct.unpack_from("<I", buf, pos)[0]
     pos += 4
     if depth > (body_end - pos) // 11:
-        raise RuntimeError(f"0x0002 path depth {depth} exceeds chunk bounds")
+        raise PtxCorruptFileError(f"0x0002 path depth {depth} exceeds chunk bounds")
+    for _ in range(depth):
+        poff = struct.unpack_from("<i", buf, pos + 2)[0]
+        if poff != -1 and not (0 <= poff < len(buf) and buf[poff] == 0x5A):
+            raise PtxCorruptFileError(f"0x0002 path offset 0x{poff:x} does not point to a Z-chunk")
+        pos += 11
+    if pos + 4 > body_end:
+        raise PtxCorruptFileError("Truncated 0x0002 occurrence count")
+    occ_cnt = struct.unpack_from("<I", buf, pos)[0]
+    pos += 4
+    if occ_cnt > (body_end - pos) // 11:
+        raise PtxCorruptFileError(f"0x0002 occurrence count {occ_cnt} exceeds chunk bounds")
+    for _ in range(occ_cnt):
+        if pos + 5 > body_end:
+            raise PtxCorruptFileError("Truncated 0x0002 occurrence header")
+        _b0, byte_len, off_cnt = struct.unpack_from("<BHH", buf, pos)
+        pos += 5
+        if byte_len != 4 * off_cnt or pos + byte_len + 6 > body_end:
+            raise PtxCorruptFileError(f"Invalid 0x0002 occurrence bounds (byte_len={byte_len}, count={off_cnt})")
+        for j in range(off_cnt):
+            off = struct.unpack_from("<I", buf, pos + 4 * j)[0]
+            if not (0 <= off < len(buf) and buf[off] == 0x5A):
+                raise PtxCorruptFileError(f"0x0002 chunk offset 0x{off:x} does not point to a Z-chunk")
+        pos += byte_len + 6
+    return pos
+
+
+def _shift_index_entry(buf: bytearray, pos: int, body_end: int, threshold: int, delta: int) -> int:
+    if pos + 4 > body_end:
+        raise PtxCorruptFileError("Truncated 0x0002 chunk offset index")
+    depth = struct.unpack_from("<I", buf, pos)[0]
+    pos += 4
+    if depth > (body_end - pos) // 11:
+        raise PtxCorruptFileError(f"0x0002 path depth {depth} exceeds chunk bounds")
     for _ in range(depth):
         poff = struct.unpack_from("<i", buf, pos + 2)[0]
         if poff != -1:
             if poff >= threshold:
                 poff += delta
             if not (0 <= poff < len(buf) and buf[poff] == 0x5A):
-                raise RuntimeError(f"0x0002 path offset 0x{poff:x} does not point to a Z-chunk")
+                raise PtxCorruptFileError(f"0x0002 path offset 0x{poff:x} does not point to a Z-chunk")
             struct.pack_into("<i", buf, pos + 2, poff)
         pos += 11
     if pos + 4 > body_end:
-        raise RuntimeError("Truncated 0x0002 occurrence count")
+        raise PtxCorruptFileError("Truncated 0x0002 occurrence count")
     occ_cnt = struct.unpack_from("<I", buf, pos)[0]
     pos += 4
     if occ_cnt > (body_end - pos) // 11:
-        raise RuntimeError(f"0x0002 occurrence count {occ_cnt} exceeds chunk bounds")
+        raise PtxCorruptFileError(f"0x0002 occurrence count {occ_cnt} exceeds chunk bounds")
     for _ in range(occ_cnt):
         if pos + 5 > body_end:
-            raise RuntimeError("Truncated 0x0002 occurrence header")
+            raise PtxCorruptFileError("Truncated 0x0002 occurrence header")
         _b0, byte_len, off_cnt = struct.unpack_from("<BHH", buf, pos)
         pos += 5
         if byte_len != 4 * off_cnt or pos + byte_len + 6 > body_end:
-            raise RuntimeError(f"Invalid 0x0002 occurrence bounds (byte_len={byte_len}, count={off_cnt})")
+            raise PtxCorruptFileError(f"Invalid 0x0002 occurrence bounds (byte_len={byte_len}, count={off_cnt})")
         for j in range(off_cnt):
             off_pos = pos + 4 * j
             off = struct.unpack_from("<I", buf, off_pos)[0]
             if off >= threshold:
                 off += delta
             if not (0 <= off < len(buf) and buf[off] == 0x5A):
-                raise RuntimeError(f"0x0002 chunk offset 0x{off:x} does not point to a Z-chunk")
+                raise PtxCorruptFileError(f"0x0002 chunk offset 0x{off:x} does not point to a Z-chunk")
             struct.pack_into("<I", buf, off_pos, off)
         pos += byte_len + 6
     return pos
@@ -440,18 +501,17 @@ def validate_index_0002(buf: bytes) -> bool:
     if len(buf) >= 0x1F:
         ptr = struct.unpack_from("<I", buf, 0x1B)[0]
         if ptr != c2.offset:
-            raise RuntimeError(f"Root 0x1B pointer 0x{ptr:x} does not match 0x0002 at 0x{c2.offset:x}")
+            raise PtxCorruptFileError(f"Root 0x1B pointer 0x{ptr:x} does not match 0x0002 at 0x{c2.offset:x}")
     body_end = c2.offset + 7 + c2.size
     pos = c2.offset + 9
     if pos + 4 > body_end:
-        raise RuntimeError("Truncated 0x0002 body")
+        raise PtxCorruptFileError("Truncated 0x0002 body")
     entry_count = struct.unpack_from("<I", buf, pos)[0]
     pos += 4
-    tmp = bytearray(buf)
     for _ in range(entry_count):
-        pos = _shift_index_entry(tmp, pos, body_end, len(buf) + 1, 0)
+        pos = _validate_index_entry(buf, pos, body_end)
     if pos != body_end:
-        raise RuntimeError(f"0x0002 parse ended at {pos}, expected {body_end}")
+        raise PtxCorruptFileError(f"0x0002 parse ended at {pos}, expected {body_end}")
     return True
 
 
@@ -463,20 +523,20 @@ def shift_index_0002(buf: bytearray, threshold: int, delta: int) -> None:
     c2 = next((c for c in reversed(chunks) if c.tag == 0x0002), None)
     if c2 is None:
         if len(buf) >= 0x1F and struct.unpack_from("<I", buf, 0x1B)[0] != 0:
-            raise RuntimeError("Header 0x1B referenced 0x0002 index, but 0x0002 chunk is missing")
+            raise PtxCorruptFileError("Header 0x1B referenced 0x0002 index, but 0x0002 chunk is missing")
         return
     if len(buf) >= 0x1F:
         struct.pack_into("<I", buf, 0x1B, c2.offset)
     body_end = c2.offset + 7 + c2.size
     pos = c2.offset + 9
     if pos + 4 > body_end:
-        raise RuntimeError("Truncated 0x0002 body")
+        raise PtxCorruptFileError("Truncated 0x0002 body")
     entry_count = struct.unpack_from("<I", buf, pos)[0]
     pos += 4
     for _ in range(entry_count):
         pos = _shift_index_entry(buf, pos, body_end, threshold, delta)
     if pos != body_end:
-        raise RuntimeError(f"0x0002 parse ended at {pos}, expected {body_end}")
+        raise PtxCorruptFileError(f"0x0002 parse ended at {pos}, expected {body_end}")
 
 
 def splice_top_chunk(buf: bytearray, tag: int, new_chunk_bytes: bytes) -> int:
@@ -484,7 +544,7 @@ def splice_top_chunk(buf: bytearray, tag: int, new_chunk_bytes: bytes) -> int:
     chunks = iter_top_chunks(bytes(buf), strict=True)
     target = next((c for c in reversed(chunks) if c.tag == tag), None)
     if target is None:
-        raise RuntimeError(f"Top-level chunk 0x{tag:04x} not found in .ptx")
+        raise PtxCorruptFileError(f"Top-level chunk 0x{tag:04x} not found in .ptx")
     old_end = target.offset + 7 + target.size
     delta = len(new_chunk_bytes) - (old_end - target.offset)
     buf[target.offset : old_end] = new_chunk_bytes

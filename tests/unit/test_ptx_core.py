@@ -14,7 +14,6 @@ from sessionpreplib.ptx import (
     apply_atomic_ptx_patch,
     decrypt_ptx,
     encrypt_ptx,
-    find_subchunks,
     group_id_to_label,
     patch_add_group,
     patch_clear_track_inputs,
@@ -23,6 +22,7 @@ from sessionpreplib.ptx import (
     patch_modify_group,
     patch_track_volumes,
 )
+from sessionpreplib.ptx.lowlevel import find_subchunks
 from sessionpreplib.ptx.models import PTX_MAGIC, UUID_PREFIX
 
 
@@ -63,10 +63,9 @@ def _track_251a(name: str, type_code: int, uid: bytes, *, is_folder: bool = Fals
 
 
 def _chunk_260a(value: int) -> bytes:
-    # 39-byte chunk: 9-byte header + 30-byte body; value at len - 4
-    body = bytearray(30)
-    struct.pack_into("<h", body, len(body) - 4, value)
-    return _zchunk(0x260A, bytes(body), version=1)
+    # 39-byte real single-point 0x260A: 9-byte Z-header + 28-byte 0x46 curve + 2-byte tail
+    body = struct.pack("<HHIHII", 0x4601, 1, 20, 0, 1, 2) + struct.pack("<Qhh", 0, value, 0)
+    return _zchunk(0x260A, body, version=1)
 
 
 def _chunk_1029(vol_tenths: int, *, post_fader: bool = True) -> bytes:
@@ -447,7 +446,8 @@ def test_calibrate_signalpath_base_rejects_ties_malformed_and_zero_matches(monke
 
 
 def test_clip_gain_shared_curve_multipoint_zero_legacy_and_missing_2637():
-    from sessionpreplib.ptx import splice_top_chunk, validate_index_0002
+    from sessionpreplib.ptx import validate_index_0002
+    from sessionpreplib.ptx.lowlevel import splice_top_chunk
 
     raw = _build_synthetic_ptx()
 
@@ -505,13 +505,17 @@ def test_clip_gain_shared_curve_multipoint_zero_legacy_and_missing_2637():
     with pytest.raises(RuntimeError, match="unsupported 0x2628 version 4"):
         patch_clip_gains(legacy_raw, {"Kick": 3.0})
 
-    # 4) Missing 0x2637 raises RuntimeError
+    # 4) Virgin session missing 0x2637 synthesizes 0x2637 cleanly with valid 0x0002
     dec_m, delta_m = decrypt_ptx(raw)
     buf_m = bytearray(dec_m)
     c37_m = PtxSession(bytes(buf_m), xor_delta=delta_m).chunk_map[0x2637]
     struct.pack_into("<H", buf_m, c37_m.offset + 7, 0x7FFD)  # rename tag away from 0x2637
-    with pytest.raises(RuntimeError, match="Missing 0x2637"):
-        patch_clip_gains(encrypt_ptx(bytes(buf_m), delta_m), {"Kick": 3.0})
+    p_synth, _ = patch_clip_gains(encrypt_ptx(bytes(buf_m), delta_m), {"Kick": 3.5})
+    dec_s, _ = decrypt_ptx(p_synth)
+    assert validate_index_0002(dec_s)
+    s_synth = PtxSession.from_bytes(p_synth)
+    assert 0x2637 in s_synth.chunk_map
+    assert s_synth.clips[0].gain_db == pytest.approx(3.5, abs=0.02)
 
 
 def test_patch_clear_track_inputs_shrinks_enclosing_261b_and_aligns_trailing_chunk():

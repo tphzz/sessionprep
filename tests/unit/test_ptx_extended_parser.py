@@ -13,12 +13,10 @@ from sessionpreplib.ptx import (
     PtxSession,
     decrypt_ptx,
     encrypt_ptx,
-    find_subchunks,
     format_timecode,
     lookup_pt_color_rgb,
-    parse_chunk_tree,
-    parse_control_curve,
 )
+from sessionpreplib.ptx.lowlevel import find_subchunks, parse_chunk_tree, parse_control_curve
 from sessionpreplib.ptx.models import PTX_MAGIC, UUID_PREFIX
 
 

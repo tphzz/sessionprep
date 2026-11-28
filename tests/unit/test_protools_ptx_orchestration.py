@@ -190,7 +190,8 @@ def test_folder_groups_and_vca_planning_links_vca_and_avoids_cross_folder_collis
     kept_groups = [g for g in PtxSession.from_bytes(kept_raw).groups if g.name == "KIK"]
     assert len(kept_groups) == 2 and all(g.is_edit_active is True and g.is_mix_active is True for g in kept_groups)
     # Build diverged Edit (edit_act=True, mix_act=False) vs Mix (edit_act=False, mix_act=True) entries and override only is_edit_active=False
-    from sessionpreplib.ptx import decrypt_ptx, encrypt_ptx, splice_top_chunk
+    from sessionpreplib.ptx import decrypt_ptx, encrypt_ptx
+    from sessionpreplib.ptx.lowlevel import splice_top_chunk
     from sessionpreplib.ptx.parser import split_202b
     from sessionpreplib.ptx.patcher import _build_202b
     dec_a, delta_a = decrypt_ptx(act_raw)

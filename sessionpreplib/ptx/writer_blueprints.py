@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import struct
 import uuid
 
-from .models import ZERO_TICKS
+from .models import ZERO_TICKS, PtxValidationError
 from .writer_chunks import (
     serialize_audio_desc_1001,
     serialize_clip_core_2628_dims,
@@ -54,18 +54,24 @@ TRACK_FORMAT_CODES: dict[str, tuple[int, int, int, int]] = {
 }
 
 
-def resolve_track_format_codes(channels: int, track_format: str | None = None) -> tuple[int, int, int, int]:
+def resolve_track_format_codes(channels: int | None, track_format: str | None = None) -> tuple[int, int, int, int]:
     """Return ``(legacy_w, mid_w, ext_w, channel_count)`` for a track format or channel count."""
+    if channels is not None and isinstance(channels, bool):
+        raise PtxValidationError(f"Invalid channel count: {channels!r}")
     if track_format is not None:
         entry = TRACK_FORMAT_CODES.get(track_format.strip().lower())
         if entry is None:
-            raise ValueError(f"Unsupported Pro Tools track_format: {track_format!r}")
+            raise PtxValidationError(f"Unsupported Pro Tools track_format: {track_format!r}")
+        if channels is not None and channels != entry[3]:
+            raise PtxValidationError(
+                f"channels={channels} conflicts with track_format={track_format!r} (expected {entry[3]})"
+            )
         return entry
+    if channels is None or channels == 2:
+        return TRACK_FORMAT_CODES["stereo"]
     if channels == 1:
         return TRACK_FORMAT_CODES["mono"]
-    if channels == 2:
-        return TRACK_FORMAT_CODES["stereo"]
-    raise ValueError(f"Specify track_format explicitly for channel count {channels!r}")
+    raise PtxValidationError(f"Specify track_format explicitly for channel count {channels!r}")
 
 
 @dataclass(frozen=True)
@@ -81,12 +87,12 @@ class OutputBusSpec:
 
 def _check_bytes_len(data: bytes, expected: int, name: str) -> None:
     if len(data) != expected:
-        raise ValueError(f"{name} must be {expected} bytes, got {len(data)}")
+        raise PtxValidationError(f"{name} must be {expected} bytes, got {len(data)}")
 
 
 def _check_uint(value: int, max_val: int, name: str) -> None:
     if isinstance(value, bool) or not (0 <= value <= max_val):
-        raise ValueError(f"{name} out of range 0..{max_val}: {value!r}")
+        raise PtxValidationError(f"{name} out of range 0..{max_val}: {value!r}")
 
 
 # ── Small UI state Z-chunks (used by 0x2589 and 0x200B) ──────────────
@@ -155,7 +161,7 @@ def build_output_bus_260e(
     if parent_uuid16 is not None:
         _check_bytes_len(parent_uuid16, 16, "parent_uuid16")
         if parent_uuid16 == b"\x00" * 16:
-            raise ValueError("parent_uuid16 must be non-zero for subpaths (use None for primary paths)")
+            raise PtxValidationError("parent_uuid16 must be non-zero for subpaths (use None for primary paths)")
     bus_id = bus_ptsl_index + 1
     parent_bytes = parent_uuid16 if parent_uuid16 is not None else (b"\x00" * 16)
     sub_flags = b"\x00\x00" if is_subpath else b"\x01\x01"
@@ -362,7 +368,7 @@ def _build_mixer_core_261b(
     out_260e, bus_ch = _resolve_output_bus_260e(output_bus)
     send_ids = tuple(send_uuids16) if send_uuids16 is not None else tuple(uuid.uuid4().bytes_le for _ in range(10))
     if len(send_ids) != 10 or any(len(u) != 16 for u in send_ids):
-        raise ValueError("send_uuids16 must contain ten 16-byte UUIDs")
+        raise PtxValidationError("send_uuids16 must contain ten 16-byte UUIDs")
 
     if include_sends:
         send_260d = _build_empty_send_260d(is_stereo=is_stereo)
@@ -696,8 +702,8 @@ def build_instrument_mixer_strip_2621(
 ) -> bytes:
     """Synthesize a complete ``0x2621`` (v17) Instrument track mixer strip (Mono or Stereo)."""
     _check_bytes_len(track_uuid16, 16, "track_uuid16")
-    if channels not in (1, 2):
-        raise ValueError(f"Instrument track channels must be 1 or 2, got {channels!r}")
+    if isinstance(channels, bool) or channels not in (1, 2):
+        raise PtxValidationError(f"Instrument track channels must be 1 or 2, got {channels!r}")
     _check_uint(track_ordinal_1based, 0xFFFF_FFFF, "track_ordinal_1based")
     _check_uint(id_base, 0xFFFF_FFF5, "id_base")
     _check_uint(midi_index, 0xFFFF, "midi_index")
@@ -707,7 +713,7 @@ def build_instrument_mixer_strip_2621(
     out_260e, bus_ch = _resolve_output_bus_260e(output_bus)
     send_ids = tuple(send_uuids16) if send_uuids16 is not None else tuple(uuid.uuid4().bytes_le for _ in range(10))
     if len(send_ids) != 10 or any(len(u) != 16 for u in send_ids):
-        raise ValueError("send_uuids16 must contain ten 16-byte UUIDs")
+        raise PtxValidationError("send_uuids16 must contain ten 16-byte UUIDs")
 
     send_260d = _build_empty_send_260d(is_stereo=is_stereo)
     sends_blob = bytearray(struct.pack("<I", 10))
@@ -761,7 +767,7 @@ def build_track_summary_2519(
     _check_uint(visible_order_1based, 0xFFFF, "visible_order_1based")
     tinfo = TRACK_TYPE_TO_251A.get(track_type)
     if tinfo is None:
-        raise ValueError(f"Unsupported track_type for 0x2519: {track_type!r}")
+        raise PtxValidationError(f"Unsupported track_type for 0x2519: {track_type!r}")
     type_code, _is_folder = tinfo
     if track_type in ("Vca", "BasicFolder", "Midi"):
         legacy_w = 0
@@ -793,7 +799,7 @@ def build_track_entry_251a(
     _check_uint(color_index, 0xFFFF, "color_index")
     tinfo = TRACK_TYPE_TO_251A.get(track_type)
     if tinfo is None:
-        raise ValueError(f"Unsupported track_type for 0x251A: {track_type!r}")
+        raise PtxValidationError(f"Unsupported track_type for 0x251A: {track_type!r}")
     type_code, is_folder = tinfo
     if track_type in ("Vca", "BasicFolder", "Midi"):
         legacy_w = mid_w = ext_w = 0
@@ -839,9 +845,10 @@ def build_playlist_1014_v9(
     track_format: str | None = None,
 ) -> bytes:
     """Build a Pro Tools v12+ ``0x1014`` (v9) playlist entry (Mono, Stereo, or Surround)."""
-    _lw, _mw, ext_w, expected_lanes = resolve_track_format_codes(2 if is_stereo else 1, track_format)
+    channels_arg = None if track_format is not None else (2 if is_stereo else 1)
+    _lw, _mw, ext_w, expected_lanes = resolve_track_format_codes(channels_arg, track_format)
     if len(lane_indices) != expected_lanes:
-        raise ValueError(
+        raise PtxValidationError(
             f"Expected {expected_lanes} lane index(es) for format {track_format or ('Stereo' if is_stereo else 'Mono')}, got {len(lane_indices)}"
         )
     return serialize_playlist_1014(

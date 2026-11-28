@@ -8,14 +8,17 @@ import pytest
 
 from sessionpreplib.ptx import (
     PT12_COLOR_PALETTE,
-    PtxDirTreeEntry,
     PtxSession,
-    build_zchunk,
     closest_pt_color_index,
     decrypt_ptx,
-    encode_lp_str,
     encrypt_ptx,
     generate_ptx_uuid,
+    validate_index_0002,
+)
+from sessionpreplib.ptx.lowlevel import (
+    PtxDirTreeEntry,
+    build_zchunk,
+    encode_lp_str,
     iter_top_chunks,
     parse_index_0002,
     patch_session_audio_format_1028,
@@ -27,7 +30,6 @@ from sessionpreplib.ptx import (
     serialize_placement_104f,
     serialize_playlist_1014,
     shift_parsed_index_0002,
-    validate_index_0002,
 )
 from sessionpreplib.ptx.parser_timeline import (
     _parse_region_core_2628,
@@ -39,8 +41,20 @@ from tests.unit.test_ptx_core import _build_synthetic_ptx
 
 
 def test_patch_session_audio_format_1028_roundtrip_and_guards():
+    from sessionpreplib.ptx import PtxUnsupportedTemplateError
+
     raw = _build_synthetic_ptx()
-    patched = patch_session_audio_format_1028(raw, sample_rate=96000, bit_depth=32, audio_format_code=3)
+    # Short 15-byte 0x1028 rejects 32-bit float (missing byte +30 float flag)
+    with pytest.raises(PtxUnsupportedTemplateError, match="32-bit float"):
+        patch_session_audio_format_1028(raw, sample_rate=96000, bit_depth=32, audio_format_code=3)
+    # Full >=31-byte 0x1028 roundtrips 32-bit float cleanly
+    dec0, delta0 = decrypt_ptx(raw)
+    c1028_full = build_zchunk(0x1028, bytes([3, 24]) + struct.pack("<I", 48000) + (b"\x00" * 16), version=1)
+    from sessionpreplib.ptx.lowlevel import splice_top_chunk
+    buf_full = bytearray(dec0)
+    splice_top_chunk(buf_full, 0x1028, c1028_full)
+    raw_full = encrypt_ptx(bytes(buf_full), delta0)
+    patched = patch_session_audio_format_1028(raw_full, sample_rate=96000, bit_depth=32, audio_format_code=3)
     sess = PtxSession.from_bytes(patched)
     assert sess.info.sample_rate == 96000
     assert sess.info.bit_depth == 32
@@ -49,7 +63,6 @@ def test_patch_session_audio_format_1028_roundtrip_and_guards():
     assert validate_index_0002(dec) is True
 
     # Partial patch preserves untouched fields and non-zero k0 encrypts cleanly
-    dec0, delta0 = decrypt_ptx(raw)
     re_k0 = encrypt_ptx(dec0, delta0, k0=0x37)
     p_sr = patch_session_audio_format_1028(re_k0, sample_rate=88200)
     assert PtxSession.from_bytes(p_sr).info.sample_rate == 88200
@@ -180,7 +193,7 @@ def test_shift_and_replace_index_0002_full_lifecycle():
     assert validate_index_0002(bytes(buf)) is True
 
     # Negative shift and upper-bound overflow guards (u32 occurrences + signed i32 path step)
-    from sessionpreplib.ptx import PtxIndex0002, PtxIndexEntry, PtxIndexPathStep
+    from sessionpreplib.ptx.lowlevel import PtxIndex0002, PtxIndexEntry, PtxIndexPathStep
 
     with pytest.raises(ValueError):
         shift_parsed_index_0002(idx, threshold=0, delta=-100_000)

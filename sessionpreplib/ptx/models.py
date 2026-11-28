@@ -5,13 +5,14 @@ from __future__ import annotations
 import base64
 import bisect
 from dataclasses import dataclass, field
-from typing import Protocol
+from typing import Any, Literal, Protocol
 
 PTX_MAGIC = b"\x030010111100101011"
 UUID_PREFIX = b"\x00\x00\x00\x00\x2a\x00\x00\x00"
 MAX_GROUP_ID = 104  # 4 Pro Tools group banks * 26 letters (a..z, 2a..2z, 3a..3z, 4a..4z)
 VALID_PROTOOLS_SAMPLE_RATES = frozenset({44100, 48000, 88200, 96000, 176400, 192000})
 VALID_PROTOOLS_BIT_DEPTHS = frozenset({16, 24, 32})
+TrackRef = str | int
 
 
 class PtxError(Exception):
@@ -20,6 +21,10 @@ class PtxError(Exception):
 
 class PtxValidationError(PtxError, ValueError):
     """Raised when caller inputs violate Pro Tools ``.ptx`` constraints."""
+
+
+class PtxNotFoundError(PtxValidationError, KeyError):
+    """Raised when a referenced track, group, marker, or clip is absent from a ``.ptx`` session."""
 
 
 class PtxUnsupportedTemplateError(PtxError, ValueError):
@@ -1041,3 +1046,113 @@ class PtxSessionLike(Protocol):
     def timeline(self) -> PtxTimeConverter: ...
     def track_by_name(self, name: str) -> PtxTrack | None: ...
     def group_by_name(self, name: str, kind: str = "edit") -> PtxGroup | None: ...
+
+
+_HEX_CHARS = frozenset("0123456789abcdefABCDEF")
+
+
+def closest_pt_color_index(argb_hex: str) -> int | None:
+    """Map an ``#AARRGGBB`` or ``#RRGGBB`` color string to the closest ``PT12_COLOR_PALETTE`` index offline."""
+    cleaned = argb_hex.strip().lstrip("#")
+    if len(cleaned) == 8:
+        cleaned = cleaned[2:]
+    if len(cleaned) != 6 or not all(ch in _HEX_CHARS for ch in cleaned):
+        return None
+    r0 = int(cleaned[0:2], 16)
+    g0 = int(cleaned[2:4], 16)
+    b0 = int(cleaned[4:6], 16)
+    best_idx: int | None = None
+    best_dist: int | None = None
+    for idx, (r1, g1, b1) in PT12_COLOR_PALETTE.items():
+        dr, dg, db = r0 - r1, g0 - g1, b0 - b1
+        dist = 2 * dr * dr + 4 * dg * dg + 3 * db * db
+        if best_dist is None or dist < best_dist:
+            best_dist = dist
+            best_idx = idx
+    return best_idx
+
+
+@dataclass(frozen=True)
+class PtxSessionSettings:
+    """Typed session audio format, timecode, and UI/transport settings patch."""
+
+    sample_rate: int | None = None
+    bit_depth: int | None = None
+    audio_format: str | None = None
+    is_interleaved: bool | None = None
+    audio_pull_rate: str | None = None
+    video_pull_rate: str | None = None
+    fps_code: int | None = None
+    start_frames: int | None = None
+    feet_frames_rate: str | None = None
+    session_length: str | None = None
+    main_counter_format: str | None = None
+    sub_counter_format: str | None = None
+    edit_mode: str | None = None
+    grid_relative: bool | None = None
+    edit_tool: str | None = None
+    smart_tool_enabled: bool | None = None
+    pre_roll_enabled: bool | None = None
+    pre_roll_samples: int | None = None
+    post_roll_enabled: bool | None = None
+    post_roll_samples: int | None = None
+    timeline_in_sample: int | None = None
+    timeline_out_sample: int | None = None
+
+    def has_any(self) -> bool:
+        """Return ``True`` when at least one setting field is non-``None``."""
+        return any(
+            getattr(self, name) is not None
+            for name in self.__dataclass_fields__
+        )
+
+
+@dataclass(frozen=True)
+class PtxTrackStatePatch:
+    """Typed per-track state patch using field names aligned with ``PtxTrack``."""
+
+    is_muted: bool | None = None
+    is_soloed: bool | None = None
+    is_solo_safe: bool | None = None
+    is_inactive: bool | None = None
+    is_hidden: bool | None = None
+    is_folder_open: bool | None = None
+    color_index: int | None = None
+    height: str | int | None = None
+    timebase: Literal["Samples", "Ticks"] | None = None
+
+    def to_state_dict(self) -> dict[str, Any]:
+        """Convert populated fields into the canonical patcher dictionary."""
+        mapping = (
+            ("mute", self.is_muted),
+            ("solo", self.is_soloed),
+            ("solo_safe", self.is_solo_safe),
+            ("inactive", self.is_inactive),
+            ("hidden", self.is_hidden),
+            ("folder_open", self.is_folder_open),
+            ("color_index", self.color_index),
+            ("height", self.height),
+            ("timebase", self.timebase),
+        )
+        return {key: val for key, val in mapping if val is not None}
+
+
+@dataclass(frozen=True)
+class PtxClipAttributesPatch:
+    """Typed clip placement attributes patch with optional clip disambiguation."""
+
+    is_muted: bool | None = None
+    is_time_locked: bool | None = None
+    is_edit_locked: bool | None = None
+    color_index: int | None = None
+    clip_name: str | None = None
+    clip_index: int | None = None
+
+
+@dataclass(frozen=True)
+class PtxPatchResult:
+    """Structured result returned by ``PtxPatchBuilder.build_result()``."""
+
+    patched_bytes: bytes
+    original_bytes: bytes
+    summary: dict[str, Any]

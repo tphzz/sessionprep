@@ -509,9 +509,11 @@ sessionpreplib/
         analysis.py              # Balance validation, pre-fader send caveats, path tracing & semantic-tier DAG layout
         solver.py                # DAW-agnostic DAG reconstruction, float64 summing & recursive multi-stage bus staging
     ptx/
-        __init__.py              # Public .ptx parser, 5-layer API, stock plugin decoders, patcher & signal-flow exports
-        codec.py                 # 4 KB rolling-XOR decrypt/encrypt, Z-chunk tree/traversal, 0x46 control curves, 0x0002 index shifting
-        models.py                # Dataclasses, PtxError hierarchy, automation/clip-gain evaluators, PtxTimeConverter/PtxSessionLike protocols & constants
+        __init__.py              # Crisp public .ptx parser, 5-layer API, typed patchers, offline writer & signal-flow exports
+        lowlevel.py              # Low-level Z-chunk serializers, binary mutators, blueprints & 0x0002 index AST primitives
+        codec.py                 # Vectorized 4 KB rolling-XOR decrypt/encrypt, Z-chunk traversal, 0x46 control curves, zero-copy 0x0002 validation/shifting
+        models.py                # Dataclasses, PtxError/PtxNotFoundError hierarchy, typed patch models, automation evaluators, protocols & constants
+        _document.py             # Shared decrypted PtxBuffer, mixer strip iteration, static 0x260A patching, chunk assembly & pair validation
         timeline.py              # PtxTimeline & PtxBarBeat (samples/seconds/ticks/bars|beats/timecode, tempo/meter/marker queries)
         arrangement.py           # ResolvedAudioEvent/MidiEvent/VideoEvent joiners (fades, compounds, loops, overlap trimming)
         queries.py               # Track/folder/group/VCA/insert/audio-file queries, effective mix-state evaluation & PtxSessionAudit
@@ -520,15 +522,19 @@ sessionpreplib/
         parser_mixer.py          # Mixer strips, automation lanes, 0x2015 metadata, AAX plugin states/automation & ARA2 parsers
         parser_timeline.py       # Session start TC, tempo/meter/markers, audio trees, clips/warp/fades/compounds, MIDI & video parsers
         plugin_trim.py           # Validated AAX Slot A trim reader/patcher & 0x2625->0x2616 auto-insert (delegates payload codecs to signal_flow)
-        patcher.py               # Atomic .ptx patchers (No Input, 0x2637 Clip Gain, faders, groups/VCAs, Slot A trims)
-        patcher_extended.py      # Extended .ptx patchers (session settings/UI state, markers, track states/timebase, track & clip renames, clip attributes, fades)
-        patch_builder.py         # Fluent transactional PtxPatchBuilder wrapping validated in-memory/file batch mutations
+        patcher.py               # Core .ptx patchers (No Input, 0x2637 Clip Gain, faders, groups/VCAs, Slot A trims, atomic file helper)
+        patch_session.py         # Session-level patchers (0x1028/0x204D/UI settings via PtxSessionSettings, 0x2030 markers add/delete)
+        patch_tracks.py          # Track-level patchers (track states/timebase via PtxTrackStatePatch, UUID-matched track renames)
+        patch_clips.py           # Clip/fade patchers (0x262A clip renames, 0x104F clip attributes via PtxClipAttributesPatch, 0x2630 fades)
+        patch_builder.py         # Single-pass PtxBuffer transactional PtxPatchBuilder (from_bytes/from_file/from_buffer, build_result/build/commit)
         writer_primitives.py     # Low-level Z-chunk/control-curve serializers & byte-exact 0x0002 chunk-offset index codec/mutators
-        writer_chunks.py         # Verified Pro Tools chunk serializers (0x1028, 0x204D, session UI state, 0x2077, 0x103a, 0x1001, 0x104f/1052, 0x1014, 0x2628, 0x262f) & palette mapper
-        writer_index.py          # Deterministic 0x0002 chunk-offset index structural rebuilder (0x2587 sibling shifts, 3/4-step 0x2624 racks, 0x1058 MIDI tracks & synthesized chunks)
-        writer_blueprints.py     # Blob-free structured Z-chunk builders for all 8 track types (Audio/Aux/RoutingFolder/Master/Vca/BasicFolder/Midi/Instrument, Mono–7.1.4), 0x2589 UI & media chunks
-        writer_mutations.py      # Per-chunk binary mutators (0x2519, 0x2107, 0x210C, 0x2587, 0x2624, 0x202B, 0x2030, 0x1004, 0x0F3D, 0x262A, 0x1015, 0x1054, 0x1058)
-        writer.py                # Pure offline Pro Tools .ptx session writer (write_offline_ptx_session) for virgin, clean & pre-populated templates (surround, MIDI/Instrument, sub-clips, fades, UI state)
+        writer_chunks.py         # Verified Pro Tools chunk serializers (0x1028, 0x204D, session UI state, 0x2077, 0x103a, 0x1001, 0x104f/1052, 0x1014, 0x2628, 0x262f)
+        writer_index.py          # Deterministic 0x0002 chunk-offset index structural rebuilder (0x2587 sibling shifts, 3/4-step 0x2624 racks, 0x1058 & inserted chunks)
+        writer_blueprints.py     # Blob-free structured Z-chunk builders for all 8 track types (Audio/Aux/RoutingFolder/Master/Vca/BasicFolder/Midi/Instrument, Mono–7.1.4)
+        writer_track_mutations.py # Track/layout binary mutators (0x2519, 0x2107, 0x210C, 0x2587, 0x2624, 0x202B, 0x2030, multi-playlist MIDI remapping)
+        writer_media_mutations.py # Media/clip/playlist/MIDI binary mutators (0x0F3D, 0x1004, 0x262A, 0x1015, 0x1054, 0x1058, survival compaction)
+        writer_specs.py          # Declarative offline write request/result dataclasses (OfflineClipSpec, OfflinePtxWriteRequest) & upfront validators
+        writer.py                # Pure offline Pro Tools .ptx session writer (build_offline_ptx_bytes, write_offline_ptx_session) with single-pass PtxBuffer execution
         signal_flow.py           # Thin Pro Tools adapter (ptx_to_mixer_session, build_annotated_signal_flow) over signal_flow
         signal_flow_analysis.py  # Backward-compatible re-exports of signal_flow.analysis
 

@@ -13,7 +13,8 @@ from sessionpreplib.daw_processors.protools import ProToolsDawProcessor
 from sessionpreplib.daw_processors.protools_ptx_plan import build_protools_creation_plan
 from sessionpreplib.daw_processors.protools_ptx_preview import read_template_folders_from_ptxt
 from sessionpreplib.models import ProcessorResult, SessionContext, TrackContext, TransferEntry
-from sessionpreplib.ptx import build_zchunk, decrypt_ptx, encrypt_ptx
+from sessionpreplib.ptx import decrypt_ptx, encrypt_ptx
+from sessionpreplib.ptx.lowlevel import build_zchunk
 from tests.unit.test_protools_ptx_orchestration import _build_nested_folder_ptx
 from tests.unit.test_ptx_core import _build_synthetic_ptx
 

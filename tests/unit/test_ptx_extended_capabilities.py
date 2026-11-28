@@ -17,30 +17,32 @@ from sessionpreplib.ptx import (
     PtxPatchBuilder,
     PtxSession,
     PtxValidationError,
+    decrypt_ptx,
+    encrypt_ptx,
+    format_pull_rate,
+    generate_ptx_uuid,
+    patch_add_marker,
+    patch_delete_marker,
+    patch_rename_tracks,
+    patch_session_settings,
+    patch_track_states,
+    validate_index_0002,
+    write_offline_ptx_session,
+)
+from sessionpreplib.ptx.lowlevel import (
     build_aux_or_rf_mixer_strip_261e,
     build_basic_folder_mixer_strip_263b,
     build_master_mixer_strip_261d,
     build_vca_mixer_strip_261f,
     build_zchunk,
-    decrypt_ptx,
     encode_lp_str,
-    encrypt_ptx,
-    format_pull_rate,
-    generate_ptx_uuid,
     iter_top_chunks,
     parse_pull_rate_codes,
-    patch_add_marker,
-    patch_delete_marker,
-    patch_rename_tracks,
     patch_session_audio_format_1028,
-    patch_session_settings,
     patch_session_timecode_204d,
-    patch_track_states,
     rebuild_index_0002,
     serialize_index_0002,
     serialize_marker_2077,
-    validate_index_0002,
-    write_offline_ptx_session,
 )
 from sessionpreplib.ptx.models import PTX_MAGIC
 from sessionpreplib.ptx.writer_blueprints import (
@@ -387,7 +389,7 @@ def test_non_audio_strip_builders_exact_structure() -> None:
 
 def test_review_regressions_rename_sizes_vca_inactive_204d_sep_and_instrument_0002(tmp_path: Path) -> None:
     from sessionpreplib.ptx.codec import find_subchunks, read_zchunk_at, walk_sequential_zchunks
-    from sessionpreplib.ptx.writer_mutations import mutate_2030_markers_for_track_map
+    from sessionpreplib.ptx.writer_track_mutations import mutate_2030_markers_for_track_map
 
     # 1. Blocker #1: Rename with length change must update enclosing 0x261B and 0x102D Z-chunk sizes
     raw = _build_blank_modern_ptx(with_tracks=True)

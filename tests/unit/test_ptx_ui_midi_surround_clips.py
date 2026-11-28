@@ -18,16 +18,9 @@ from sessionpreplib.ptx import (
     PtxPatchBuilder,
     PtxSession,
     PtxValidationError,
-    build_instrument_mixer_strip_2621,
-    build_midi_mixer_strip_2620,
-    build_midi_track_1057,
-    build_playlist_1014_v9,
-    build_zchunk,
     decrypt_ptx,
     encrypt_ptx,
-    find_subchunks,
     generate_ptx_uuid,
-    iter_top_chunks,
     patch_add_fade,
     patch_add_marker,
     patch_clip_attributes,
@@ -35,14 +28,23 @@ from sessionpreplib.ptx import (
     patch_rename_tracks,
     patch_session_settings,
     patch_track_states,
+    validate_index_0002,
+    write_offline_ptx_session,
+)
+from sessionpreplib.ptx.lowlevel import (
+    build_instrument_mixer_strip_2621,
+    build_midi_mixer_strip_2620,
+    build_midi_track_1057,
+    build_playlist_1014_v9,
+    build_zchunk,
+    find_subchunks,
+    iter_top_chunks,
     rebuild_index_0002,
     serialize_fade_262f,
     serialize_index_0002,
     serialize_marker_2077,
     serialize_placement_104f,
     serialize_playlist_1014,
-    validate_index_0002,
-    write_offline_ptx_session,
 )
 from sessionpreplib.ptx.codec import find_zchunk_offset
 from sessionpreplib.ptx.writer_primitives import (
@@ -166,9 +168,11 @@ def test_session_length_counters_edit_mode_tool_roll_and_timeline_roundtrip() ->
     l66 = 7 + struct.unpack_from("<I", c2587, p66_in_87 + 3)[0]
     assert p66_in_87 >= 0 and c2587[p66_in_87 + l66 - 4] == 1
 
-    # Partial timeline_in_sample on a tick-flagged session never mixes ticks & samples
-    part_tick, _ = patch_session_settings(raw, timeline_in_sample=96000)
-    s_pt = PtxSession.from_bytes(part_tick)
+    # Partial timeline_in_sample on a tick-flagged session is rejected to avoid mixing ticks & samples
+    with pytest.raises(ValueError, match="tick-based"):
+        patch_session_settings(raw, timeline_in_sample=96000)
+    both_tick, _ = patch_session_settings(raw, timeline_in_sample=96000, timeline_out_sample=96000)
+    s_pt = PtxSession.from_bytes(both_tick)
     assert (s_pt.info.timeline_in_sample, s_pt.info.timeline_out_sample) == (96000, 96000)
 
     # Partial timeline_out_sample < existing cur_in is rejected

@@ -34,7 +34,7 @@ from ..signal_flow.trim_codecs import (
     trackcontrol_norm_to_db,
 )
 from .codec import decrypt_ptx, encrypt_ptx, find_subchunks, shift_index_0002, validate_index_0002
-from .models import PtxPluginInfo, SlotATrimInfo
+from .models import PtxCorruptFileError, PtxNotFoundError, PtxPluginInfo, PtxValidationError, SlotATrimInfo
 
 log = logging.getLogger(__name__)
 
@@ -292,22 +292,22 @@ def inspect_slot_a_trim(
 
 def _patch_trackcontrol_1038(b1038: bytes, gain_db: float, expected_tag: bytes) -> bytes:
     if len(b1038) < 21 or expected_tag not in b1038[:64]:
-        raise ValueError("TrackControl 0x1038 chunk missing expected AAX header.")
+        raise PtxValidationError("TrackControl 0x1038 chunk missing expected AAX header.")
     old_inner_len = struct.unpack_from("<I", b1038, 13)[0]
     if 17 + old_inner_len > len(b1038):
-        raise ValueError("TrackControl 0x1038 inner length out of bounds.")
+        raise PtxValidationError("TrackControl 0x1038 inner length out of bounds.")
     buf = bytearray(b1038)
     dgct = buf.find(b"DGCT")
     ep = buf.find(b"d_2dl \x00\x00", 0, dgct) if dgct >= 20 else -1
     if ep == -1 or ep + 16 > dgct:
-        raise ValueError("TrackControl 0x1038 chunk missing expected elck/DGCT structure.")
+        raise PtxValidationError("TrackControl 0x1038 chunk missing expected elck/DGCT structure.")
 
     chunk_start = dgct - 20
     old_chunk_len = struct.unpack_from(">I", buf, chunk_start)[0]
     zpos = buf.find(b"ZIP ", dgct)
     z_end = chunk_start + old_chunk_len
     if zpos == -1 or z_end > len(buf) or zpos + 4 >= z_end:
-        raise ValueError("TrackControl DGCT ZIP payload out of bounds.")
+        raise PtxValidationError("TrackControl DGCT ZIP payload out of bounds.")
     new_zip, norm = patch_trackcontrol_dgct_zip(bytes(buf[zpos + 4 : z_end]), gain_db)
     struct.pack_into(">d", buf, ep + 8, norm)
 
@@ -322,10 +322,10 @@ def _patch_trackcontrol_1038(b1038: bytes, gain_db: float, expected_tag: bytes) 
 def _patch_avid_trim_1038(b1038: bytes, gain_db: float, expected_tag: bytes) -> bytes:
     tag_pos = b1038.find(expected_tag + b"All ", 0, 48)
     if tag_pos < 8 or tag_pos + 64 > len(b1038):
-        raise ValueError("Avid Trim 0x1038 chunk missing expected DigiTrimTR11All header.")
+        raise PtxValidationError("Avid Trim 0x1038 chunk missing expected DigiTrimTR11All header.")
     _, flag1, flag2, flag3 = struct.unpack_from(">iiii", b1038, tag_pos + 48)
     if (flag1, flag2, flag3) != (_AVID_OFF_I32, _AVID_OFF_I32, _AVID_OFF_I32):
-        raise ValueError("Avid Trim has non-default switch state (+12 dB mode, Mute, or Phase); refusing to patch.")
+        raise PtxValidationError("Avid Trim has non-default switch state (+12 dB mode, Mute, or Phase); refusing to patch.")
     buf = bytearray(b1038)
     step = avid_trim_db_to_step(gain_db)
     struct.pack_into(">i", buf, tag_pos + 48, _avid_trim_step_to_i32(step))
@@ -334,30 +334,30 @@ def _patch_avid_trim_1038(b1038: bytes, gain_db: float, expected_tag: bytes) -> 
 
 def _patch_protility_1038(b1038: bytes, gain_db: float, expected_tag: bytes) -> bytes:
     if len(b1038) < 21 or expected_tag not in b1038[:64]:
-        raise ValueError("Protility 0x1038 chunk missing expected AAX header.")
+        raise PtxValidationError("Protility 0x1038 chunk missing expected AAX header.")
     old_inner_len = struct.unpack_from("<I", b1038, 13)[0]
     if 17 + old_inner_len > len(b1038):
-        raise ValueError("Protility 0x1038 inner length out of bounds.")
+        raise PtxValidationError("Protility 0x1038 inner length out of bounds.")
     buf = bytearray(b1038)
     norm = protility_db_to_norm(gain_db)
     juce = buf.find(b"juce")
     gp = buf.find(b"d_GAIN\x00\x00", 0, juce) if juce >= 20 else -1
     if gp == -1 or gp + 16 > juce:
-        raise ValueError("Protility 0x1038 chunk missing expected elck/juce structure.")
+        raise PtxValidationError("Protility 0x1038 chunk missing expected elck/juce structure.")
     struct.pack_into(">d", buf, gp + 8, norm)
 
     chunk_start = juce - 20
     old_chunk_len = struct.unpack_from(">I", buf, chunk_start)[0]
     chunk_end = chunk_start + old_chunk_len
     if chunk_end > len(buf):
-        raise ValueError("Protility juce chunk length out of bounds.")
+        raise PtxValidationError("Protility juce chunk length out of bounds.")
     vc2 = buf.find(b"VC2!", juce, chunk_end)
     if vc2 == -1 or vc2 + 8 > chunk_end:
-        raise ValueError("Protility juce chunk missing VC2! header.")
+        raise PtxValidationError("Protility juce chunk missing VC2! header.")
     old_xml_len = struct.unpack_from("<I", buf, vc2 + 4)[0]
     xml_start = vc2 + 8
     if xml_start + old_xml_len > chunk_end:
-        raise ValueError("Protility XML payload out of bounds.")
+        raise PtxValidationError("Protility XML payload out of bounds.")
     new_xml_bytes = patch_protility_vc2_xml(bytes(buf[xml_start : xml_start + old_xml_len]), gain_db)
     delta = len(new_xml_bytes) - old_xml_len
     buf[xml_start : xml_start + old_xml_len] = new_xml_bytes
@@ -539,15 +539,15 @@ def _validate_and_shift_span_ancestors(
     new_sizes: list[tuple[int, int]] = []
     for anc in ancestors:
         if anc + 9 > len(dec) or dec[anc] != 0x5A:
-            raise ValueError(f"Corrupt ancestor Z-chunk header at 0x{anc:x}.")
+            raise PtxValidationError(f"Corrupt ancestor Z-chunk header at 0x{anc:x}.")
         ver = struct.unpack_from("<H", dec, anc + 1)[0]
         old_sz = struct.unpack_from("<I", dec, anc + 3)[0]
         end = anc + 7 + old_sz
         if ver >= 0x1000 or not (prev_start < anc < target_s < target_e <= end <= prev_end):
-            raise ValueError(f"Ancestor Z-chunk at 0x{anc:x} violates strict nesting.")
+            raise PtxValidationError(f"Ancestor Z-chunk at 0x{anc:x} violates strict nesting.")
         new_sz = old_sz + delta
         if not (2 <= new_sz <= 0xFFFFFFFF):
-            raise ValueError(f"Ancestor Z-chunk size overflow/underflow at 0x{anc:x}.")
+            raise PtxValidationError(f"Ancestor Z-chunk size overflow/underflow at 0x{anc:x}.")
         new_sizes.append((anc, new_sz))
         prev_start, prev_end = anc, end
     for anc, new_sz in new_sizes:
@@ -562,21 +562,21 @@ def _patch_1038_for_plugin(b1038: bytes, trim_info: SlotATrimInfo, clamped_db: f
         return _patch_avid_trim_1038(b1038, clamped_db, expected_tag)
     if trim_info.plugin_id == "protility":
         return _patch_protility_1038(b1038, clamped_db, expected_tag)
-    raise ValueError(f"Unsupported Slot A Trim plugin ID: {trim_info.plugin_id!r}")
+    raise PtxValidationError(f"Unsupported Slot A Trim plugin ID: {trim_info.plugin_id!r}")
 
 
 def _extract_pristine_donor_2616(orig_dec: bytes, c2624_off: int, donor_trk: Any) -> bytes:
     """Extract the raw ``0x2616`` Insert Slot A chunk from *donor_trk* before any mutations."""
     bounds = _locate_track_block_bounds(orig_dec, c2624_off, donor_trk.index, donor_trk.uuid_hex)
     if bounds is None:
-        raise ValueError(f"Could not locate donor track {donor_trk.name!r} in 0x2624.")
+        raise PtxValidationError(f"Could not locate donor track {donor_trk.name!r} in 0x2624.")
     blk = orig_dec[bounds[0] : bounds[1]]
     r2627 = _find_child_zchunk_span(blk, bounds[0], 0x2627)
     if r2627 is None:
-        raise ValueError(f"Donor track {donor_trk.name!r} missing 0x2627 insert bank.")
+        raise PtxValidationError(f"Donor track {donor_trk.name!r} missing 0x2627 insert bank.")
     slot0 = _first_slot_in_2627(orig_dec[r2627[0] : r2627[1]], r2627[0])
     if slot0 is None or slot0[2] != 0x2616:
-        raise ValueError(f"Donor track {donor_trk.name!r} does not have an occupied 0x2616 Slot A.")
+        raise PtxValidationError(f"Donor track {donor_trk.name!r} does not have an occupied 0x2616 Slot A.")
     return orig_dec[slot0[0] : slot0[1]]
 
 
@@ -591,7 +591,7 @@ def _build_cloned_slot_a_2616(
     buf = bytearray(donor_2616)
     r2613 = _find_child_zchunk_span(bytes(buf), 0, 0x2613)
     if r2613 is None:
-        raise ValueError("Donor 0x2616 missing 0x2613 subchunk.")
+        raise PtxValidationError("Donor 0x2616 missing 0x2613 subchunk.")
     p2613, e2613 = r2613
     ancestors: list[int] = [0]
     for sub_15 in find_subchunks(bytes(buf), 0x2615):
@@ -602,7 +602,7 @@ def _build_cloned_slot_a_2616(
     ancestors.append(p2613)
     r1038 = _find_child_zchunk_span(bytes(buf[p2613:e2613]), p2613, 0x1038)
     if r1038 is None:
-        raise ValueError("Donor 0x2616 missing 0x1038 plugin state.")
+        raise PtxValidationError("Donor 0x2616 missing 0x1038 plugin state.")
     p1038, e1038 = r1038
     new_1038 = _patch_1038_for_plugin(bytes(buf[p1038:e1038]), trim_info, clamped_db)
     delta = len(new_1038) - (e1038 - p1038)
@@ -652,7 +652,7 @@ def _apply_one_slot_a_patch(
 ) -> dict[str, Any]:
     loc = _locate_slot_a_offsets(dec, c2624_off, trk_idx, trk_uuid_hex)
     if loc is None:
-        raise ValueError(f"Could not locate Slot A 0x1038 chunk on track {trk_name!r}.")
+        raise PtxValidationError(f"Could not locate Slot A 0x1038 chunk on track {trk_name!r}.")
     b1038 = bytes(dec[loc.p1038 : loc.p1038 + loc.len1038])
     new_1038 = _patch_1038_for_plugin(b1038, trim_info, clamped_db)
 
@@ -698,7 +698,7 @@ def _apply_one_slot_a_auto_insert(
 ) -> dict[str, Any]:
     loc = _locate_slot_a_empty_2625(dec, c2624_off, trk_idx, trk_uuid_hex)
     if loc is None:
-        raise ValueError(f"Track {trk_name!r} does not have an empty Insert Slot A (0x2625) for auto-insert.")
+        raise PtxValidationError(f"Track {trk_name!r} does not have an empty Insert Slot A (0x2625) for auto-insert.")
     cloned_2616, activated = _build_cloned_slot_a_2616(
         donor_2616, donor_trim, clamped_db, activate_if_inactive=activate_if_inactive,
     )
@@ -726,14 +726,14 @@ def _resolve_slot_a_targets(
     targets: list[tuple[int, str, str, SlotATrimInfo, float, Any | None]] = []
     seen_keys: set[str] = set()
     for name, raw_db in track_gains_db.items():
-        if not math.isfinite(float(raw_db)):
-            raise ValueError(f"Non-finite Slot A trim gain for track {name!r}: {raw_db!r}")
+        if isinstance(raw_db, bool) or not math.isfinite(float(raw_db)):
+            raise PtxValidationError(f"Non-finite Slot A trim gain for track {name!r}: {raw_db!r}")
         trk = session.track_by_name(name)
         if trk is None:
-            raise ValueError(f"Track {name!r} not found in .ptx session.")
+            raise PtxNotFoundError(f"Track {name!r} not found in .ptx session.")
         key = trk.uuid_hex or f"idx:{trk.index}"
         if key in seen_keys:
-            raise ValueError(f"Duplicate Slot A trim target resolving to track {trk.name!r}.")
+            raise PtxValidationError(f"Duplicate Slot A trim target resolving to track {trk.name!r}.")
         seen_keys.add(key)
         donor_trk = None
         trim_info = trk.slot_a_trim
@@ -741,15 +741,15 @@ def _resolve_slot_a_targets(
             slot_a_ins = next((ins for ins in trk.inserts if ins.slot_index == 0), None)
             if slot_a_ins is not None:
                 plug = slot_a_ins.plugin_name or slot_a_ins.fourcc or "unknown plugin"
-                raise ValueError(
+                raise PtxValidationError(
                     f"Track {trk.name!r} does not have a validated Slot A Trim plugin "
                     f"(Insert Slot A is occupied by {plug!r})."
                 )
             if not allow_auto_insert:
-                raise ValueError(f"Track {trk.name!r} does not have a validated Slot A Trim plugin.")
+                raise PtxValidationError(f"Track {trk.name!r} does not have a validated Slot A Trim plugin.")
             donor_trk = select_preferred_slot_a_trim_donor(session, trk.format)
             if donor_trk is None or donor_trk.slot_a_trim is None:
-                raise ValueError(
+                raise PtxValidationError(
                     f"Track {trk.name!r} ({trk.format}) has an empty Slot A, but no matching "
                     f"{trk.format} Slot A Trim donor exists in the session."
                 )
@@ -759,6 +759,66 @@ def _resolve_slot_a_targets(
         targets.append((trk.index, trk.uuid_hex, trk.name, trim_info, clamped, donor_trk))
     targets.sort(key=lambda item: item[0], reverse=True)
     return targets
+
+
+def _patch_slot_a_trim_decrypted(
+    buf: bytearray,
+    session: Any,
+    track_gains_db: dict[str, float],
+    *,
+    activate_if_inactive: bool = True,
+    unbypass_if_bypassed: bool = False,
+    allow_auto_insert: bool = True,
+) -> dict[str, Any]:
+    c2624 = session.chunk_map.get(0x2624)
+    if c2624 is None:
+        raise PtxCorruptFileError("Session missing 0x2624 mixer chunk.")
+    targets = _resolve_slot_a_targets(session, track_gains_db, allow_auto_insert=allow_auto_insert)
+    dec_bytes = bytes(buf)
+    donor_blobs: dict[str, bytes] = {}
+    for _, _, _, _, _, donor_trk in targets:
+        if donor_trk is not None:
+            dkey = donor_trk.uuid_hex or f"idx:{donor_trk.index}"
+            if dkey not in donor_blobs:
+                donor_blobs[dkey] = _extract_pristine_donor_2616(dec_bytes, c2624.offset, donor_trk)
+    meta: dict[str, Any] = {}
+    for trk_idx, trk_uuid_hex, trk_name, trim_info, clamped_db, donor_trk in targets:
+        if donor_trk is not None:
+            dkey = donor_trk.uuid_hex or f"idx:{donor_trk.index}"
+            meta[trk_name] = _apply_one_slot_a_auto_insert(
+                buf, c2624.offset, trk_idx, trk_uuid_hex, trk_name,
+                donor_blobs[dkey], trim_info, clamped_db,
+                activate_if_inactive=activate_if_inactive,
+            )
+        else:
+            meta[trk_name] = _apply_one_slot_a_patch(
+                buf, c2624.offset, trk_idx, trk_uuid_hex, trk_name, trim_info, clamped_db,
+                activate_if_inactive=activate_if_inactive,
+                unbypass_if_bypassed=unbypass_if_bypassed,
+            )
+    validate_index_0002(bytes(buf))
+    return meta
+
+
+def patch_slot_a_trim_gains_on_buffer(
+    ptx_buf: Any,
+    track_gains_db: dict[str, float],
+    *,
+    activate_if_inactive: bool = True,
+    unbypass_if_bypassed: bool = False,
+    allow_auto_insert: bool = True,
+) -> dict[str, Any]:
+    """Patch (or auto-insert into empty Slot A) validated Slot A Trim gains in-place on a ``PtxBuffer``."""
+    if not track_gains_db:
+        return {}
+    meta = _patch_slot_a_trim_decrypted(
+        ptx_buf.data, ptx_buf.session, track_gains_db,
+        activate_if_inactive=activate_if_inactive,
+        unbypass_if_bypassed=unbypass_if_bypassed,
+        allow_auto_insert=allow_auto_insert,
+    )
+    ptx_buf.invalidate()
+    return meta
 
 
 def patch_slot_a_trim_gains_on_session(
@@ -773,36 +833,13 @@ def patch_slot_a_trim_gains_on_session(
     """Patch (or auto-insert into empty Slot A) validated Slot A Trim gains on *session*."""
     if not track_gains_db:
         return raw_ptx, {}
-    c2624 = session.chunk_map.get(0x2624)
-    if c2624 is None:
-        raise ValueError("Session missing 0x2624 mixer chunk.")
-
-    targets = _resolve_slot_a_targets(session, track_gains_db, allow_auto_insert=allow_auto_insert)
     dec_bytes, xor_delta = decrypt_ptx(raw_ptx)
     k0 = raw_ptx[0x14] ^ 0x5A
-    donor_blobs: dict[str, bytes] = {}
-    for _, _, _, _, _, donor_trk in targets:
-        if donor_trk is not None:
-            dkey = donor_trk.uuid_hex or f"idx:{donor_trk.index}"
-            if dkey not in donor_blobs:
-                donor_blobs[dkey] = _extract_pristine_donor_2616(dec_bytes, c2624.offset, donor_trk)
-
-    dec = bytearray(dec_bytes)
-    meta: dict[str, Any] = {}
-    for trk_idx, trk_uuid_hex, trk_name, trim_info, clamped_db, donor_trk in targets:
-        if donor_trk is not None:
-            dkey = donor_trk.uuid_hex or f"idx:{donor_trk.index}"
-            meta[trk_name] = _apply_one_slot_a_auto_insert(
-                dec, c2624.offset, trk_idx, trk_uuid_hex, trk_name,
-                donor_blobs[dkey], trim_info, clamped_db,
-                activate_if_inactive=activate_if_inactive,
-            )
-        else:
-            meta[trk_name] = _apply_one_slot_a_patch(
-                dec, c2624.offset, trk_idx, trk_uuid_hex, trk_name, trim_info, clamped_db,
-                activate_if_inactive=activate_if_inactive,
-                unbypass_if_bypassed=unbypass_if_bypassed,
-            )
-
-    validate_index_0002(bytes(dec))
-    return encrypt_ptx(bytes(dec), xor_delta, k0=k0), meta
+    buf = bytearray(dec_bytes)
+    meta = _patch_slot_a_trim_decrypted(
+        buf, session, track_gains_db,
+        activate_if_inactive=activate_if_inactive,
+        unbypass_if_bypassed=unbypass_if_bypassed,
+        allow_auto_insert=allow_auto_insert,
+    )
+    return encrypt_ptx(bytes(buf), xor_delta, k0=k0), meta

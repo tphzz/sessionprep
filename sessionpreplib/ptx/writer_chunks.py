@@ -25,16 +25,18 @@ from .models import (
     MARKER_GENERAL_PROP_BITS,
     MARKER_REFERENCE_MAP,
     MARKER_TIME_PROPS,
-    PT12_COLOR_PALETTE,
     TICK_MASK_56,
     VALID_PROTOOLS_BIT_DEPTHS,
     VALID_PROTOOLS_SAMPLE_RATES,
+    PtxCorruptFileError,
+    PtxUnsupportedTemplateError,
+    PtxValidationError,
+    closest_pt_color_index as closest_pt_color_index,
 )
 from .writer_primitives import build_zchunk, encode_lp_str
 
 _VALID_AUDIO_RATES = VALID_PROTOOLS_SAMPLE_RATES
 _VALID_BIT_DEPTHS = VALID_PROTOOLS_BIT_DEPTHS
-_HEX_CHARS = frozenset("0123456789abcdefABCDEF")
 _AUDIO_FORMAT_TO_CODE = {v.upper(): k for k, v in AUDIO_FORMAT_MAP.items()}
 _FEET_FRAMES_TO_CODE = {v: k for k, v in FEET_FRAMES_RATE_MAP.items()}
 _PULL_4_TO_CODE = {v: k for k, v in AUDIO_PULL_4_MAP.items() if v}
@@ -58,7 +60,7 @@ _MARKER_MID_FLAGS_40 = (
 
 def _encode_min_le(value: int, field_name: str) -> bytes:
     if isinstance(value, bool) or value < 0 or value > 0xFFFF_FFFF_FFFF_FFFF:
-        raise ValueError(f"{field_name} out of u64 range: {value}")
+        raise PtxValidationError(f"{field_name} out of u64 range: {value}")
     if value == 0:
         return b""
     width = (value.bit_length() + 7) // 8
@@ -88,21 +90,40 @@ def parse_pull_rate_codes(label: str) -> tuple[int, int]:
         elif token in _PULL_01_TO_CODE and pull_01 == 0:
             pull_01 = _PULL_01_TO_CODE[token]
         else:
-            raise ValueError(f"Unsupported Pro Tools pull rate: {label!r}")
+            raise PtxValidationError(f"Unsupported Pro Tools pull rate: {label!r}")
     return pull_4, pull_01
 
 
 def _resolve_audio_format_code(audio_format: str | None, audio_format_code: int | None) -> int | None:
     if audio_format is not None and audio_format_code is not None:
-        raise ValueError("Provide either audio_format or audio_format_code, not both")
+        raise PtxValidationError("Provide either audio_format or audio_format_code, not both")
     if audio_format is not None:
         code = _AUDIO_FORMAT_TO_CODE.get(audio_format.strip().upper())
         if code is None:
-            raise ValueError(f"Unsupported Pro Tools audio format: {audio_format!r} (expected WAV or AIFF)")
+            raise PtxValidationError(f"Unsupported Pro Tools audio format: {audio_format!r} (expected WAV or AIFF)")
         return code
     if audio_format_code is not None and (isinstance(audio_format_code, bool) or not (0 <= audio_format_code <= 0xFF)):
-        raise ValueError(f"audio_format_code out of u8 range: {audio_format_code}")
+        raise PtxValidationError(f"audio_format_code out of u8 range: {audio_format_code}")
     return audio_format_code
+
+
+def _check_1028_tail_support(
+    raw_len: int,
+    bit_depth: int | None,
+    ap_codes: tuple[int, int] | None,
+    vp_codes: tuple[int, int] | None,
+    is_interleaved: bool | None,
+) -> bool:
+    has_tail = raw_len >= 31
+    if bit_depth == 32 and not has_tail:
+        raise PtxUnsupportedTemplateError("0x1028 chunk too short to encode 32-bit float audio format")
+    if ap_codes is not None and (raw_len < 16 or not has_tail):
+        raise PtxUnsupportedTemplateError("0x1028 chunk too short to patch audio pull rate")
+    if vp_codes is not None and not has_tail:
+        raise PtxUnsupportedTemplateError("0x1028 chunk too short to patch video pull rate")
+    if is_interleaved is not None and not has_tail:
+        raise PtxUnsupportedTemplateError("0x1028 chunk too short to patch interleaved state")
+    return has_tail
 
 
 def patch_session_audio_format_1028_decrypted(
@@ -118,49 +139,36 @@ def patch_session_audio_format_1028_decrypted(
 ) -> None:
     """Patch ``0x1028`` session format, bit depth, pull rates, and interleaved state in-place."""
     if sample_rate is not None and (isinstance(sample_rate, bool) or sample_rate not in _VALID_AUDIO_RATES):
-        raise ValueError(f"Unsupported Pro Tools sample rate: {sample_rate}")
+        raise PtxValidationError(f"Unsupported Pro Tools sample rate: {sample_rate}")
     if bit_depth is not None and (isinstance(bit_depth, bool) or bit_depth not in _VALID_BIT_DEPTHS):
-        raise ValueError(f"Unsupported Pro Tools bit depth: {bit_depth}")
+        raise PtxValidationError(f"Unsupported Pro Tools bit depth: {bit_depth}")
     fmt_code = _resolve_audio_format_code(audio_format, audio_format_code)
     ap_codes = parse_pull_rate_codes(audio_pull_rate) if audio_pull_rate is not None else None
     vp_codes = parse_pull_rate_codes(video_pull_rate) if video_pull_rate is not None else None
     if vp_codes is not None and vp_codes[0] != 0:
-        raise ValueError(f"Video pull rate only supports +/-0.1% or None in 0x1028, got {video_pull_rate!r}")
+        raise PtxValidationError(f"Video pull rate only supports +/-0.1% or None in 0x1028, got {video_pull_rate!r}")
 
     chunks = iter_top_chunks(bytes(buf), strict=True)
     c1028 = next((c for c in reversed(chunks) if c.tag == 0x1028), None)
     if c1028 is None or len(c1028.raw) < 15:
-        raise RuntimeError("Missing or truncated 0x1028 session audio format chunk in .ptx")
+        raise PtxCorruptFileError("Missing or truncated 0x1028 session audio format chunk in .ptx")
 
-    base = c1028.offset
-    end = base + len(c1028.raw)
-    has_tail = len(c1028.raw) >= 31
+    base, end = c1028.offset, c1028.offset + len(c1028.raw)
+    has_tail = _check_1028_tail_support(len(c1028.raw), bit_depth, ap_codes, vp_codes, is_interleaved)
     if fmt_code is not None:
         buf[base + 9] = fmt_code
     if bit_depth is not None:
-        if bit_depth == 32 and has_tail:
-            buf[base + 10] = 24
-            buf[end - 8] = 1
-            buf[end - 6] = 32
-        else:
-            buf[base + 10] = bit_depth
-            if has_tail:
-                buf[end - 8] = 0
-                buf[end - 6] = bit_depth
+        buf[base + 10] = 24 if bit_depth == 32 else bit_depth
+        if has_tail:
+            buf[end - 8] = 1 if bit_depth == 32 else 0
+            buf[end - 6] = bit_depth
     if sample_rate is not None:
         struct.pack_into("<I", buf, base + 11, sample_rate)
     if ap_codes is not None:
-        if len(c1028.raw) < 16 or not has_tail:
-            raise RuntimeError("0x1028 chunk too short to patch audio pull rate")
-        buf[base + 15] = ap_codes[1]
-        buf[end - 15] = ap_codes[0]
+        buf[base + 15], buf[end - 15] = ap_codes[1], ap_codes[0]
     if vp_codes is not None:
-        if not has_tail:
-            raise RuntimeError("0x1028 chunk too short to patch video pull rate")
         buf[end - 14] = vp_codes[1]
     if is_interleaved is not None:
-        if not has_tail:
-            raise RuntimeError("0x1028 chunk too short to patch interleaved state")
         buf[end - 7] = 1 if is_interleaved else 0
 
 
@@ -196,12 +204,12 @@ def _validate_session_length(session_length: str, effective_fps_code: int | None
     cleaned = session_length.strip()
     m = _SESSION_LENGTH_RE.match(cleaned)
     if m is None:
-        raise ValueError(f"Invalid session_length {session_length!r} (expected HH:MM:SS:FF or HH:MM:SS;FF)")
+        raise PtxValidationError(f"Invalid session_length {session_length!r} (expected HH:MM:SS:FF or HH:MM:SS;FF)")
     hh, mm, ss, sep, ff = int(m.group(1)), int(m.group(2)), int(m.group(3)), m.group(4), int(m.group(5))
     fps_entry = FPS_CODE_MAP.get(effective_fps_code) if effective_fps_code is not None else None
     max_ff = fps_entry[1] if fps_entry is not None else 30
     if hh < 6 or hh > 24 or (hh == 24 and (mm > 0 or ss > 0 or ff > 0)) or mm >= 60 or ss >= 60 or ff >= max_ff:
-        raise ValueError(f"session_length out of Pro Tools valid range (06:00:00:00..24:00:00:00): {session_length!r}")
+        raise PtxValidationError(f"session_length out of Pro Tools valid range (06:00:00:00..24:00:00:00): {session_length!r}")
     if fps_entry is not None:
         sep = ";" if fps_entry[3] else ":"
     return f"{hh:02d}:{mm:02d}:{ss:02d}{sep}{ff:02d}".encode("ascii")
@@ -217,24 +225,28 @@ def patch_session_timecode_204d_decrypted(
 ) -> None:
     """Patch ``0x204D`` timecode frame rate, session start frames, length, and Feet+Frames rate in-place."""
     if fps_code is not None and (isinstance(fps_code, bool) or fps_code not in FPS_CODE_MAP):
-        raise ValueError(f"Unsupported Pro Tools fps_code: {fps_code!r} (valid: {sorted(FPS_CODE_MAP)})")
+        raise PtxValidationError(f"Unsupported Pro Tools fps_code: {fps_code!r} (valid: {sorted(FPS_CODE_MAP)})")
     if start_frames is not None and (isinstance(start_frames, bool) or not (0 <= start_frames <= 0xFFFF_FFFF)):
-        raise ValueError(f"start_frames out of u32 range: {start_frames!r}")
+        raise PtxValidationError(f"start_frames out of u32 range: {start_frames!r}")
     ff_code: int | None = None
     if feet_frames_rate is not None:
         ff_code = _FEET_FRAMES_TO_CODE.get(feet_frames_rate.strip())
         if ff_code is None:
-            raise ValueError(f"Unsupported Pro Tools feet_frames_rate: {feet_frames_rate!r} (expected 23.976, 24, or 25)")
+            raise PtxValidationError(f"Unsupported Pro Tools feet_frames_rate: {feet_frames_rate!r} (expected 23.976, 24, or 25)")
 
     chunks = iter_top_chunks(bytes(buf), strict=True)
     c204d = next((c for c in reversed(chunks) if c.tag == 0x204D), None)
     if c204d is None or len(c204d.raw) < 22:
-        raise RuntimeError("Missing or truncated 0x204D session timecode chunk in .ptx")
+        raise PtxCorruptFileError("Missing or truncated 0x204D session timecode chunk in .ptx")
 
     body_off = c204d.offset + 9
     body_len = len(c204d.raw) - 9
     eff_fps = fps_code if fps_code is not None else struct.unpack_from("<I", buf, body_off)[0]
     len_bytes = _validate_session_length(session_length, eff_fps) if session_length is not None else None
+    if len_bytes is not None and (body_len < 40 or struct.unpack_from("<I", buf, body_off + 25)[0] != 11):
+        raise PtxUnsupportedTemplateError("0x204D chunk lacks 11-byte session_length field")
+    if ff_code is not None and body_len <= 17:
+        raise PtxUnsupportedTemplateError("0x204D chunk too short to patch feet_frames_rate")
     if fps_code is not None:
         struct.pack_into("<I", buf, body_off, fps_code)
         if body_len >= 44:
@@ -248,8 +260,6 @@ def patch_session_timecode_204d_decrypted(
             ):
                 buf[body_off + tc_off + 8] = sep
     if len_bytes is not None:
-        if body_len < 40 or struct.unpack_from("<I", buf, body_off + 25)[0] != 11:
-            raise RuntimeError("0x204D chunk lacks 11-byte session_length field")
         buf[body_off + 29 : body_off + 40] = len_bytes
         if body_len >= 67 and struct.unpack_from("<I", buf, body_off + 52)[0] == 11:
             buf[body_off + 56 : body_off + 67] = len_bytes
@@ -258,8 +268,6 @@ def patch_session_timecode_204d_decrypted(
         if body_len >= 48:
             struct.pack_into("<I", buf, body_off + 44, start_frames)
     if ff_code is not None:
-        if body_len <= 17:
-            raise RuntimeError("0x204D chunk too short to patch feet_frames_rate")
         buf[body_off + 17] = ff_code
 
 
@@ -295,7 +303,7 @@ def _resolve_edit_mode_and_grid(edit_mode: str | None, grid_relative: bool | Non
         return 3, True if grid_relative is None else grid_relative
     code = _EDIT_MODE_TO_CODE.get(low)
     if code is None:
-        raise ValueError(f"Unsupported Pro Tools edit_mode: {edit_mode!r}")
+        raise PtxValidationError(f"Unsupported Pro Tools edit_mode: {edit_mode!r}")
     return code, grid_relative
 
 
@@ -304,10 +312,12 @@ def _resolve_edit_tool_and_smart(edit_tool: str | None, smart_tool: bool | None)
         return None, smart_tool
     low = edit_tool.strip().lower()
     if low in ("smarttool", "smart"):
+        if smart_tool is False:
+            raise PtxValidationError("Contradictory edit_tool='SmartTool' with smart_tool_enabled=False")
         return None, True
     code = _EDIT_TOOL_TO_CODE.get(low)
     if code is None:
-        raise ValueError(f"Unsupported Pro Tools edit_tool: {edit_tool!r}")
+        raise PtxValidationError(f"Unsupported Pro Tools edit_tool: {edit_tool!r}")
     return code, (False if smart_tool is None else smart_tool)
 
 
@@ -320,29 +330,41 @@ def _patch_2056_block(
     em_code: int | None,
     tool_code: int | None,
     smart_flag: bool | None,
+    applied: set[str],
 ) -> None:
     if smart_flag is not None and length >= 10:
         buf[off + 9] = 1 if smart_flag else 0
+        applied.add("smart_tool_enabled")
     if tool_code is not None and length >= 23:
         buf[off + 22] = tool_code
+        applied.add("edit_tool")
     if em_code is not None and length >= 45:
         buf[off + 26] = em_code
         buf[off + 44] = EDIT_MODE_MASK_MAP[em_code]
+        applied.add("edit_mode")
     if mc_code is not None and length >= 31:
         buf[off + 30] = mc_code
+        applied.add("main_counter_format")
 
 
-def _patch_grid_relative_chunks(buf: bytearray, by_tag: dict[int, tuple[int, int]], grid_rel: bool) -> None:
+def _patch_grid_relative_chunks(
+    buf: bytearray,
+    by_tag: dict[int, tuple[int, int]],
+    grid_rel: bool,
+    applied: set[str],
+) -> None:
     val = 1 if grid_rel else 0
     if 0x2016 in by_tag:
         off, ln = by_tag[0x2016]
         if ln >= 45:
             buf[off + ln - 45] = val
+            applied.add("grid_relative")
     for tag in (0x2066, 0x2530):
         if tag in by_tag:
             off, ln = by_tag[tag]
             if ln > 275:
                 buf[off + 275] = val
+                applied.add("grid_relative")
     if 0x2587 in by_tag:
         off, ln = by_tag[0x2587]
         p66 = find_zchunk_offset(buf, 0x2066, off + 9, off + ln)
@@ -350,8 +372,10 @@ def _patch_grid_relative_chunks(buf: bytearray, by_tag: dict[int, tuple[int, int
             l66 = 7 + struct.unpack_from("<I", buf, p66 + 3)[0]
             if l66 > 275:
                 buf[p66 + 275] = val
+                applied.add("grid_relative")
             elif l66 >= 197:
                 buf[p66 + l66 - 4] = val
+                applied.add("grid_relative")
 
 
 def _validate_ui_state_args(
@@ -368,10 +392,10 @@ def _validate_ui_state_args(
 ) -> tuple[int | None, int | None, int | None, bool | None, int | None, bool | None]:
     mc_code = _COUNTER_FMT_TO_CODE.get(main_counter_format.strip().lower()) if main_counter_format is not None else None
     if main_counter_format is not None and mc_code is None:
-        raise ValueError(f"Unsupported main_counter_format: {main_counter_format!r}")
+        raise PtxValidationError(f"Unsupported main_counter_format: {main_counter_format!r}")
     sc_code = _COUNTER_FMT_TO_CODE.get(sub_counter_format.strip().lower()) if sub_counter_format is not None else None
     if sub_counter_format is not None and sc_code is None:
-        raise ValueError(f"Unsupported sub_counter_format: {sub_counter_format!r}")
+        raise PtxValidationError(f"Unsupported sub_counter_format: {sub_counter_format!r}")
     em_code, grid_rel = _resolve_edit_mode_and_grid(edit_mode, grid_relative)
     tool_code, smart_flag = _resolve_edit_tool_and_smart(edit_tool, smart_tool_enabled)
     for lbl, val in (
@@ -381,9 +405,9 @@ def _validate_ui_state_args(
         ("timeline_out_sample", timeline_out_sample),
     ):
         if val is not None and (isinstance(val, bool) or not (0 <= val <= TICK_MASK_56)):
-            raise ValueError(f"{lbl} out of 56-bit range: {val!r}")
+            raise PtxValidationError(f"{lbl} out of 56-bit range: {val!r}")
     if timeline_in_sample is not None and timeline_out_sample is not None and timeline_out_sample < timeline_in_sample:
-        raise ValueError("timeline_out_sample must be >= timeline_in_sample")
+        raise PtxValidationError("timeline_out_sample must be >= timeline_in_sample")
     return mc_code, sc_code, em_code, grid_rel, tool_code, smart_flag
 
 
@@ -397,32 +421,103 @@ def _patch_roll_and_selection(
     post_roll_samples: int | None,
     timeline_in_sample: int | None,
     timeline_out_sample: int | None,
+    applied: set[str],
 ) -> None:
     if 0x2025 in by_tag and any(x is not None for x in (pre_roll_enabled, pre_roll_samples, post_roll_enabled, post_roll_samples)):
         off, ln = by_tag[0x2025]
         if ln >= 27:
             if pre_roll_enabled is not None:
                 buf[off + 9] = 1 if pre_roll_enabled else 0
+                applied.add("pre_roll_enabled")
             if pre_roll_samples is not None:
                 struct.pack_into("<Q", buf, off + 10, pre_roll_samples)
+                applied.add("pre_roll_samples")
             if post_roll_enabled is not None:
                 buf[off + 18] = 1 if post_roll_enabled else 0
+                applied.add("post_roll_enabled")
             if post_roll_samples is not None:
                 struct.pack_into("<Q", buf, off + 19, post_roll_samples)
+                applied.add("post_roll_samples")
     if 0x2016 in by_tag and (timeline_in_sample is not None or timeline_out_sample is not None):
         off, ln = by_tag[0x2016]
         if ln >= 129:
             cur_in, cur_out = struct.unpack_from("<QQ", buf, off + 89)
             cur_is_tick = (cur_in >> 56) == 0x40 or (cur_out >> 56) == 0x40
-            if cur_is_tick:
-                in_val = timeline_in_sample if timeline_in_sample is not None else int(timeline_out_sample or 0)
-                out_val = timeline_out_sample if timeline_out_sample is not None else in_val
-            else:
-                in_val = timeline_in_sample if timeline_in_sample is not None else cur_in
-                out_val = timeline_out_sample if timeline_out_sample is not None else max(cur_out, in_val)
+            if cur_is_tick and (timeline_in_sample is None or timeline_out_sample is None):
+                raise PtxValidationError(
+                    "Provide both timeline_in_sample and timeline_out_sample when converting a tick-based selection"
+                )
+            in_val = timeline_in_sample if timeline_in_sample is not None else cur_in
+            out_val = timeline_out_sample if timeline_out_sample is not None else max(cur_out, in_val)
             if out_val < in_val:
-                raise ValueError(f"timeline_out_sample ({out_val}) must be >= timeline_in_sample ({in_val})")
+                raise PtxValidationError(f"timeline_out_sample ({out_val}) must be >= timeline_in_sample ({in_val})")
             struct.pack_into("<QQQQQ", buf, off + 89, in_val, out_val, in_val, out_val, in_val)
+            if timeline_in_sample is not None:
+                applied.add("timeline_in_sample")
+            if timeline_out_sample is not None:
+                applied.add("timeline_out_sample")
+
+
+def _verify_requested_ui_applied(
+    applied: set[str],
+    pairs: Sequence[tuple[str, Any]],
+    *,
+    grid_rel: bool | None,
+    edit_mode: str | None,
+    smart_flag: bool | None,
+    edit_tool: str | None,
+    tool_code: int | None,
+) -> None:
+    if edit_tool is not None and tool_code is None and smart_flag is True and "smart_tool_enabled" in applied:
+        applied.add("edit_tool")
+    requested = {k for k, v in pairs if v is not None}
+    if grid_rel is not None and edit_mode is not None:
+        requested.add("grid_relative")
+    if smart_flag is not None and edit_tool is not None:
+        requested.add("smart_tool_enabled")
+    missing = requested - applied
+    if missing:
+        raise PtxUnsupportedTemplateError(
+            f"Template lacks writable UI state chunks for requested settings: {sorted(missing)}"
+        )
+
+
+def _patch_counter_and_tool_chunks(
+    buf: bytearray,
+    by_tag: dict[int, tuple[int, int]],
+    *,
+    mc_code: int | None,
+    sc_code: int | None,
+    em_code: int | None,
+    tool_code: int | None,
+    smart_flag: bool | None,
+    applied: set[str],
+) -> None:
+    if 0x2024 in by_tag and (em_code is not None or mc_code is not None):
+        off, ln = by_tag[0x2024]
+        if em_code is not None and ln >= 14:
+            buf[off + 9], buf[off + 13] = em_code, EDIT_MODE_MASK_MAP[em_code]
+            applied.add("edit_mode")
+        if mc_code is not None and ln >= 11:
+            buf[off + 10] = mc_code
+            applied.add("main_counter_format")
+    if any(x is not None for x in (mc_code, em_code, tool_code, smart_flag)):
+        if 0x2056 in by_tag:
+            _patch_2056_block(buf, *by_tag[0x2056], mc_code=mc_code, em_code=em_code, tool_code=tool_code, smart_flag=smart_flag, applied=applied)
+        for parent_tag in (0x2016, 0x2587):
+            if parent_tag in by_tag:
+                poff, plen = by_tag[parent_tag]
+                p56 = find_zchunk_offset(buf, 0x2056, poff + 9, poff + plen)
+                if p56 >= 0:
+                    l56 = 7 + struct.unpack_from("<I", buf, p56 + 3)[0]
+                    _patch_2056_block(buf, p56, l56, mc_code=mc_code, em_code=em_code, tool_code=tool_code, smart_flag=smart_flag, applied=applied)
+    if sc_code is not None:
+        if 0x201F in by_tag and by_tag[0x201F][1] > 41:
+            buf[by_tag[0x201F][0] + 41] = sc_code
+            applied.add("sub_counter_format")
+        if 0x2016 in by_tag and by_tag[0x2016][1] > 134:
+            buf[by_tag[0x2016][0] + 134] = sc_code
+            applied.add("sub_counter_format")
 
 
 def patch_session_ui_state_decrypted(
@@ -440,43 +535,41 @@ def patch_session_ui_state_decrypted(
     post_roll_samples: int | None = None,
     timeline_in_sample: int | None = None,
     timeline_out_sample: int | None = None,
-) -> None:
-    """Patch counters, edit mode/tool, pre/post roll, and timeline selection in-place."""
+) -> set[str]:
+    """Patch counters, edit mode/tool, pre/post roll, and timeline selection in-place, returning applied keys."""
     mc_code, sc_code, em_code, grid_rel, tool_code, smart_flag = _validate_ui_state_args(
         main_counter_format, sub_counter_format, edit_mode, grid_relative,
         edit_tool, smart_tool_enabled, pre_roll_samples, post_roll_samples,
         timeline_in_sample, timeline_out_sample,
     )
     by_tag = {c.tag: (c.offset, len(c.raw)) for c in iter_top_chunks(bytes(buf), strict=True)}
-    if 0x2024 in by_tag and (em_code is not None or mc_code is not None):
-        off, ln = by_tag[0x2024]
-        if em_code is not None and ln >= 14:
-            buf[off + 9], buf[off + 13] = em_code, EDIT_MODE_MASK_MAP[em_code]
-        if mc_code is not None and ln >= 11:
-            buf[off + 10] = mc_code
-    if any(x is not None for x in (mc_code, em_code, tool_code, smart_flag)):
-        if 0x2056 in by_tag:
-            _patch_2056_block(buf, *by_tag[0x2056], mc_code=mc_code, em_code=em_code, tool_code=tool_code, smart_flag=smart_flag)
-        for parent_tag in (0x2016, 0x2587):
-            if parent_tag in by_tag:
-                poff, plen = by_tag[parent_tag]
-                p56 = find_zchunk_offset(buf, 0x2056, poff + 9, poff + plen)
-                if p56 >= 0:
-                    l56 = 7 + struct.unpack_from("<I", buf, p56 + 3)[0]
-                    _patch_2056_block(buf, p56, l56, mc_code=mc_code, em_code=em_code, tool_code=tool_code, smart_flag=smart_flag)
-    if sc_code is not None:
-        if 0x201F in by_tag and by_tag[0x201F][1] > 41:
-            buf[by_tag[0x201F][0] + 41] = sc_code
-        if 0x2016 in by_tag and by_tag[0x2016][1] > 134:
-            buf[by_tag[0x2016][0] + 134] = sc_code
-    if grid_rel is not None:
-        _patch_grid_relative_chunks(buf, by_tag, grid_rel)
-    _patch_roll_and_selection(
-        buf, by_tag,
-        pre_roll_enabled=pre_roll_enabled, pre_roll_samples=pre_roll_samples,
-        post_roll_enabled=post_roll_enabled, post_roll_samples=post_roll_samples,
-        timeline_in_sample=timeline_in_sample, timeline_out_sample=timeline_out_sample,
+    work = bytearray(buf)
+    applied: set[str] = set()
+    _patch_counter_and_tool_chunks(
+        work, by_tag, mc_code=mc_code, sc_code=sc_code, em_code=em_code,
+        tool_code=tool_code, smart_flag=smart_flag, applied=applied,
     )
+    if grid_rel is not None:
+        _patch_grid_relative_chunks(work, by_tag, grid_rel, applied)
+    _patch_roll_and_selection(
+        work, by_tag, pre_roll_enabled=pre_roll_enabled, pre_roll_samples=pre_roll_samples,
+        post_roll_enabled=post_roll_enabled, post_roll_samples=post_roll_samples,
+        timeline_in_sample=timeline_in_sample, timeline_out_sample=timeline_out_sample, applied=applied,
+    )
+    _verify_requested_ui_applied(
+        applied,
+        (
+            ("main_counter_format", main_counter_format), ("sub_counter_format", sub_counter_format),
+            ("edit_mode", edit_mode), ("grid_relative", grid_relative), ("edit_tool", edit_tool),
+            ("smart_tool_enabled", smart_tool_enabled), ("pre_roll_enabled", pre_roll_enabled),
+            ("pre_roll_samples", pre_roll_samples), ("post_roll_enabled", post_roll_enabled),
+            ("post_roll_samples", post_roll_samples), ("timeline_in_sample", timeline_in_sample),
+            ("timeline_out_sample", timeline_out_sample),
+        ),
+        grid_rel=grid_rel, edit_mode=edit_mode, smart_flag=smart_flag, edit_tool=edit_tool, tool_code=tool_code,
+    )
+    buf[:] = work
+    return applied
 
 
 def _validate_marker_args(
@@ -491,30 +584,30 @@ def _validate_marker_args(
     marker_uuid16: bytes | None,
 ) -> tuple[int, int, int, bytes, bytes]:
     if isinstance(number, bool) or not (1 <= number <= 999):
-        raise ValueError(f"Marker number must be 1..999, got {number!r}")
+        raise PtxValidationError(f"Marker number must be 1..999, got {number!r}")
     ref_code = _MARKER_REF_TO_CODE.get(reference.strip().lower())
     if ref_code is None:
-        raise ValueError(f"Unsupported marker reference: {reference!r}")
+        raise PtxValidationError(f"Unsupported marker reference: {reference!r}")
     prop_code = _MARKER_PROP_TO_CODE.get(time_properties.strip().lower())
     if prop_code is None:
-        raise ValueError(f"Unsupported marker time_properties: {time_properties!r}")
+        raise PtxValidationError(f"Unsupported marker time_properties: {time_properties!r}")
     end_val = start_pos if end_pos is None else end_pos
     for lbl, pos_val in (("start_pos", start_pos), ("end_pos", end_val)):
         if isinstance(pos_val, bool) or not (0 <= pos_val <= TICK_MASK_56):
-            raise ValueError(f"Marker {lbl} out of 56-bit range: {pos_val!r}")
+            raise PtxValidationError(f"Marker {lbl} out of 56-bit range: {pos_val!r}")
     if prop_code == 2 and end_val < start_pos:
-        raise ValueError(f"Selection marker end_pos ({end_val}) must be >= start_pos ({start_pos})")
+        raise PtxValidationError(f"Selection marker end_pos ({end_val}) must be >= start_pos ({start_pos})")
     if isinstance(color_index, bool) or not (0 <= color_index <= 0xFFFF):
-        raise ValueError(f"Marker color_index out of u16 range: {color_index!r}")
+        raise PtxValidationError(f"Marker color_index out of u16 range: {color_index!r}")
     if isinstance(track_index, bool) or track_index < -1 or track_index > 0x7FFF_FFFF:
-        raise ValueError(f"Marker track_index out of range: {track_index!r}")
+        raise PtxValidationError(f"Marker track_index out of range: {track_index!r}")
     uid = uuid.uuid4().bytes_le if marker_uuid16 is None else marker_uuid16
     if len(uid) != 16:
-        raise ValueError(f"marker_uuid16 must be 16 bytes, got {len(uid)}")
+        raise PtxValidationError(f"marker_uuid16 must be 16 bytes, got {len(uid)}")
     rgb_body = b"\x00" * 7
     if color_rgb is not None:
         if len(color_rgb) != 3 or any(isinstance(c, bool) or not (0 <= c <= 255) for c in color_rgb):
-            raise ValueError(f"color_rgb must be 3 ints in 0..255, got {color_rgb!r}")
+            raise PtxValidationError(f"color_rgb must be 3 ints in 0..255, got {color_rgb!r}")
         r, g, b = color_rgb
         rgb_body = bytes([1, 0, r, 0, g, 0, b])
     return ref_code, prop_code, end_val, uid, rgb_body
@@ -576,12 +669,12 @@ def serialize_directory_tree_103a(entries: Sequence[PtxDirTreeEntry], *, version
     """Serialize ``0x1004`` -> ``0x103a`` directory/file entries into a Z-chunk."""
     body = bytearray(struct.pack("<I", len(entries)))
     for entry in entries:
-        if not (0 <= entry.kind <= 0xFF):
-            raise ValueError(f"0x103a entry kind out of u8 range: {entry.kind}")
-        if not (0 <= entry.parent_index <= 0xFFFF_FFFF):
-            raise ValueError(f"0x103a parent_index out of u32 range: {entry.parent_index}")
+        if isinstance(entry.kind, bool) or not (0 <= entry.kind <= 0xFF):
+            raise PtxValidationError(f"0x103a entry kind out of u8 range: {entry.kind}")
+        if isinstance(entry.parent_index, bool) or not (0 <= entry.parent_index <= 0xFFFF_FFFF):
+            raise PtxValidationError(f"0x103a parent_index out of u32 range: {entry.parent_index}")
         if len(entry.tag4) != 4:
-            raise ValueError(f"0x103a entry tag4 must be 4 bytes, got {len(entry.tag4)}")
+            raise PtxValidationError(f"0x103a entry tag4 must be 4 bytes, got {len(entry.tag4)}")
         body.append(entry.kind)
         body.extend(struct.pack("<I", entry.parent_index))
         body.extend(encode_lp_str(entry.name))
@@ -600,18 +693,18 @@ def serialize_audio_desc_1001(
     version: int = 2,
 ) -> bytes:
     """Serialize a ``0x1003`` -> ``0x1001`` audio file format descriptor Z-chunk."""
-    if sample_rate <= 0 or sample_rate > 0xFFFF_FFFF:
-        raise ValueError(f"Invalid sample_rate for 0x1001: {sample_rate}")
-    if not (1 <= channels <= 64):
-        raise ValueError(f"Invalid channel count for 0x1001: {channels}")
-    if bit_depth not in _VALID_BIT_DEPTHS:
-        raise ValueError(f"Invalid bit_depth for 0x1001: {bit_depth}")
-    if length_samples < 0 or length_samples > 0xFFFF_FFFF_FFFF_FFFF:
-        raise ValueError(f"Invalid length_samples for 0x1001: {length_samples}")
-    if not (0 <= format_code <= 0xFF):
-        raise ValueError(f"Invalid format_code for 0x1001: {format_code}")
+    if isinstance(sample_rate, bool) or sample_rate <= 0 or sample_rate > 0xFFFF_FFFF:
+        raise PtxValidationError(f"Invalid sample_rate for 0x1001: {sample_rate}")
+    if isinstance(channels, bool) or not (1 <= channels <= 64):
+        raise PtxValidationError(f"Invalid channel count for 0x1001: {channels}")
+    if isinstance(bit_depth, bool) or bit_depth not in _VALID_BIT_DEPTHS:
+        raise PtxValidationError(f"Invalid bit_depth for 0x1001: {bit_depth}")
+    if isinstance(length_samples, bool) or length_samples < 0 or length_samples > 0xFFFF_FFFF_FFFF_FFFF:
+        raise PtxValidationError(f"Invalid length_samples for 0x1001: {length_samples}")
+    if isinstance(format_code, bool) or not (0 <= format_code <= 0xFF):
+        raise PtxValidationError(f"Invalid format_code for 0x1001: {format_code}")
     if len(tail16) != 16:
-        raise ValueError(f"0x1001 tail16 must be 16 bytes, got {len(tail16)}")
+        raise PtxValidationError(f"0x1001 tail16 must be 16 bytes, got {len(tail16)}")
     body = struct.pack("<IBBQB", sample_rate, channels, bit_depth, length_samples, format_code) + tail16
     return build_zchunk(0x1001, body, version=version)
 
@@ -629,13 +722,13 @@ def serialize_placement_104f(
 ) -> bytes:
     """Serialize a single 44-byte ``0x104f`` clip or fade placement Z-chunk."""
     if isinstance(clip_index, bool) or not (0 <= clip_index <= 0xFFFF_FFFF):
-        raise ValueError(f"clip_index out of u32 range: {clip_index}")
+        raise PtxValidationError(f"clip_index out of u32 range: {clip_index}")
     if isinstance(start_sample, bool) or not (0 <= start_sample <= 0x00FF_FFFF_FFFF_FFFF):
-        raise ValueError(f"start_sample out of 56-bit range: {start_sample}")
+        raise PtxValidationError(f"start_sample out of 56-bit range: {start_sample}")
     if isinstance(flags, bool) or not (0 <= flags <= 0xFF):
-        raise ValueError(f"flags out of u8 range: {flags}")
+        raise PtxValidationError(f"flags out of u8 range: {flags}")
     if isinstance(color_index, bool) or not (0 <= color_index <= 0xFFFF):
-        raise ValueError(f"color_index out of u16 range: {color_index}")
+        raise PtxValidationError(f"color_index out of u16 range: {color_index}")
     mute_b = 1 if is_muted else 0
     elock_b = 1 if is_edit_locked else 0
     tlock_b = 1 if (is_time_locked or is_edit_locked) else 0
@@ -663,36 +756,36 @@ def serialize_fade_262f(
 ) -> bytes:
     """Serialize a ``0x2630`` -> ``0x262F`` (v2) fade-in, fade-out, or crossfade Z-chunk."""
     if isinstance(total_samples, bool) or total_samples <= 0 or total_samples > 0xFFFF_FFFF_FFFF_FFFF:
-        raise ValueError(f"Fade total_samples must be positive u64, got {total_samples!r}")
+        raise PtxValidationError(f"Fade total_samples must be positive u64, got {total_samples!r}")
     ftype = fade_type.strip().lower()
     if ftype == "in":
         b1 = _encode_min_le(total_samples, "total_samples")
         shape_code = _FADE_SHAPE_TO_CODE.get(shape.strip().lower())
         if shape_code is None:
-            raise ValueError(f"Unsupported fade shape: {shape!r}")
+            raise PtxValidationError(f"Unsupported fade shape: {shape!r}")
         tail = bytes([3, 1, 0, 0, 0, 0, shape_code, 1, 0, 0, 0xFF, 0xFF])
         body = (b"\x00" * 5) + bytes([len(b1) << 4, 0, 0]) + b1 + tail
     elif ftype == "out":
         b1 = _encode_min_le(total_samples, "total_samples")
         shape_code = _FADE_SHAPE_TO_CODE.get(shape.strip().lower())
         if shape_code is None:
-            raise ValueError(f"Unsupported fade shape: {shape!r}")
+            raise PtxValidationError(f"Unsupported fade shape: {shape!r}")
         hdr = (b"\x00" * 5) + bytes([(len(b1) << 4) | len(b1), 0, 0])
         out_shape = 2 if shape_code == 0 else shape_code
         body = hdr + b1 + b1 + bytes([2, 1]) + (b"\x00" * 10) + bytes([out_shape, 0xFF, 0xFF])
     elif ftype == "crossfade":
         pre = total_samples // 2 if pre_samples is None else pre_samples
         if isinstance(pre, bool) or pre < 0 or pre > total_samples:
-            raise ValueError(f"Crossfade pre_samples ({pre}) must be in 0..{total_samples}")
+            raise PtxValidationError(f"Crossfade pre_samples ({pre}) must be in 0..{total_samples}")
         link_code = _CROSSFADE_LINK_TO_CODE.get(crossfade_link.strip().lower())
         if link_code is None:
-            raise ValueError(f"Unsupported crossfade_link: {crossfade_link!r}")
+            raise PtxValidationError(f"Unsupported crossfade_link: {crossfade_link!r}")
         b_pre = _encode_min_le(pre, "pre_samples")
         b_tot = _encode_min_le(total_samples, "total_samples")
         hdr = (b"\x00" * 5) + bytes([(len(b_pre) << 4) | len(b_tot), 0, 0])
         body = hdr + b_pre + b_tot + bytes([1, link_code]) + (b"\x00" * 10) + b"\x02\xff\xff\x00\x00\x00\x00\x02\xff\xff"
     else:
-        raise ValueError(f"Unsupported fade_type {fade_type!r} (expected 'in', 'out', or 'crossfade')")
+        raise PtxValidationError(f"Unsupported fade_type {fade_type!r} (expected 'in', 'out', or 'crossfade')")
     return build_zchunk(0x262F, body, version=version)
 
 
@@ -741,20 +834,24 @@ def serialize_playlist_1014(
 ) -> bytes:
     """Serialize a ``0x1015`` -> ``0x1014`` playlist entry Z-chunk (v9 Mono, Stereo, and Surround)."""
     if len(playlist_uuid16) != 16:
-        raise ValueError(f"playlist_uuid16 must be 16 bytes, got {len(playlist_uuid16)}")
+        raise PtxValidationError(f"playlist_uuid16 must be 16 bytes, got {len(playlist_uuid16)}")
     for li in lane_indices:
         if isinstance(li, bool) or not (0 <= li <= 0xFFFF):
-            raise ValueError(f"lane_index out of u16 range: {li}")
+            raise PtxValidationError(f"lane_index out of u16 range: {li}")
+    if flags is not None and isinstance(flags, bool):
+        raise PtxValidationError(f"playlist flags must be an int, got {flags!r}")
+    if format_code is not None and isinstance(format_code, bool):
+        raise PtxValidationError(f"playlist format_code must be an int, got {format_code!r}")
     ext_code = format_code
     if ext_code is None:
         stereo = bool(is_stereo) if is_stereo is not None else (bool(flags & 1) if flags is not None else len(lane_indices) >= 2)
         ext_code = 1 if stereo else 0
     if ext_code == 17 and len(lane_indices) != 10:
-        raise ValueError(f"7.1.2 playlist requires 10 lane indices, got {len(lane_indices)}")
+        raise PtxValidationError(f"7.1.2 playlist requires 10 lane indices, got {len(lane_indices)}")
     if ext_code == 30 and len(lane_indices) != 12:
-        raise ValueError(f"7.1.4 playlist requires 12 lane indices, got {len(lane_indices)}")
+        raise PtxValidationError(f"7.1.4 playlist requires 12 lane indices, got {len(lane_indices)}")
     if ext_code not in (17, 30) and len(lane_indices) > 8:
-        raise ValueError(f"Playlist format_code {ext_code} supports at most 8 lanes, got {len(lane_indices)}")
+        raise PtxValidationError(f"Playlist format_code {ext_code} supports at most 8 lanes, got {len(lane_indices)}")
     first_lanes = list(lane_indices[:8])
     extra_lanes = list(lane_indices[8:])
     if ext_code in (14, 17, 30):
@@ -764,7 +861,7 @@ def serialize_playlist_1014(
     else:
         fbyte = flags if flags is not None else ext_code
     if not (0 <= fbyte <= 0xFF):
-        raise ValueError(f"playlist flags out of u8 range: {fbyte}")
+        raise PtxValidationError(f"playlist flags out of u8 range: {fbyte}")
     body = bytearray(encode_lp_str(playlist_name))
     body.append(fbyte)
     body.extend(struct.pack("<I", len(first_lanes)))
@@ -807,25 +904,3 @@ def serialize_clip_core_2628_dims(
         0x00,
     ])
     return hdr + b_start + b_sync + b_len + b_orig + b_user
-
-
-def closest_pt_color_index(argb_hex: str) -> int | None:
-    """Map an ``#AARRGGBB`` or ``#RRGGBB`` color string to the closest ``PT12_COLOR_PALETTE`` index offline."""
-    cleaned = argb_hex.strip().lstrip("#")
-    if len(cleaned) == 8:
-        cleaned = cleaned[2:]
-    if len(cleaned) != 6 or not all(ch in _HEX_CHARS for ch in cleaned):
-        return None
-    r0 = int(cleaned[0:2], 16)
-    g0 = int(cleaned[2:4], 16)
-    b0 = int(cleaned[4:6], 16)
-    best_idx: int | None = None
-    best_dist: int | None = None
-    for idx, (r1, g1, b1) in PT12_COLOR_PALETTE.items():
-        # Perceptually weighted squared RGB distance (fast, stdlib-only)
-        dr, dg, db = r0 - r1, g0 - g1, b0 - b1
-        dist = 2 * dr * dr + 4 * dg * dg + 3 * db * db
-        if best_dist is None or dist < best_dist:
-            best_dist = dist
-            best_idx = idx
-    return best_idx

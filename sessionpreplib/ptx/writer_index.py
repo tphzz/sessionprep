@@ -6,13 +6,14 @@ from dataclasses import dataclass
 import struct
 
 from .codec import find_zchunk_offset, iter_top_chunks
-from .models import PtxChunk
+from .models import PtxChunk, PtxCorruptFileError
 from .writer_primitives import (
     PtxIndex0002,
     PtxIndexEntry,
     PtxIndexOccurrence,
     PtxIndexPathStep,
     replace_index_0002_chunk,
+    shift_parsed_index_0002,
 )
 
 _ZERO5 = b"\x00" * 5
@@ -57,12 +58,12 @@ def _walk_counted_children(
     pos = start
     for _ in range(count):
         if pos + 9 > end or buf[pos] != 0x5A:
-            raise RuntimeError(f"Expected Z-chunk at offset 0x{pos:x} while rebuilding 0x0002")
+            raise PtxCorruptFileError(f"Expected Z-chunk at offset 0x{pos:x} while rebuilding 0x0002")
         sz = struct.unpack_from("<I", buf, pos + 3)[0]
         tag = struct.unpack_from("<H", buf, pos + 7)[0]
         nxt = pos + 7 + sz
         if sz < 2 or nxt > end:
-            raise RuntimeError(f"Truncated Z-chunk 0x{tag:04x} at offset 0x{pos:x}")
+            raise PtxCorruptFileError(f"Truncated Z-chunk 0x{tag:04x} at offset 0x{pos:x}")
         items.append((tag, pos, nxt))
         pos = nxt
     return items, pos
@@ -463,7 +464,7 @@ def _append_synthesized_chunk_entries(
             [PtxIndexPathStep(0x0F3D, -1, m0)],
             [_occ(ctx.c0f3d_off), *(_occ(o) for o in ctx.c0f3d_subs)],
         ))
-    for tag in (0x1004, 0x2637, 0x262A, 0x2630, 0x210C):
+    for tag in (0x1004, 0x2637, 0x262A, 0x2630, 0x2030, 0x210C):
         if tag not in old_tags and (tag,) not in present_paths and tag in by_tag:
             out_entries.append(PtxIndexEntry([PtxIndexPathStep(tag, -1, _ZERO5)], [_occ(by_tag[tag].offset)]))
     if 0x1058 not in old_tags and (0x1058,) not in present_paths and ctx.c1058_off is not None:
@@ -527,3 +528,23 @@ def apply_rebuilt_index_0002(
     """Rebuild and splice the trailing ``0x0002`` index into *buf* in place."""
     rebuilt = rebuild_index_0002(template_index, old_buf, bytes(buf))
     replace_index_0002_chunk(buf, rebuilt)
+
+
+def apply_inserted_top_chunk_index_0002(
+    buf: bytearray,
+    template_index: PtxIndex0002,
+    inserted_tag: int,
+    inserted_raw: bytes,
+) -> None:
+    """Shift *template_index* for one newly inserted top-level chunk and register its entry."""
+    chunks = iter_top_chunks(bytes(buf), strict=True)
+    target = next((c for c in reversed(chunks) if c.tag == inserted_tag), None)
+    if target is None:
+        raise PtxCorruptFileError(f"Inserted top-level chunk 0x{inserted_tag:04x} not found in buffer")
+    shifted = shift_parsed_index_0002(template_index, target.offset, len(inserted_raw))
+    present_paths = {tuple(s.tag for s in e.path) for e in shifted.entries if e.path}
+    if (inserted_tag,) not in present_paths:
+        shifted.entries.append(
+            PtxIndexEntry([PtxIndexPathStep(inserted_tag, -1, _ZERO5)], [_occ(target.offset)])
+        )
+    replace_index_0002_chunk(buf, shifted)

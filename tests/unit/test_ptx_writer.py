@@ -23,24 +23,26 @@ from sessionpreplib.ptx import (
     OfflineAudioTrackRequest,
     OfflineGroupRequest,
     OfflinePtxWriteRequest,
+    PtxSession,
+    decrypt_ptx,
+    encrypt_ptx,
+    generate_ptx_uuid,
+    validate_index_0002,
+    write_offline_ptx_session,
+)
+from sessionpreplib.ptx.lowlevel import (
     PtxIndex0002,
     PtxIndexEntry,
     PtxIndexOccurrence,
     PtxIndexPathStep,
-    PtxSession,
     apply_rebuilt_index_0002,
     build_zchunk,
-    decrypt_ptx,
     encode_lp_str,
-    encrypt_ptx,
-    generate_ptx_uuid,
     iter_top_chunks,
     parse_index_0002,
     rebuild_index_0002,
     serialize_folder_tree_210c,
     serialize_index_0002,
-    validate_index_0002,
-    write_offline_ptx_session,
 )
 from sessionpreplib.ptx.models import PTX_MAGIC
 from sessionpreplib.ptx.writer_blueprints import (
@@ -56,7 +58,7 @@ from sessionpreplib.ptx.writer_blueprints import (
     build_whole_file_clip_2629,
 )
 from sessionpreplib.ptx.writer_chunks import serialize_directory_tree_103a
-from sessionpreplib.ptx.writer_mutations import (
+from sessionpreplib.ptx.writer_track_mutations import (
     NewAudioTrackSpec,
     TrackSlotOp,
     mutate_202b_groups_for_track_map,
@@ -708,7 +710,9 @@ def test_template_with_preexisting_audio_append_and_delete(tmp_path: Path):
     assert validate_index_0002(dec_del) is True
     c2624_del = next(c.raw for c in iter_top_chunks(dec_del, strict=True) if c.tag == 0x2624)
     from sessionpreplib.ptx.codec import find_zchunk_offset, read_zchunk_at, walk_sequential_zchunks
-    from sessionpreplib.ptx.writer_mutations import _extract_261c_playlist_indices
+    from sessionpreplib.ptx.writer_track_mutations import (
+        extract_261c_playlist_indices as _extract_261c_playlist_indices,
+    )
     strips_del, _ = walk_sequential_zchunks(c2624_del, 13, struct.unpack_from("<I", c2624_del, 9)[0])
     audio_pl_indices = []
     audio_view_ordinals = []
@@ -729,10 +733,12 @@ def test_review_edge_cases_playlist_ownership_fades_strides_and_guards(tmp_path:
     """Lock down edge cases: non-Audio name collisions, renamed playlists, fade tails, alternate playlists, guards."""
     from sessionpreplib.ptx.codec import splice_top_chunk
     from sessionpreplib.ptx.writer_chunks import serialize_lane_1052
-    from sessionpreplib.ptx.writer_mutations import (
-        _extract_261c_playlist_indices,
-        _parse_playlist_1014_meta,
+    from sessionpreplib.ptx.writer_track_mutations import (
+        extract_261c_playlist_indices as _extract_261c_playlist_indices,
         _remap_261c_strip_indices,
+    )
+    from sessionpreplib.ptx.writer_media_mutations import (
+        _parse_playlist_1014_meta,
         _remap_playlist_1014_lanes,
         mutate_0f3d_volumes,
         plan_existing_media_survival,
@@ -760,7 +766,7 @@ def test_review_edge_cases_playlist_ownership_fades_strides_and_guards(tmp_path:
     assert len(surv.lanes) == 3  # lane 1 survived because SharedEnd still references it!
 
     # 2. Alternate playlists (pl_cnt == 2) for both 2-byte (<H) and 4-byte (<I) mid_gap strides + error on malformed gap
-    from sessionpreplib.ptx.writer_mutations import _read_zchunk_at
+    from sessionpreplib.ptx.codec import read_zchunk_at as _read_zchunk_at
     _, _, mid_off = _read_zchunk_at(st_keep2, 9, expected_tag=0x261B)
     _, raw_200b, tail_off = _read_zchunk_at(st_keep2, mid_off + 12, expected_tag=0x200B)
     st_alt_u16 = build_zchunk(
@@ -863,12 +869,12 @@ def test_review_edge_cases_playlist_ownership_fades_strides_and_guards(tmp_path:
 def test_virgin_template_2587_siblings_hidden_tracks_top_level_and_guards(tmp_path: Path, monkeypatch):
     """Verify virgin-template synthesis, canonical ordering, 0x2587 sibling shifts, hidden tracks, top-level/empty tracks, and guards."""
     from sessionpreplib.ptx import (
-        OutputBusSpec,
         PtxUnsupportedTemplateError,
         PtxValidationError,
         normalize_ptx_uuid16,
     )
-    from sessionpreplib.ptx.writer_mutations import mutate_2519_tracks
+    from sessionpreplib.ptx.lowlevel import OutputBusSpec
+    from sessionpreplib.ptx.writer_track_mutations import mutate_2519_tracks
 
     # 1. Virgin template missing 0x0F3D, 0x1004, 0x2637, 0x262A, 0x1054, 0x1015, 0x210C PLUS 0x2587 sibling after 0x258A!
     raw_base = _build_clean_template_ptxt(include_0f3d=False, include_2587=True)
@@ -988,7 +994,9 @@ def test_virgin_template_2587_siblings_hidden_tracks_top_level_and_guards(tmp_pa
         version=9,
     )
     mut_hid = mutate_2519_tracks(c2519_hid, [TrackSlotOp(old_index=0), TrackSlotOp(old_index=1), TrackSlotOp(old_index=2)])
-    from sessionpreplib.ptx.writer_mutations import _parse_2519_sections
+    from sessionpreplib.ptx.writer_track_mutations import (
+        parse_2519_sections as _parse_2519_sections,
+    )
     _, rows_h, p1_h, _, _ = _parse_2519_sections(mut_hid)
     vis_orders = [struct.unpack_from("<H", r, len(r) - 3)[0] for r in rows_h]
     assert vis_orders == [1, 0, 2]
@@ -1057,10 +1065,11 @@ def test_virgin_template_2587_siblings_hidden_tracks_top_level_and_guards(tmp_pa
             tracks=(OfflineAudioTrackRequest("BadColor", 1, None, None, None, color_index=70000),),
         ))
 
-    # 5. _verify_written_ptx ignores pre-existing baseline warnings but fails on newly introduced parser warnings
+    # 5. _verify_written_buffer ignores pre-existing baseline warnings but fails on newly introduced parser warnings
     from sessionpreplib.ptx import PtxCorruptFileError
     from sessionpreplib.ptx import writer as writer_mod
-    from sessionpreplib.ptx.writer import _verify_written_ptx
+    from sessionpreplib.ptx._document import PtxBuffer
+    from sessionpreplib.ptx.writer import _verify_written_buffer
     sess_ok = PtxSession.from_file(res.ptx_path)
     raw_ok = res.ptx_path.read_bytes()
     dec_ok, delta_ok = decrypt_ptx(raw_ok)
@@ -1073,15 +1082,15 @@ def test_virgin_template_2587_siblings_hidden_tracks_top_level_and_guards(tmp_pa
             self.warnings.append("Pre-existing tempo warning")
 
     monkeypatch.setattr(writer_mod, "PtxSession", _WarnSession)
-    _verify_written_ptx(
-        raw_ok,
+    _verify_written_buffer(
+        PtxBuffer.from_encrypted(raw_ok),
         expected_track_count=len(sess_ok.tracks), created_names=[t.name for t in sess_ok.tracks],
         expected_audio_file_count=1, expected_clip_count=2, expected_playlist_count=len(sess_ok.playlists),
         baseline_warnings=("Pre-existing tempo warning",),
     )
     with pytest.raises(PtxCorruptFileError, match="Pre-existing tempo warning"):
-        _verify_written_ptx(
-            raw_ok,
+        _verify_written_buffer(
+            PtxBuffer.from_encrypted(raw_ok),
             expected_track_count=len(sess_ok.tracks), created_names=[t.name for t in sess_ok.tracks],
             expected_audio_file_count=1, expected_clip_count=2, expected_playlist_count=len(sess_ok.playlists),
             baseline_warnings=(),
@@ -1092,8 +1101,8 @@ def test_virgin_template_2587_siblings_hidden_tracks_top_level_and_guards(tmp_pa
     bad_idx_dec = bytearray(dec_ok)
     struct.pack_into("<I", bad_idx_dec, 0x1B, 0x1F)
     with pytest.raises(PtxCorruptFileError, match="0x0002"):
-        _verify_written_ptx(
-            encrypt_ptx(bytes(bad_idx_dec), delta_ok),
+        _verify_written_buffer(
+            PtxBuffer(bad_idx_dec, delta_ok, 0),
             expected_track_count=len(sess_ok.tracks), created_names=[],
             expected_audio_file_count=1, expected_clip_count=2, expected_playlist_count=len(sess_ok.playlists),
         )
@@ -1103,10 +1112,10 @@ def test_virgin_template_2587_siblings_hidden_tracks_top_level_and_guards(tmp_pa
 def test_output_bus_260e_root_and_mono_subpath_resolution():
     from types import SimpleNamespace
 
-    from sessionpreplib.ptx import OutputBusSpec
+    from sessionpreplib.ptx.lowlevel import OutputBusSpec
     from sessionpreplib.ptx.codec import find_subchunks
     from sessionpreplib.ptx.models import PtxSignalPath
-    from sessionpreplib.ptx.writer import _resolve_output_bus
+    from sessionpreplib.ptx.writer_specs import resolve_output_bus as _resolve_output_bus
 
     bus_uid = generate_ptx_uuid()
     parent_uid = generate_ptx_uuid()

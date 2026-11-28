@@ -6,17 +6,19 @@ import pytest
 
 from sessionpreplib.ptx import (
     PtxAutomationPoint,
+    PtxSession,
+    decrypt_ptx,
+    generate_ptx_uuid,
+)
+from sessionpreplib.ptx.lowlevel import (
     PtxIndex0002,
     PtxIndexEntry,
     PtxIndexOccurrence,
     PtxIndexPathStep,
-    PtxSession,
     build_zchunk,
-    decrypt_ptx,
     encode_control_curve,
     encode_lp_str,
     encode_packed_uint,
-    generate_ptx_uuid,
     iter_top_chunks,
     parse_control_curve,
     parse_index_0002,
